@@ -13,8 +13,14 @@ Rust utility crates are allowed: `png` and `zune-jpeg` decode input pixels,
 metadata. The optional suffix-index route uses a vendored pure-Rust `libsais-rs`
 utility with a serial-threading fix, not a codec or native binding; see
 [its provenance](vendor/libsais-rs/PROVENANCE.md). SIMD uses `std::arch` with runtime detection.
+Runtime decoding uses maintained official Rust source under
+`vendor/jxl-rs`, not from C++ or an external CLI. Its first acceptance target is
+djxl-equivalent functionality; see [decoder status](docs/DECODER_STATUS.md).
 Current development targets x86_64 and the portable fallback; further ARM-specific
-kernel work is paused at the user's request.
+kernel work is paused at the user's request. Pixel decoding, visible frames and
+original-JPEG reconstruction are connected end to end; this is not yet a claim
+of complete djxl coverage. Decoder checks and remaining limits are recorded
+separately from encoder migration.
 
 ## Active Paths
 
@@ -52,6 +58,9 @@ kernel work is paused at the user's request.
 - Separate byte-reversible JPEG coefficient transcoding with shared auxiliary
   trees/entropy, adaptive coefficient order, CfL, source candidate search and
   exact-source ICC/Exif/XMP reconstruction deduplication.
+- Maintained pure-Rust decoder source with typed pixel/extra-plane output,
+  visible-frame reconstruction and integer-coefficient JPEG restoration.
+  See [decoder status](docs/DECODER_STATUS.md) for its distinct acceptance gates.
 
 Source coverage, active versus pending integration, and remaining optimization
 work are tracked in [PIXEL_LOSSLESS_PORT_STATUS.md](docs/PIXEL_LOSSLESS_PORT_STATUS.md).
@@ -88,8 +97,9 @@ support Python CFFI. Lossy encoding and neural scheduling are out of scope.
 
 **The `encode` command's JPEG input decodes to pixels. Original JPEG bytes cannot
 be reconstructed from that output.** Use `transcode-jpeg` or the separate archival API instead of this
-route. Runtime decoding/Python packaging are not implemented; official `djxl`
-is an independent test oracle, not an implementation dependency.
+route. Python packaging is not implemented. Decoder integration is tracked
+separately; official `djxl` remains an independent test oracle, not an
+implementation dependency.
 
 ## Build and Run
 
@@ -101,6 +111,9 @@ cargo build --locked --release -p rs-jxl-cli
 .\target\release\rs-jxl.exe encode input.png output.jxl --source-effort 9 --source-search --threads 8
 .\target\release\rs-jxl.exe transcode-jpeg input.jpg archive.jxl --effort 9 --threads 4
 .\target\release\rs-jxl.exe transcode-jpeg input.jpg archive.jxl --effort 9 --source-search --threads 4
+.\target\release\rs-jxl.exe decode output.jxl restored.png --threads 4
+.\target\release\rs-jxl.exe decode archive.jxl original.jpg
+.\target\release\rs-jxl.exe decode animation.jxl frames.npy --bits 32
 ```
 
 Linux/macOS use `./target/release/rs-jxl`; those platforms still require actual
@@ -168,6 +181,7 @@ not verified. Later changes must repeat the checks; see the checkpoint document.
 - [Incremental output and frame indexes](docs/STREAMING_OUTPUT.md)
 - [Fast lossless source port](docs/FJXL_PORT_STATUS.md)
 - [Byte-reversible JPEG API](docs/JPEG_API.md)
+- [Maintained Rust decoder and API](docs/DECODER_STATUS.md)
 - [Integer, floating-point and SIMD contracts](docs/INTEGER_AND_FLOAT_PATHS.md)
 - [Historical bitstream bring-up](docs/PIXEL_LOSSLESS_MILESTONE.md)
 - [Kernel provenance and upstream BSD notice](docs/PORTING_KERNELS.md)

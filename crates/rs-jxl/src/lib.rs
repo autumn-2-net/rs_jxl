@@ -20,11 +20,12 @@
 //! a valid stream alone does not establish migration completion. Byte-reversible
 //! JPEG coefficient transcoding has its own [`jpeg::transcode`] entry point;
 //! it never falls back to decoding and recompressing pixels.
-//! A runtime decoder remains a later phase.
+//! Runtime decoding uses maintained official Rust decoder sources; see [`decode`].
 #![deny(unsafe_op_in_unsafe_fn)]
 
 pub mod bit_writer;
 pub mod color;
+pub mod decode;
 pub mod entropy;
 pub mod frame;
 pub mod icc;

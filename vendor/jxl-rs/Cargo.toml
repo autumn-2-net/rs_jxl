@@ -1,0 +1,33 @@
+[profile.release]
+debug = true
+lto = "thin"
+panic = "abort"
+
+[profile.dev]
+debug-assertions = true
+overflow-checks = true
+opt-level = 1
+panic = "abort"
+
+[profile.bench]
+debug = true
+
+[workspace]
+members = [
+  "jxl",
+  "jxl_macros",
+  "jxl_simd",
+  "jxl_transforms",
+]
+resolver = "2"
+
+[workspace.package]
+rust-version = "1.89.0"
+
+[workspace.lints.clippy]
+chunks_exact_to_as_chunks = "allow"
+missing_safety_doc = "deny"
+undocumented_unsafe_blocks = "deny"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"

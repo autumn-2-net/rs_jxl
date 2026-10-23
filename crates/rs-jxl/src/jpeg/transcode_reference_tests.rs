@@ -14,7 +14,7 @@
 //! schedules, independent of that matrix variable. No input paths are required.
 
 #[path = "../../tests/support/jpeg_fixtures.rs"]
-mod fixtures;
+pub(super) mod fixtures;
 
 use std::{
     collections::BTreeSet,

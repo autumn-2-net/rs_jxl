@@ -9,6 +9,7 @@ publish.workspace = true
 libsais-rs = { version = "=0.2.2", default-features = false }
 rayon.workspace = true
 brotli.workspace = true
+jxl-decoder.workspace = true
 
 [dev-dependencies]
 png.workspace = true

@@ -15,8 +15,11 @@
   PNG and JPEG pixel input libraries are now explicitly authorized for the first
   complete pixel-lossless milestone. Keep pixel input separate from the later
   byte-reversible JPEG coefficient transcoder.
-- Official `djxl` is a development-only independent decoder oracle. The official
-  Rust decoder may be evaluated later; it must not replace encoder migration.
+- Official `djxl` is a development-only independent decoder oracle. The user
+  authorized maintaining official `jxl-rs` source under `vendor/jxl-rs` for
+  runtime decoding. Keep its provenance and local patch ledger. It must not
+  replace encoder migration. First target djxl-equivalent functionality;
+  beyond-djxl raw-layer/native-U31 interfaces are later extensions.
 - Work in stages. Do not expose a working encoder API until it actually emits
   complete standard-compatible JXL. Helper tests are not codec compatibility.
 - The first acceptance phase is the COMPLETE PIXEL-LOSSLESS PORT, not merely

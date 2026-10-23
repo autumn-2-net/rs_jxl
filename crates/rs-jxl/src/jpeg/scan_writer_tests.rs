@@ -1,6 +1,33 @@
 use super::*;
 use crate::jpeg::coefficient_reader::read_coefficients;
 
+#[test]
+fn jbrd_implicit_one_padding_matches_explicit_padding_and_obeys_budget() {
+    let mut original = header(0xc0, 8);
+    sos(&mut original, 0, 63, 0, &[0x3f]);
+    original.extend([255, 0xd9]);
+    let mut jpeg = read_coefficients(&original).unwrap();
+    assert!(jpeg.padding_bits.iter().all(|&bit| bit == 1));
+    let required = jpeg.padding_bits.len();
+    assert!(required > 0);
+    jpeg.padding_bits.clear();
+    jpeg.has_zero_padding_bit = false;
+    assert_eq!(
+        reconstruct_from_coefficients(&jpeg, &WriteLimits::default()).unwrap(),
+        original
+    );
+    assert!(
+        reconstruct_from_coefficients(
+            &jpeg,
+            &WriteLimits {
+                max_padding_bits: required - 1,
+                ..Default::default()
+            }
+        )
+        .is_err()
+    );
+}
+
 fn segment(bytes: &mut Vec<u8>, marker: u8, payload: &[u8]) {
     bytes.extend([0xff, marker]);
     bytes.extend(u16::try_from(payload.len() + 2).unwrap().to_be_bytes());

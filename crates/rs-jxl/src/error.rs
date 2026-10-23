@@ -5,12 +5,13 @@ pub enum Error {
     InvalidInput(String),
     Limit(&'static str),
     Encoding(String),
+    Decoding(String),
     Io(std::io::Error),
 }
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidInput(s) | Self::Encoding(s) => f.write_str(s),
+            Self::InvalidInput(s) | Self::Encoding(s) | Self::Decoding(s) => f.write_str(s),
             Self::Limit(s) => write!(f, "resource limit: {s}"),
             Self::Io(e) => e.fmt(f),
         }

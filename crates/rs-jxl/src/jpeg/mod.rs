@@ -23,6 +23,7 @@ pub mod modular_policy;
 pub mod quantization;
 pub mod reader;
 pub mod reconstruction_brotli;
+pub mod reconstruction_decode;
 pub mod reconstruction_metadata;
 mod reconstruction_validation;
 pub mod scan_progression;

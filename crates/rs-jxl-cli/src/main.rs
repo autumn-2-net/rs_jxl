@@ -1,3 +1,4 @@
+mod decode;
 mod input;
 mod io;
 mod options;
@@ -23,8 +24,9 @@ const DEFAULT_SOURCE_SAMPLE_LIMIT: usize = 1_048_576;
 #[command(
     name = "rs-jxl",
     version,
-    about = "Encode lossless pixels or transcode JPEG coefficients to JPEG XL",
-    long_about = "Encode or transcode one image using the direct Rust JXL encoder.\n\
+    about = "Encode, decode, or transcode JPEG XL images",
+    long_about = "Encode, decode, or transcode images using Rust JPEG XL codecs.\n\
+decode: JPEG XL pixels to PNG/APNG, NPY, PPM, PGM or PFM, or original JPEG reconstruction.\n\
 encode: PNG or JPEG decoded pixels to lossless JPEG XL.\n\
 PNG: gray, gray-alpha, RGB and RGBA at 8/16 bits; palette and low-bit gray \
 are expanded without losing decoded samples, including RGB under zero alpha.\n\
@@ -33,7 +35,7 @@ relative to this decoder's samples, NOT the original JPEG bytes. \
 Use transcode-jpeg for byte-reversible JPEG coefficient transcoding instead.\n\
 transcode-jpeg: supported 8-bit Huffman DCT JPEG inputs only, with JPEG \
 reconstruction data and no pixel fallback. Full optimized source-tool parity \
-is not claimed. A decoder command is not available."
+is not claimed."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -42,6 +44,8 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Decode JPEG XL pixels or reconstruct original JPEG bytes
+    Decode(decode::DecodeArgs),
     /// Encode one still PNG or JPEG to a JXL file
     Encode(EncodeArgs),
     /// Transcode JPEG coefficients with original-JPEG reconstruction data
@@ -225,6 +229,7 @@ fn run(args: EncodeArgs) -> Result<()> {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
+        Command::Decode(args) => decode::run(args),
         Command::Encode(args) => run(args),
         Command::TranscodeJpeg(args) => transcode::run(args),
     };
@@ -404,6 +409,6 @@ mod tests {
                 Cli::try_parse_from(["rs-jxl", "encode", "a", "b", "--threads", count]).is_err()
             );
         }
-        assert!(Cli::try_parse_from(["rs-jxl", "decode", "a", "b"]).is_err());
+        assert!(Cli::try_parse_from(["rs-jxl", "decode", "a", "b"]).is_ok());
     }
 }

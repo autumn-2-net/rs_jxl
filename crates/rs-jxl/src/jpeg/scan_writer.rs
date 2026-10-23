@@ -113,7 +113,7 @@ pub fn reconstruct_from_coefficients(
             append_record(&mut output, record, jpeg, limits.max_output_bytes)?;
         }
     }
-    if padding != jpeg.padding_bits.len() {
+    if !implicit_one_padding(jpeg) && padding != jpeg.padding_bits.len() {
         return Err(ReconstructionError::Invalid("unused JPEG padding bits"));
     }
     Ok(output)
@@ -131,20 +131,33 @@ fn table(definition: &HuffmanCode) -> Result<HuffmanTable, ReconstructionError> 
         .map_err(|_| ReconstructionError::Invalid("JPEG Huffman definition"))
 }
 
+fn implicit_one_padding(jpeg: &JpegData) -> bool {
+    // jbrd omits padding entirely when all alignment bits are one.
+    !jpeg.has_zero_padding_bit && jpeg.padding_bits.is_empty()
+}
+
 fn align(
     writer: &mut EntropyBitWriter,
     jpeg: &JpegData,
     position: &mut usize,
+    limit: usize,
 ) -> Result<(), ReconstructionError> {
     let count = writer.padding_bits_needed();
     let end = position
         .checked_add(usize::from(count))
         .ok_or(ReconstructionError::Limit("padding offset"))?;
-    let bits = jpeg
-        .padding_bits
-        .get(*position..end)
-        .ok_or(ReconstructionError::Invalid("missing JPEG padding bits"))?;
-    let value = bits.iter().fold(0, |value, bit| (value << 1) | bit);
+    if end > limit {
+        return Err(ReconstructionError::Limit("padding bits"));
+    }
+    let value = if implicit_one_padding(jpeg) {
+        ((1u16 << count) - 1) as u8
+    } else {
+        let bits = jpeg
+            .padding_bits
+            .get(*position..end)
+            .ok_or(ReconstructionError::Invalid("missing JPEG padding bits"))?;
+        bits.iter().fold(0, |value, bit| (value << 1) | bit)
+    };
     writer.align_with(value, count)?;
     *position = end;
     Ok(())
@@ -210,7 +223,7 @@ fn encode_scan(
                         block: block_index,
                         message: error.to_string(),
                     })?;
-                align(&mut writer, jpeg, padding)?;
+                align(&mut writer, jpeg, padding, limits.max_padding_bits)?;
                 let restart = &entropy.restart_markers[restart_index];
                 writer.write_restart_with_fill((restart_index % 8) as u8, restart.fill_count)?;
                 restart_index += 1;
@@ -292,7 +305,7 @@ fn encode_scan(
             block: block_index,
             message: error.to_string(),
         })?;
-    align(&mut writer, jpeg, padding)?;
+    align(&mut writer, jpeg, padding, limits.max_padding_bits)?;
     Ok(writer.into_bytes()?)
 }
 
