@@ -1,0 +1,96 @@
+mod jpeg;
+mod png;
+
+use rs_jxl::Image;
+
+use crate::Result;
+
+pub(crate) const MAX_INPUT_BYTES: usize = 512 * 1024 * 1024;
+pub(super) const MAX_DIMENSION: u32 = 16_384;
+const MAX_PIXELS: u64 = 64_000_000;
+const MAX_DECODED_BYTES: usize = 512 * 1024 * 1024;
+
+pub(crate) struct Decoded {
+    pub image: Image,
+    pub jpeg: bool,
+}
+
+pub(crate) fn decode(bytes: &[u8], strip_metadata: bool) -> Result<Decoded> {
+    if bytes.len() > MAX_INPUT_BYTES {
+        return Err("input exceeds the 512 MiB limit".into());
+    }
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Ok(Decoded {
+            image: png::decode(bytes, strip_metadata)?,
+            jpeg: false,
+        })
+    } else if bytes.starts_with(&[0xff, 0xd8]) {
+        Ok(Decoded {
+            image: jpeg::decode(bytes, strip_metadata)?,
+            jpeg: true,
+        })
+    } else {
+        Err("unsupported input: expected a PNG or JPEG signature".into())
+    }
+}
+
+fn checked_size(
+    width: u32,
+    height: u32,
+    channels: usize,
+    bytes_per_sample: usize,
+) -> Result<usize> {
+    if width == 0 || height == 0 || width > MAX_DIMENSION || height > MAX_DIMENSION {
+        return Err("image dimensions must be in 1..=16384".into());
+    }
+    let pixels = u64::from(width) * u64::from(height);
+    if pixels > MAX_PIXELS {
+        return Err("image exceeds the 64000000 pixel limit".into());
+    }
+    let size = usize::try_from(pixels)?
+        .checked_mul(channels)
+        .and_then(|n| n.checked_mul(bytes_per_sample))
+        .filter(|&n| n <= MAX_DECODED_BYTES)
+        .ok_or("decoded image exceeds the 512 MiB limit")?;
+    Ok(size)
+}
+
+fn zeroed_bytes(size: usize) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(size)?;
+    bytes.resize(size, 0);
+    Ok(bytes)
+}
+
+fn metadata(kind: &str, strip: bool) -> Result<()> {
+    if strip {
+        Ok(())
+    } else {
+        Err(format!(
+            "{kind} metadata cannot be preserved; use --strip-metadata to explicitly \
+             discard it without color conversion or EXIF orientation transforms"
+        )
+        .into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_unknown_or_empty_input() {
+        for bytes in [&b""[..], &b"not a PNG"[..], &b"\xff\x0a"[..]] {
+            assert!(decode(bytes, false).is_err());
+        }
+    }
+
+    #[test]
+    fn checks_dimensions_and_products_before_allocation() {
+        assert_eq!(checked_size(2, 3, 4, 2).unwrap(), 48);
+        assert!(checked_size(0, 3, 1, 1).is_err());
+        assert!(checked_size(u32::MAX, u32::MAX, 4, 2).is_err());
+        assert!(checked_size(16384, 16384, 1, 1).is_err());
+        assert!(checked_size(8192, 8192, usize::MAX, 2).is_err());
+    }
+}

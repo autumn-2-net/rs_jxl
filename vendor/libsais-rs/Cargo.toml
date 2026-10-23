@@ -1,0 +1,53 @@
+# Rust-only vendoring of the crates.io 0.2.2 utility. See PROVENANCE.md.
+
+[package]
+edition = "2021"
+name = "libsais-rs"
+version = "0.2.2"
+build = false
+include = [
+    "/Cargo.toml",
+    "/README.md",
+    "/LICENSE",
+    "/PROVENANCE.md",
+    "/src/**",
+]
+autolib = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+description = "Rust translation of libsais for suffix array construction and related transforms"
+homepage = "https://github.com/henriksson-lab/libsais-rs"
+documentation = "https://docs.rs/libsais-rs"
+readme = "README.md"
+keywords = [
+    "suffix-array",
+    "bwt",
+    "text",
+    "bioinformatics",
+]
+categories = [
+    "algorithms",
+    "science",
+]
+license = "Apache-2.0"
+repository = "https://github.com/henriksson-lab/libsais-rs"
+
+[features]
+default = []
+
+[lib]
+name = "libsais_rs"
+path = "src/lib.rs"
+
+[dependencies.rayon]
+version = "1.10"
+
+# Retain upstream's disabled C comparison code without exposing a feature that
+# could enable it. There is no build script, build dependency or native target.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("upstream-c"))'] }
+
+# Keep this third-party utility out of parent --workspace test/lint targets.
+[workspace]

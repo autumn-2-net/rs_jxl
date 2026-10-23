@@ -1,0 +1,19 @@
+[package]
+name = "rs-jxl-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "rs-jxl"
+path = "src/main.rs"
+
+[dependencies]
+rs-jxl = { path = "../rs-jxl" }
+clap = { workspace = true, features = ["derive"] }
+png.workspace = true
+zune-jpeg.workspace = true
+
+[lints]
+workspace = true

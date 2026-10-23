@@ -1,0 +1,17 @@
+[package]
+name = "rs-jxl"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+libsais-rs = { version = "=0.2.2", default-features = false }
+rayon.workspace = true
+brotli.workspace = true
+
+[dev-dependencies]
+png.workspace = true
+
+[lints]
+workspace = true

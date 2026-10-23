@@ -1,0 +1,29 @@
+[workspace]
+members = ["crates/rs-jxl", "crates/rs-jxl-cli"]
+resolver = "2"
+
+[patch.crates-io]
+libsais-rs = { path = "vendor/libsais-rs" }
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+publish = false
+
+[workspace.dependencies]
+rayon = "1.10"
+png = "=0.18.1"
+zune-jpeg = "=0.5.15"
+clap = { version = "4", features = ["derive"] }
+brotli = { version = "=8.0.4", default-features = false, features = ["std"] }
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+all = "warn"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
