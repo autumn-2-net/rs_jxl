@@ -21,6 +21,9 @@ kernel work is paused at the user's request. Pixel decoding, visible frames and
 original-JPEG reconstruction are connected end to end; this is not yet a claim
 of complete djxl coverage. Decoder checks and remaining limits are recorded
 separately from encoder migration.
+Acceptance prioritizes exact lossless samples, original JPEG bytes and composed
+frames. Small finite differences in lossy floating rendering are recorded
+diagnostics, not a requirement to reproduce C++ arithmetic bit for bit.
 
 ## Active Paths
 
@@ -51,6 +54,10 @@ separately from encoder migration.
   [streaming API](docs/STREAMING_OUTPUT.md).
 - Full-frame difference planning against the previous or first frame, including
   hidden RGB and extra planes. Crop area is a heuristic, not an encoded-size claim.
+- Separate byte-selected automatic multiframe encoding compares full/crop,
+  eligible binary masks and multiple REPLACE layers, retaining actual winners.
+  See [automatic frames](docs/MULTIFRAME_AUTO.md) and
+  [encode-frames CLI](docs/MULTIFRAME_AUTO_CLI.md).
 - Owned thread pools, byte-vector/writer APIs, file/stdin/stdout CLI.
 - Cooperative source task queues share that pool across search roots, MA
   partitions/subtrees and LZ77 work. Scoped borrowing and failure draining are
@@ -117,6 +124,7 @@ cargo build --locked --release -p rs-jxl-cli
 .\target\release\rs-jxl.exe decode output.jxl restored.png --threads 4
 .\target\release\rs-jxl.exe decode archive.jxl original.jpg
 .\target\release\rs-jxl.exe decode animation.jxl frames.npy --bits 32
+.\target\release\rs-jxl.exe encode-frames first.png second.png -o animation.jxl --durations 100,150 --threads 4
 ```
 
 Linux/macOS use `./target/release/rs-jxl`; those platforms still require actual
@@ -134,11 +142,13 @@ expensive than lower efforts. Optional preflight/frontier/worker policies are
 available through `scheduler::DriverOptions`, not automatically enabled.
 
 PNG sRGB/gAMA/cHRM/iCCP and JPEG ICC are retained. Unsupported ancillary metadata
-requires explicit `--strip-metadata`, which also drops color metadata without
-conversion. Untagged input defaults to sRGB. CLI input currently rejects APNG,
+requires explicit `--strip-metadata`; supported color metadata is still retained,
+and no color conversion is performed. Untagged input defaults to sRGB. CLI input
+currently rejects APNG,
 CMYK/YCCK and non-8-bit JPEG. PNG palettes/tRNS and packed gray expand losslessly
 to decoded samples. Use `-` for binary stdin/stdout and `--force` to replace an
-output file. The Rust frame API is separate from CLI image input.
+output file. `encode-frames` accepts ordered still-image inputs; the Rust frame
+API additionally exposes explicit layer headers and extra planes.
 
 `transcode-jpeg` never decodes JPEG to pixels and never strips metadata or falls
 back to pixel encoding. It preserves the original JPEG byte stream through

@@ -1,4 +1,24 @@
 use super::*;
+
+#[test]
+fn cmyk_policy_is_explicit_and_does_not_enable_color_conversion_alone() {
+    let default = args(&["in.jxl", "out.npy", "--color-space", "sRGB"]);
+    let mut options = default.options(OutputFormat::Npy);
+    default
+        .configure_color(&mut options, OutputFormat::Npy)
+        .unwrap();
+    assert!(!options.color.cmyk_icc_conventions);
+    let icc = args(&[
+        "in.jxl",
+        "out.npy",
+        "--color-space",
+        "sRGB",
+        "--cmyk-icc-conventions",
+    ]);
+    icc.configure_color(&mut options, OutputFormat::Npy)
+        .unwrap();
+    assert!(options.color.cmyk_icc_conventions);
+}
 use std::{
     fs,
     sync::atomic::{AtomicU64, Ordering},

@@ -11,6 +11,8 @@ mod color;
 mod color_lut;
 mod convert;
 mod engine;
+#[cfg(test)]
+mod error_tests;
 mod inspect;
 mod jpeg;
 mod runner;
@@ -146,6 +148,20 @@ pub struct DecodedImage {
 
 fn failure(error: impl std::fmt::Display) -> Error {
     Error::Decoding(error.to_string())
+}
+
+fn backend_error(error: jxl_decoder::error::Error) -> Error {
+    use jxl_decoder::error::Error as BackendError;
+    match error {
+        BackendError::OutOfMemory(_) | BackendError::ImageOutOfMemory(..) => {
+            Error::Limit("decoder allocation")
+        }
+        BackendError::ImageSizeTooLarge(..) | BackendError::ImageDimensionTooLarge(_) => {
+            Error::Limit("decoder image size")
+        }
+        BackendError::IOError(error) => Error::Io(error),
+        other => failure(other),
+    }
 }
 
 fn check_info(info: &JxlBasicInfo, options: &DecodeOptions) -> Result<()> {

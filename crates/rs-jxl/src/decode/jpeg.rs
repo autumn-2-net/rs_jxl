@@ -1,9 +1,13 @@
 //! Original-byte reconstruction from a complete JXL container, never pixels.
-use super::{DecodeOptions, DecodedBox, backend_options, boxes, failure, runner};
+use super::{DecodeOptions, DecodedBox, backend_error, backend_options, boxes, failure, runner};
+use crate::jpeg::data::JpegError;
+use crate::jpeg::entropy_writer::WriteError;
 use crate::jpeg::reconstruction_decode::{
-    CapturedJpegCoefficients, CapturedJpegComponent, ReconstructionDecodeLimits,
+    CapturedJpegCoefficients, CapturedJpegComponent, ReconstructionDecodeError,
+    ReconstructionDecodeLimits, decode_reconstruction_metadata,
 };
 use crate::jpeg::reconstruction_metadata::ReconstructionMetadataSources;
+use crate::jpeg::scan_writer::{ReconstructionError, reconstruct_from_coefficients};
 use crate::{Error, Result};
 use jxl_decoder::api::{Event, JxlColorProfile, JxlDecoder, JxlJpegCoefficientCapture};
 
@@ -16,6 +20,24 @@ fn unique_box(boxes: &[DecodedBox], kind: [u8; 4]) -> Result<Option<&[u8]>> {
         ));
     }
     Ok(first)
+}
+
+fn reconstruction_error(error: ReconstructionDecodeError) -> Error {
+    match error {
+        ReconstructionDecodeError::Limit(resource)
+        | ReconstructionDecodeError::Structural(JpegError::LimitExceeded { resource, .. })
+        | ReconstructionDecodeError::Reconstruction(ReconstructionError::Limit(resource))
+        | ReconstructionDecodeError::Reconstruction(ReconstructionError::Structural(
+            JpegError::LimitExceeded { resource, .. },
+        )) => Error::Limit(resource),
+        ReconstructionDecodeError::Reconstruction(ReconstructionError::Entropy(
+            WriteError::OutputLimit { .. },
+        )) => Error::Limit("JPEG reconstruction entropy output"),
+        ReconstructionDecodeError::Reconstruction(ReconstructionError::Entropy(
+            WriteError::AllocationFailed,
+        )) => Error::Limit("JPEG reconstruction entropy allocation"),
+        other => failure(other),
+    }
 }
 
 /// Reconstruct the original JPEG byte stream from JXL coefficients and `jbrd`.
@@ -47,7 +69,7 @@ pub fn reconstruct_jpeg(mut input: &[u8], options: &DecodeOptions) -> Result<Vec
     loop {
         match decoder
             .process(&mut input, None, Some(&mut pool))
-            .map_err(failure)?
+            .map_err(backend_error)?
         {
             Event::BasicInfo => {
                 let info = decoder
@@ -82,7 +104,11 @@ pub fn reconstruct_jpeg(mut input: &[u8], options: &DecodeOptions) -> Result<Vec
                 if capture.is_some() || frame_complete {
                     return Err(failure("JPEG reconstruction requires one frame"));
                 }
-                capture = Some(decoder.enable_jpeg_coefficient_capture().map_err(failure)?);
+                capture = Some(
+                    decoder
+                        .enable_jpeg_coefficient_capture()
+                        .map_err(backend_error)?,
+                );
             }
             Event::FrameComplete { has_more_frames } => {
                 if has_more_frames {
@@ -105,14 +131,6 @@ pub fn reconstruct_jpeg(mut input: &[u8], options: &DecodeOptions) -> Result<Vec
     let boxes = boxes::extract(&decoder, input, options.limits.max_metadata_bytes)?;
     let jbrd = unique_box(&boxes, *b"jbrd")?
         .ok_or_else(|| failure("JXL has no original-JPEG reconstruction data"))?;
-    let sources = ReconstructionMetadataSources {
-        icc_profile: match decoder.embedded_color_profile() {
-            Some(JxlColorProfile::Icc(bytes)) => Some(bytes),
-            _ => None,
-        },
-        exif_box_payload: unique_box(&boxes, *b"Exif")?,
-        xmp_box_payload: unique_box(&boxes, *b"xml ")?,
-    };
     let mut limits = ReconstructionDecodeLimits {
         max_jbrd_bytes: options.limits.max_metadata_bytes,
         max_metadata_bytes: options.limits.max_metadata_bytes,
@@ -123,6 +141,25 @@ pub fn reconstruct_jpeg(mut input: &[u8], options: &DecodeOptions) -> Result<Vec
         ..Default::default()
     };
     limits.write.max_output_bytes = options.limits.max_output_bytes;
+    let metadata = decode_reconstruction_metadata(jbrd, &limits).map_err(reconstruction_error)?;
+    // Unreferenced display metadata is not an original-JPEG source. Multiple
+    // boxes are ambiguous only when jbrd needs their bytes to restore an APP.
+    let sources = ReconstructionMetadataSources {
+        icc_profile: match decoder.embedded_color_profile() {
+            Some(JxlColorProfile::Icc(bytes)) => Some(bytes),
+            _ => None,
+        },
+        exif_box_payload: if metadata.needs_exif() {
+            unique_box(&boxes, *b"Exif")?
+        } else {
+            None
+        },
+        xmp_box_payload: if metadata.needs_xmp() {
+            unique_box(&boxes, *b"xml ")?
+        } else {
+            None
+        },
+    };
     let components = recovered
         .components
         .into_iter()
@@ -143,15 +180,63 @@ pub fn reconstruct_jpeg(mut input: &[u8], options: &DecodeOptions) -> Result<Vec
             })
         })
         .collect::<Result<_>>()?;
-    crate::jpeg::reconstruction_decode::reconstruct_jpeg(
-        jbrd,
-        CapturedJpegCoefficients {
-            width: recovered.width,
-            height: recovered.height,
-            components,
-        },
-        sources,
-        &limits,
-    )
-    .map_err(failure)
+    let jpeg = metadata
+        .into_jpeg(
+            CapturedJpegCoefficients {
+                width: recovered.width,
+                height: recovered.height,
+                components,
+            },
+            sources,
+            &limits,
+        )
+        .map_err(reconstruction_error)?;
+    reconstruct_from_coefficients(&jpeg, &limits.write)
+        .map_err(ReconstructionDecodeError::Reconstruction)
+        .map_err(reconstruction_error)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reconstruction_resource_errors_retain_their_public_classification() {
+        for error in [
+            ReconstructionDecodeError::Limit("expanded metadata"),
+            ReconstructionDecodeError::Structural(JpegError::LimitExceeded {
+                offset: 3,
+                resource: "records",
+            }),
+            ReconstructionDecodeError::Reconstruction(ReconstructionError::Limit("scan work")),
+            ReconstructionDecodeError::Reconstruction(ReconstructionError::Structural(
+                JpegError::LimitExceeded {
+                    offset: 7,
+                    resource: "tables",
+                },
+            )),
+            ReconstructionDecodeError::Reconstruction(ReconstructionError::Entropy(
+                WriteError::OutputLimit { limit: 1 },
+            )),
+            ReconstructionDecodeError::Reconstruction(ReconstructionError::Entropy(
+                WriteError::AllocationFailed,
+            )),
+        ] {
+            assert!(matches!(reconstruction_error(error), Error::Limit(_)));
+        }
+        for error in [
+            ReconstructionDecodeError::Truncated("Brotli stream"),
+            ReconstructionDecodeError::MissingSource("Exif box"),
+            ReconstructionDecodeError::Unsupported("JPEG marker"),
+            ReconstructionDecodeError::Structural(JpegError::Invalid {
+                offset: 0,
+                reason: "marker",
+            }),
+            ReconstructionDecodeError::Reconstruction(ReconstructionError::Entropy(
+                WriteError::MissingHuffmanSymbol(1),
+            )),
+        ] {
+            assert!(matches!(reconstruction_error(error), Error::Decoding(_)));
+        }
+    }
 }

@@ -6,6 +6,12 @@ use crate::{
 };
 use std::borrow::Cow;
 
+mod auto;
+mod regions;
+pub use auto::{
+    AutoCandidateReport, AutoEncodeResult, AutoFrameReport, AutoOptions, Strategy, encode_auto,
+};
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Reference {
     Full,

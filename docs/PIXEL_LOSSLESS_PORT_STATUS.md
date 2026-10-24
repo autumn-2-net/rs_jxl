@@ -173,8 +173,9 @@ acceptance or a guarantee about all large inputs.
 5. Continue JPEG byte transcoding as a separately verified track. Shared source
    auxiliary models and the public byte/writer API now work and passed 696
    official original-byte checks. Optimized search and metadata deduplication
-   now have separate passing checkpoints; runtime decoding and other documented
-   gaps remain. This does not complete
-   the pixel phase.
+   now have separate passing checkpoints. Runtime pixel decoding and original-byte
+   JPEG restoration are integrated; their lossless checks and remaining boundaries
+   are tracked in [DECODER_STATUS.md](DECODER_STATUS.md). This does not complete
+   the separate encoder performance/platform acceptance gates.
 
 Decoded pixels, not unchanged compressed bytes, determine pixel correctness.

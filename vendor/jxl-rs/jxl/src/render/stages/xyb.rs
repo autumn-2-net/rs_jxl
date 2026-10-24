@@ -3,7 +3,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-use jxl_simd::{F32SimdVec, SimdDescriptor, simd_function};
+use jxl_simd::{F32SimdVec, SimdDescriptor, SimdMask, simd_function};
 
 use crate::api::{
     JxlColorEncoding, JxlPrimaries, JxlTransferFunction, JxlWhitePoint, adapt_to_xyz_d50,
@@ -308,14 +308,19 @@ simd_function!(
             }
             TransferFunction::Gamma(g) => {
                 let g_vec = D::F32Vec::splat(d, *g);
+                let threshold = D::F32Vec::splat(d, 1e-5);
+                let zero = D::F32Vec::splat(d, 0.0);
                 process_xyb(d, params, xsize, x, y, b, {
                     #[inline(always)]
-                    |[r, g, b]| {
-                        [
-                            crate::util::fast_powf_simd(d, r.abs(), g_vec).copysign(r),
-                            crate::util::fast_powf_simd(d, g.abs(), g_vec).copysign(g),
-                            crate::util::fast_powf_simd(d, b.abs(), g_vec).copysign(b),
-                        ]
+                    |rgb| {
+                        // libjxl stage_from_linear.cc OpGamma clamps the linear
+                        // input, including the cutoff, instead of mirroring it.
+                        rgb.map(|v| {
+                            v.gt(threshold).if_then_else_f32(
+                                crate::util::fast_powf_simd(d, v.abs(), g_vec),
+                                zero,
+                            )
+                        })
                     }
                 });
             }
@@ -502,6 +507,69 @@ mod test {
             3,
         )
     }
+
+    fn gamma_linear_cutoff<D: SimdDescriptor>(d: D) {
+        let threshold = 1e-5_f32;
+        let samples = [
+            -1.0,
+            -threshold,
+            -0.0,
+            0.0,
+            1e-6,
+            f32::from_bits(threshold.to_bits() - 1),
+            threshold,
+            f32::from_bits(threshold.to_bits() + 1),
+            0.25,
+            1.0,
+            2.0,
+        ];
+        for gamma in [1.0, 0.4545455, 2.6_f32.recip()] {
+            for linear in samples {
+                // Inject exact linear samples through the cubic bias and an
+                // identity matrix, so the cutoff is not perturbed by a cube.
+                let params = XybParams {
+                    mat: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+                    bias_cbrt: [0.0; 3],
+                    scaled_bias: [linear; 3],
+                    intensity_scale: 1.0,
+                };
+                let mut row_x = vec![0.0; D::F32Vec::LEN];
+                let mut row_y = row_x.clone();
+                let mut row_b = row_x.clone();
+                xyb_color_convert_process(
+                    d,
+                    &params,
+                    &TransferFunction::Gamma(gamma),
+                    D::F32Vec::LEN,
+                    &mut row_x,
+                    &mut row_y,
+                    &mut row_b,
+                );
+                let expected = if gamma == 1.0 {
+                    linear
+                } else if linear <= threshold {
+                    0.0
+                } else {
+                    let mut reference = vec![0.0; D::F32Vec::LEN];
+                    crate::util::fast_powf_simd(
+                        d,
+                        D::F32Vec::splat(d, linear),
+                        D::F32Vec::splat(d, gamma),
+                    )
+                    .store(&mut reference);
+                    reference[0]
+                };
+                for value in row_x.into_iter().chain(row_y).chain(row_b) {
+                    assert_eq!(value, expected, "linear {linear}, gamma {gamma}");
+                    if gamma != 1.0 && linear <= threshold {
+                        assert_eq!(value.to_bits(), 0);
+                    }
+                }
+            }
+        }
+    }
+
+    test_all_instruction_sets!(gamma_linear_cutoff);
 
     #[test]
     fn sdr_white_hlg() -> Result<()> {

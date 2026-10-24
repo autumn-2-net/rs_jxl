@@ -129,6 +129,9 @@ pub(crate) struct DecodeArgs {
     /// Destination ICC profile file
     #[arg(long, alias = "icc-profile")]
     pub(super) color_profile: Option<PathBuf>,
+    /// Use intent-aware legacy ICC CMYK tables instead of djxl conventions
+    #[arg(long, requires = "color_space")]
+    pub(super) cmyk_icc_conventions: bool,
     #[arg(long, alias = "display_nits", value_parser = parse_nits)]
     pub(super) display_nits: Option<f32>,
     #[arg(long, alias = "alpha_blend")]
@@ -336,6 +339,7 @@ impl DecodeArgs {
             );
         }
         options.color.display_nits = self.display_nits.filter(|&n| n != 0.0);
+        options.color.cmyk_icc_conventions = self.cmyk_icc_conventions;
         if self.alpha_blend {
             options.color.background = Some(decode::parse_background(
                 self.background.as_deref().unwrap_or("white"),

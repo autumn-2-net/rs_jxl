@@ -23,10 +23,11 @@ impl GaborishStage {
         let mut w1 = [0.0; 3];
         let mut w2 = [0.0; 3];
         for i in 0..3 {
-            let weight_total = 1.0 + weight1[i] * 4.0 + weight2[i] * 4.0;
+            // stage_gaborish.cc normalizes with one shared reciprocal.
+            let weight_total = 1.0 + 4.0 * (weight1[i] + weight2[i]);
             w0[i] = 1.0 / weight_total;
-            w1[i] = weight1[i] / weight_total;
-            w2[i] = weight2[i] / weight_total;
+            w1[i] = weight1[i] * w0[i];
+            w2[i] = weight2[i] * w0[i];
         }
         Self {
             weight0: w0,
@@ -73,9 +74,11 @@ simd_function!(
                         let p21 = inv.load::<_, $ch>(d, 1, 0);
                         let p22 = inv.load::<_, $ch>(d, 1, 1);
 
+                        let sides = (p10 + p12) + (p01 + p21);
+                        let corners = (p00 + p02) + (p20 + p22);
                         let sum = p11 * w0[$ch];
-                        let sum = w1[$ch].mul_add(p01 + p10 + p21 + p12, sum);
-                        let sum = w2[$ch].mul_add(p00 + p02 + p20 + p22, sum);
+                        let sum = sides.mul_add(w1[$ch], sum);
+                        let sum = corners.mul_add(w2[$ch], sum);
                         outv.store::<_, $ch>(d, 0, sum);
                     }};
                 }
@@ -112,13 +115,73 @@ impl RenderPipelineInOutStage for GaborishStage {
 
 #[cfg(test)]
 mod test {
+    use jxl_simd::{SimdDescriptor, test_all_instruction_sets};
     use test_log::test;
 
     use super::*;
     use crate::error::Result;
-    use crate::image::Image;
+    use crate::image::{DataTypeTag, Image};
+    use crate::render::low_memory_pipeline::row_buffers::RowBuffer;
     use crate::render::test::make_and_run_simple_pipeline;
     use crate::tests::assert_close;
+
+    #[test]
+    fn normalization_source_order() {
+        let tiny = 1.0f32 / 67_108_864.0;
+        let weight1 = [tiny, 0.115169525, 0.75];
+        let weight2 = [tiny, 0.061248592, 0.5];
+        let stage = GaborishStage::new(weight1, weight2);
+        for c in 0..3 {
+            let reciprocal = 1.0 / (1.0 + 4.0 * (weight1[c] + weight2[c]));
+            assert_eq!(stage.weight0[c].to_bits(), reciprocal.to_bits());
+            assert_eq!(
+                stage.weight1[c].to_bits(),
+                (weight1[c] * reciprocal).to_bits()
+            );
+            assert_eq!(
+                stage.weight2[c].to_bits(),
+                (weight2[c] * reciprocal).to_bits()
+            );
+        }
+        // Separate additions each lose the half-ULP term at 1.0.
+        let old_total = (1.0 + 4.0 * tiny) + 4.0 * tiny;
+        assert_ne!(stage.weight0[0].to_bits(), (1.0 / old_total).to_bits());
+    }
+
+    fn gaborish_pairwise_sums<D: SimdDescriptor>(d: D) {
+        let x0 = RowBuffer::x0_offset::<f32>();
+        let large = 16_777_216.0f32;
+        let values = [[large, 1.0, 0.0], [large, 0.0, -large], [1.0, 0.0, -large]];
+        let inputs: Vec<_> = (0..3)
+            .map(|_| {
+                let mut input = RowBuffer::new(DataTypeTag::F32, 1, 0, 0, 1).unwrap();
+                for (y, row) in values.iter().enumerate() {
+                    input.get_row_mut::<f32>(y)[x0 - 1..x0 + 2].copy_from_slice(row);
+                }
+                input
+            })
+            .collect();
+        let mut outputs: Vec<_> = (0..3)
+            .map(|_| RowBuffer::new(DataTypeTag::F32, 0, 0, 0, 1).unwrap())
+            .collect();
+        let refs: Vec<_> = inputs.iter().collect();
+        let input_rows = Channels::from_row_buffers(&refs, x0, 1, 3, 1);
+        let stage = GaborishStage {
+            weight0: [0.0; 3],
+            weight1: [1.0, 0.0, 1.0],
+            weight2: [0.0, 1.0, 1.0],
+        };
+        {
+            let mut output_rows = ChannelsMut::from_row_buffers(&mut outputs, x0, 0, 1);
+            gaborish_process(d, &stage, 1, &input_rows, &mut output_rows);
+        }
+        // Both source pairwise sums are 1; the old serial sums are 0.
+        for (output, expected) in outputs.iter().zip([1.0f32, 1.0, 2.0]) {
+            assert_eq!(output.get_row::<f32>(0)[x0].to_bits(), expected.to_bits());
+        }
+    }
+
+    test_all_instruction_sets!(gaborish_pairwise_sums);
 
     #[test]
     fn consistency() -> Result<()> {

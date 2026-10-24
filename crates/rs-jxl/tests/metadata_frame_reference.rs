@@ -204,6 +204,125 @@ fn options() -> EncodeOptions {
     }
 }
 
+#[test]
+#[ignore = "requires explicit RS_JXL_DJXL; byte-selected automatic crop/mask/multiple layers"]
+fn automatic_byte_selected_layers_match_official_decoders() {
+    use rs_jxl::multiframe::{AutoOptions, Strategy, encode_auto};
+    let decoders = decoder_paths();
+    let scratch = ScratchDir::new();
+    let mut mask_winners = 0;
+    let mut tile_winners = 0;
+    let mut checks = 0;
+    for (bits, alpha_bits) in [(8, 8), (16, 16), (8, 16), (16, 8), (12, 1)] {
+        for transparent in [false, true] {
+            let (w, h) = (49usize, 37usize);
+            let maximum = (1u32 << bits) - 1;
+            let alpha_maximum = (1u32 << alpha_bits) - 1;
+            let mut base: Vec<u16> = (0..w * h * 4)
+                .map(|i| ((i * 1237 + i / 17 * 2017) as u32 & maximum) as u16)
+                .collect();
+            for (i, p) in base.chunks_exact_mut(4).enumerate() {
+                p[3] = if transparent && i % 2 == 0 {
+                    0
+                } else {
+                    alpha_maximum as u16
+                };
+            }
+            let images: Vec<_> = (0..5)
+                .map(|index| {
+                    let mut values = base.clone();
+                    if index == 1 || index == 2 {
+                        values[(2 * w + 2) * 4] ^= 0x55;
+                        values[((h - 3) * w + w - 3) * 4] ^= 0x55;
+                    }
+                    let pixels = if bits <= 8 && alpha_bits <= 8 {
+                        PixelData::U8(values.into_iter().map(|v| v as u8).collect())
+                    } else {
+                        PixelData::U16(values)
+                    };
+                    let image = Image::new(w as u32, h as u32, PixelLayout::Rgba, pixels).unwrap();
+                    let mut metadata = image.metadata().clone();
+                    metadata.bit_depth = BitDepth::new(bits).unwrap();
+                    metadata.extra_channels[0].bit_depth = BitDepth::new(alpha_bits).unwrap();
+                    metadata.animation = Some(Animation::default());
+                    image.with_metadata(metadata, vec![]).unwrap()
+                })
+                .collect();
+            for timing in [Timing::Animation, Timing::Mixed] {
+                let durations = timing.durations();
+                let frames: Vec<_> = images
+                    .iter()
+                    .zip(durations)
+                    .map(|(image, duration)| Frame {
+                        image,
+                        options: FrameOptions {
+                            duration,
+                            ..Default::default()
+                        },
+                    })
+                    .collect();
+                let full = rs_jxl::encode_frames(&images[0], &frames, &options()).unwrap();
+                fs::write(scratch.0.join("auto-full.jxl"), full).unwrap();
+                for reference in [
+                    Reference::Previous,
+                    Reference::First,
+                    Reference::SmallestCrop,
+                ] {
+                    for allow_multi_rect in [false, true] {
+                        let result = encode_auto(
+                            &images,
+                            &durations,
+                            &options(),
+                            &AutoOptions {
+                                reference,
+                                allow_multi_rect,
+                                tile_size: 8,
+                                ..Default::default()
+                            },
+                        )
+                        .unwrap();
+                        for frame in &result.frames {
+                            match frame.candidates[frame.winner_index].strategy {
+                                Strategy::MaskPrevious | Strategy::MaskFirst => mask_winners += 1,
+                                Strategy::TilesPrevious | Strategy::TilesFirst => tile_winners += 1,
+                                _ => {}
+                            }
+                        }
+                        let input = scratch.0.join("auto.jxl");
+                        fs::write(&input, result.bytes).unwrap();
+                        for decoder in &decoders {
+                            let context = format!(
+                                "auto color={bits} alpha={alpha_bits} transparent={transparent} {timing:?} {reference:?} multi={allow_multi_rect}"
+                            );
+                            let expected = decode(
+                                decoder,
+                                &scratch.0.join("auto-full.jxl"),
+                                &scratch,
+                                &context,
+                            );
+                            let actual = decode(decoder, &input, &scratch, &context);
+                            assert_decoded_equal(&actual, &expected, &context);
+                            assert_original_colors(&actual, &images, &timing.visible(), &context);
+                            checks += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        mask_winners > 0,
+        "mask route must actually win and be decoded"
+    );
+    assert!(
+        tile_winners > 0,
+        "multiple-layer route must actually win and be decoded"
+    );
+    eprintln!(
+        "automatic strategies: {checks} official exact-sample comparisons; {mask_winners} mask and {tile_winners} tile winners"
+    );
+}
+
 fn assert_full_plan(images: &[Image], durations: &[u32], plan: &[PlannedFrame<'_>]) {
     assert_eq!(plan.len(), images.len());
     for (i, planned) in plan.iter().enumerate() {
@@ -378,8 +497,8 @@ fn assert_original_colors(decoded: &Npy, images: &[Image], visible: &[usize], co
                 let word = decoded.words[(frame * pixels + pixel) * channels + c];
                 let source = pixel * image.layout().channels() + c;
                 let integer = match image.pixels() {
-                    PixelData::U8(values) => Some((u32::from(values[source]), 255u32)),
-                    PixelData::U16(values) => Some((u32::from(values[source]), 65535u32)),
+                    PixelData::U8(values) => Some(u32::from(values[source])),
+                    PixelData::U16(values) => Some(u32::from(values[source])),
                     PixelData::F32(values) => {
                         assert_eq!(
                             word,
@@ -390,7 +509,8 @@ fn assert_original_colors(decoded: &Npy, images: &[Image], visible: &[usize], co
                     }
                     _ => panic!("unexpected fixture storage"),
                 };
-                if let Some((expected, maximum)) = integer {
+                if let Some(expected) = integer {
+                    let maximum = (1u32 << image.channel_depth(c).bits_per_sample) - 1;
                     let value = f32::from_bits(word);
                     assert!(
                         value.is_finite() && (0.0..=1.0).contains(&value),

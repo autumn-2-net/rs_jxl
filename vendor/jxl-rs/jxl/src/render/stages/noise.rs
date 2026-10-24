@@ -194,6 +194,23 @@ impl RenderPipelineInOutStage for ConvolveNoiseStage {
 }
 
 #[inline(always)]
+fn noise_lut_lookup<D: SimdDescriptor>(
+    d: D,
+    table: &[D::F32Vec; 8],
+    indices: D::I32Vec,
+) -> D::F32Vec {
+    // stage_noise.cc::StrengthEvalLut preserves all LUT bits. The encoded
+    // multiples of 1/1024 are not all representable by the BF16 lookup API.
+    let mut value = table[0];
+    for (i, entry) in table.iter().enumerate().skip(1) {
+        value = indices
+            .eq(D::I32Vec::splat(d, i as i32))
+            .if_then_else_f32(*entry, value);
+    }
+    value
+}
+
+#[inline(always)]
 fn add_noise_simd_impl<D: SimdDescriptor>(
     d: D,
     row_c: &mut [&mut [f32]],
@@ -203,7 +220,7 @@ fn add_noise_simd_impl<D: SimdDescriptor>(
     ytob: f32,
     xsize: usize,
 ) {
-    let table = D::F32Vec::prepare_table_bf16_8(d, lut);
+    let table = lut.map(|value| D::F32Vec::splat(d, value));
     let c_zero = D::F32Vec::zero(d);
     let c_one = D::F32Vec::splat(d, 1.0);
     let c_six = D::F32Vec::splat(d, 6.0);
@@ -225,8 +242,8 @@ fn add_noise_simd_impl<D: SimdDescriptor>(
             let floor_x = pre_floor_x.min(c_six);
             let frac_x = is_ge_7.if_then_else_f32(c_one, pre_frac_x);
             let floor_x_int = floor_x.as_i32();
-            let low = D::F32Vec::table_lookup_bf16_8(d, table, floor_x_int);
-            let hi = D::F32Vec::table_lookup_bf16_8(d, table, floor_x_int + c_i32_one);
+            let low = noise_lut_lookup(d, &table, floor_x_int);
+            let hi = noise_lut_lookup(d, &table, floor_x_int + c_i32_one);
             (hi - low).mul_add(frac_x, low).max(c_zero).min(c_one)
         }
     };
@@ -347,8 +364,10 @@ impl RenderPipelineInPlaceStage for AddNoiseStage {
             return;
         }
         let color_correlation = self.color_correlation.try_read().unwrap();
-        let ytox = color_correlation.y_to_x_lf();
-        let ytob = color_correlation.y_to_b_lf();
+        // stage_noise.cc::AddNoiseStage uses YtoXRatio(0)/YtoBRatio(0),
+        // not the separate LF/DC correlation factors.
+        let ytox = color_correlation.y_to_x(0);
+        let ytob = color_correlation.y_to_b(0);
 
         let (row_c, rest) = row.split_at_mut(3);
         let row_rnd: [&[f32]; 3] = [&*rest[0], &*rest[1], &*rest[2]];
@@ -359,8 +378,10 @@ impl RenderPipelineInPlaceStage for AddNoiseStage {
 
 #[cfg(test)]
 mod test {
+    use jxl_simd::{F32SimdVec, I32SimdVec, SimdDescriptor, test_all_instruction_sets};
     use test_log::test;
 
+    use super::noise_lut_lookup;
     use crate::error::Result;
     use crate::features::noise::Noise;
     use crate::frame::color_correlation_map::ColorCorrelationParams;
@@ -375,7 +396,63 @@ mod test {
         crate::render::test::test_stage_consistency(|| ConvolveNoiseStage::new(0), (500, 500), 3)
     }
 
-    // TODO(firsching): Add more relevant AddNoise tests as per discussions in https://github.com/libjxl/jxl-rs/pull/60.
+    fn noise_lut_preserves_encoded_precision<D: SimdDescriptor>(d: D) {
+        for start in (0..1024).step_by(8) {
+            let lut: [f32; 8] = std::array::from_fn(|i| (start + i) as f32 / 1024.0);
+            let table = lut.map(|value| D::F32Vec::splat(d, value));
+            for offset in 0..8 {
+                let indices: Vec<i32> = (0..D::I32Vec::LEN)
+                    .map(|lane| ((lane + offset) % 8) as i32)
+                    .collect();
+                let mut actual = vec![0.0; D::F32Vec::LEN];
+                noise_lut_lookup(d, &table, D::I32Vec::load(d, &indices)).store(&mut actual);
+                for (value, index) in actual.iter().zip(indices) {
+                    assert_eq!(value.to_bits(), lut[index as usize].to_bits());
+                }
+            }
+        }
+    }
+
+    test_all_instruction_sets!(noise_lut_preserves_encoded_precision);
+
+    #[test]
+    fn add_noise_uses_base_correlation_not_lf() -> Result<()> {
+        let size = (17, 2);
+        let inputs = [0.125, 0.5, 0.25, 0.75, -0.25, 0.5]
+            .map(|value| Image::new_with_value(size, value))
+            .into_iter()
+            .collect::<Result<Vec<_>>>()?;
+        let noise = Arc::new(RwLock::new(Noise { lut: [0.5; 8] }));
+        let base = ColorCorrelationParams {
+            base_correlation_x: 0.25,
+            base_correlation_b: -0.5,
+            ..ColorCorrelationParams::default()
+        };
+        let with_lf = ColorCorrelationParams {
+            color_factor: 2,
+            ytox_lf: 127,
+            ytob_lf: -128,
+            ..base
+        };
+        let render = |params| {
+            make_and_run_simple_pipeline(
+                AddNoiseStage::new(noise.clone(), Arc::new(RwLock::new(params)), 3),
+                &inputs,
+                size,
+                0,
+                256,
+            )
+        };
+        let expected = render(base)?;
+        let actual = render(with_lf)?;
+        assert_ne!(expected[1].row(0)[0], inputs[1].row(0)[0]);
+        for c in 0..inputs.len() {
+            for y in 0..size.1 {
+                assert_eq!(actual[c].row(y), expected[c].row(y));
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn add_noise_process_row_chunk() -> Result<()> {

@@ -1,6 +1,6 @@
 use super::{
     DecodeOptions, DecodedFrame, ExtraChannel, JxlBasicInfo, JxlBitDepth, JxlFrameHeader,
-    SampleFormat, failure,
+    SampleFormat, backend_error, failure,
 };
 use crate::{Error, PixelData, PixelLayout, Result};
 use jxl_decoder::api::{Endianness, JxlColorType, JxlDataFormat, JxlPixelFormat};
@@ -151,7 +151,7 @@ impl Buffers {
         }
         let images = sizes
             .into_iter()
-            .map(|size| OwnedRawImage::new(size).map_err(failure))
+            .map(|size| OwnedRawImage::new(size).map_err(backend_error))
             .collect::<Result<_>>()?;
         Ok(Self {
             images,

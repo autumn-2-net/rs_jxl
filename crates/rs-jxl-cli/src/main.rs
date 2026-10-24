@@ -1,6 +1,7 @@
 mod decode;
 mod input;
 mod io;
+mod multiframe;
 mod options;
 mod transcode;
 
@@ -28,6 +29,7 @@ const DEFAULT_SOURCE_SAMPLE_LIMIT: usize = 1_048_576;
     long_about = "Encode, decode, or transcode images using Rust JPEG XL codecs.\n\
 decode: JPEG XL pixels to PNG/APNG, NPY, PPM, PGM or PFM, or original JPEG reconstruction.\n\
 encode: PNG or JPEG decoded pixels to lossless JPEG XL.\n\
+encode-frames: ordered PNG/JPEG frames to pixel-lossless animated JPEG XL.\n\
 PNG: gray, gray-alpha, RGB and RGBA at 8/16 bits; palette and low-bit gray \
 are expanded without losing decoded samples, including RGB under zero alpha.\n\
 JPEG: 8-bit grayscale/RGB pixel input via zune-jpeg. Pixel losslessness is \
@@ -48,6 +50,8 @@ enum Command {
     Decode(decode::DecodeArgs),
     /// Encode one still PNG or JPEG to a JXL file
     Encode(EncodeArgs),
+    /// Encode ordered PNG/JPEG frames with automatic lossless strategies
+    EncodeFrames(multiframe::EncodeFramesArgs),
     /// Transcode JPEG coefficients with original-JPEG reconstruction data
     TranscodeJpeg(transcode::TranscodeArgs),
 }
@@ -68,8 +72,8 @@ PNG sRGB/gAMA/cHRM/iCCP and JPEG ICC color metadata are preserved. \
 Untagged input defaults to sRGB gray/RGB. No color conversion or EXIF orientation \
 transform is performed; PNG tRNS is decoded pixel data.\n\
 Unsupported metadata such as EXIF/XMP/comments requires --strip-metadata. \
-That option also discards supported color metadata and assumes sRGB, which can \
-change displayed colors despite unchanged decoded samples.\n\
+Supported color metadata is retained even with --strip-metadata. Stripping \
+unsupported metadata can change displayed orientation without changing samples.\n\
 APNG, CMYK/YCCK JPEG and non-8-bit JPEG are unsupported. Limits: 512 MiB input, \
 16,384 pixels per dimension, 64,000,000 pixels and 512 MiB decoded samples. \
 The encoder applies its own resource limits as well.\n\
@@ -107,7 +111,7 @@ struct EncodeArgs {
     /// Encoder worker count (1..=256)
     #[arg(long, value_name = "N", default_value = "1", value_parser = parse_threads)]
     threads: usize,
-    /// Discard metadata without color conversion or EXIF orientation changes
+    /// Discard unsupported metadata; retain supported color metadata and samples
     #[arg(long)]
     strip_metadata: bool,
     /// Replace an existing output file; input and output must still differ
@@ -211,13 +215,14 @@ fn run(args: EncodeArgs) -> Result<()> {
     }
     if args.strip_metadata {
         eprintln!(
-            "warning: --strip-metadata discards metadata without color conversion \
-             or EXIF orientation transforms; displayed colors/orientation may change."
+            "warning: --strip-metadata discards unsupported metadata without color \
+             conversion or EXIF orientation transforms; supported color metadata \
+             is retained, but displayed orientation may change."
         );
     }
     eprintln!(
         "note: encoding decoded samples without color or orientation conversion; \
-         supported color metadata is retained unless --strip-metadata is used."
+         supported color metadata is retained, including with --strip-metadata."
     );
     let encoded = {
         let _encoding = rs_jxl::profile::scope("cli.encode");
@@ -231,6 +236,7 @@ fn main() -> ExitCode {
     let result = match cli.command {
         Command::Decode(args) => decode::run(args),
         Command::Encode(args) => run(args),
+        Command::EncodeFrames(args) => multiframe::run(args),
         Command::TranscodeJpeg(args) => transcode::run(args),
     };
     if let Some(report) = rs_jxl::profile::report() {

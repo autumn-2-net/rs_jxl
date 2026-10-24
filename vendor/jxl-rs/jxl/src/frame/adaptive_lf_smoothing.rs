@@ -37,9 +37,11 @@ fn compute_pixel_channel(
     let bl = row_bottom[x_left];
     let bc = row_bottom[x_center];
     let br = row_bottom[x_right];
-    let corner = tl + tr + bl + br;
-    let side = ml + mr + tc + bc;
-    let sm = corner * W_CORNER + side * W_SIDE + mc * W_CENTER;
+    // Match compressed_dc.cc::ComputePixelChannel's grouping and evaluation
+    // order, retaining the existing scalar (non-fused) multiply-add behavior.
+    let corner = (tl + tr) + (bl + br);
+    let side = (ml + mr) + (tc + bc);
+    let sm = corner * W_CORNER + (side * W_SIDE + mc * W_CENTER);
     (mc, sm, gap.max(abs((mc - sm) / dc_factor)))
 }
 
@@ -199,4 +201,28 @@ pub fn adaptive_lf_smoothing(
     drop(splitter2);
     *lf_image = [smoothed0, smoothed1, smoothed2];
     Ok(())
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn smoothing_pairwise_sums() {
+        let large = 16_777_216.0f32;
+        let (mc, sm, gap) = compute_pixel_channel(
+            1.0,
+            0.5,
+            0,
+            1,
+            2,
+            &[large, 1.0, 0.0],
+            &[large, 0.0, 0.0],
+            &[1.0, -large, -large],
+        );
+        // Each pairwise sum is 1; left-to-right addition loses both units.
+        assert_eq!(mc, 0.0);
+        assert_eq!(sm.to_bits(), (W_CORNER + W_SIDE).to_bits());
+        assert_eq!(gap, 0.5);
+    }
 }

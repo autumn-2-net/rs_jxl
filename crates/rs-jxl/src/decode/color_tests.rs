@@ -4,6 +4,28 @@ use jxl_decoder::api::{
     JxlLayerInfo, Orientation, ToneMapping,
 };
 
+// Scalar skcms approx_pow applied to libjxl's S15Fixed16 sRGB parameters.
+const SKCMS_SRGB_HALF: f32 = 0.213_997_84;
+
+#[test]
+fn gamma_linear_conversion_matches_djxl_on_unquantized_pixels() {
+    let mut input = image(
+        PixelLayout::Rgb,
+        &[128.0 / 255.0, 64.0 / 255.0, 1.0],
+        "RGB_D65_SRG_Rel_g0.4545455",
+    );
+    process_image(&mut input, &target("linear"), &DecodeLimits::default()).unwrap();
+    // Official 3x3_srgb_lossless fixture uses gamma 2.2, despite its filename.
+    for (actual, expected) in values(&input)
+        .iter()
+        .zip([0x3e60_c700, 0x3d43_b080, 0x3f80_0000])
+    {
+        // Scalar skcms approximation vs the independent SIMD oracle. This
+        // conversion is not native lossless sample extraction.
+        close(*actual, f32::from_bits(expected), 2e-6);
+    }
+}
+
 fn profile(name: &str) -> JxlColorProfile {
     ColorProfile::parse(name).unwrap().as_jxl()
 }
@@ -12,6 +34,13 @@ fn target(name: &str) -> ColorOptions {
     ColorOptions {
         output_profile: Some(name.parse().unwrap()),
         ..Default::default()
+    }
+}
+
+fn icc_cmyk_target(name: &str) -> ColorOptions {
+    ColorOptions {
+        cmyk_icc_conventions: true,
+        ..target(name)
     }
 }
 
@@ -212,7 +241,7 @@ fn output_profile_is_source_and_embedded_profile_stays_unchanged() {
     let embedded = image.embedded_profile.clone();
     process_image(&mut image, &target("linear"), &DecodeLimits::default()).unwrap();
     for &value in values(&image) {
-        close(value, 0.21404114, 2e-6);
+        close(value, SKCMS_SRGB_HALF, 2e-6);
     }
     assert_eq!(image.output_profile, Some(profile("linear")));
     assert_eq!(image.embedded_profile, embedded);
@@ -234,7 +263,7 @@ fn straight_alpha_and_extra_planes_are_not_color_managed() {
     process_image(&mut image, &target("linear"), &DecodeLimits::default()).unwrap();
     assert_eq!(values(&image)[3].to_bits(), alpha_nan.to_bits());
     assert_eq!(image.frames[0].extra_planes, extras);
-    close(values(&image)[0], 0.21404114, 2e-6);
+    close(values(&image)[0], SKCMS_SRGB_HALF, 2e-6);
 }
 
 #[test]
@@ -246,8 +275,8 @@ fn associated_alpha_unassociates_reassociates_and_keeps_hidden_color() {
     );
     image.info.extra_channels[0].alpha_associated = true;
     process_image(&mut image, &target("linear"), &DecodeLimits::default()).unwrap();
-    close(values(&image)[0], 0.21404114 * 0.5, 2e-6);
-    close(values(&image)[4], 0.21404114, 2e-6);
+    close(values(&image)[0], SKCMS_SRGB_HALF * 0.5, 2e-6);
+    close(values(&image)[4], SKCMS_SRGB_HALF, 2e-6);
     assert_eq!(values(&image)[7].to_bits(), (-0.0f32).to_bits());
     assert!(image.info.extra_channels[0].alpha_associated);
 }
@@ -265,7 +294,7 @@ fn finite_extended_range_is_not_clamped() {
     // Same primaries exercise signed transfer behavior without a gamut change.
     let mut image = image_for_extended_sign();
     process_image(&mut image, &target("linear"), &DecodeLimits::default()).unwrap();
-    close(values(&image)[0], -0.21404114, 2e-6);
+    close(values(&image)[0], -SKCMS_SRGB_HALF, 2e-6);
     assert!(values(&image)[1] > 1.0);
 }
 
@@ -333,7 +362,7 @@ fn chunk_tail_retains_alpha_and_transforms_last_pixel() {
     process_image(&mut image, &target("linear"), &DecodeLimits::default()).unwrap();
     let tail = &values(&image)[CHUNK_PIXELS * 4..];
     for &sample in &tail[..3] {
-        close(sample, 0.21404114, 2e-6);
+        close(sample, SKCMS_SRGB_HALF, 2e-6);
     }
     assert_eq!(tail[3].to_bits(), (-0.0f32).to_bits());
 }
@@ -374,7 +403,7 @@ fn background_blends_after_conversion_and_keeps_original_alpha_plane() {
     process_image(&mut image, &options, &DecodeLimits::default()).unwrap();
     assert_eq!(image.frames[0].layout, PixelLayout::Rgb);
     for &value in values(&image) {
-        close(value, 0.21404114 * 0.25 + 0.75, 2e-6);
+        close(value, SKCMS_SRGB_HALF * 0.25 + 0.75, 2e-6);
     }
     assert_eq!(image.frames[0].extra_planes, extras);
 }
@@ -415,7 +444,7 @@ fn grayscale_can_expand_to_rgb_and_preserve_alpha() {
     process_image(&mut image, &target("linear"), &DecodeLimits::default()).unwrap();
     assert_eq!(image.frames[0].layout, PixelLayout::Rgba);
     for &value in &values(&image)[..3] {
-        close(value, 0.21404114, 1e-3);
+        close(value, SKCMS_SRGB_HALF, 1e-3);
     }
     assert_eq!(values(&image)[3].to_bits(), 0.3f32.to_bits());
 }
@@ -616,7 +645,12 @@ fn cmyk_routes_and_inverts_black_without_using_alpha_as_k() {
     }
     let mut image = cmyk_image();
     let extras = image.frames[0].extra_planes.clone();
-    process_image(&mut image, &target("linear"), &DecodeLimits::default()).unwrap();
+    process_image(
+        &mut image,
+        &icc_cmyk_target("linear"),
+        &DecodeLimits::default(),
+    )
+    .unwrap();
     assert!(values(&image)[4] > values(&image)[0] + 0.2);
     assert_eq!(values(&image)[3], 0.75);
     assert_eq!(values(&image)[7], 0.75);
@@ -624,18 +658,18 @@ fn cmyk_routes_and_inverts_black_without_using_alpha_as_k() {
 }
 
 #[test]
-fn destination_intent_selects_distinct_cmyk_luts() {
+fn icc_conventions_destination_intent_selects_distinct_cmyk_luts() {
     let mut perceptual = cmyk_image();
     let mut relative = cmyk_image();
     process_image(
         &mut perceptual,
-        &target("RGB_D65_SRG_Per_Lin"),
+        &icc_cmyk_target("RGB_D65_SRG_Per_Lin"),
         &DecodeLimits::default(),
     )
     .unwrap();
     process_image(
         &mut relative,
-        &target("RGB_D65_SRG_Rel_Lin"),
+        &icc_cmyk_target("RGB_D65_SRG_Rel_Lin"),
         &DecodeLimits::default(),
     )
     .unwrap();
@@ -643,12 +677,12 @@ fn destination_intent_selects_distinct_cmyk_luts() {
 }
 
 #[test]
-fn cmyk_to_gray_uses_pcs_luminance_and_keeps_alpha() {
+fn icc_conventions_cmyk_to_gray_uses_pcs_luminance_and_keeps_alpha() {
     let mut image = cmyk_image();
     let extras = image.frames[0].extra_planes.clone();
     process_image(
         &mut image,
-        &target("Gra_D65_Rel_Lin"),
+        &icc_cmyk_target("Gra_D65_Rel_Lin"),
         &DecodeLimits::default(),
     )
     .unwrap();
@@ -658,6 +692,226 @@ fn cmyk_to_gray_uses_pcs_luminance_and_keeps_alpha() {
     assert_eq!(values(&image)[1], 0.75);
     assert_eq!(values(&image)[3], 0.75);
     assert_eq!(image.frames[0].extra_planes, extras);
+}
+
+#[test]
+fn djxl_cmyk_default_intents_have_identical_pixels_but_keep_destination_metadata() {
+    let mut reference = cmyk_image();
+    process_image(
+        &mut reference,
+        &target("RGB_D65_SRG_Per_Lin"),
+        &DecodeLimits::default(),
+    )
+    .unwrap();
+    for intent in ["Per", "Rel", "Sat", "Abs"] {
+        let name = format!("RGB_D65_SRG_{intent}_Lin");
+        let mut image = cmyk_image();
+        let extras = image.frames[0].extra_planes.clone();
+        let embedded = image.embedded_profile.clone();
+        process_image(&mut image, &target(&name), &DecodeLimits::default()).unwrap();
+        assert_eq!(values(&image), values(&reference));
+        assert_eq!(image.output_profile, Some(profile(&name)));
+        assert_eq!(image.embedded_profile, embedded);
+        assert_eq!(image.frames[0].extra_planes, extras);
+        assert_eq!(values(&image)[3], 0.75);
+        assert_eq!(values(&image)[7], 0.75);
+    }
+}
+
+#[test]
+fn djxl_cmyk_gray_uses_x_and_inverted_black() {
+    let mut cms = CmsProfile::new_from_slice(&cmyk_icc()).unwrap();
+    let Some(moxcms::LutWarehouse::Lut(lut)) = &mut cms.lut_a_to_b_perceptual else {
+        panic!("test LUT")
+    };
+    // Colored PCS distinguishes skcms gray (X/white-X) from luminance Y.
+    let mut clut = Vec::new();
+    for index in 0..16 {
+        clut.extend(if index & 1 == 0 {
+            [16384, 32768, 49152]
+        } else {
+            [0; 3]
+        });
+    }
+    lut.clut_table = moxcms::LutStore::Store16(clut);
+    let mut image = cmyk_image();
+    image.output_profile = Some(JxlColorProfile::Icc(cms.encode().unwrap()));
+    let limits = DecodeLimits::default();
+    let destination = Endpoint::new(&profile("Gra_D65_Rel_Lin"), &limits, true).unwrap();
+    process_image(&mut image, &target("Gra_D65_Rel_Lin"), &limits).unwrap();
+    assert_eq!(image.frames[0].layout, PixelLayout::GrayAlpha);
+    close(values(&image)[0], 0.0, 1e-6);
+    close(
+        values(&image)[2],
+        (16384.0 / 65535.0) / destination.cms.white_point.x as f32,
+        1e-6,
+    );
+    assert_eq!(values(&image)[1], 0.75);
+    assert_eq!(values(&image)[3], 0.75);
+}
+
+#[test]
+fn djxl_cmyk_absolute_does_not_apply_media_white_scale() {
+    let mut cms = CmsProfile::new_from_slice(&cmyk_icc()).unwrap();
+    cms.media_white_point = Some(Xyzd::new(0.4821, 0.5, 0.41245));
+    let bytes = cms.encode().unwrap();
+    for icc in [false, true] {
+        let mut relative = cmyk_image();
+        relative.output_profile = Some(JxlColorProfile::Icc(bytes.clone()));
+        let mut absolute = cmyk_image();
+        absolute.output_profile = Some(JxlColorProfile::Icc(bytes.clone()));
+        let options = ColorOptions {
+            cmyk_icc_conventions: icc,
+            ..target("Gra_D65_Rel_Lin")
+        };
+        process_image(&mut relative, &options, &DecodeLimits::default()).unwrap();
+        let options = ColorOptions {
+            output_profile: Some("Gra_D65_Abs_Lin".parse().unwrap()),
+            ..options
+        };
+        process_image(&mut absolute, &options, &DecodeLimits::default()).unwrap();
+        close(
+            values(&absolute)[2],
+            values(&relative)[2] * if icc { 0.5 } else { 1.0 },
+            1e-6,
+        );
+    }
+}
+
+#[test]
+fn cmyk_policy_alone_does_not_activate_cms_or_require_float_storage() {
+    for icc in [false, true] {
+        let mut image = cmyk_image();
+        image.frames[0].pixels = PixelData::U8(vec![1, 2, 3, 0, 4, 5, 6, 255]);
+        image.frames[0].extra_planes[1] = PixelData::U8(vec![1, 255]);
+        let original = image.frames[0].clone();
+        let original_profile = image.output_profile.clone();
+        let options = ColorOptions {
+            cmyk_icc_conventions: icc,
+            ..Default::default()
+        };
+        assert!(options.is_noop());
+        assert!(!options.needs_float());
+        process_image(&mut image, &options, &DecodeLimits::default()).unwrap();
+        assert_eq!(image.frames[0].pixels, original.pixels);
+        assert_eq!(image.frames[0].extra_planes, original.extra_planes);
+        assert_eq!(image.output_profile, original_profile);
+    }
+}
+
+#[test]
+fn cmyk_default_covers_preview_and_all_frames_transactionally() {
+    let mut image = cmyk_image();
+    image.frames.push(image.frames[0].clone());
+    image.frames[1].index = 1;
+    image.frames[1].duration_ticks = 17;
+    image.preview = Some(image.frames[0].clone());
+    image.preview.as_mut().unwrap().header.is_preview = true;
+    let original_frames = image.frames.clone();
+    let original_preview = image.preview.clone();
+    let original_profile = image.output_profile.clone();
+    process_image(&mut image, &target("linear"), &DecodeLimits::default()).unwrap();
+    assert_eq!(
+        image.preview.as_ref().unwrap().pixels,
+        image.frames[0].pixels
+    );
+    assert_eq!(image.frames[1].pixels, image.frames[0].pixels);
+    assert_eq!(image.frames[1].duration_ticks, 17);
+    for (actual, before) in image
+        .preview
+        .iter()
+        .chain(&image.frames)
+        .zip(original_preview.iter().chain(&original_frames))
+    {
+        assert_eq!(actual.extra_planes, before.extra_planes);
+        assert_eq!(actual.header.name, before.header.name);
+        assert_eq!(actual.header.is_preview, before.header.is_preview);
+        assert_eq!(actual.header.size, before.header.size);
+    }
+
+    // Only the last frame has invalid device input. Neither staged preview nor
+    // the first frame may escape when that late failure occurs.
+    image.frames = original_frames;
+    image.preview = original_preview;
+    image.output_profile = original_profile.clone();
+    image.frames[1].extra_planes[1] = PixelData::F32(vec![-0.1, 1.0]);
+    let original_frames = image.frames.clone();
+    let original_preview = image.preview.clone();
+    assert!(process_image(&mut image, &target("linear"), &DecodeLimits::default()).is_err());
+    assert_eq!(image.output_profile, original_profile);
+    for (actual, before) in image
+        .preview
+        .iter()
+        .chain(&image.frames)
+        .zip(original_preview.iter().chain(&original_frames))
+    {
+        assert_eq!(actual.pixels, before.pixels);
+        assert_eq!(actual.extra_planes, before.extra_planes);
+    }
+}
+
+#[test]
+fn cmyk_rejects_device_range_after_unassociation_not_before() {
+    let mut image = cmyk_image();
+    image.info.extra_channels[0].alpha_associated = true;
+    // Stored K is in [0, 1], but its unassociated value 1/0.75 is not.
+    let original = image.frames[0].clone();
+    let original_profile = image.output_profile.clone();
+    assert!(process_image(&mut image, &target("linear"), &DecodeLimits::default()).is_err());
+    assert_eq!(image.frames[0].pixels, original.pixels);
+    assert_eq!(image.frames[0].extra_planes, original.extra_planes);
+    assert_eq!(image.output_profile, original_profile);
+}
+
+#[test]
+fn djxl_legacy_lab_profile_keeps_normalization_through_parsing_and_pipeline() {
+    let mut cms = CmsProfile::new_from_slice(&cmyk_icc()).unwrap();
+    cms.pcs = DataColorSpace::Lab;
+    let Some(moxcms::LutWarehouse::Lut(lut)) = &mut cms.lut_a_to_b_perceptual else {
+        panic!("test LUT")
+    };
+    lut.clut_table = moxcms::LutStore::Store16([65280, 32768, 32768].repeat(16));
+    let mut image = cmyk_image();
+    image.output_profile = Some(JxlColorProfile::Icc(cms.encode().unwrap()));
+    let limits = DecodeLimits::default();
+    let destination = Endpoint::new(&profile("Gra_D65_Per_Lin"), &limits, true).unwrap();
+    process_image(&mut image, &target("Gra_D65_Per_Lin"), &limits).unwrap();
+    let fy = (100.0_f64 * 256.0 / 257.0 + 16.0) / 116.0;
+    let fx = fy - (128.0 / 257.0) / 500.0;
+    let expected = (0.9642 * fx.powi(3) / destination.cms.white_point.x) as f32;
+    close(values(&image)[0], expected, 1e-6);
+    close(values(&image)[2], expected, 1e-6);
+    assert!(values(&image)[0] < 0.99);
+}
+
+#[test]
+fn skcms_srgb_uses_quantized_parameters_and_source_approximation() {
+    let curve = skcms::Transfer::srgb();
+    for (encoded, expected) in [
+        (0.0, 0.0),
+        (0.04, 0.003_095_703),
+        (0.25, 0.050_866_842),
+        (0.5, SKCMS_SRGB_HALF),
+        (0.75, 0.522_487_64),
+        (0.9, 0.787_212_4),
+        (1.0, 1.0),
+    ] {
+        close(curve.apply(encoded), expected, 1e-7);
+        close(curve.apply(-encoded), -expected, 1e-7);
+    }
+    assert_eq!(curve.apply(-0.0).to_bits(), (-0.0f32).to_bits());
+    assert!(curve.apply(1.5) > 2.5);
+    let inverse = curve.inverse();
+    assert!(inverse.apply(2.0) > 1.0);
+    assert!(inverse.apply(-0.1) < 0.0);
+    assert_eq!(inverse.apply(-0.0).to_bits(), (-0.0f32).to_bits());
+    // Keep the analytic transfer independently tested; it is still used by
+    // non-skcms paths and the explicit ICC-conventions CMYK output route.
+    close(
+        decode_transfer(&JxlTransferFunction::SRGB, 0.5, 255.0),
+        0.21404114,
+        1e-7,
+    );
 }
 
 #[test]
@@ -836,19 +1090,33 @@ fn pq_display_matches_djxl_near_black_and_gamut_mapped_highlight() {
 
 #[test]
 fn cmyk_pcs_route_preserves_out_of_gamut_rgb() {
-    let mut cms = CmsProfile::new_from_slice(&cmyk_icc()).unwrap();
-    let Some(moxcms::LutWarehouse::Lut(lut)) = &mut cms.lut_a_to_b_colorimetric else {
-        panic!("test LUT")
-    };
-    // PCS XYZ with too much Z for sRGB produces a negative red component.
-    let xyz = [0.1 * 32768.0, 0.2 * 32768.0, 0.7 * 32768.0].map(|x| x as u16);
-    lut.clut_table = moxcms::LutStore::Store16(xyz.repeat(16));
-    let mut image = cmyk_image();
-    image.output_profile = Some(JxlColorProfile::Icc(cms.encode().unwrap()));
-    let extras = image.frames[0].extra_planes.clone();
-    process_image(&mut image, &target("linear"), &DecodeLimits::default()).unwrap();
-    assert!(values(&image)[0] < -0.1);
-    assert!(values(&image)[2] > 0.8);
-    assert_eq!(image.frames[0].extra_planes, extras);
-    assert_eq!(values(&image)[3], 0.75);
+    for icc in [false, true] {
+        let mut cms = CmsProfile::new_from_slice(&cmyk_icc()).unwrap();
+        let selected = if icc {
+            &mut cms.lut_a_to_b_colorimetric
+        } else {
+            &mut cms.lut_a_to_b_perceptual
+        };
+        let Some(moxcms::LutWarehouse::Lut(lut)) = selected else {
+            panic!("test LUT")
+        };
+        // The same extended PCS result under each policy's XYZ normalization.
+        let scale = if icc { 32768.0 } else { 65535.0 };
+        let xyz = [0.1, 0.2, 0.7].map(|x| (x * scale) as u16);
+        lut.clut_table = moxcms::LutStore::Store16(xyz.repeat(16));
+        for destination in ["linear", "sRGB"] {
+            let mut image = cmyk_image();
+            image.output_profile = Some(JxlColorProfile::Icc(cms.encode().unwrap()));
+            let extras = image.frames[0].extra_planes.clone();
+            let options = ColorOptions {
+                cmyk_icc_conventions: icc,
+                ..target(destination)
+            };
+            process_image(&mut image, &options, &DecodeLimits::default()).unwrap();
+            assert!(values(&image)[0] < -0.1);
+            assert!(values(&image)[2] > 0.8);
+            assert_eq!(image.frames[0].extra_planes, extras);
+            assert_eq!(values(&image)[3], 0.75);
+        }
+    }
 }

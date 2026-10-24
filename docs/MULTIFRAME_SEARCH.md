@@ -44,6 +44,12 @@ previous-reference or first-reference crop sequences. It compares every
 channel, including hidden RGB, and uses REPLACE rather than alpha compositing.
 Explicit alpha-blended layers remain supported with the caller's semantics.
 
+For automatic choice between full/crop, eligible binary masks and multiple
+REPLACE rectangles, use [multiframe::encode_auto](MULTIFRAME_AUTO.md). It compares
+actual bytes with explicit backend options. That sequence-strategy search and
+this source-parameter search are distinct APIs; neither silently invokes the
+other or changes caller-supplied layer semantics.
+
 Acceptance compares decoded pixels through both official decoders. The current
 integration suite `searched_layers_and_animation_match_official_djxl` covers
 8/16-bit RGBA, hidden samples, animation, zero-duration layers and explicit

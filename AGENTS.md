@@ -34,6 +34,12 @@
 - Pixel acceptance compares original decoded samples including invisible RGB;
   JPEG acceptance compares original reconstructed JPEG bytes. Identical JXL bytes
   are not a compression goal. Low-level primitive equivalence tests are allowed.
+- Prioritize lossless pixel decoding, byte-exact JPEG reconstruction and exact
+  multiframe reconstruction. Lossy VarDCT rendering need not numerically match
+  C++ down to an arbitrary floating-point tolerance. Record small finite
+  differences without blocking lossless work; crashes, invalid dimensions,
+  missing frames/channels and substantial rendering errors still need attention.
+  Do not relax lossless comparisons or infer full upstream conformance from this.
 - This is an independent repository on main. Do not modify the old C++ projects.
   Do not stage rejected bootstrap artifacts, data, targets, or temporary binaries.
   Do not commit/push without the main agent's explicit instruction.

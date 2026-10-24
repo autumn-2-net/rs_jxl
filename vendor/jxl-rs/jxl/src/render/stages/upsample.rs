@@ -64,8 +64,8 @@ impl<const N: usize, const SHIFT: u8> std::fmt::Display for Upsample<N, SHIFT> {
     }
 }
 
-/// Processes 2 output rows per pass (`N = 2` or `N = 4`), keeping `2 * N <= 8` vector
-/// accumulators plus `minval`/`maxval` in SIMD registers.
+/// Processes 2 output rows per pass (`N = 2` or `N = 4`), with three
+/// independent accumulators per output sample, as in stage_upsampling.cc.
 #[inline(always)]
 fn upsample_2rows_per_step<D: jxl_simd::SimdDescriptor, const N: usize>(
     d: D,
@@ -105,40 +105,51 @@ fn upsample_2rows_per_step<D: jxl_simd::SimdDescriptor, const N: usize>(
             for oy_pair in 0..(N / 2) {
                 let oy0 = 2 * oy_pair;
                 let oy1 = oy0 + 1;
-                let k0_00 = &kernels[oy0][0][0];
-                let k1_00 = &kernels[oy1][0][0];
-                let mut acc0 = [first; N];
-                let mut acc1 = [first; N];
-                for ox in 0..N {
-                    acc0[ox] = first * D::F32Vec::splat(d, k0_00[ox]);
-                    acc1[ox] = first * D::F32Vec::splat(d, k1_00[ox]);
-                }
-
-                for ty in 0..5 {
-                    for tx in 0..5 {
-                        if ty == 0 && tx == 0 {
-                            continue;
-                        }
-                        let v = inv.load::<_, 0>(d, ty as isize - 2, tx as isize - 2);
-                        if N == 2 {
-                            minval = minval.min(v);
-                            maxval = maxval.max(v);
-                        }
-                        let k0 = &kernels[oy0][ty][tx];
-                        let k1 = &kernels[oy1][ty][tx];
-                        for ox in 0..N {
-                            acc0[ox] = v.mul_add(D::F32Vec::splat(d, k0[ox]), acc0[ox]);
-                            acc1[ox] = v.mul_add(D::F32Vec::splat(d, k1[ox]), acc1[ox]);
-                        }
+                let mut acc0 = [[first; N]; 3];
+                let mut acc1 = [[first; N]; 3];
+                for i in 0..3 {
+                    let v = inv.load::<_, 0>(d, -2, i as isize - 2);
+                    if N == 2 {
+                        minval = minval.min(v);
+                        maxval = maxval.max(v);
+                    }
+                    for ox in 0..N {
+                        acc0[i][ox] = v * D::F32Vec::splat(d, kernels[oy0][0][i][ox]);
+                        acc1[i][ox] = v * D::F32Vec::splat(d, kernels[oy1][0][i][ox]);
                     }
                 }
 
-                for ox in 0..N {
-                    acc0[ox] = acc0[ox].max(minval).min(maxval);
-                    acc1[ox] = acc1[ox].max(minval).min(maxval);
+                // Preserve the three chains and final addition order from
+                // stage_upsampling.cc::UpsamplingStage::ProcessRowImpl.
+                for i in 3..25 {
+                    let ty = i / 5;
+                    let tx = i % 5;
+                    let a = i % 3;
+                    let v = inv.load::<_, 0>(d, ty as isize - 2, tx as isize - 2);
+                    if N == 2 {
+                        minval = minval.min(v);
+                        maxval = maxval.max(v);
+                    }
+                    let k0 = &kernels[oy0][ty][tx];
+                    let k1 = &kernels[oy1][ty][tx];
+                    for ox in 0..N {
+                        acc0[a][ox] = v.mul_add(D::F32Vec::splat(d, k0[ox]), acc0[a][ox]);
+                        acc1[a][ox] = v.mul_add(D::F32Vec::splat(d, k1[ox]), acc1[a][ox]);
+                    }
                 }
-                outv.store_interleaved::<_, 0>(d, oy0, acc0);
-                outv.store_interleaved::<_, 0>(d, oy1, acc1);
+
+                let mut out0 = [first; N];
+                let mut out1 = [first; N];
+                for ox in 0..N {
+                    out0[ox] = ((acc0[1][ox] + acc0[2][ox]) + acc0[0][ox])
+                        .max(minval)
+                        .min(maxval);
+                    out1[ox] = ((acc1[1][ox] + acc1[2][ox]) + acc1[0][ox])
+                        .max(minval)
+                        .min(maxval);
+                }
+                outv.store_interleaved::<_, 0>(d, oy0, out0);
+                outv.store_interleaved::<_, 0>(d, oy1, out1);
             }
         },
     );
@@ -200,29 +211,33 @@ simd_function!(
                 }
 
                 for oy in 0..8 {
-                    let k_00 = &kernels[oy][0][0];
-                    let mut acc = [first; 8];
-                    for ox in 0..8 {
-                        acc[ox] = first * D::F32Vec::splat(d, k_00[ox]);
-                    }
-
-                    for ty in 0..5 {
-                        for tx in 0..5 {
-                            if ty == 0 && tx == 0 {
-                                continue;
-                            }
-                            let v = inv.load::<_, 0>(d, ty as isize - 2, tx as isize - 2);
-                            let k = &kernels[oy][ty][tx];
-                            for ox in 0..8 {
-                                acc[ox] = v.mul_add(D::F32Vec::splat(d, k[ox]), acc[ox]);
-                            }
+                    let mut acc = [[first; 8]; 3];
+                    for i in 0..3 {
+                        let v = inv.load::<_, 0>(d, -2, i as isize - 2);
+                        for ox in 0..8 {
+                            acc[i][ox] = v * D::F32Vec::splat(d, kernels[oy][0][i][ox]);
                         }
                     }
 
-                    for ox in 0..8 {
-                        acc[ox] = acc[ox].max(minval).min(maxval);
+                    // The last tap (24) belongs to accumulator zero.
+                    for i in 3..25 {
+                        let ty = i / 5;
+                        let tx = i % 5;
+                        let a = i % 3;
+                        let v = inv.load::<_, 0>(d, ty as isize - 2, tx as isize - 2);
+                        let k = &kernels[oy][ty][tx];
+                        for ox in 0..8 {
+                            acc[a][ox] = v.mul_add(D::F32Vec::splat(d, k[ox]), acc[a][ox]);
+                        }
                     }
-                    outv.store_interleaved::<_, 0>(d, oy, acc);
+
+                    let mut out = [first; 8];
+                    for ox in 0..8 {
+                        out[ox] = ((acc[1][ox] + acc[2][ox]) + acc[0][ox])
+                            .max(minval)
+                            .min(maxval);
+                    }
+                    outv.store_interleaved::<_, 0>(d, oy, out);
                 }
             },
         );
@@ -266,18 +281,61 @@ pub type Upsample8x = Upsample<8, 3>;
 
 #[cfg(test)]
 mod test {
+    use jxl_simd::{SimdDescriptor, test_all_instruction_sets};
     use test_log::test;
 
     use super::*;
     use crate::error::Result;
     use crate::headers::CustomTransformDataNonserialized;
-    use crate::image::Image;
+    use crate::image::{DataTypeTag, Image};
+    use crate::render::low_memory_pipeline::row_buffers::RowBuffer;
     use crate::render::test::make_and_run_simple_pipeline;
     use crate::tests::assert_close;
 
     fn ups_factors() -> CustomTransformData {
         CustomTransformData::default(&CustomTransformDataNonserialized { xyb_encoded: true })
     }
+
+    fn upsample_three_accumulator_order<D: SimdDescriptor>(d: D) {
+        let x0 = RowBuffer::x0_offset::<f32>();
+        let mut input = RowBuffer::new(DataTypeTag::F32, 2, 0, 0, 1).unwrap();
+        let large = 16_777_216.0f32;
+        input.get_row_mut::<f32>(0)[x0 - 2..x0 + 1].copy_from_slice(&[large, 1.0, -large]);
+        input.get_row_mut::<f32>(4)[x0 + 2] = 2.0;
+        let refs = [&input];
+        let input_rows = Channels::from_row_buffers(&refs, x0, 2, 5, 2);
+
+        // Unit taps give source accumulators [large + 2, 1, -large].
+        // The serial chain gives 2, and (acc0 + acc1) + acc2 gives 4, not 3.
+        let serial = ((large + 1.0) - large) + 2.0;
+        assert_eq!(serial, 2.0);
+        macro_rules! check {
+            ($n:literal, $shift:literal, $process:ident) => {{
+                let kernels = [[[[1.0; $n]; 5]; 5]; $n];
+                let mut output = RowBuffer::new(DataTypeTag::F32, 0, $shift, $shift, $n).unwrap();
+                {
+                    let mut output_rows =
+                        ChannelsMut::from_row_buffers(std::slice::from_mut(&mut output), x0, 0, $n);
+                    $process(d, &input_rows, 1, &kernels, &mut output_rows);
+                }
+                for oy in 0..$n {
+                    for ox in 0..$n {
+                        assert_eq!(
+                            output.get_row::<f32>(oy)[x0 + ox].to_bits(),
+                            3.0f32.to_bits(),
+                            "{}x upsampling at ({ox}, {oy})",
+                            $n,
+                        );
+                    }
+                }
+            }};
+        }
+        check!(2, 1, upsample_2x_simd);
+        check!(4, 2, upsample_4x_simd);
+        check!(8, 3, upsample_8x_simd);
+    }
+
+    test_all_instruction_sets!(upsample_three_accumulator_order);
 
     #[test]
     fn upsample2x_consistency() -> Result<()> {

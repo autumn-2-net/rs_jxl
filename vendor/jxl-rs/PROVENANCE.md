@@ -55,6 +55,16 @@ new ARM work. Existing upstream non-x86 source is retained unchanged.
   accumulate progressive passes with overflow checks, recover exact extra-DC
   precision, and honor compatible non-unit quantizers. Fractional/clamped or
   otherwise unreconstructable data is rejected, not silently rounded.
+- Noise rendering: use base color correlation rather than LF/DC offsets,
+  following libjxl `stage_noise.cc`; retain every encoded 10-bit strength in
+  SIMD LUT lookup instead of truncating entries through a BF16 table.
+- Rendering arithmetic: align 2x/4x/8x upsampling's three accumulators and final
+  sum, Gaborish's shared reciprocal/pairwise sums, and scalar adaptive LF
+  smoothing's grouping with the C++ reference. This is source arithmetic
+  compatibility, not a relaxed floating-output tolerance or a performance claim.
+- XYB Gamma/DCI output: use libjxl's near-black cutoff at linear values `<=1e-5`
+  instead of mirroring negative inputs. Native original-color samples bypass
+  this stage. This does not resolve the separately documented sRGB residuals.
 
 Update this ledger and docs/DECODER_STATUS.md for behavioral patches. Do not
 replace this directory from upstream without reviewing and replaying patches.

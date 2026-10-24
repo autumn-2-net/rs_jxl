@@ -9,6 +9,25 @@ It is not satisfied by parsing headers or by returning a re-encoded JPEG.
 Full CLI flag parity and full format coverage are separate checks, not assumptions
 made from adopting an upstream decoder.
 
+### Lossless-First Scope Clarification (2026-10-24)
+
+The user clarified that lossless functionality is the acceptance priority:
+original sample equality (including invisible RGB), original JPEG byte equality,
+and exact multiframe reconstruction. Native decode without color/format
+conversion remains distinct from a requested rendered/color-converted output.
+
+The five recorded VarDCT rendering differences of approximately `1e-5` to `2e-5`
+are numerical diagnostics, not demonstrated lossless failures or blockers for
+this milestone. Their existing reports and comparison thresholds remain intact;
+they are not relabeled as passing. Do not continue changing rendering arithmetic
+solely to satisfy that diagnostic threshold. Lossy decode must still handle the
+file, dimensions, frames and channels correctly; crashes, nonfinite corruption
+and substantial rendering errors remain defects to investigate.
+
+These measurements concern our maintained decoder, not a measured pristine
+upstream build. They neither establish an upstream bug nor certify full format
+conformance. A pristine comparison was not completed before reprioritizing.
+
 Runtime decoding uses the maintained official `libjxl/jxl-rs` sources in
 `vendor/jxl-rs`, pinned to `5ccf8694e3779e2931ca487d46251e3050bf849b`.
 The four supporting crates are local path dependencies, not an opaque registry
@@ -113,17 +132,21 @@ an ignored SDR `display_nits` request does not relabel unchanged pixels.
 Legacy CMYK `mft1`/`mft2` ICC tables are evaluated directly for structured RGB
 or gray destinations: input curves, original four-dimensional CLUT, output curves,
 then PCS conversion. This avoids a second fixed-grid resampling and premature
-RGB/XYZ clipping. Absolute colorimetric intent applies the media-white XYZ ratio
-after PCS conversion, preserving luminance. Other ICC forms use moxcms, with
-extended matrix handling and its general-stage support enabled.
+RGB/XYZ clipping. The default now follows the tested skcms-based djxl conventions:
+A2B0 then A2B1 selection independent of intent, unit-normalized table PCS,
+and no intent-dependent absolute white-point adjustment on this route.
 
-CMS output is not bit-for-bit interchangeable between engines. In particular,
-the tested skcms-based djxl chooses A2B0 preferentially even for a requested
-relative/absolute intent, and normalizes legacy 16-bit Lab tables differently.
-This implementation retains the requested intent and the legacy Lab `0xff00`
-white encoding. A full file can decode losslessly while an explicitly requested
-color-space conversion produces different colors from another CMS. Native
-sample extraction and original-JPEG reconstruction never use this conversion.
+`ColorOptions::cmyk_icc_conventions = true` retains the previous intent-aware
+table selection, legacy 16-bit Lab `0xff00` white encoding, XYZ scaling and
+absolute media-white correction. The CLI exposes `--cmyk-icc-conventions` together
+with `--color-space`. This is a scoped CMYK table policy, not a claim of complete
+ICC conformance or a switch for every moxcms transform. Other ICC forms use
+moxcms, with extended matrix handling and general-stage support enabled.
+
+CMS output is not universally bit-interchangeable between engines. Neither
+mode clips extended PCS/RGB output. Out-of-range or nonfinite device input still
+fails explicitly instead of silently clamping. Native sample extraction and
+original-JPEG reconstruction never use this optional color conversion.
 
 `allow_partial = true` permits flushed output at EOF. It does not convert corrupt
 stream errors into success. `image.complete` and `frame.complete` distinguish
@@ -215,6 +238,9 @@ wire default, with the same padding-work budget as explicit bits.
 
 ## Known Boundaries
 
+- The 2026-10-24 strict floating-render matrix is 12/17 against each official
+  decoder version, not an all-green conformance result. Five VarDCT cases exceed
+  the unchanged `1e-5` diagnostic threshold; see the checkpoint below.
 - Exact native U31 integer output remains beyond the rendered-pixel djxl target.
 - Mixed-upsampled patch dictionaries are supported when color patches do not
   blend extra channels. Cross-resolution EC/alpha blending rejected by the C++
@@ -226,15 +252,31 @@ wire default, with the same padding-work budget as explicit bits.
   Required reference frames and unsupported progressions retain full quality.
 - Output CMS is explicit; opaque ICC transforms reject out-of-range input instead
   of silently clipping it. Structured profiles use an unclamped matrix path.
-- Numerical rendering and ICC policy differences with the tested skcms-based
-  djxl remain. In particular CMYK-to-RGB is not claimed to match that CMS's
-  intent/Lab-normalization behavior; raw CMYK layer samples do match exactly.
+- Numerical rendering and general ICC-engine differences with skcms-based djxl
+  remain separate from native-lossless sample correctness. The default direct
+  CMYK table route now follows its intent/PCS conventions; the explicitly
+  selectable intent-aware route deliberately uses different conventions.
 - Absolute ICC conversions with different media whites use explicit PCS stages.
   If the scaled intermediate exceeds the supported opaque-ICC numeric domain,
   conversion fails without clipping or publishing partial output. This is not
   a claim of arbitrary extended-range ICC coverage.
 - Feature implementation does not imply complete standards conformance. Runtime
   coverage and remaining compatibility differences are recorded below.
+
+## Error Categories
+
+Backend sample/dimension ceilings and allocation failures retain `Error::Limit`
+through pixel decoding, selected-frame decoding, inspection and JPEG restoration.
+Backend I/O failures retain `Error::Io`; malformed bitstreams remain
+`Error::Decoding`. Reconstruction's nested metadata, coefficient, entropy and
+output budgets likewise retain their resource classification. These categories
+do not turn unsupported files into accepted output or imply a whole-process
+memory sandbox.
+
+Only Exif/XMP boxes actually referenced by the JPEG reconstruction metadata must
+be unique. Unrelated duplicate display metadata does not prevent restoring an
+original JPEG. Missing or ambiguous required sources and duplicate `jbrd` boxes
+remain errors, including compressed and trailing source boxes.
 
 ## Local Maintenance
 
@@ -251,6 +293,41 @@ Do not run the vendor's full test suite as if its large upstream test corpus
 were included: that corpus was intentionally excluded. Project integration
 tests generate fixtures and verify public behavior. Optional independent
 oracle checks exercise official `djxl` on the same streams.
+
+## Lossless Closure Checkpoint: 2026-10-24
+
+After the lossless-first scope clarification, the affected release targets
+passed 61 integration tests, 13 reconstruction/error unit tests and 35 CLI
+tests. This was a targeted run, not another complete workspace or upstream
+conformance suite. Checks include:
+
+- Every integer value at every declared depth from 1 through 16, with one/four
+  decoder threads. Floating special words, hidden RGB and extra-plane tests
+  retain exact equality, never the lossy rendering tolerance.
+- All eight orientations with negative/off-canvas crop origins, checking raw
+  samples, oriented headers, selected layers, inspection and composed output.
+- Automatic zero-duration reference chains, extra-only changes, actual mask
+  winners with unequal color/alpha depths, and exact work/output-budget edges.
+- JPEG source metadata before/after coefficient data, Brotli and EOF-sized
+  boxes, missing/ambiguous required sources, unrelated duplicate display boxes,
+  every incomplete synthetic container prefix, and typed resource failures.
+
+The automatic-frame independent matrix passed 240 exact-sample comparisons
+against official djxl 0.12 and 0.13, with 50 actual mask and 100 multiple-rectangle
+winners; see [automatic frames](MULTIFRAME_AUTO.md). Two real JPEGs encoded by
+Rust, cjxl 0.12 and cjxl 0.13 passed all six original-byte reconstruction cases
+with both Rust and djxl 0.13. A separate check verified both djxl versions
+restore the Rust-produced files exactly. Reports are ignored local artifacts
+`lossless-final-jpeg-cross.json` and `lossless-final-jpeg-encoder.json` under
+`out/decoder-integration/`. Previously documented old-decoder/new-encoder JPEG
+differences are not relabeled or hidden by this scope.
+
+The normal release CLI was rebuilt. Strict workspace all-target Clippy,
+Rust 1.89 all-target compilation, formatting and whitespace checks passed.
+No lossy-render arithmetic, performance policy, native-U31 extension or CI
+changes were made in this closure pass. Runtime checks remain Windows x86_64;
+this is not Linux/macOS, fuzzing, full decoder conformance or production
+certification. Existing native-U31/CMS/streaming boundaries remain explicit.
 
 ## Feature Verification: 2026-10-24
 
@@ -327,6 +404,61 @@ is a lossless sample tolerance or a claim of complete CMS conformance.
 
 Reports belong in ignored `out/decoder-integration/`. Source fixtures and local
 absolute paths are not part of the committed documentation or test inputs.
+
+## Compatibility Checkpoint: 2026-10-24
+
+The integrated release workspace run passed 1,679 ordinary tests and one doctest.
+Subsequent CMS corrections passed all 61 affected color tests in debug; 60 had
+already passed in release before the new gamma fixture's cross-SIMD assertion
+was corrected to its explicit color-conversion criterion. Native lossless tests
+still compare exact samples/words. This does not substitute a tolerance for
+lossless round trips. The 29 affected noise/upsampling/Gaborish/LF tests and 17
+XYB-stage tests passed separately in the fixture-enabled vendor validation copy.
+Only affected paths were rerun after fixes, not another full workspace matrix.
+Final strict all-target Clippy, formatting and Rust 1.89 all-target compilation
+passed. Runtime verification here is Windows x86_64, not Linux/macOS execution.
+
+The default CMYK path now matches the local skcms conventions in A2B priority,
+Lab/XYZ normalization, CLUT interpolation order and inverse transfer generation.
+The latter uses skcms's approximate scalar `powf_`, not system `powf`. Structured
+sRGB/gamma-to-linear also follows the ICC parameter quantization and transfer
+approximation. The fixture named `3x3_srgb_lossless.jxl` actually declares a
+gamma curve, so handling only the sRGB transfer enum did not cover it.
+
+Renderer corrections use base rather than LF noise correlation, exact encoded
+noise LUT precision, source-order filtering and the C++ Gamma/DCI near-black
+cutoff in XYB output. None changes the lossless encoder, SIMD target policy,
+CI, or original-JPEG reconstruction contract.
+
+Final reports are ignored artifacts `out/decoder-integration/compatibility-final-012.json`
+and `compatibility-final-013.json`. Both contain **12 passes out of 17**, using
+the original `1e-5` finite-render threshold; native CMYK raw layers use zero
+tolerance. The CMYK RGB conversion, gamma-to-linear fixture, PQ/HLG display and
+unsubsampled extra-channel fixtures have zero differing sample words. No general
+CMS or standards-conformance certificate follows from these fixtures.
+
+The five outstanding diagnostics are identical against both official versions:
+
+| Case | Maximum Absolute Difference |
+| --- | ---: |
+| 75%-length partial `progressive_ac` | 1.28825195e-5 |
+| Progressive quality 2 | 1.28825195e-5 |
+| Progressive quality 4 | 1.07800588e-5 |
+| Progressive quality 8 | 1.01486221e-5 |
+| `ec_upsampling8_multi_group` | 1.95843168e-5 |
+
+In the last fixture the alpha/extra samples are exact; the discrepancy is in
+base RGB. Full-quality `progressive_ac` has maximum `1.19339675e-5` and RMS
+`3.04987718e-7`. The extra-channel fixture's RMS is `4.51581641e-7`. All values
+are normalized floating output. Small magnitude alone does not prove the cause
+or harmlessness. A source-order XYB matrix experiment was not retained because
+it did not explain the residual and worsened some diagnosed pixels. Further
+attribution needs matched pre-XYB intermediates; these cases remain failures,
+not silently waived passes. Aggressive performance changes were not started.
+
+Automatic multiframe selection has separate exact-sample acceptance in
+[MULTIFRAME_AUTO.md](MULTIFRAME_AUTO.md), rather than sharing these lossy-render
+tolerances.
 
 ## Verification Checkpoint: 2026-10-23
 

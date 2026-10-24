@@ -364,6 +364,27 @@ fn deduplicated_app_sources_are_exact_required_and_length_checked() {
         reconstruct_jpeg(&encoded, captured(&jpeg), sources, &limits).unwrap(),
         original
     );
+    // Deduplication changes storage, not the expanded metadata budget. Count
+    // each reconstructed APP envelope as well as its externally stored bytes.
+    let mut bounded = limits.clone();
+    bounded.max_jbrd_bytes = encoded.len();
+    bounded.max_metadata_bytes = parts.header.len()
+        + parts.payload.len()
+        + profile.len()
+        + 2 * 17
+        + tiff.len()
+        + 9
+        + xml.len()
+        + 32;
+    assert_eq!(
+        reconstruct_jpeg(&encoded, captured(&jpeg), sources, &bounded).unwrap(),
+        original
+    );
+    bounded.max_metadata_bytes -= 1;
+    assert!(matches!(
+        reconstruct_jpeg(&encoded, captured(&jpeg), sources, &bounded),
+        Err(Error::Limit("expanded metadata"))
+    ));
     for missing in [
         ReconstructionMetadataSources {
             icc_profile: None,
@@ -398,6 +419,25 @@ fn deduplicated_app_sources_are_exact_required_and_length_checked() {
         },
     ] {
         assert!(reconstruct_jpeg(&encoded, captured(&jpeg), bad, &limits).is_err());
+    }
+    let mut longer_profile = profile.to_vec();
+    longer_profile.push(0);
+    let mut offset_exif = exif_box.clone();
+    offset_exif[3] = 1;
+    for bad in [
+        ReconstructionMetadataSources {
+            icc_profile: Some(&longer_profile),
+            ..sources
+        },
+        ReconstructionMetadataSources {
+            exif_box_payload: Some(&offset_exif),
+            ..sources
+        },
+    ] {
+        assert!(matches!(
+            reconstruct_jpeg(&encoded, captured(&jpeg), bad, &limits),
+            Err(Error::Invalid(_))
+        ));
     }
 }
 

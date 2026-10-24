@@ -32,6 +32,14 @@
 //! ICC transforms use moxcms's conventional table domain: input outside [0, 1]
 //! is rejected, not silently clipped. Their output follows the ICC tables and
 //! does not promise extended-range gamut preservation.
+//! CMYK mft1/mft2 -> structured RGB/gray defaults to the local skcms-based
+//! djxl conventions; see ColorOptions::cmyk_icc_conventions. This direct route
+//! preserves extended PCS/RGB output, but still rejects out-of-range device
+//! input (after alpha unassociation and JXL CMYK inversion), unlike skcms's
+//! input clamp. Other ICC forms continue through moxcms, not a skcms emulator.
+//! Structured sRGB -> structured linear and default CMYK -> structured sRGB
+//! use skcms's quantized ICC sRGB parameters and scalar power approximation.
+//! This numerical compatibility never activates processing by itself.
 //! F32 CMS results are
 //! not promised bit-identical to a different CMS or libjxl's SIMD math.
 
@@ -59,6 +67,20 @@ pub enum ColorProfile {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ColorOptions {
     pub output_profile: Option<ColorProfile>,
+    /// CMYK mft1/mft2 -> structured RGB/gray policy; does not activate CMS.
+    /// False (default): skcms-based djxl's A2B0-then-A2B1 selection (not A2B2),
+    /// unit-normalized Lab/XYZ tables, no absolute media-white scaling, and
+    /// gray from PCS X / header-white X, with skcms sRGB output transfer math.
+    /// Destination intent is retained as
+    /// metadata but does not alter this route's pixels.
+    /// True: destination-intent selection with A2B0 fallback, legacy 16-bit
+    /// Lab 0xff00 normalization, ICC XYZ scaling, absolute media-white ratios,
+    /// and gray from PCS Y with analytic output transfer math. This is not a
+    /// full ICC conformance mode and does not change non-CMYK processing.
+    /// Neither mode clips extended output; both reject nonfinite or out-of-
+    /// range CMYK input. Other ICC forms/destinations use the existing moxcms
+    /// path and are not covered by this compatibility policy.
+    pub cmyk_icc_conventions: bool,
     /// Positive finite display peak. PQ down-mapping follows Rec.2408; HLG
     /// adapts its OOTF when the destination is not HLG. SDR is unchanged.
     /// HDR adjustment requires structured source AND destination encodings;
@@ -634,10 +656,14 @@ struct Pipeline {
     absolute_output: Option<Arc<TransformF32Executor>>,
     absolute_scale: [f32; 3],
     cmyk_lut: Option<super::color_lut::CmykLut>,
+    djxl_cmyk: bool,
+    cmyk_gray_component: usize,
     cmyk_gray_scale: f32,
     matrix: Option<Matrix3d>,
     post_matrix: Option<Matrix3d>,
     gray_curve: Option<Box<dyn ToneCurveEvaluator + Send + Sync>>,
+    srgb_input: Option<skcms::Transfer>,
+    srgb_output: Option<skcms::Transfer>,
     source_nits: f32,
     destination_nits: f32,
     tone: Option<DisplayMap>,
@@ -703,8 +729,20 @@ impl Pipeline {
         } else {
             None
         };
-        // A CMYK LUT can produce out-of-gamut RGB. Its PCS XYZ is nonnegative;
-        // defer the destination RGB matrix until after the sampled CMS path.
+        let cmyk_lut = if input.layout == Layout::Rgba && output.curve.is_some() {
+            super::color_lut::CmykLut::new(&input.cms, &output.cms, options.cmyk_icc_conventions)?
+        } else {
+            None
+        };
+        let djxl_cmyk = cmyk_lut.is_some() && !options.cmyk_icc_conventions;
+        let absolute_scale = if djxl_cmyk {
+            // skcms_Transform has no rendering-intent/media-white operation.
+            [1.0; 3]
+        } else {
+            super::color_lut::absolute_scale(&input.cms, &output.cms)?
+        };
+        // A CMYK LUT can produce negative XYZ as well as out-of-gamut RGB.
+        // Keep PCS conversion and the destination matrix outside sampled CMS.
         let mut cms_destination = output.cms.clone();
         let post_matrix = if input.layout == Layout::Rgba
             && output.curve.is_some()
@@ -714,9 +752,8 @@ impl Pipeline {
             cms_destination.green_colorant = Xyzd::new(0.0, 1.0, 0.0);
             cms_destination.blue_colorant = Xyzd::new(0.0, 0.0, 1.0);
             let mut matrix = checked_inverse(output.cms.colorant_matrix())?;
-            let scale = super::color_lut::absolute_scale(&input.cms, &output.cms)?;
             for row in &mut matrix.v {
-                for (entry, scale) in row.iter_mut().zip(scale) {
+                for (entry, scale) in row.iter_mut().zip(absolute_scale) {
                     *entry *= scale;
                 }
             }
@@ -726,17 +763,20 @@ impl Pipeline {
         };
         let cmyk_gray =
             input.layout == Layout::Rgba && output.layout == Layout::Gray && output.curve.is_some();
-        let cmyk_gray_scale = if cmyk_gray {
-            super::color_lut::absolute_scale(&input.cms, &output.cms)?[1] as f32
+        let cmyk_gray_component = usize::from(!djxl_cmyk);
+        let cmyk_gray_scale = if cmyk_gray && djxl_cmyk {
+            // skcms parses gray as a diagonal header-illuminant matrix;
+            // libjxl contracts its RGB result by retaining channel zero.
+            let white_x = output.cms.white_point.x;
+            if !white_x.is_finite() || white_x <= 0.0 {
+                return Err(invalid("invalid ICC PCS white point"));
+            }
+            (1.0 / white_x) as f32
+        } else if cmyk_gray {
+            absolute_scale[1] as f32
         } else {
             1.0
         };
-        let cmyk_lut = if post_matrix.is_some() || cmyk_gray {
-            super::color_lut::CmykLut::new(&input.cms, &output.cms)?
-        } else {
-            None
-        };
-        let absolute_scale = super::color_lut::absolute_scale(&input.cms, &output.cms)?;
         let absolute_output = if !same_linear
             && matrix.is_none()
             && post_matrix.is_none()
@@ -794,6 +834,26 @@ impl Pipeline {
                 )
             };
         let preserve_encoding = source == destination && tone.is_none();
+        let srgb_input = if output
+            .curve
+            .as_ref()
+            .is_some_and(|c| c.transfer == JxlTransferFunction::Linear)
+        {
+            input.curve.as_ref().and_then(|curve| match curve.transfer {
+                JxlTransferFunction::SRGB => Some(skcms::Transfer::srgb()),
+                JxlTransferFunction::Gamma(gamma) => Some(skcms::Transfer::gamma(gamma)),
+                JxlTransferFunction::DCI => Some(skcms::Transfer::gamma(1.0 / 2.6)),
+                _ => None,
+            })
+        } else {
+            None
+        };
+        let srgb_output = (djxl_cmyk
+            && output
+                .curve
+                .as_ref()
+                .is_some_and(|c| c.transfer == JxlTransferFunction::SRGB))
+        .then(|| skcms::Transfer::srgb().inverse());
         Ok(Self {
             input,
             output,
@@ -801,10 +861,14 @@ impl Pipeline {
             absolute_output,
             absolute_scale: absolute_scale.map(|v| v as f32),
             cmyk_lut,
+            djxl_cmyk,
+            cmyk_gray_component,
             cmyk_gray_scale,
             matrix,
             post_matrix,
             gray_curve,
+            srgb_input,
+            srgb_output,
             source_nits,
             destination_nits,
             tone,
@@ -875,7 +939,13 @@ impl Pipeline {
                     .as_ref()
                     .filter(|_| !self.preserve_encoding)
                 {
-                    curve.decode(pixel, self.source_nits);
+                    if let Some(srgb) = &self.srgb_input {
+                        for value in pixel.iter_mut() {
+                            *value = srgb.apply(*value);
+                        }
+                    } else {
+                        curve.decode(pixel, self.source_nits);
+                    }
                 }
                 if pixel.iter().any(|v| !v.is_finite()) {
                     return Err(invalid(
@@ -890,7 +960,7 @@ impl Pipeline {
                     for (input, value) in input.chunks_exact(4).zip(output.iter_mut()) {
                         let mut xyz = [0.0; 3];
                         lut.transform(input, &mut xyz)?;
-                        *value = xyz[1] * self.cmyk_gray_scale;
+                        *value = xyz[self.cmyk_gray_component] * self.cmyk_gray_scale;
                     }
                 } else {
                     lut.transform(input, output)?;
@@ -945,7 +1015,15 @@ impl Pipeline {
                 for pixel in output.chunks_exact_mut(3) {
                     let xyz = [pixel[0] as f64, pixel[1] as f64, pixel[2] as f64];
                     for (row, value) in matrix.v.iter().zip(pixel) {
-                        *value = row.iter().zip(xyz).map(|(a, b)| a * b).sum::<f64>() as f32;
+                        *value = if self.djxl_cmyk {
+                            // skcms stores the inverse matrix and evaluates it
+                            // in F32, without fused multiply-add operations.
+                            row[0] as f32 * xyz[0] as f32
+                                + row[1] as f32 * xyz[1] as f32
+                                + row[2] as f32 * xyz[2] as f32
+                        } else {
+                            row.iter().zip(xyz).map(|(a, b)| a * b).sum::<f64>() as f32
+                        };
                     }
                 }
             }
@@ -960,7 +1038,13 @@ impl Pipeline {
                     .as_ref()
                     .filter(|_| !self.preserve_encoding)
                 {
-                    curve.encode(pixel, self.destination_nits);
+                    if let Some(srgb) = &self.srgb_output {
+                        for value in pixel.iter_mut() {
+                            *value = srgb.apply(*value);
+                        }
+                    } else {
+                        curve.encode(pixel, self.destination_nits);
+                    }
                 }
                 if pixel.iter().any(|v| !v.is_finite()) {
                     return Err(invalid(
@@ -1485,3 +1569,6 @@ fn gather_color(
 #[cfg(test)]
 #[path = "color_tests.rs"]
 mod tests;
+
+#[path = "color_skcms.rs"]
+mod skcms;

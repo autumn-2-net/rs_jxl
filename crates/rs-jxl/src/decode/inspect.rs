@@ -1,6 +1,6 @@
 use super::{
-    DecodeOptions, DecodedBox, JxlBasicInfo, JxlColorProfile, JxlFrameHeader, backend_options,
-    boxes, buffers::Buffers, check_info, failure,
+    DecodeOptions, DecodedBox, JxlBasicInfo, JxlColorProfile, JxlFrameHeader, backend_error,
+    backend_options, boxes, buffers::Buffers, check_info, failure,
 };
 use crate::{Error, Result};
 use jxl_decoder::api::{Event, JxlDecoder};
@@ -20,7 +20,10 @@ pub struct ImageInspection {
 pub fn read_basic_info(mut input: &[u8], options: &DecodeOptions) -> Result<JxlBasicInfo> {
     let mut decoder = JxlDecoder::new(backend_options(input, options)?);
     decoder.close_input();
-    match decoder.process(&mut input, None, None).map_err(failure)? {
+    match decoder
+        .process(&mut input, None, None)
+        .map_err(backend_error)?
+    {
         Event::BasicInfo => {
             let info = decoder
                 .basic_info()
@@ -45,13 +48,16 @@ pub fn inspect(mut input: &[u8], options: &DecodeOptions) -> Result<ImageInspect
     let mut frames = Vec::new();
     let mut preview = None;
     loop {
-        match decoder.process(&mut input, None, None).map_err(failure)? {
+        match decoder
+            .process(&mut input, None, None)
+            .map_err(backend_error)?
+        {
             Event::BasicInfo => {
                 let info = decoder.basic_info().unwrap();
                 check_info(info, options)?;
                 let color_type = decoder.current_pixel_format().unwrap().color_type;
                 let format = Buffers::pixel_format(info, color_type, options);
-                decoder.set_pixel_format(format).map_err(failure)?;
+                decoder.set_pixel_format(format).map_err(backend_error)?;
             }
             Event::FrameHeader => {
                 let header = decoder

@@ -204,8 +204,13 @@ djxl archive.jxl restored.jpg
 ```
 
 Check `restored.jpg` against the original JPEG bytes. Decoding both JPEGs to RGB
-is insufficient to establish archival correctness. The Rust runtime JXL
-decoder and Python CFFI/wheel layer are separate pending work.
+is insufficient to establish archival correctness. The Rust runtime decoder is
+available as `rs_jxl::decode::reconstruct_jpeg(&jxl, &DecodeOptions::default())`.
+It restores original bytes from captured coefficients and `jbrd`, without pixel
+re-encoding or access to the original JPEG. Missing, ambiguous required metadata
+sources and incomplete input are errors; pixel partial/progression options never
+permit a partial JPEG. Reconstruction budget failures return `Error::Limit`.
+The Python CFFI/wheel layer remains separate pending work.
 
 ## Verification
 

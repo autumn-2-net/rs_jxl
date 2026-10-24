@@ -1,6 +1,6 @@
 use super::{
-    AlphaMode, DecodeOptions, DecodedImage, backend_options, boxes, buffers::Buffers, check_info,
-    color, failure, runner::Runner,
+    AlphaMode, DecodeOptions, DecodedImage, backend_error, backend_options, boxes,
+    buffers::Buffers, check_info, color, failure, runner::Runner,
 };
 use crate::{Error, Result};
 use jxl_decoder::api::{Event, JxlDecoder, JxlFrameHeader, JxlOutputBuffer};
@@ -57,7 +57,7 @@ fn decode_impl(
             let output = (wanted && !views.is_empty()).then_some(views.as_mut_slice());
             decoder
                 .process(&mut input, output, Some(&mut runner))
-                .map_err(failure)?
+                .map_err(backend_error)?
         };
         match event {
             Event::BasicInfo => {
@@ -70,7 +70,7 @@ fn decode_impl(
                     .ok_or_else(|| failure("missing pixel format"))?
                     .color_type;
                 let format = Buffers::pixel_format(info, color_type, options);
-                decoder.set_pixel_format(format).map_err(failure)?;
+                decoder.set_pixel_format(format).map_err(backend_error)?;
             }
             Event::FrameHeader => {
                 let current = decoder
@@ -144,7 +144,7 @@ fn decode_impl(
                         .collect();
                     if decoder
                         .flush_pixels(&mut views, Some(&mut runner))
-                        .map_err(failure)?
+                        .map_err(backend_error)?
                     {
                         let frame = allocated.copy_frame(index, current, false)?;
                         if current.is_preview {
