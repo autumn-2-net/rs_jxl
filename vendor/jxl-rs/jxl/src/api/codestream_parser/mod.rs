@@ -13,7 +13,7 @@ use crate::api::{
     JxlParallelRunner, JxlPixelFormat, ProfileLevel, SmallBuffer, VisibleFrameSeekTarget,
 };
 use crate::error::{Error, Result};
-use crate::headers::frame_header::FrameHeader;
+use crate::headers::frame_header::{FrameHeader, FrameType};
 
 mod frame_info;
 mod frame_scan_info;
@@ -112,6 +112,7 @@ pub(super) struct CodestreamParser {
     // Output information
     pub output_color_profile: Option<JxlColorProfile>,
     pub pixel_format: Option<JxlPixelFormat>,
+    pub last_frame_progression: Option<crate::api::JxlFrameProgression>,
 
     /// While seeking: the number of visible frames still to skip before the target.
     visible_frames_to_skip: Option<usize>,
@@ -142,6 +143,7 @@ impl CodestreamParser {
             state: ParserState::FileHeader,
             output_color_profile: None,
             pixel_format: None,
+            last_frame_progression: None,
             local_buffer: SmallBuffer::new(4096),
             header_needed_bytes: None,
             frame_info: FrameInfo::new(),
@@ -165,6 +167,7 @@ impl CodestreamParser {
         self.header_needed_bytes = None;
         self.output_color_profile = None;
         self.pixel_format = None;
+        self.last_frame_progression = None;
         self.visible_frames_to_skip = None;
         self.next_frame_index = 0;
         self.slot_frames = [None; 8];
@@ -208,6 +211,7 @@ impl CodestreamParser {
         self.next_frame_index = start.frame_index;
         self.state = ParserState::FrameHeader { is_preview: false };
         self.header_needed_bytes = None;
+        self.last_frame_progression = None;
         start.box_parser_checkpoint
     }
 
@@ -349,16 +353,28 @@ impl CodestreamParser {
                     // Decide how much to decode this frame.
                     let mut process_mode = ProcessMode::Process;
 
-                    if is_preview && decode_options.skip_preview {
-                        process_mode = ProcessMode::Skip(false);
-                    }
-
                     let header = self.frame_info.current_frame_header().unwrap();
                     let is_stored = stored_slot(header).is_some();
-                    if !header.is_visible() {
+                    let is_layer = matches!(
+                        header.frame_type,
+                        FrameType::RegularFrame | FrameType::SkipProgressive
+                    );
+                    let output_frame = if decode_options.coalescing {
+                        header.is_visible()
+                    } else {
+                        is_layer
+                    };
+                    if is_preview && decode_options.skip_preview {
+                        process_mode = ProcessMode::Skip(false);
+                    } else if !output_frame {
                         process_mode = ProcessMode::SkipOutput;
-                    } else if let Some(n) = self.visible_frames_to_skip.as_mut() {
-                        if *n > 0 {
+                    }
+                    // Seeking is indexed by display frames, not raw-layer events.
+                    // Suppress every intermediate layer until the target header.
+                    if !is_preview && let Some(n) = self.visible_frames_to_skip.as_mut() {
+                        if !header.is_visible() {
+                            process_mode = ProcessMode::SkipOutput;
+                        } else if *n > 0 {
                             *n -= 1;
                             // A frame that is not stored does not affect later frames.
                             process_mode = if is_stored {
@@ -375,8 +391,8 @@ impl CodestreamParser {
                     if !is_preview {
                         self.next_frame_index += 1;
                     }
-                    if decode_options.scan_frames_only && process_mode == ProcessMode::Process {
-                        process_mode = ProcessMode::Skip(true);
+                    if decode_options.scan_frames_only {
+                        process_mode = ProcessMode::Skip(process_mode.notify_user());
                     }
                     #[cfg(test)]
                     if !matches!(process_mode, ProcessMode::Skip(_)) {
@@ -402,10 +418,9 @@ impl CodestreamParser {
                         toc,
                         self.image_info.file_header(),
                         decode_options,
-                        self.pixel_format.as_ref().unwrap(),
-                        self.output_color_profile.as_ref().unwrap(),
                         process_mode,
                         level5_limits,
+                        is_preview,
                     )?;
 
                     if !matches!(process_mode, ProcessMode::Skip(..)) {
@@ -413,6 +428,7 @@ impl CodestreamParser {
                     }
 
                     if process_mode.notify_user() {
+                        self.last_frame_progression = None;
                         return Ok(Event::FrameHeader);
                     }
                 }
@@ -445,6 +461,10 @@ impl CodestreamParser {
 
                     let header = self.frame_info.current_frame_header().unwrap();
                     let is_last = header.is_last;
+                    if process_mode.notify_user() {
+                        self.last_frame_progression = (process_mode == ProcessMode::Process)
+                            .then(|| self.frame_info.output_progression());
+                    }
                     if !is_preview
                         && !matches!(process_mode, ProcessMode::Skip(_))
                         && let Some(slot) = stored_slot(header)
@@ -498,6 +518,16 @@ impl CodestreamParser {
         matches!(
             self.state,
             ParserState::Sections { process_mode, .. } if process_mode.notify_user()
+        )
+    }
+
+    pub fn is_preview_frame(&self) -> bool {
+        matches!(
+            self.state,
+            ParserState::Sections {
+                is_preview: true,
+                ..
+            }
         )
     }
 }

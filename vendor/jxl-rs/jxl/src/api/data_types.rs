@@ -320,7 +320,58 @@ pub struct JxlAnimation {
 #[derive(Clone, Debug)]
 pub struct JxlFrameHeader {
     pub name: String,
+    /// Duration in milliseconds, or None for non-animated images and previews.
     pub duration: Option<f64>,
-    /// Frame size (width, height)
+    /// Actual output buffer dimensions, after the requested orientation transform.
     pub size: (usize, usize),
+    pub duration_ticks: u32,
+    pub timecode: Option<u32>,
+    pub is_last: bool,
+    /// Preview frames use the same FrameHeader/FrameComplete events as image frames.
+    pub is_preview: bool,
+    /// Encoded layer metadata, even when the output pixels are coalesced.
+    pub layer_info: JxlLayerInfo,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JxlBlendMode {
+    Replace,
+    Add,
+    Blend,
+    AlphaWeightedAdd,
+    Mul,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct JxlBlendInfo {
+    pub mode: JxlBlendMode,
+    pub source: u32,
+    /// Extra-channel index, not the interleaved output channel index.
+    pub alpha_channel: u32,
+    pub clamp: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JxlLayerInfo {
+    pub have_crop: bool,
+    /// Signed origin in the oriented image canvas. May be outside that canvas.
+    pub crop_origin: (i64, i64),
+    /// Upsampled layer dimensions, after the requested orientation transform.
+    pub size: (usize, usize),
+    pub blend_info: JxlBlendInfo,
+    pub extra_channel_blend_info: Vec<JxlBlendInfo>,
+    /// None if the layer is not stored. Slot zero is a valid reference slot.
+    pub save_as_reference: Option<u32>,
+    pub save_before_color_transform: bool,
+}
+
+/// Reconstruction quality of the most recently completed output frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct JxlFrameProgression {
+    pub decoded_passes: u32,
+    pub total_passes: u32,
+    /// Intended quality ratio, not a reduction in output dimensions.
+    pub intended_downsampling: usize,
+    /// False only when later HF passes were deliberately not decoded.
+    pub full_quality: bool,
 }

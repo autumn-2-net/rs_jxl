@@ -401,12 +401,7 @@ impl Frame {
             debug!(?color_correlation_params);
 
             if let Some(capture) = &self.decoder_state.jpeg_capture {
-                let quant = quant_params.as_ref().unwrap();
-                capture.validate_lf_params(
-                    color_correlation_params.as_ref().unwrap(),
-                    quant.global_scale,
-                    quant.quant_lf,
-                )?;
+                capture.validate_lf_params(color_correlation_params.as_ref().unwrap())?;
             }
 
             // Validate spline parameters
@@ -646,7 +641,7 @@ impl Frame {
             });
         }
         // Set EPF sigma values to the correct values if we are doing EPF.
-        if self.header.restoration_filter.epf_iters > 0 {
+        if self.header.restoration_filter.epf_iters > 0 && !self.is_jpeg_reconstruction() {
             *self.epf_sigma.try_write().unwrap() = SigmaSource::new(
                 &self.header,
                 self.lf_global.as_ref().unwrap(),
@@ -855,6 +850,9 @@ impl Frame {
         buffer_splitter: &BufferSplitter,
         force_render: bool,
     ) -> Result<()> {
+        if self.is_jpeg_reconstruction() {
+            return self.decode_jpeg_group(group, passes);
+        }
         if passes.is_empty() {
             assert!(force_render);
         }

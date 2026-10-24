@@ -20,8 +20,13 @@ pub struct JxlDecoderOptions {
     /// and the caller is responsible for applying the orientation.
     pub adjust_orientation: bool,
     pub render_spot_colors: bool,
+    /// Combine layers into full-canvas display frames (default). When false,
+    /// return unblended, crop-sized regular/skip-progressive layers, including
+    /// zero-duration layers. Internal reference and LF frames remain hidden.
     pub coalescing: bool,
     pub desired_intensity_target: Option<f32>,
+    /// Skip embedded previews (default). When false, previews produce ordinary
+    /// FrameHeader/FrameComplete events with JxlFrameHeader::is_preview set.
     pub skip_preview: bool,
     /// Fail decoding images with more than this number of samples, or with frames with
     /// more than this number of samples. The limit counts the product of pixels and
@@ -38,11 +43,17 @@ pub struct JxlDecoderOptions {
     /// Controls how alpha premultiplication is handled for output color channels.
     /// Default: [`AlphaMode::AsIs`].
     pub alpha_mode: AlphaMode,
-    /// If true, only parse frame headers/TOC and skip section decoding.
+    /// If true, only parse frame headers/TOC and skip every frame's sections,
+    /// including hidden reference/LF frames. No pixel or reference data is decoded.
     ///
     /// This is useful for collecting [`VisibleFrameInfo`](crate::api::VisibleFrameInfo)
     /// via the regular decoder API without producing pixels.
     pub scan_frames_only: bool,
+    /// Stop at the first renderable VarDCT progression whose intended ratio is
+    /// at most this value (default 1: decode all passes). Output dimensions do
+    /// not change. Reference frames, non-progressive Modular transforms, and
+    /// single-section frames are decoded fully. JPEG capture always decodes fully.
+    pub max_downsampling: usize,
     /// Additional boxes to request from the decoder.
     ///
     /// Note that if you request additional boxes, you must call `close_input()` when the
@@ -106,6 +117,7 @@ impl Default for JxlDecoderOptions {
             high_precision: false,
             alpha_mode: AlphaMode::AsIs,
             scan_frames_only: false,
+            max_downsampling: 1,
             request_aux_boxes: Vec::new(),
             max_profile_level: ProfileLevel::Main5,
             allow_implicit_main10: false,

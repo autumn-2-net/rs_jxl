@@ -33,6 +33,256 @@ const REFERENCES: [Reference; 4] = [
 ];
 
 #[test]
+fn cms_quantizes_both_primary_alpha_copies_consistently() {
+    let source = Image::new(
+        2,
+        1,
+        PixelLayout::Rgba,
+        PixelData::F32(vec![0.25, 0.5, 0.75, 0.5, 0.1, 0.2, 0.3, 0.0]),
+    )
+    .unwrap();
+    let bytes = encoded(&source);
+    for format in [SampleFormat::U8, SampleFormat::U16, SampleFormat::U8Bits(5)] {
+        let result = decode(
+            &bytes,
+            &DecodeOptions {
+                format,
+                color: rs_jxl::decode::ColorOptions {
+                    output_profile: Some(rs_jxl::decode::ColorProfile::parse("sRGB").unwrap()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let frame = only_frame(&result);
+        assert_pixels(
+            &alpha_plane(&frame.pixels, frame.layout),
+            &frame.extra_planes[0],
+        );
+    }
+}
+
+#[test]
+fn raw_layers_reject_transformations_that_invalidate_blend_headers() {
+    let bytes = encode_sequence(
+        &sequence_images(true),
+        &[0, 1, 0, 1, 0],
+        Reference::Previous,
+    );
+    let mut options = DecodeOptions {
+        coalescing: false,
+        ..Default::default()
+    };
+    options.color.output_profile = Some(rs_jxl::decode::ColorProfile::parse("linear").unwrap());
+    assert!(matches!(
+        decode(&bytes, &options),
+        Err(Error::InvalidInput(_))
+    ));
+    options.color = Default::default();
+    options.alpha_mode = rs_jxl::decode::AlphaMode::Premultiplied;
+    assert!(matches!(
+        decode(&bytes, &options),
+        Err(Error::InvalidInput(_))
+    ));
+    options.alpha_mode = rs_jxl::decode::AlphaMode::AsIs;
+    options.color.background = Some([1.0; 3]);
+    assert!(matches!(
+        decode(&bytes, &options),
+        Err(Error::InvalidInput(_))
+    ));
+}
+
+#[test]
+fn raw_spot_layers_require_unrendered_color_planes() {
+    let source = integer_image(3, 2, PixelLayout::Rgb, false);
+    let mut metadata = source.metadata().clone();
+    let mut spot = ExtraChannelInfo::new(ExtraChannelType::SpotColor, 8).unwrap();
+    spot.spot_color = [1.0; 4];
+    metadata.extra_channels.push(spot);
+    let source = source
+        .with_metadata(metadata, vec![PixelData::U8(vec![127; 6])])
+        .unwrap();
+    let bytes = encoded(&source);
+    let mut options = DecodeOptions {
+        coalescing: false,
+        ..Default::default()
+    };
+    assert!(matches!(
+        decode(&bytes, &options),
+        Err(Error::InvalidInput(_))
+    ));
+    options.render_spot_colors = false;
+    let decoded = decode(&bytes, &options).unwrap();
+    assert_pixels(&only_frame(&decoded).pixels, source.pixels());
+    assert_eq!(only_frame(&decoded).extra_planes, source.extra_planes());
+}
+
+#[test]
+fn inspection_and_decode_negotiate_the_same_pixel_profile() {
+    let bytes = encoded(&integer_image(3, 2, PixelLayout::Rgb, false));
+    for format in [
+        SampleFormat::Native,
+        SampleFormat::U8,
+        SampleFormat::U16,
+        SampleFormat::F32,
+    ] {
+        let options = DecodeOptions {
+            format,
+            ..Default::default()
+        };
+        let inspection = rs_jxl::decode::inspect(&bytes, &options).unwrap();
+        let decoded = decode(&bytes, &options).unwrap();
+        assert_eq!(inspection.output_profile, decoded.output_profile);
+    }
+}
+
+#[test]
+fn raw_layers_return_every_crop_without_applying_blend() {
+    let images = sequence_images(true);
+    let durations = [0, 2, 0, 3, 0];
+    for reference in REFERENCES {
+        let plan = multiframe::plan(&images, &durations, reference).unwrap();
+        let frames: Vec<_> = plan.iter().map(|p| p.as_frame()).collect();
+        let bytes = encode_frames(&images[0], &frames, &encode_options()).unwrap();
+        let options = DecodeOptions {
+            coalescing: false,
+            ..Default::default()
+        };
+        let decoded = decode(&bytes, &options).unwrap();
+        assert_eq!(decoded.frames.len(), plan.len());
+        for (index, (actual, expected)) in decoded.frames.iter().zip(&plan).enumerate() {
+            assert_eq!(actual.index, index);
+            assert!(actual.complete);
+            assert!(!actual.header.is_preview);
+            assert_eq!(
+                actual.header.layer_info.crop_origin,
+                (
+                    expected.options.origin.0 as i64,
+                    expected.options.origin.1 as i64
+                )
+            );
+            assert_eq!(
+                (actual.width, actual.height),
+                (
+                    expected.image.width() as usize,
+                    expected.image.height() as usize
+                )
+            );
+            assert_eq!(actual.duration_ticks, durations[index]);
+            assert_pixels(&actual.pixels, expected.image.pixels());
+            assert_pixels(&actual.extra_planes[1], &expected.image.extra_planes()[0]);
+            let selected = decode_frame(&bytes, index, &options).unwrap();
+            assert_pixels(&selected.frames[0].pixels, expected.image.pixels());
+        }
+        let scan = rs_jxl::decode::inspect(&bytes, &options).unwrap();
+        assert_eq!(scan.frames.len(), plan.len());
+        for (header, frame) in scan.frames.iter().zip(&decoded.frames) {
+            assert_eq!(header.size, frame.header.size);
+            assert_eq!(header.duration_ticks, frame.duration_ticks);
+        }
+    }
+}
+
+#[test]
+fn inspection_skips_pixels_and_retains_container_metadata() {
+    let bytes = encoded(&integer_image(11, 7, PixelLayout::Rgb, false));
+    let options = DecodeOptions::default();
+    let info = rs_jxl::decode::inspect(&bytes, &options).unwrap();
+    assert_eq!(info.info.size, (11, 7));
+    assert_eq!(info.frames.len(), 1);
+    assert_eq!(info.frames[0].size, (11, 7));
+    assert!(info.preview.is_none());
+    assert!(info.bytes_read <= bytes.len());
+    // An inspection does not allocate output samples.
+    let mut tight = options;
+    tight.limits.max_output_bytes = 0;
+    assert!(rs_jxl::decode::inspect(&bytes, &tight).is_ok());
+    assert!(decode(&bytes, &tight).is_err());
+    assert!(rs_jxl::decode::inspect(&bytes[..bytes.len() - 1], &tight).is_err());
+}
+
+#[test]
+fn requested_integer_bit_depths_are_explicit_and_checked() {
+    let image = Image::new(3, 1, PixelLayout::Gray, PixelData::U8(vec![0, 128, 255])).unwrap();
+    let bytes = encoded(&image);
+    for bits in 1..=16 {
+        let format = if bits <= 8 {
+            SampleFormat::U8Bits(bits)
+        } else {
+            SampleFormat::U16Bits(bits)
+        };
+        let result = decode(
+            &bytes,
+            &DecodeOptions {
+                format,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let max = (1u32 << bits) - 1;
+        let expected = [0, ((128.0f64 / 255.0) * max as f64).round() as u32, max];
+        match &result.frames[0].pixels {
+            PixelData::U8(p) => {
+                assert_eq!(p.iter().map(|&x| x as u32).collect::<Vec<_>>(), expected)
+            }
+            PixelData::U16(p) => {
+                assert_eq!(p.iter().map(|&x| x as u32).collect::<Vec<_>>(), expected)
+            }
+            _ => panic!("unexpected output storage"),
+        }
+    }
+    for format in [
+        SampleFormat::U8Bits(0),
+        SampleFormat::U8Bits(9),
+        SampleFormat::U16Bits(0),
+        SampleFormat::U16Bits(17),
+    ] {
+        assert!(
+            decode(
+                &bytes,
+                &DecodeOptions {
+                    format,
+                    ..Default::default()
+                }
+            )
+            .is_err()
+        );
+    }
+}
+
+#[test]
+fn partial_input_is_opt_in_and_completed_earlier_frames_remain_available() {
+    let images = sequence_images(true);
+    let bytes = encode_sequence(&images, &[1, 2, 3, 4, 5], Reference::Previous);
+    let truncated = &bytes[..bytes.len() - 1];
+    assert!(decode(truncated, &DecodeOptions::default()).is_err());
+    let result = decode(
+        truncated,
+        &DecodeOptions {
+            allow_partial: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(!result.complete);
+    assert!(!result.frames.is_empty());
+    assert!(result.frames[0].complete);
+    assert_pixels(&result.frames[0].pixels, images[0].pixels());
+    assert!(result.boxes.is_empty());
+    assert!(
+        decode(
+            b"not a codestream",
+            &DecodeOptions {
+                allow_partial: true,
+                ..Default::default()
+            }
+        )
+        .is_err()
+    );
+}
+
+#[test]
 fn implicit_level10_compatibility_is_explicit_and_keeps_resource_limits() {
     let base = Image::new(2, 1, PixelLayout::Gray, PixelData::U8(vec![7, 19])).unwrap();
     let mut metadata = base.metadata().clone();
@@ -290,7 +540,9 @@ fn requested_integer_formats_rescale_and_f32_normalizes() {
                         assert!((actual - f32::from(expected) / 255.0).abs() <= f32::EPSILON);
                     }
                 }
-                SampleFormat::Native => unreachable!(),
+                SampleFormat::Native | SampleFormat::U8Bits(_) | SampleFormat::U16Bits(_) => {
+                    unreachable!()
+                }
             }
         }
     }

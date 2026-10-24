@@ -349,6 +349,10 @@ pub struct Frame {
 }
 
 impl Frame {
+    pub fn is_jpeg_reconstruction(&self) -> bool {
+        self.decoder_state.jpeg_capture.is_some()
+    }
+
     pub fn toc(&self) -> &Toc {
         &self.toc
     }
@@ -393,6 +397,9 @@ impl Frame {
     }
 
     pub fn finalize_lf(&mut self, parallel_runner: &mut dyn JxlParallelRunner) -> Result<()> {
+        if self.is_jpeg_reconstruction() {
+            return Ok(());
+        }
         if self.header.should_do_adaptive_lf_smoothing() {
             let lf_global = self.lf_global.as_mut().unwrap();
             let lf_quant = &lf_global.lf_quant;

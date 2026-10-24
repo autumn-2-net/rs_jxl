@@ -1,23 +1,31 @@
 //! Pure Rust decoding, backed by maintained official sources in `vendor/jxl-rs`.
-//! Visible frames are coalesced full canvases. Invisible zero-duration layers are
-//! applied internally, not returned as independent frames.
 //!
-//! `Native` preserves integer ranges through 16 bits and widens floats to F32.
-//! Wider integers become normalized F32, like djxl's float output, NOT exact U31.
-//! Limits bound input, samples and retained outputs, not total decoder RSS.
+//! By default output is full-canvas, coalesced display frames. Raw layers and
+//! previews are explicit options. Native samples retain integer ranges through
+//! 16 bits; wider integers become normalized F32, not exact native U31.
+//! Budgets bound input, samples and retained output, not total decoder RSS.
 
 mod boxes;
 mod buffers;
+mod color;
+mod color_lut;
+mod convert;
+mod engine;
+mod inspect;
 mod jpeg;
 mod runner;
+pub use color::{ColorOptions, ColorProfile, parse_background, parse_color_description};
+pub use engine::{decode, decode_frame};
+pub use inspect::{ImageInspection, inspect, read_basic_info};
 pub use jpeg::reconstruct_jpeg;
 
 use crate::{Error, PixelData, PixelLayout, Result};
-use jxl_decoder::api::{Event, JxlDecoder, JxlDecoderOptions, JxlOutputBuffer, ProfileLevel};
 pub use jxl_decoder::api::{
-    ExtraChannel, JxlAnimation, JxlBasicInfo, JxlBitDepth, JxlColorProfile, JxlExtraChannel,
-    Orientation,
+    AlphaMode, ExtraChannel, JxlAnimation, JxlBasicInfo, JxlBitDepth, JxlBlendInfo, JxlBlendMode,
+    JxlColorEncoding, JxlColorProfile, JxlExtraChannel, JxlFrameHeader, JxlLayerInfo, JxlPrimaries,
+    JxlTransferFunction, JxlWhitePoint, Orientation, RenderingIntent,
 };
+use jxl_decoder::api::{JxlDecoderOptions, ProfileLevel};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum SampleFormat {
@@ -27,6 +35,10 @@ pub enum SampleFormat {
     U8,
     /// Rescale/clamp to the full 16-bit range.
     U16,
+    /// Rescale to 1..=8 significant bits, stored in U8 samples.
+    U8Bits(u8),
+    /// Rescale to 1..=16 significant bits, stored in U16 samples.
+    U16Bits(u8),
     /// Integers become normalized floats; floating samples retain their range.
     F32,
 }
@@ -38,6 +50,7 @@ pub struct DecodeLimits {
     pub max_metadata_bytes: usize,
     pub max_pixels: usize,
     pub max_samples: usize,
+    /// Returned frames/layers, excluding the optional preview.
     pub max_frames: usize,
 }
 impl Default for DecodeLimits {
@@ -57,16 +70,21 @@ impl Default for DecodeLimits {
 pub struct DecodeOptions {
     pub threads: usize,
     pub format: SampleFormat,
-    /// Legacy djxl compatibility: allow Main10 complexity without a jxll box.
-    /// Off by default; enabling this does not disable the configured budgets.
+    /// Allow legacy Main10 complexity without a jxll box; budgets still apply.
     pub allow_implicit_main10: bool,
-    /// Apply encoded orientation, as djxl does by default.
     pub adjust_orientation: bool,
-    /// Render spot colors into the main color output.
     pub render_spot_colors: bool,
-    /// Return every extra channel, including alpha, as a separate plane.
-    /// Planes are rendered at canvas resolution (dim_shift is still reported).
+    /// Return all extra channels (including alpha) as separate full-size planes.
     pub include_extra_channels: bool,
+    /// False returns unblended crop layers, including zero-duration layers.
+    pub coalescing: bool,
+    pub include_preview: bool,
+    /// Opt into incomplete pixel output on EOF, never on malformed data.
+    pub allow_partial: bool,
+    /// Progressive quality selection (1, 2, 4, 8), not spatial resizing.
+    pub downsampling: u8,
+    pub alpha_mode: AlphaMode,
+    pub color: ColorOptions,
     pub limits: DecodeLimits,
 }
 impl Default for DecodeOptions {
@@ -78,6 +96,12 @@ impl Default for DecodeOptions {
             adjust_orientation: true,
             render_spot_colors: true,
             include_extra_channels: true,
+            coalescing: true,
+            include_preview: false,
+            allow_partial: false,
+            downsampling: 1,
+            alpha_mode: AlphaMode::AsIs,
+            color: ColorOptions::default(),
             limits: DecodeLimits::default(),
         }
     }
@@ -90,31 +114,61 @@ pub struct DecodedFrame {
     pub height: usize,
     pub layout: PixelLayout,
     pub pixels: PixelData,
-    /// In basic_info.extra_channels order. Empty when explicitly disabled.
-    /// For alpha of a different source depth this is the authoritative output:
-    /// interleaved alpha uses the main image's output depth instead.
+    /// In basic_info.extra_channels order. Separate alpha is authoritative when
+    /// its depth differs from the main image. Empty only when explicitly disabled.
     pub extra_planes: Vec<PixelData>,
     pub duration_ticks: u32,
     pub name: String,
+    pub header: JxlFrameHeader,
+    /// False for explicitly requested partial/progressive output.
+    pub complete: bool,
 }
 #[derive(Debug, Clone)]
 pub struct DecodedBox {
     pub kind: [u8; 4],
-    /// Decompressed contents. For Exif this includes the TIFF offset prefix.
+    /// Decompressed contents. Exif includes the TIFF offset prefix.
     pub data: Vec<u8>,
 }
 pub struct DecodedImage {
     pub info: JxlBasicInfo,
     pub frames: Vec<DecodedFrame>,
+    pub preview: Option<DecodedFrame>,
     pub embedded_profile: Option<JxlColorProfile>,
     pub output_profile: Option<JxlColorProfile>,
+    /// Resolved display peak after color processing; source tone mapping stays in info.
+    pub output_intensity_target: f32,
     pub boxes: Vec<DecodedBox>,
-    /// False when decode_frame stopped early; trailing boxes were not scanned.
+    /// False for early frame selection, partial or progressive decode.
     pub complete: bool,
+    /// Input bytes consumed, including any parser read-ahead.
+    pub bytes_read: usize,
 }
 
 fn failure(error: impl std::fmt::Display) -> Error {
     Error::Decoding(error.to_string())
+}
+
+fn check_info(info: &JxlBasicInfo, options: &DecodeOptions) -> Result<()> {
+    if !options.coalescing
+        && options.render_spot_colors
+        && info
+            .extra_channels
+            .iter()
+            .any(|ec| ec.ec_type == ExtraChannel::SpotColor)
+    {
+        return Err(Error::InvalidInput(
+            "raw layers with spot channels require render_spot_colors=false to preserve blend/reference semantics".into(),
+        ));
+    }
+    let pixels = info
+        .size
+        .0
+        .checked_mul(info.size.1)
+        .ok_or(Error::Limit("pixel count overflow"))?;
+    if pixels > options.limits.max_pixels {
+        return Err(Error::Limit("decoded pixel count"));
+    }
+    Ok(())
 }
 
 fn backend_options(input: &[u8], options: &DecodeOptions) -> Result<JxlDecoderOptions> {
@@ -126,169 +180,38 @@ fn backend_options(input: &[u8], options: &DecodeOptions) -> Result<JxlDecoderOp
             "decoder threads must be in 1..=256".into(),
         ));
     }
+    match options.format {
+        SampleFormat::U8Bits(n) if !(1..=8).contains(&n) => {
+            return Err(Error::InvalidInput("U8 bit depth must be in 1..=8".into()));
+        }
+        SampleFormat::U16Bits(n) if !(1..=16).contains(&n) => {
+            return Err(Error::InvalidInput(
+                "U16 bit depth must be in 1..=16".into(),
+            ));
+        }
+        _ => {}
+    }
+    if ![1, 2, 4, 8].contains(&options.downsampling) {
+        return Err(Error::InvalidInput(
+            "downsampling must be 1, 2, 4 or 8".into(),
+        ));
+    }
+    if !options.coalescing && (!options.color.is_noop() || options.alpha_mode != AlphaMode::AsIs) {
+        return Err(Error::InvalidInput(
+            "raw layers must keep source color and alpha association to preserve blend/reference semantics; coalesce before transforming".into(),
+        ));
+    }
     let mut backend = JxlDecoderOptions::default();
     backend.adjust_orientation = options.adjust_orientation;
     backend.render_spot_colors = options.render_spot_colors;
+    backend.coalescing = options.coalescing;
+    backend.skip_preview = !options.include_preview;
+    backend.alpha_mode = options.alpha_mode;
+    backend.max_downsampling = usize::from(options.downsampling);
     backend.sample_limit = Some(options.limits.max_samples);
     backend.max_profile_level = ProfileLevel::Main10;
     backend.allow_implicit_main10 = options.allow_implicit_main10;
     // libjxl/common.h defaults JXL_HIGH_PRECISION to 1; upstream Rust does not.
     backend.high_precision = true;
-    // Alpha stays AsIs: never discard invisible RGB.
     Ok(backend)
-}
-
-/// Read image/color headers only, without decoding a pixel frame. Does not
-/// validate the remaining codestream or prove that the file is complete.
-pub fn read_basic_info(mut input: &[u8], options: &DecodeOptions) -> Result<JxlBasicInfo> {
-    let mut decoder = JxlDecoder::new(backend_options(input, options)?);
-    decoder.close_input();
-    match decoder.process(&mut input, None, None).map_err(failure)? {
-        Event::BasicInfo => {
-            let info = decoder
-                .basic_info()
-                .ok_or_else(|| failure("missing basic info"))?;
-            let pixels = info
-                .size
-                .0
-                .checked_mul(info.size.1)
-                .ok_or(Error::Limit("pixel count overflow"))?;
-            if pixels > options.limits.max_pixels {
-                return Err(Error::Limit("decoded pixel count"));
-            }
-            Ok(info.clone())
-        }
-        _ => Err(failure("incomplete JPEG XL image header")),
-    }
-}
-/// Decode all visible frames from a complete input buffer.
-pub fn decode(input: &[u8], options: &DecodeOptions) -> Result<DecodedImage> {
-    decode_impl(input, None, options)
-}
-/// Decode one zero-based visible frame, reconstructing dependencies as needed.
-/// Stops after that frame; later frames/trailing metadata are not validated.
-/// This is sequential dependency-aware decoding, not random access.
-pub fn decode_frame(input: &[u8], index: usize, options: &DecodeOptions) -> Result<DecodedImage> {
-    if index >= options.limits.max_frames {
-        return Err(Error::Limit("requested frame index"));
-    }
-    decode_impl(input, Some(index), options)
-}
-
-fn decode_impl(
-    mut input: &[u8],
-    target: Option<usize>,
-    options: &DecodeOptions,
-) -> Result<DecodedImage> {
-    let mut backend = backend_options(input, options)?;
-    backend.request_aux_boxes = boxes::REQUESTED.to_vec();
-    let mut decoder = JxlDecoder::new(backend);
-    decoder.close_input();
-    let mut runner = runner::Runner::new(options.threads)?;
-    let mut buffers = None;
-    let mut frames = Vec::new();
-    let mut index = 0;
-    let mut retained = 0usize;
-    let mut complete = false;
-    loop {
-        let mut views: Vec<_> = buffers
-            .as_mut()
-            .map(|b: &mut buffers::Buffers| {
-                b.images
-                    .iter_mut()
-                    .map(|image| JxlOutputBuffer::from_image_rect_mut(image.as_rect_mut()))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let wanted = target.is_none_or(|n| n == index);
-        let output = if views.is_empty() || !wanted {
-            None
-        } else {
-            Some(views.as_mut_slice())
-        };
-        let event = decoder
-            .process(&mut input, output, Some(&mut runner))
-            .map_err(failure)?;
-        match event {
-            Event::BasicInfo => {
-                let info = decoder
-                    .basic_info()
-                    .ok_or_else(|| failure("missing basic info"))?;
-                let color = decoder
-                    .current_pixel_format()
-                    .ok_or_else(|| failure("missing pixel format"))?
-                    .color_type;
-                let (allocated, format) = buffers::Buffers::new(info, color, options)?;
-                decoder.set_pixel_format(format).map_err(failure)?;
-                buffers = Some(allocated);
-            }
-            Event::FrameHeader => {
-                if index >= options.limits.max_frames {
-                    return Err(Error::Limit("visible frame count"));
-                }
-                if wanted {
-                    let bytes = buffers
-                        .as_ref()
-                        .ok_or_else(|| failure("missing output buffers"))?
-                        .byte_count;
-                    retained = retained
-                        .checked_add(bytes)
-                        .ok_or(Error::Limit("output size overflow"))?;
-                    if retained > options.limits.max_output_bytes {
-                        return Err(Error::Limit("retained decoded outputs"));
-                    }
-                }
-            }
-            Event::FrameComplete { .. } => {
-                if wanted {
-                    frames
-                        .try_reserve(1)
-                        .map_err(|_| Error::Limit("decoded frame list"))?;
-                    let header = decoder
-                        .scanned_frames()
-                        .last()
-                        .ok_or_else(|| failure("missing visible frame header"))?;
-                    frames.push(
-                        buffers
-                            .as_ref()
-                            .ok_or_else(|| failure("missing output buffers"))?
-                            .copy_frame(index, header)?,
-                    );
-                }
-                if target == Some(index) {
-                    break;
-                }
-                index += 1;
-            }
-            Event::Complete => {
-                complete = true;
-                break;
-            }
-            Event::NeedMoreInput { .. } => return Err(failure("truncated JPEG XL input")),
-        }
-    }
-    if frames.is_empty() {
-        return Err(failure(if target.is_some() {
-            "requested visible frame does not exist"
-        } else {
-            "JXL contains no visible frames"
-        }));
-    }
-    let info = decoder
-        .basic_info()
-        .ok_or_else(|| failure("missing basic info"))?
-        .clone();
-    let metadata = if complete {
-        boxes::extract(&decoder, input, options.limits.max_metadata_bytes)?
-    } else {
-        Vec::new()
-    };
-    Ok(DecodedImage {
-        info,
-        frames,
-        embedded_profile: decoder.embedded_color_profile().cloned(),
-        output_profile: decoder.output_color_profile().cloned(),
-        boxes: metadata,
-        complete,
-    })
 }

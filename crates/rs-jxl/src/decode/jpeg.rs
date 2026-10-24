@@ -22,10 +22,22 @@ fn unique_box(boxes: &[DecodedBox], kind: [u8; 4]) -> Result<Option<&[u8]>> {
 /// Requires a supported JPEG-transcode frame; pixel-only JXL is an error. No
 /// lossy JPEG re-encoding fallback and no access to the original input JPEG.
 /// Sample output format and orientation settings never alter JPEG bytes.
+/// Supports multipass DCT8 capture and exact integer DC extra precision, with
+/// JPEG RAW tables and JPEG-compatible CfL. Other transforms, non-RAW tables,
+/// fractional/clamped DC, animations, LF frames, crops and extra channels are
+/// rejected; an arbitrary pixel JXL is not an original-JPEG source.
 pub fn reconstruct_jpeg(mut input: &[u8], options: &DecodeOptions) -> Result<Vec<u8>> {
     let mut backend = backend_options(input, options)?;
+    if options.limits.max_frames == 0 {
+        return Err(Error::Limit("JPEG frame count"));
+    }
     backend.adjust_orientation = false;
     backend.render_spot_colors = false;
+    // Pixel preview/progression options must never select incomplete coefficients.
+    backend.skip_preview = true;
+    backend.max_downsampling = 1;
+    backend.coalescing = true;
+    backend.scan_frames_only = false;
     backend.request_aux_boxes = boxes::REQUESTED.to_vec();
     let mut decoder = JxlDecoder::new(backend);
     decoder.close_input();

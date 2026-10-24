@@ -1,4 +1,6 @@
 /target/
+/vendor/jxl-rs/target/
+/vendor/jxl-rs/Cargo.lock
 /out/
 *.jxl
 *.profraw

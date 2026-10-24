@@ -29,7 +29,9 @@ use crate::image::{DataTypeTag, Image, OwnedRawImage, Rect};
 use crate::render::SimpleRenderPipeline;
 use crate::render::buffer_splitter::BufferSplitter;
 use crate::render::stages::*;
-use crate::render::{LowMemoryRenderPipeline, RenderPipeline, RenderPipelineBuilder};
+use crate::render::{
+    LowMemoryRenderPipeline, RenderPipeline, RenderPipelineBuilder, RenderPipelineInPlaceStage,
+};
 use crate::util::SmallVec;
 use crate::util::sync::{Arc, RwLock};
 
@@ -107,11 +109,15 @@ impl Frame {
         &mut self,
         api_buffers: &mut Option<&mut [JxlOutputBuffer<'_>]>,
         pixel_format: &JxlPixelFormat,
-        groups: Vec<(usize, Vec<(usize, BitReader)>)>,
+        mut groups: Vec<(usize, Vec<(usize, BitReader)>)>,
         do_flush: bool,
         output_profile: &JxlColorProfile,
         parallel_runner: &mut dyn JxlParallelRunner,
     ) -> Result<bool> {
+        if self.is_jpeg_reconstruction() {
+            self.decode_jpeg_groups(&mut groups, parallel_runner)?;
+            return Ok(false);
+        }
         if !do_flush && groups.is_empty() {
             // Nothing to do.
             return Ok(false);
@@ -122,6 +128,24 @@ impl Frame {
             // We don't yet have any output ready (as the pipeline would be initialized otherwise),
             // so exit without doing anything.
             return Ok(false);
+        }
+
+        if self.header.has_patches()
+            && self.header.upsampling > 1
+            && let Some(&ec_up) = self
+                .header
+                .ec_upsampling
+                .iter()
+                .find(|&&up| up != self.header.upsampling)
+            && self.patches.try_read().unwrap().uses_extra_channels()
+        {
+            // libjxl/dec_frame.cc rejects mixed-resolution patch blending.
+            // Only independent color patches can be evaluated without
+            // inventing a cross-resolution alpha/EC blending rule.
+            return Err(Error::PatchesUnsupportedMixedUpsampling(
+                self.header.upsampling,
+                ec_up,
+            ));
         }
 
         let mut buffers: Vec<Option<JxlOutputBuffer>> = Vec::new();
@@ -526,6 +550,7 @@ impl Frame {
         pixel_format: &JxlPixelFormat,
         output_profile: &JxlColorProfile,
         buffer_recycler: Arc<crate::image::BufferRecycler>,
+        coalescing: bool,
     ) -> Result<Box<T>> {
         let num_channels = frame_header.num_extra_channels as usize + 3;
         let num_temp_channels = if frame_header.has_noise() { 3 } else { 0 };
@@ -653,7 +678,15 @@ impl Frame {
         if frame_header.has_patches() {
             pipeline = pipeline.add_inplace_stage(PatchesStage::new(
                 patches,
-                metadata.extra_channel_info.clone(),
+                if frame_header.upsampling > 1 && !late_ec_upsample {
+                    // Independent color patches run on the encoded color grid;
+                    // ECs keep their original direct upsampling filters. This
+                    // avoids changing the 4x/8x filter into cascaded 2x filters.
+                    // The decoded dictionary is checked before rendering.
+                    vec![]
+                } else {
+                    metadata.extra_channel_info.clone()
+                },
                 decoder_state.reference_frames.clone(),
             ))
         }
@@ -754,7 +787,7 @@ impl Frame {
             pipeline = pipeline.add_inplace_stage(XybColorConvertStage::new(0, stage_color_info));
         }
 
-        if frame_header.needs_blending() {
+        if coalescing && frame_header.needs_blending() {
             pipeline = pipeline.add_inplace_stage(BlendingStage::new(
                 frame_header,
                 &decoder_state.file_header,
@@ -797,7 +830,13 @@ impl Frame {
             }
         }
 
-        if frame_header.is_visible() {
+        if frame_header.is_visible()
+            || (!coalescing
+                && matches!(
+                    frame_header.frame_type,
+                    FrameType::RegularFrame | FrameType::SkipProgressive
+                ))
+        {
             let color_space = decoder_state
                 .file_header
                 .image_metadata
@@ -915,7 +954,25 @@ impl Frame {
         &mut self,
         pixel_format: &JxlPixelFormat,
         output_profile: &JxlColorProfile,
+        coalescing: bool,
     ) -> Result<()> {
+        if self.is_jpeg_reconstruction() {
+            self.render_pipeline = None;
+            return Ok(());
+        }
+        if !coalescing
+            && self.header.can_be_referenced
+            && !self.header.save_before_ct
+            && self.header.needs_blending()
+        {
+            // Save the unblended layer before spot-color/alpha output transforms.
+            // It is composited only when finalized for use as a reference.
+            self.reference_frame_data = Some(
+                (0..3 + self.header.num_extra_channels as usize)
+                    .map(|_| Image::new(self.header.size_upsampled()))
+                    .collect::<Result<Vec<_>>>()?,
+            );
+        }
         #[cfg(test)]
         let render_pipeline = if self.use_simple_pipeline {
             Self::build_render_pipeline::<SimpleRenderPipeline>(
@@ -930,6 +987,7 @@ impl Frame {
                 pixel_format,
                 output_profile,
                 self.buffer_recycler.clone(),
+                coalescing,
             )? as Box<dyn std::any::Any + Send + Sync>
         } else {
             Self::build_render_pipeline::<LowMemoryRenderPipeline>(
@@ -944,6 +1002,7 @@ impl Frame {
                 pixel_format,
                 output_profile,
                 self.buffer_recycler.clone(),
+                coalescing,
             )? as Box<dyn std::any::Any + Send + Sync>
         };
         #[cfg(not(test))]
@@ -959,9 +1018,67 @@ impl Frame {
             pixel_format,
             output_profile,
             self.buffer_recycler.clone(),
+            coalescing,
         )?;
         self.render_pipeline = Some(render_pipeline);
         self.section0_render_up_to_date = false;
+        Ok(())
+    }
+
+    /// Preserve the same post-color-transform reference canvas as coalesced
+    /// decoding, while API buffers contain only the unblended layer.
+    /// Uses the existing blending/extension algorithms from libjxl's
+    /// render_pipeline/stage_blending.cc, not output-format-converted pixels.
+    pub(crate) fn coalesce_reference_for_raw_output(&mut self) -> Result<()> {
+        if !self.header.can_be_referenced
+            || self.header.save_before_ct
+            || !self.header.needs_blending()
+        {
+            return Ok(());
+        }
+        let Some(layer) = self.reference_frame_data.as_mut() else {
+            return Ok(());
+        };
+        let blend = BlendingStage::new(
+            &self.header,
+            &self.decoder_state.file_header,
+            self.decoder_state.reference_frames.clone(),
+        )?;
+        let extend = ExtendToImageDimensionsStage::new(
+            &self.header,
+            &self.decoder_state.file_header,
+            self.decoder_state.reference_frames.clone(),
+        )?;
+        let mut canvas = (0..layer.len())
+            .map(|_| Image::<f32>::new(extend.image_size))
+            .collect::<Result<Vec<_>>>()?;
+        for (c, plane) in canvas.iter_mut().enumerate() {
+            for y in 0..extend.image_size.1 {
+                extend.process_row_chunk((0, y), extend.image_size.0, c, plane.row_mut(y));
+            }
+        }
+        let (width, height) = self.header.size_upsampled();
+        let x0 = i64::from(self.header.x0);
+        let y0 = i64::from(self.header.y0);
+        let left = x0.max(0).min(extend.image_size.0 as i64);
+        let right = (x0 + width as i64).max(0).min(extend.image_size.0 as i64);
+        let mut scratch = blend.init_local_state()?;
+        if left < right {
+            for y in 0..height {
+                let canvas_y = y0 + y as i64;
+                if !(0..extend.image_size.1 as i64).contains(&canvas_y) {
+                    continue;
+                }
+                let mut rows: Vec<_> = layer.iter_mut().map(|p| p.row_mut(y)).collect();
+                blend.process_row_chunk((0, y), width, &mut rows, scratch.as_deref_mut(), false);
+                let source_x = (left - x0) as usize;
+                for (plane, row) in canvas.iter_mut().zip(rows) {
+                    plane.row_mut(canvas_y as usize)[left as usize..right as usize]
+                        .copy_from_slice(&row[source_x..source_x + (right - left) as usize]);
+                }
+            }
+        }
+        self.reference_frame_data = Some(canvas);
         Ok(())
     }
 }

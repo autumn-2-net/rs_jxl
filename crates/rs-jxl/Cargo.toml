@@ -10,6 +10,7 @@ libsais-rs = { version = "=0.2.2", default-features = false }
 rayon.workspace = true
 brotli.workspace = true
 jxl-decoder.workspace = true
+moxcms.workspace = true
 
 [dev-dependencies]
 png.workspace = true

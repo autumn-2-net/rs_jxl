@@ -59,7 +59,10 @@ separately from encoder migration.
   trees/entropy, adaptive coefficient order, CfL, source candidate search and
   exact-source ICC/Exif/XMP reconstruction deduplication.
 - Maintained pure-Rust decoder source with typed pixel/extra-plane output,
-  visible-frame reconstruction and integer-coefficient JPEG restoration.
+  visible frames, raw crop layers, previews, ICC/color conversion, progressive
+  and partial output, metadata inspection, and IDCT-free JPEG restoration.
+  Decoder CLI formats include PNG/APNG, NPY, PNM/PAM/PGX/PFM, EXR and metadata
+  sidecars. Lossy JPEG output is deliberately excluded.
   See [decoder status](docs/DECODER_STATUS.md) for its distinct acceptance gates.
 
 Source coverage, active versus pending integration, and remaining optimization

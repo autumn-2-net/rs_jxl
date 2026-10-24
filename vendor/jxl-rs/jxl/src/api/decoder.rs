@@ -11,6 +11,48 @@ use super::{
     JxlPixelFormat,
 };
 use crate::error::{Error, Result};
+use crate::headers::frame_header::{BlendingInfo, BlendingMode};
+
+impl From<&BlendingInfo> for super::JxlBlendInfo {
+    fn from(info: &BlendingInfo) -> Self {
+        Self {
+            mode: match info.mode {
+                BlendingMode::Replace => super::JxlBlendMode::Replace,
+                BlendingMode::Add => super::JxlBlendMode::Add,
+                BlendingMode::Blend => super::JxlBlendMode::Blend,
+                BlendingMode::AlphaWeightedAdd => super::JxlBlendMode::AlphaWeightedAdd,
+                BlendingMode::Mul => super::JxlBlendMode::Mul,
+            },
+            source: info.source,
+            alpha_channel: info.alpha_channel,
+            clamp: info.clamp,
+        }
+    }
+}
+
+// Crop orientation follows libjxl/lib/jxl/decode.cc, JxlDecoderGetFrameHeader.
+// Signed arithmetic also handles layers extending beyond any canvas edge.
+fn oriented_crop_origin(
+    orientation: super::Orientation,
+    origin: (i64, i64),
+    size: (usize, usize),
+    canvas: (usize, usize),
+) -> (i64, i64) {
+    use super::Orientation::*;
+    let (x, y) = origin;
+    let right = canvas.0 as i64 - size.0 as i64 - x;
+    let bottom = canvas.1 as i64 - size.1 as i64 - y;
+    match orientation {
+        Identity => (x, y),
+        FlipHorizontal => (right, y),
+        Rotate180 => (right, bottom),
+        FlipVertical => (x, bottom),
+        Transpose => (y, x),
+        Rotate90Cw => (bottom, x),
+        AntiTranspose => (bottom, right),
+        Rotate90Ccw => (y, right),
+    }
+}
 
 struct SequentialRunner;
 
@@ -92,9 +134,9 @@ impl JxlDecoder {
         self.codestream_parser.reset();
     }
 
-    /// Captures exact quantized JPEG coefficients in addition to normal decoding.
+    /// Decodes exact quantized JPEG coefficients without a pixel/IDCT pipeline.
     /// Call once immediately after `Event::FrameHeader`, before decoding sections.
-    /// Supports single-frame, single-pass original-color JPEG transcodes only;
+    /// Supports single-frame original-color JPEG transcodes, including multiple passes;
     /// unsupported forms return errors instead of reencoding pixels.
     /// Pixel restoration filters do not affect the captured integer coefficients.
     pub fn enable_jpeg_coefficient_capture(&mut self) -> Result<super::JxlJpegCoefficientCapture> {
@@ -208,22 +250,73 @@ impl JxlDecoder {
             return None;
         }
         let frame_header = self.codestream_parser.frame_info.current_frame_header()?;
-        // The render pipeline always adds ExtendToImageDimensionsStage which extends
-        // frames to the full image size. So the output size is always the image size,
-        // not the frame's upsampled size.
-        let size = self.codestream_parser.image_info.basic_info().size;
+        let file_header = self.codestream_parser.image_info.file_header();
+        let metadata = &file_header.image_metadata;
+        let is_preview = self.codestream_parser.is_preview_frame();
+        let canvas = if is_preview {
+            let preview = metadata.preview.as_ref()?;
+            (preview.xsize() as usize, preview.ysize() as usize)
+        } else {
+            (
+                file_header.size.xsize() as usize,
+                file_header.size.ysize() as usize,
+            )
+        };
+        let orientation = if self.options.adjust_orientation {
+            metadata.orientation
+        } else {
+            super::Orientation::Identity
+        };
+        let layer_size = frame_header.size_upsampled();
+        let size = orientation.map_size(if self.options.coalescing {
+            canvas
+        } else {
+            layer_size
+        });
         Some(JxlFrameHeader {
             name: frame_header.name.clone(),
-            duration: self
-                .codestream_parser
-                .image_info
-                .file_header()
-                .image_metadata
-                .animation
-                .as_ref()
+            duration: (!is_preview)
+                .then_some(metadata.animation.as_ref())
+                .flatten()
                 .map(|anim| frame_header.duration(anim)),
             size,
+            duration_ticks: frame_header.duration,
+            timecode: metadata
+                .animation
+                .as_ref()
+                .filter(|a| a.have_timecodes && !is_preview)
+                .map(|_| frame_header.timecode),
+            is_last: frame_header.is_last,
+            is_preview,
+            layer_info: super::JxlLayerInfo {
+                have_crop: frame_header.have_crop,
+                crop_origin: oriented_crop_origin(
+                    orientation,
+                    (frame_header.x0 as i64, frame_header.y0 as i64),
+                    layer_size,
+                    canvas,
+                ),
+                size: orientation.map_size(layer_size),
+                blend_info: (&frame_header.blending_info).into(),
+                extra_channel_blend_info: frame_header
+                    .ec_blending_info
+                    .iter()
+                    .map(Into::into)
+                    .collect(),
+                save_as_reference: frame_header
+                    .can_be_referenced
+                    .then_some(frame_header.save_as_reference),
+                save_before_color_transform: frame_header.save_before_ct,
+            },
         })
+    }
+
+    /// Quality of the output from the last FrameComplete event. None in
+    /// scan-only mode, after reset/seek, or after the next FrameHeader event.
+    /// Early progression selection keeps full canvas dimensions and consumes
+    /// all encoded sections; only later HF entropy decoding is skipped.
+    pub fn last_frame_progression(&self) -> Option<&super::JxlFrameProgression> {
+        self.codestream_parser.last_frame_progression.as_ref()
     }
 
     /// Returns visible frame info entries collected during parsing.
@@ -293,8 +386,10 @@ impl JxlDecoder {
     /// file/frame header, finished decoding a frame, or finished the entire decode).
     ///
     /// Output `buffers` may be provided any time after [`Event::BasicInfo`]; they will only be
-    /// written to when decoding a visible frame's sections (between [`Event::FrameHeader`] and
-    /// [`Event::FrameComplete`]).
+    /// written to between [`Event::FrameHeader`] and [`Event::FrameComplete`].
+    /// Allocate them using [`Self::frame_header()`]'s size for each event: raw
+    /// layers and previews may differ from the main image dimensions. Previews
+    /// have `is_preview = true` and do not appear in [`Self::scanned_frames()`].
     ///
     /// If called when decoding a frame with `None` for `buffers`, the frame will still be read,
     /// but pixel data will not be produced. Note that reference frames that may be needed by
@@ -347,6 +442,12 @@ impl JxlDecoder {
         buffers: &mut [JxlOutputBuffer],
         parallel_runner: Option<&mut (dyn JxlParallelRunner + '_)>,
     ) -> Result<bool> {
+        if self.options.scan_frames_only
+            || (!self.options.coalescing && !self.codestream_parser.has_visible_frame())
+            || (self.options.skip_preview && self.codestream_parser.is_preview_frame())
+        {
+            return Ok(false);
+        }
         let Some(profile) = self.codestream_parser.output_color_profile.as_ref() else {
             return Ok(false);
         };

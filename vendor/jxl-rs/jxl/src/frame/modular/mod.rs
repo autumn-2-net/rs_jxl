@@ -978,6 +978,7 @@ fn dequant_lf(
     mul: f32,
     frame_header: &FrameHeader,
     bctx: &BlockContextMap,
+    jpeg: bool,
 ) -> Result<()> {
     if storage == ModularStorage::I16 {
         dequant_lf_impl::<i16>(
@@ -991,6 +992,7 @@ fn dequant_lf(
             mul,
             frame_header,
             bctx,
+            jpeg,
         )
     } else {
         dequant_lf_impl::<i32>(
@@ -1004,6 +1006,7 @@ fn dequant_lf(
             mul,
             frame_header,
             bctx,
+            jpeg,
         )
     }
 }
@@ -1020,12 +1023,15 @@ fn dequant_lf_impl<T: ImageDataType + Into<i32> + Copy>(
     mul: f32,
     frame_header: &FrameHeader,
     bctx: &BlockContextMap,
+    jpeg: bool,
 ) -> Result<()> {
     let inv_quant_lf = (quantizer::GLOBAL_SCALE_DENOM as f32)
         / (quant_params.global_scale as f32 * quant_params.quant_lf as f32);
     let lf_factors = lf_quant.quant_factors.map(|factor| factor * inv_quant_lf);
 
-    if frame_header.is444() {
+    // Reconstruction captures exact integers separately, but still needs the
+    // raw LF threshold buckets below to decode AC entropy contexts correctly.
+    if !jpeg && frame_header.is444() {
         let [lf0, lf1, lf2] = lf else {
             unreachable!();
         };
@@ -1050,7 +1056,7 @@ fn dequant_lf_impl<T: ImageDataType + Into<i32> + Copy>(
                 dec_row_b[x] = in_y * cfl_fac_b + in_b;
             }
         }
-    } else {
+    } else if !jpeg {
         for c in 0..3 {
             let rect_size = (
                 r.size.0 >> frame_header.hshift(c),
@@ -1198,6 +1204,7 @@ pub(super) fn decode_vardct_lf(
         mul,
         frame_header,
         bctx,
+        jpeg_capture.is_some(),
     )?;
     for b in buffers {
         recycler.recycle_raw_buffer(b.data);

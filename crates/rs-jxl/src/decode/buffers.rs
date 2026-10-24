@@ -1,8 +1,9 @@
 use super::{
-    DecodeOptions, DecodedFrame, ExtraChannel, JxlBasicInfo, JxlBitDepth, SampleFormat, failure,
+    DecodeOptions, DecodedFrame, ExtraChannel, JxlBasicInfo, JxlBitDepth, JxlFrameHeader,
+    SampleFormat, failure,
 };
 use crate::{Error, PixelData, PixelLayout, Result};
-use jxl_decoder::api::{Endianness, JxlColorType, JxlDataFormat, JxlPixelFormat, VisibleFrameInfo};
+use jxl_decoder::api::{Endianness, JxlColorType, JxlDataFormat, JxlPixelFormat};
 use jxl_decoder::image::OwnedRawImage;
 
 pub(super) struct Buffers {
@@ -13,9 +14,14 @@ pub(super) struct Buffers {
     height: usize,
     layout: PixelLayout,
 }
-fn format(depth: &JxlBitDepth, requested: SampleFormat) -> JxlDataFormat {
+pub(super) fn format(depth: &JxlBitDepth, requested: SampleFormat) -> JxlDataFormat {
     match (requested, depth) {
         (SampleFormat::U8, _) => JxlDataFormat::U8 { bit_depth: 8 },
+        (SampleFormat::U8Bits(bit_depth), _) => JxlDataFormat::U8 { bit_depth },
+        (SampleFormat::U16Bits(bit_depth), _) => JxlDataFormat::U16 {
+            bit_depth,
+            endianness: Endianness::LittleEndian,
+        },
         (SampleFormat::U16, _) => JxlDataFormat::U16 {
             bit_depth: 16,
             endianness: Endianness::LittleEndian,
@@ -43,38 +49,86 @@ fn format(depth: &JxlBitDepth, requested: SampleFormat) -> JxlDataFormat {
     }
 }
 impl Buffers {
-    pub(super) fn new(
+    pub(super) fn has_size(&self, size: (usize, usize)) -> bool {
+        (self.width, self.height) == size
+    }
+    pub(super) fn pixel_format(
         info: &JxlBasicInfo,
         color: JxlColorType,
         options: &DecodeOptions,
-    ) -> Result<(Self, JxlPixelFormat)> {
-        let (width, height) = info.size;
+    ) -> JxlPixelFormat {
+        let alpha = info
+            .extra_channels
+            .iter()
+            .any(|ec| ec.ec_type == ExtraChannel::Alpha);
+        let color_type = match (color.is_grayscale(), alpha) {
+            (true, false) => JxlColorType::Grayscale,
+            (true, true) => JxlColorType::GrayscaleAlpha,
+            (false, false) => JxlColorType::Rgb,
+            (false, true) => JxlColorType::Rgba,
+        };
+        let processing = options.color.needs_float();
+        let requested_main = if processing {
+            SampleFormat::F32
+        } else {
+            options.format
+        };
+        let main = format(&info.bit_depth, requested_main);
+        // CMYK conversion needs K even if the caller does not retain extras.
+        // Keep complete header order internally; finish() discards these on request.
+        let include_extras = options.include_extra_channels
+            || (processing
+                && info
+                    .extra_channels
+                    .iter()
+                    .any(|ec| ec.ec_type == ExtraChannel::Black));
+        let extras: Vec<_> = info
+            .extra_channels
+            .iter()
+            .map(|ec| {
+                include_extras.then(|| {
+                    // Alpha must use the same final quantizer as interleaved alpha,
+                    // not backend dithering for one copy and rounding for the other.
+                    let requested = if processing
+                        && matches!(ec.ec_type, ExtraChannel::Alpha | ExtraChannel::Black)
+                    {
+                        SampleFormat::F32
+                    } else {
+                        options.format
+                    };
+                    format(&ec.bit_depth, requested)
+                })
+            })
+            .collect();
+        JxlPixelFormat {
+            color_type,
+            color_data_format: Some(main),
+            extra_channel_format: extras,
+        }
+    }
+    pub(super) fn new(
+        size: (usize, usize),
+        pixel_format: &JxlPixelFormat,
+        options: &DecodeOptions,
+    ) -> Result<Self> {
+        let (width, height) = size;
         let count = width
             .checked_mul(height)
             .ok_or(Error::Limit("pixel count overflow"))?;
         if count > options.limits.max_pixels {
             return Err(Error::Limit("decoded pixel count"));
         }
-        let alpha = info
-            .extra_channels
-            .iter()
-            .any(|ec| ec.ec_type == ExtraChannel::Alpha);
-        let (layout, color_type) = match (color.is_grayscale(), alpha) {
-            (true, false) => (PixelLayout::Gray, JxlColorType::Grayscale),
-            (true, true) => (PixelLayout::GrayAlpha, JxlColorType::GrayscaleAlpha),
-            (false, false) => (PixelLayout::Rgb, JxlColorType::Rgb),
-            (false, true) => (PixelLayout::Rgba, JxlColorType::Rgba),
+        let layout = match pixel_format.color_type {
+            JxlColorType::Grayscale => PixelLayout::Gray,
+            JxlColorType::GrayscaleAlpha => PixelLayout::GrayAlpha,
+            JxlColorType::Rgb => PixelLayout::Rgb,
+            JxlColorType::Rgba => PixelLayout::Rgba,
+            _ => return Err(failure("unsupported decoder color layout")),
         };
-        let main = format(&info.bit_depth, options.format);
-        let extras: Vec<_> = info
-            .extra_channels
-            .iter()
-            .map(|ec| {
-                options
-                    .include_extra_channels
-                    .then(|| format(&ec.bit_depth, options.format))
-            })
-            .collect();
+        let main = pixel_format
+            .color_data_format
+            .ok_or_else(|| failure("missing color format"))?;
+        let extras = &pixel_format.extra_channel_format;
         let formats: Vec<_> = std::iter::once(main)
             .chain(extras.iter().flatten().copied())
             .collect();
@@ -99,26 +153,20 @@ impl Buffers {
             .into_iter()
             .map(|size| OwnedRawImage::new(size).map_err(failure))
             .collect::<Result<_>>()?;
-        Ok((
-            Self {
-                images,
-                byte_count,
-                formats,
-                width,
-                height,
-                layout,
-            },
-            JxlPixelFormat {
-                color_type,
-                color_data_format: Some(main),
-                extra_channel_format: extras,
-            },
-        ))
+        Ok(Self {
+            images,
+            byte_count,
+            formats,
+            width,
+            height,
+            layout,
+        })
     }
     pub(super) fn copy_frame(
         &self,
         index: usize,
-        header: &VisibleFrameInfo,
+        header: &JxlFrameHeader,
+        complete: bool,
     ) -> Result<DecodedFrame> {
         let mut planes = self
             .images
@@ -135,6 +183,8 @@ impl Buffers {
             extra_planes: planes.collect::<Result<_>>()?,
             name: header.name.clone(),
             duration_ticks: header.duration_ticks,
+            header: header.clone(),
+            complete,
         })
     }
 }

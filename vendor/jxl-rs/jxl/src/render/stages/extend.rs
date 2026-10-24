@@ -53,7 +53,7 @@ impl std::fmt::Display for ExtendToImageDimensionsStage {
 }
 
 impl ExtendToImageDimensionsStage {
-    pub(in crate::render) fn process_row_chunk(
+    pub(crate) fn process_row_chunk(
         &self,
         position: (usize, usize),
         xsize: usize,

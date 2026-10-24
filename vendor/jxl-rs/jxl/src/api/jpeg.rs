@@ -36,6 +36,11 @@ pub struct JxlJpegComponent {
 
 /// Opt-in capture that survives the decoder releasing its last frame.
 /// Obtain immediately after `Event::FrameHeader`, then continue decoding.
+/// Capture replaces pixel rendering and IDCT. It supports one full-canvas
+/// 8-bit original-color final frame with one or more coefficient passes,
+/// DCT8 JPEG RAW tables, JPEG-compatible CfL, and exact integer DC precision.
+/// Coefficients requiring fractional-DC truncation, clamping or arithmetic
+/// overflow are rejected. Marker/scan reconstruction still requires `jbrd`.
 #[derive(Clone)]
 pub struct JxlJpegCoefficientCapture {
     pub(crate) inner: Arc<JpegCapture>,
@@ -43,7 +48,9 @@ pub struct JxlJpegCoefficientCapture {
 
 impl JxlJpegCoefficientCapture {
     /// Takes coefficients once, only after a successful `FrameComplete` event.
-    /// Returns `None` while incomplete, after an error, or after taking them.
+    /// Returns `None` while incomplete, after a frame decoding failure, or after
+    /// taking them. A completed capture survives a later reset/container error;
+    /// callers requiring a valid complete container must also await `Complete`.
     pub fn take(&self) -> Option<JxlJpegCoefficients> {
         self.inner.take()
     }

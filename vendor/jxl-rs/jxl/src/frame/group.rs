@@ -322,7 +322,25 @@ impl<'a> CoeffsMut<'a> {
         reader: &mut SymbolReader,
         histograms: &Histograms,
         br: &mut BitReader,
+        jpeg: bool,
     ) -> Result<(), Error> {
+        if jpeg {
+            let Self::I32(channels) = self else {
+                return Err(crate::frame::jpeg::unsupported(
+                    "JPEG capture requires i32 coefficients",
+                ));
+            };
+            return decode_jpeg_channel(
+                &mut channels[c][offset..offset + num_coeffs],
+                permutation,
+                histo_offset,
+                shift,
+                nonzeros,
+                reader,
+                histograms,
+                br,
+            );
+        }
         match self {
             Self::I32(c_arr) => decode_channel_coeffs(
                 &mut c_arr[c][offset..offset + num_coeffs],
@@ -352,6 +370,52 @@ impl<'a> CoeffsMut<'a> {
             ),
         }
     }
+}
+
+fn checked_jpeg_add(current: i32, value: i32, shift: u32) -> Result<i32> {
+    let value = i64::from(value)
+        .checked_mul(1i64.checked_shl(shift).ok_or(Error::SizeOverflow)?)
+        .and_then(|value| value.checked_add(i64::from(current)))
+        .and_then(|value| i32::try_from(value).ok())
+        .ok_or(crate::frame::jpeg::unsupported(
+            "JPEG coefficient accumulation overflow",
+        ))?;
+    Ok(value)
+}
+
+// dec_group.cc accumulates shifted pass coefficients before restoring CfL.
+// Keep reconstruction checked: wrapping arithmetic could manufacture valid JPEG values.
+#[allow(clippy::too_many_arguments)]
+fn decode_jpeg_channel(
+    current: &mut [i32],
+    permutation: &Permutation,
+    histo_offset: usize,
+    shift: u32,
+    mut nonzeros: usize,
+    reader: &mut SymbolReader,
+    histograms: &Histograms,
+    br: &mut BitReader,
+) -> Result<()> {
+    let mut prev = usize::from(nonzeros <= 4);
+    for k in 1..64 {
+        if nonzeros == 0 {
+            break;
+        }
+        let ctx = histo_offset + COEFF_NUM_NONZERO_CONTEXT[nonzeros] + COEFF_FREQ_CONTEXT[k] + prev;
+        let value = reader.read_signed_inline(histograms, br, ctx);
+        if value == 0 {
+            prev = 0;
+            continue;
+        }
+        let index = permutation[k] as usize;
+        current[index] = checked_jpeg_add(current[index], value, shift)?;
+        nonzeros -= 1;
+        prev = 1;
+    }
+    if nonzeros != 0 {
+        return Err(Error::EndOfBlockResidualNonZeros(nonzeros));
+    }
+    Ok(())
 }
 
 #[inline(always)]
@@ -802,7 +866,12 @@ pub fn decode_vardct_group(
     buffers: &mut VarDctBuffers,
     jpeg_capture: Option<&crate::frame::jpeg::JpegCapture>,
 ) -> Result<(), Error> {
+    let jpeg_final = jpeg_capture
+        .map(|c| c.validate_passes(frame_header, group, passes.iter().map(|(p, _)| *p)))
+        .transpose()?
+        .unwrap_or(false);
     let mut jpeg_group = jpeg_capture
+        .filter(|_| jpeg_final)
         .map(|c| c.new_group(frame_header, group))
         .transpose()?;
     let x_dm_multiplier = (1.0 / (1.25)).powf(frame_header.x_qm_scale as f32 - 2.0);
@@ -924,10 +993,9 @@ pub fn decode_vardct_group(
             let quant_lf = row_quant_lf[bx] as usize;
             let transform_type = HfTransformType::from_usize(transform_id as usize)
                 .ok_or(Error::InvalidVarDCTTransform(transform_id as usize))?;
-            if jpeg_capture.is_some() && (transform_type != HfTransformType::DCT || raw_quant != 1)
-            {
+            if jpeg_capture.is_some() && transform_type != HfTransformType::DCT {
                 return Err(crate::frame::jpeg::unsupported(
-                    "JPEG capture requires only DCT8 transforms and unit block quantization",
+                    "JPEG capture requires only DCT8 transforms",
                 ));
             }
             let cx = covered_blocks_x(transform_type) as usize;
@@ -1025,6 +1093,7 @@ pub fn decode_vardct_group(
                         reader,
                         &pass_info.histograms,
                         br,
+                        jpeg_capture.is_some(),
                     )?;
                 }
             }
@@ -1105,11 +1174,24 @@ pub fn decode_vardct_group(
     if let (Some(capture), Some(data)) = (jpeg_capture, jpeg_group) {
         capture.store_group(frame_header, group, data)?;
     }
+    if let Some(capture) = jpeg_capture {
+        capture.record_passes(group, pass_info.len());
+    }
     Ok(())
 }
 
 #[cfg(test)]
 mod test {
+    #[test]
+    fn jpeg_pass_accumulation_is_checked_before_narrowing() {
+        assert_eq!(super::checked_jpeg_add(0, 1100, 2).unwrap(), 4400);
+        assert_eq!(super::checked_jpeg_add(4400, -2198, 1).unwrap(), 4);
+        assert_eq!(super::checked_jpeg_add(4, -3, 0).unwrap(), 1);
+        assert!(super::checked_jpeg_add(i32::MAX, 1, 0).is_err());
+        assert!(super::checked_jpeg_add(i32::MIN, -1, 0).is_err());
+        assert!(super::checked_jpeg_add(0, i32::MAX, 3).is_err());
+    }
+
     use test_log::test;
 
     use crate::error::Result;

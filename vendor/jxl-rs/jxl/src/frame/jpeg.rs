@@ -3,10 +3,15 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//! JPEG integer capture, ported from libjxl dec_frame.cc/dec_group.cc at
+//! JPEG integer capture, ported from libjxl dec_frame.cc/dec_group.cc/dec_modular.cc at
 //! b866b3defec13494bfbaf705db93581cda118e37, before dequantization and IDCT.
+//! Unlike the C++ fallback conversions, fractional DC, clamping and arithmetic
+//! overflow are rejected rather than used to manufacture JPEG coefficients.
 
-use crate::api::{JxlJpegCoefficientCapture, JxlJpegCoefficients, JxlJpegComponent};
+use crate::api::{
+    JxlJpegCoefficientCapture, JxlJpegCoefficients, JxlJpegComponent, JxlParallelRunner,
+};
+use crate::bit_reader::BitReader;
 use crate::error::{Error, Result};
 use crate::headers::bit_depth::BitDepth;
 use crate::headers::color_encoding::ColorSpace;
@@ -15,9 +20,10 @@ use crate::image::{ImageDataType, ImageRect, RawImageRect};
 use crate::util::sync::{Arc, Mutex};
 
 use super::color_correlation_map::DEFAULT_COLOR_FACTOR;
-use super::modular::ModularStorage;
+use super::group::decode_vardct_group;
+use super::modular::{ModularStorage, ModularStreamId};
 use super::quant_weights::QuantEncoding;
-use super::{ColorCorrelationParams, Frame};
+use super::{ColorCorrelationParams, DataStatus, Frame};
 
 const FIXED_ONE: i32 = 1 << 11;
 const ROUND: i32 = FIXED_ONE / 2;
@@ -32,6 +38,7 @@ struct CaptureState {
     quantization: Option<[[u16; 64]; 3]>,
     lf_done: Vec<bool>,
     hf_done: Vec<bool>,
+    hf_passes: Vec<usize>,
     complete: bool,
 }
 
@@ -65,14 +72,13 @@ impl Frame {
         }
         if header.frame_type != FrameType::RegularFrame
             || !header.is_last
-            || header.passes.num_passes != 1
             || header.lf_level != 0
             || header.has_lf_frame()
             || metadata.animation.is_some()
             || self.frame_counters != (1, 0)
         {
             return Err(unsupported(
-                "JPEG capture supports only one final frame and one pass, without LF frames",
+                "JPEG capture supports only one final frame, without LF frames",
             ));
         }
         if header.needs_blending()
@@ -104,6 +110,94 @@ impl Frame {
         let inner = Arc::new(JpegCapture::new(header, grayscale)?);
         self.decoder_state.jpeg_capture = Some(inner.clone());
         Ok(JxlJpegCoefficientCapture { inner })
+    }
+
+    /// Decode coefficient sections without allocating or running a pixel pipeline.
+    pub fn decode_jpeg_groups(
+        &mut self,
+        groups: &mut [(usize, Vec<(usize, BitReader)>)],
+        parallel_runner: &mut dyn JxlParallelRunner,
+    ) -> Result<()> {
+        if !self.is_jpeg_reconstruction() {
+            return Err(unsupported("JPEG capture is not enabled"));
+        }
+        // A group owns its accumulator; reject duplicate work before parallel dispatch.
+        let mut seen = std::collections::HashSet::new();
+        for (group, _) in groups.iter() {
+            if *group >= self.header.num_groups() || !seen.insert(*group) {
+                return Err(unsupported("Invalid or duplicate JPEG coefficient group"));
+            }
+        }
+        parallel_runner.run_ordered(groups.len(), Some(groups.len().max(1)), &|i| {
+            let (group, passes) = &groups[i];
+            let mut passes = passes.clone();
+            self.decode_jpeg_group(*group, &mut passes)
+        })?;
+        for (group, passes) in groups.iter() {
+            if let Some((pass, _)) = passes.last() {
+                let status = if *pass + 1 == self.header.passes.num_passes as usize {
+                    DataStatus::Final
+                } else {
+                    DataStatus::Partial
+                };
+                for c in 0..3 {
+                    self.group_status.update_status(*group, c, status);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn decode_jpeg_group(
+        &self,
+        group: usize,
+        passes: &mut [(usize, BitReader)],
+    ) -> Result<()> {
+        if passes.is_empty() {
+            return Ok(());
+        }
+        let lf_global = self
+            .lf_global
+            .as_ref()
+            .ok_or(unsupported("Missing JPEG LF global"))?;
+        let hf_global = self
+            .hf_global
+            .as_ref()
+            .ok_or(unsupported("Missing JPEG HF global"))?;
+        let mut buffers = self.buffer_recycler.vardct_buffers.get();
+        // No ensure_allocated(): the pixel transform scratch is not needed here.
+        decode_vardct_group(
+            group,
+            passes,
+            &self.header,
+            lf_global,
+            hf_global,
+            self.hf_meta
+                .as_ref()
+                .ok_or(unsupported("Missing JPEG HF metadata"))?,
+            self.lf_image
+                .as_ref()
+                .ok_or(unsupported("Missing JPEG LF image"))?,
+            &self
+                .decoder_state
+                .file_header
+                .transform_data
+                .opsin_inverse_matrix
+                .quant_biases,
+            &mut None,
+            &mut buffers,
+            self.decoder_state.jpeg_capture.as_deref(),
+        )?;
+        for (pass, br) in passes.iter_mut() {
+            lf_global.modular_global.read_stream(
+                ModularStreamId::ModularHF { group, pass: *pass },
+                &self.header,
+                &lf_global.tree,
+                br,
+                None,
+            )?;
+        }
+        Ok(())
     }
 }
 
@@ -145,16 +239,12 @@ impl JpegCapture {
                 quantization: None,
                 lf_done: vec![false; header.num_lf_groups()],
                 hf_done: vec![false; header.num_groups()],
+                hf_passes: vec![0; header.num_groups()],
                 complete: false,
             }),
         })
     }
-    pub(crate) fn validate_lf_params(
-        &self,
-        params: &ColorCorrelationParams,
-        scale: u32,
-        quant_lf: u32,
-    ) -> Result<()> {
+    pub(crate) fn validate_lf_params(&self, params: &ColorCorrelationParams) -> Result<()> {
         if params.color_factor != DEFAULT_COLOR_FACTOR
             || params.base_correlation_x != 0.0
             || params.base_correlation_b != 0.0
@@ -165,12 +255,38 @@ impl JpegCapture {
                 "JPEG capture requires JPEG-compatible color correlation (no DC CfL)",
             ));
         }
-        if scale != 65536 || quant_lf != 1 {
-            return Err(unsupported(
-                "JPEG capture requires unit JPEG global/DC quantizer scale",
-            ));
-        }
+        // dec_frame.cc clears DC multipliers for JPEG output; the global and
+        // per-block quantizers affect entropy contexts, not recovered integers.
         Ok(())
+    }
+
+    pub(crate) fn validate_passes(
+        &self,
+        header: &FrameHeader,
+        group: usize,
+        passes: impl Iterator<Item = usize>,
+    ) -> Result<bool> {
+        let state = self.state.lock().unwrap();
+        let mut next = *state
+            .hf_passes
+            .get(group)
+            .ok_or(unsupported("Invalid JPEG group"))?;
+        if state.complete || state.output.is_none() || state.hf_done[group] {
+            return Err(unsupported("JPEG coefficient group is no longer active"));
+        }
+        for pass in passes {
+            if pass != next || pass >= header.passes.num_passes as usize {
+                return Err(unsupported(
+                    "JPEG coefficient passes must be contiguous and unique",
+                ));
+            }
+            next += 1;
+        }
+        Ok(next == header.passes.num_passes as usize)
+    }
+
+    pub(crate) fn record_passes(&self, group: usize, count: usize) {
+        self.state.lock().unwrap().hf_passes[group] += count;
     }
 
     pub(crate) fn set_quantization(&self, encoding: &QuantEncoding) -> Result<()> {
@@ -217,18 +333,22 @@ impl JpegCapture {
         storage: ModularStorage,
         extra_precision: u64,
     ) -> Result<()> {
-        if extra_precision != 0 {
-            return Err(unsupported(
-                "JPEG capture does not support extra DC precision",
-            ));
+        if extra_precision > 3 {
+            return Err(unsupported("Invalid JPEG extra DC precision"));
         }
         match storage {
-            ModularStorage::I16 => {
-                self.capture_lf_impl(header, group, input.map(ImageRect::<i16>::from_raw))
-            }
-            ModularStorage::I32 => {
-                self.capture_lf_impl(header, group, input.map(ImageRect::<i32>::from_raw))
-            }
+            ModularStorage::I16 => self.capture_lf_impl(
+                header,
+                group,
+                input.map(ImageRect::<i16>::from_raw),
+                extra_precision,
+            ),
+            ModularStorage::I32 => self.capture_lf_impl(
+                header,
+                group,
+                input.map(ImageRect::<i32>::from_raw),
+                extra_precision,
+            ),
         }
     }
 
@@ -237,6 +357,7 @@ impl JpegCapture {
         header: &FrameHeader,
         group: usize,
         input: [ImageRect<'_, T>; 3],
+        extra_precision: u64,
     ) -> Result<()> {
         let rect = header.lf_group_rect(group);
         let mut state = self.state.lock().unwrap();
@@ -254,7 +375,14 @@ impl JpegCapture {
             for y in 0..height {
                 for (x, &value) in source.row(y)[..width].iter().enumerate() {
                     // Retain the RGB DC offset until the RAW quantization tables arrive.
-                    let dc = i16::try_from(value.into())
+                    let value = value.into();
+                    let divisor = 1i32 << extra_precision;
+                    if value % divisor != 0 {
+                        return Err(unsupported(
+                            "JPEG capture DC precision would require truncation",
+                        ));
+                    }
+                    let dc = i16::try_from(value / divisor)
                         .map_err(|_| unsupported("JPEG capture DC coefficient is out of range"))?;
                     component.coefficients[((y0 + y) * component.width_in_blocks + x0 + x) * 64] =
                         dc;

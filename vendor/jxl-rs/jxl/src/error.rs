@@ -104,6 +104,8 @@ pub enum Error {
     #[error("Invalid quant encoding with mode {mode} and required size {required_size}")]
     InvalidQuantEncoding { mode: u8, required_size: usize },
     // FrameHeader format errors
+    #[error("Preview must be an uncropped regular frame with replace blending")]
+    InvalidPreview,
     #[error("Invalid extra channel upsampling: upsampling: {0} dim_shift: {1} ec_upsampling: {2}")]
     InvalidEcUpsampling(u32, u32, u32),
     #[error("Invalid lf level in UseLFFrame frame: {0}")]

@@ -41,6 +41,20 @@ new ARM work. Existing upstream non-x86 source is retained unchanged.
 - Opt-in JPEG coefficient capture: preserve quantized DC/AC coefficients and
   raw quantization tables before dequantization. Normal pixel output does not
   enable the capture; reconstruction metadata parsing remains in `rs-jxl`.
+- Layer/preview API: expose crop, blend/reference, timecode and preview headers;
+  allow uncoalesced regular layers, including zero-duration layers. Preview
+  rendering uses preview dimensions rather than the main canvas. Header-only
+  scanning skips invisible reference/LF sections as well as visible pixels.
+- Mixed-resolution patches: allow independent color patches with differently
+  upsampled extras; reject cross-resolution extra/alpha blending where libjxl
+  does too. Preserve reference storage separately from raw-layer output.
+- Progressive quality: select eligible VarDCT HF passes at full canvas size,
+  retain full reference frames, and expose actual output progression rather
+  than equating the requested ratio with a resized image.
+- JPEG capture extensions: decode quantized groups without a pixel/IDCT pipeline,
+  accumulate progressive passes with overflow checks, recover exact extra-DC
+  precision, and honor compatible non-unit quantizers. Fractional/clamped or
+  otherwise unreconstructable data is rejected, not silently rounded.
 
 Update this ledger and docs/DECODER_STATUS.md for behavioral patches. Do not
 replace this directory from upstream without reviewing and replaying patches.

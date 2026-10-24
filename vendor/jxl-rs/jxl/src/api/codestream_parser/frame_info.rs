@@ -80,6 +80,10 @@ pub struct FrameInfo {
     frame_counters: (usize, usize),
     // Which stored frames to keep in the next frame's decoder state (see `reset`).
     keep_slots: [bool; 8],
+    max_downsampling: usize,
+    decoded_pass_limit: Option<usize>,
+    coalescing: bool,
+    render_pipeline_prepared: bool,
 }
 
 impl FrameInfo {
@@ -101,6 +105,10 @@ impl FrameInfo {
             buffer_recycler: Arc::new(BufferRecycler::new()),
             frame_counters: (0, 0),
             keep_slots: [true; 8],
+            max_downsampling: 1,
+            decoded_pass_limit: None,
+            coalescing: true,
+            render_pipeline_prepared: false,
         }
     }
 
@@ -130,6 +138,7 @@ impl FrameInfo {
         self.hf_global_section = None;
         self.hf_sections.clear();
         self.candidate_hf_sections.clear();
+        self.decoded_pass_limit = None;
     }
 
     pub fn current_frame_header(&self) -> Option<&FrameHeader> {
@@ -140,6 +149,29 @@ impl FrameInfo {
 
     pub(crate) fn current_frame_mut(&mut self) -> Option<&mut Frame> {
         self.frame.as_deref_mut()
+    }
+
+    pub(super) fn output_progression(&self) -> crate::api::JxlFrameProgression {
+        let header = self.current_frame_header().unwrap();
+        let total_passes = header.passes.num_passes;
+        let decoded_passes = self.decoded_pass_limit.unwrap_or(total_passes as usize) as u32;
+        let full_quality = decoded_passes >= total_passes;
+        let intended_downsampling = if full_quality {
+            1
+        } else if decoded_passes == 0 {
+            8
+        } else {
+            1 << header
+                .passes
+                .downsampling_bracket(decoded_passes as usize - 1)
+                .0
+        };
+        crate::api::JxlFrameProgression {
+            decoded_passes,
+            total_passes,
+            intended_downsampling,
+            full_quality,
+        }
     }
 
     #[cfg(test)]
@@ -167,6 +199,13 @@ impl FrameInfo {
 
         let mut frame_header = FrameHeader::read_unconditional(&(), br, &nonserialized)?;
         frame_header.postprocess(&nonserialized);
+        // libjxl/lib/jxl/frame_header.cc: previews are ordinary full-canvas,
+        // replace-only frames; reference/LF/cropped previews are not valid.
+        if is_preview
+            && (frame_header.frame_type != FrameType::RegularFrame || frame_header.needs_blending())
+        {
+            return Err(Error::InvalidPreview);
+        }
         check_size_limit(
             decode_options.sample_limit,
             frame_header.size_upsampled(),
@@ -223,13 +262,16 @@ impl FrameInfo {
         toc: Toc,
         file_header: &FileHeader,
         decode_options: &JxlDecoderOptions,
-        pixel_format: &JxlPixelFormat,
-        output_profile: &JxlColorProfile,
         process_mode: ProcessMode,
         level5_limits: bool,
+        is_preview: bool,
     ) -> Result<()> {
         self.section_size = toc.entries.iter().map(|x| *x as u64).sum();
         self.ready_section_data = 0;
+        self.max_downsampling = decode_options.max_downsampling.max(1);
+        self.decoded_pass_limit = None;
+        self.coalescing = decode_options.coalescing;
+        self.render_pipeline_prepared = false;
 
         self.lf_global_section = None;
         self.lf_sections.clear();
@@ -251,14 +293,25 @@ impl FrameInfo {
             let mut decoder_state = self
                 .frame
                 .take()
-                .map(|x| x.finalize())
+                .map(|mut x| {
+                    if !decode_options.coalescing {
+                        x.coalesce_reference_for_raw_output()?;
+                    }
+                    x.finalize()
+                })
                 .transpose()?
                 .unwrap_or_else(|| {
-                    DecoderState::new(file_header.clone(), decode_options, level5_limits)
+                    let mut header = file_header.clone();
+                    if is_preview {
+                        let preview = header.image_metadata.preview.as_ref().unwrap();
+                        header.size =
+                            crate::headers::Size::from_dimensions(preview.xsize(), preview.ysize());
+                    }
+                    DecoderState::new(header, decode_options, level5_limits)
                 });
             decoder_state.level5_limits = level5_limits;
             decoder_state.keep_slots(std::mem::replace(&mut self.keep_slots, [true; 8]));
-            let mut frame = Frame::from_header_and_toc(
+            let frame = Frame::from_header_and_toc(
                 self.frame_header.take().unwrap(),
                 toc,
                 decoder_state,
@@ -335,7 +388,6 @@ impl FrameInfo {
 
             self.section_state =
                 SectionState::new(frame.header().num_lf_groups(), frame.header().num_groups());
-            frame.prepare_render_pipeline(pixel_format, output_profile)?;
             self.frame = Some(frame);
         } else {
             let num = (cbuf.len() as u64).min(self.section_size) as usize;
@@ -367,8 +419,10 @@ impl FrameInfo {
                     self.lf_sections.push(s);
                 }
                 Section::Hf { group, pass } => {
-                    self.hf_sections[group][pass] = Some(s);
-                    self.candidate_hf_sections.insert(group);
+                    if self.decoded_pass_limit.is_none_or(|limit| pass < limit) {
+                        self.hf_sections[group][pass] = Some(s);
+                        self.candidate_hf_sections.insert(group);
+                    }
                 }
             }
         }
@@ -510,6 +564,7 @@ impl FrameInfo {
         pixel_format: &JxlPixelFormat,
         parallel_runner: &mut dyn JxlParallelRunner,
     ) -> Result<Option<usize>> {
+        self.prepare_render_pipeline(pixel_format, output_profile)?;
         let data_for_next_section = self
             .sections
             .front()
@@ -596,6 +651,35 @@ impl FrameInfo {
             return Ok(data_for_next_section);
         }
 
+        if self.decoded_pass_limit.is_none()
+            && self.max_downsampling > 1
+            && frame.header().encoding == Encoding::VarDCT
+            && frame.header().frame_type == FrameType::RegularFrame
+            && !frame.header().can_be_referenced
+            && !frame.is_jpeg_reconstruction()
+            && frame.allow_rendering_before_last_pass()
+        {
+            // As in libjxl/lib/extras/dec/jxl.cc, select the first progression
+            // at the requested quality and flush at the original canvas size.
+            let passes = &frame.header().passes;
+            let limit = if self.max_downsampling >= 8 {
+                0
+            } else {
+                (0..passes.num_passes as usize)
+                    .find(|&pass| {
+                        let (min, max) = passes.downsampling_bracket(pass);
+                        min <= max && (1usize << min) <= self.max_downsampling
+                    })
+                    .map_or(passes.num_passes as usize, |pass| pass + 1)
+            };
+            self.decoded_pass_limit = Some(limit);
+            for group in &mut self.hf_sections {
+                for section in &mut group[limit..] {
+                    *section = None;
+                }
+            }
+        }
+
         let mut group_readers = vec![];
         let mut processed_groups = vec![];
 
@@ -604,6 +688,7 @@ impl FrameInfo {
             for (pass, grp) in self.hf_sections[g]
                 .iter()
                 .enumerate()
+                .take(self.decoded_pass_limit.unwrap_or(usize::MAX))
                 .skip(self.section_state.completed_passes[g] as usize)
             {
                 let Some(s) = &grp else {
@@ -634,11 +719,17 @@ impl FrameInfo {
             self.candidate_hf_sections.clear();
         }
 
+        let selected_progression_ready = self.decoded_pass_limit.is_some_and(|limit| {
+            self.section_state
+                .completed_passes
+                .iter()
+                .all(|&n| n as usize >= limit)
+        });
         self.pixels_dirty |= frame.decode_and_render_hf_groups(
             &mut output_buffers,
             pixel_format,
             group_readers,
-            false,
+            selected_progression_ready,
             output_profile,
             parallel_runner,
         )?;
@@ -659,6 +750,7 @@ impl FrameInfo {
         pixel_format: &JxlPixelFormat,
         parallel_runner: &mut dyn JxlParallelRunner,
     ) -> Result<()> {
+        self.prepare_render_pipeline(pixel_format, output_profile)?;
         let Some(frame) = self.frame.as_mut() else {
             return Ok(());
         };
@@ -708,6 +800,22 @@ impl FrameInfo {
                 output_profile,
                 parallel_runner,
             )?;
+        }
+        Ok(())
+    }
+
+    fn prepare_render_pipeline(
+        &mut self,
+        pixel_format: &JxlPixelFormat,
+        output_profile: &JxlColorProfile,
+    ) -> Result<()> {
+        if !self.render_pipeline_prepared
+            && let Some(frame) = self.frame.as_mut()
+        {
+            // FrameHeader gives the caller a chance to select coefficient
+            // capture before any pixel pipeline is constructed.
+            frame.prepare_render_pipeline(pixel_format, output_profile, self.coalescing)?;
+            self.render_pipeline_prepared = true;
         }
         Ok(())
     }

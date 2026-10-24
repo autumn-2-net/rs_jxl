@@ -77,6 +77,15 @@ fn map_aspect_ratio<T: Fn() -> u64>(ysize: u32, ratio: AspectRatio, fallback: T)
 }
 
 impl Size {
+    /// Construct an internal canvas from already validated image/preview sizes.
+    pub(crate) fn from_dimensions(width: u32, height: u32) -> Self {
+        Self {
+            xsize: Some(width),
+            ysize: Some(height),
+            ..Self::default()
+        }
+    }
+
     pub fn ysize(&self) -> u32 {
         if self.small {
             self.ysize_div8.unwrap() * 8

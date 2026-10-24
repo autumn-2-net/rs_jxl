@@ -263,7 +263,7 @@ fn group_cfl_transposes_once_and_does_not_modify_input() {
 }
 
 #[test]
-fn rejects_non_jpeg_quantization_correlation_and_precision() {
+fn rejects_non_jpeg_quantization_and_correlation() {
     let header = header(8, 8, true, [0; 3]);
     let capture = JpegCapture::new(&header, false).unwrap();
     assert!(capture.set_quantization(&QuantEncoding::Library).is_err());
@@ -289,13 +289,17 @@ fn rejects_non_jpeg_quantization_correlation_and_precision() {
         })
         .unwrap();
     let mut params = ColorCorrelationParams::default();
-    assert!(capture.validate_lf_params(&params, 65536, 1).is_err());
+    assert!(capture.validate_lf_params(&params).is_err());
     params.base_correlation_b = 0.0;
-    capture.validate_lf_params(&params, 65536, 1).unwrap();
-    assert!(capture.validate_lf_params(&params, 1, 1).is_err());
-    assert!(capture.validate_lf_params(&params, 65536, 2).is_err());
+    capture.validate_lf_params(&params).unwrap();
     params.ytox_lf = 1;
-    assert!(capture.validate_lf_params(&params, 65536, 1).is_err());
+    assert!(capture.validate_lf_params(&params).is_err());
+    params.ytox_lf = 0;
+    params.ytob_lf = -1;
+    assert!(capture.validate_lf_params(&params).is_err());
+    params.ytob_lf = 0;
+    params.color_factor += 1;
+    assert!(capture.validate_lf_params(&params).is_err());
     let input: [Image<i16>; 3] = std::array::from_fn(|_| Image::new_with_value((1, 1), 7).unwrap());
     let input = input.map(Image::into_raw);
     let raw = [&input[0], &input[1], &input[2]].map(|p| p.as_rect());
@@ -339,6 +343,7 @@ fn completion_requires_every_group_and_rejects_dc_clamping() {
                     size: (1, 1),
                 })
             }),
+            0,
         )
         .unwrap();
     let group = capture.new_group(&header, 0).unwrap();
@@ -370,6 +375,7 @@ fn capture_handle_outlives_frame_and_has_single_take() {
                     size: (1, 1),
                 })
             }),
+            0,
         )
         .unwrap();
     inner
@@ -380,4 +386,352 @@ fn capture_handle_outlives_frame_and_has_single_take() {
     drop(inner);
     assert_eq!(handle.take().unwrap().components[0].coefficients[0], -13);
     assert!(handle.take().is_none());
+}
+
+#[test]
+fn extra_dc_precision_requires_exact_signed_integer_coefficients() {
+    for ycbcr in [false, true] {
+        let header = header(8, 8, ycbcr, [0; 3]);
+        for precision in 0..=3 {
+            for value in [-2047, -1, 0, 1, 2047] {
+                let capture = JpegCapture::new(&header, false).unwrap();
+                capture.set_quantization(&tables()).unwrap();
+                let input: [Image<i32>; 3] = std::array::from_fn(|m| {
+                    let c = [1, 0, 2][m];
+                    let offset = if ycbcr { 0 } else { 1024 / (3 * c as i32 + 1) };
+                    Image::new_with_value((1, 1), (value + offset) << precision).unwrap()
+                });
+                let input = input.map(Image::into_raw);
+                let raw = [&input[0], &input[1], &input[2]].map(|p| p.as_rect());
+                capture
+                    .capture_lf(&header, 0, raw, ModularStorage::I32, precision)
+                    .unwrap();
+                capture
+                    .store_group(&header, 0, capture.new_group(&header, 0).unwrap())
+                    .unwrap();
+                capture.finish().unwrap();
+                for component in capture.take().unwrap().components {
+                    assert_eq!(i32::from(component.coefficients[0]), value);
+                }
+            }
+        }
+    }
+    let header = header(8, 8, true, [0; 3]);
+    for value in [-17, -1, 1, 17] {
+        let capture = JpegCapture::new(&header, true).unwrap();
+        let input: [Image<i32>; 3] =
+            std::array::from_fn(|_| Image::new_with_value((1, 1), value).unwrap());
+        let input = input.map(Image::into_raw);
+        let raw = [&input[0], &input[1], &input[2]].map(|p| p.as_rect());
+        for precision in 1..=4 {
+            assert!(
+                capture
+                    .capture_lf(&header, 0, raw, ModularStorage::I32, precision)
+                    .is_err()
+            );
+        }
+    }
+}
+
+#[test]
+fn multipass_capture_rejects_missing_duplicate_and_reordered_passes() {
+    let mut header = header(8, 8, true, [0; 3]);
+    header.passes.num_passes = 3;
+    header.passes.shift = vec![2, 1];
+    let capture = JpegCapture::new(&header, false).unwrap();
+    capture.set_quantization(&tables()).unwrap();
+    assert!(
+        capture
+            .validate_passes(&header, 0, [1].into_iter())
+            .is_err()
+    );
+    assert!(
+        capture
+            .validate_passes(&header, 0, [0, 0].into_iter())
+            .is_err()
+    );
+    assert!(
+        capture
+            .validate_passes(&header, 0, [0, 2].into_iter())
+            .is_err()
+    );
+    assert!(
+        !capture
+            .validate_passes(&header, 0, [0].into_iter())
+            .unwrap()
+    );
+    capture.record_passes(0, 1);
+    assert!(
+        capture
+            .validate_passes(&header, 0, [0].into_iter())
+            .is_err()
+    );
+    assert!(
+        capture
+            .validate_passes(&header, 0, [1, 2, 3].into_iter())
+            .is_err()
+    );
+    assert!(
+        capture
+            .validate_passes(&header, 0, [1, 2].into_iter())
+            .unwrap()
+    );
+    assert!(capture.finish().is_err());
+    assert!(capture.take().is_none());
+    let mut data = capture.new_group(&header, 0).unwrap();
+    let mut accumulated = [[0i32; 64]; 3];
+    // The first pass is not representable as JPEG; the complete sum is.
+    // CfL rounding must happen once on that sum, never on individual passes.
+    for (value, shift) in [(1100, 2), (-2198, 1), (-3, 0)] {
+        accumulated[1][8] += value << shift;
+    }
+    assert_eq!(accumulated[1][8], 1);
+    data.capture_block(&header, 0, 0, 0, &accumulated, [42, 0, -42])
+        .unwrap();
+    assert_eq!(data.coefficients[1][1], 1);
+    capture.store_group(&header, 0, data).unwrap();
+    capture.record_passes(0, 2);
+    assert!(
+        capture
+            .validate_passes(&header, 0, [2].into_iter())
+            .is_err()
+    );
+    assert!(capture.take().is_none()); // Still missing LF.
+}
+
+#[test]
+fn jpeg_groups_accumulate_without_a_pixel_pipeline_or_idct_scratch() {
+    use crate::entropy_coding::decode::Histograms;
+    use crate::frame::block_context_map::BlockContextMap;
+    use crate::frame::quant_weights::DequantMatrices;
+    use crate::frame::quantizer::{LfQuantFactors, QuantizerParams};
+    use crate::frame::{DecoderState, HfGlobalState, LfGlobalState, PassState};
+    use crate::headers::permutation::Permutation;
+    use crate::headers::toc::Toc;
+    use crate::headers::{FileHeader, JxlHeader};
+    use crate::image::BufferRecycler;
+
+    struct Runner;
+    impl JxlParallelRunner for Runner {
+        fn run(&mut self, num: usize, fun: &crate::api::JxlParallelRunnerFun<'_>) -> Result<()> {
+            for i in 0..num {
+                fun(i)?;
+            }
+            Ok(())
+        }
+        fn num_threads(&self) -> usize {
+            1
+        }
+    }
+
+    fn singleton_histogram(contexts: usize, nonzero: bool) -> Histograms {
+        // No LZ77; all contexts use one prefix histogram; direct uint tokens;
+        // singleton 0 means no nonzeros, singleton 1 means one value of -1.
+        let mut fields = vec![(1, 0), (1, 1), (2, 0), (1, 1), (4, 15)];
+        if nonzero {
+            fields.extend([(1, 1), (4, 0), (2, 1), (2, 0), (1, 1)]);
+        } else {
+            fields.push((1, 0)); // Alphabet size 1 needs no Huffman tree.
+        }
+        let bits: Vec<u8> = fields
+            .into_iter()
+            .flat_map(|(n, value)| (0..n).map(move |i| ((value >> i) & 1) as u8))
+            .collect();
+        let bytes: Vec<u8> = bits
+            .chunks(8)
+            .map(|chunk| {
+                chunk
+                    .iter()
+                    .enumerate()
+                    .fold(0, |v, (i, bit)| v | (*bit << i))
+            })
+            .collect();
+        Histograms::decode(contexts, &mut BitReader::new(&bytes), true, &mut vec![]).unwrap()
+    }
+
+    for (batches, nonzeros) in [vec![3], vec![1, 2], vec![2, 1], vec![1, 1, 1]]
+        .into_iter()
+        .flat_map(|batches| {
+            [[true; 3], [true, false, false], [false; 3]]
+                .map(|nonzeros| (batches.clone(), nonzeros))
+        })
+    {
+        // 8x8 default file header; replace XYB metadata for the JPEG test frame.
+        let mut file = FileHeader::read(&mut BitReader::new(&[0xff, 0x0a, 0x41, 0x06])).unwrap();
+        file.image_metadata.xyb_encoded = false;
+        let mut header = header(8, 8, true, [0; 3]);
+        header.passes.num_passes = 3;
+        header.passes.shift = vec![2, 1];
+        let recycler = Arc::new(BufferRecycler::default());
+        let modular_global = super::super::modular::FullModularImage::read(
+            &header,
+            &file.image_metadata,
+            0,
+            &mut BitReader::new(&[]),
+            recycler.clone(),
+            None,
+            ModularStorage::I32,
+            true,
+        )
+        .unwrap();
+        let block_context_map =
+            BlockContextMap::read(&mut BitReader::new(&[1]), &mut vec![]).unwrap();
+        let contexts = block_context_map.num_ac_contexts() + 16;
+        let toc = Toc {
+            permuted: false,
+            permutation: Permutation::default(),
+            entries: vec![],
+        };
+        let state = DecoderState::new(file, &Default::default(), true);
+        let mut frame = Frame::from_header_and_toc(header, toc, state, (1, 0), recycler).unwrap();
+        let handle = frame.enable_jpeg_coefficient_capture().unwrap();
+        let capture = handle.inner.clone();
+        capture
+            .set_quantization(&QuantEncoding::Raw {
+                qtable: vec![7; 192],
+                qtable_den: 1.0 / 2040.0,
+            })
+            .unwrap();
+        let input: [Image<i32>; 3] =
+            std::array::from_fn(|_| Image::new_with_value((1, 1), -24).unwrap());
+        let input = input.map(Image::into_raw);
+        capture
+            .capture_lf(
+                &frame.header,
+                0,
+                [&input[0], &input[1], &input[2]].map(|p| p.as_rect()),
+                ModularStorage::I32,
+                3,
+            )
+            .unwrap();
+        frame.lf_global = Some(LfGlobalState {
+            lf_quant: LfQuantFactors::default(),
+            quant_params: Some(QuantizerParams {
+                global_scale: 17,
+                quant_lf: 9,
+            }),
+            block_context_map: Some(block_context_map),
+            color_correlation_params: Some(ColorCorrelationParams {
+                base_correlation_b: 0.0,
+                ..Default::default()
+            }),
+            tree: None,
+            modular_global,
+            total_bits_read: 0,
+        });
+        let dequant_matrices = DequantMatrices::decode(
+            &frame.header,
+            frame.lf_global.as_ref().unwrap(),
+            &mut BitReader::new(&[1]),
+            None,
+        )
+        .unwrap();
+        frame.hf_global = Some(HfGlobalState {
+            num_histograms: 1,
+            passes: nonzeros
+                .into_iter()
+                .map(|nonzero| PassState {
+                    coeff_orders: vec![Permutation((0..64).collect::<Vec<_>>().into()); 3],
+                    histograms: singleton_histogram(contexts, nonzero),
+                })
+                .collect(),
+            dequant_matrices,
+            hf_coefficients: vec![Mutex::new(vec![])],
+            use_i16: false,
+        });
+        let meta = frame.hf_meta.as_mut().unwrap();
+        meta.transform_map.row_mut(0)[0] = 128; // DCT8, first block.
+        meta.raw_quant_map.row_mut(0)[0] = 39;
+        meta.ytox_map.row_mut(0)[0] = 42;
+        meta.ytob_map.row_mut(0)[0] = -42;
+        {
+            let mut buffers = frame.buffer_recycler.vardct_buffers.get();
+            buffers.coeffs_storage.resize(
+                crate::util::num_cache_lines_for::<i32>(192),
+                Default::default(),
+            );
+            crate::util::slice_from_cachelines_mut::<i32>(&mut buffers.coeffs_storage).fill(12345);
+        }
+        let mut next = 0;
+        for count in batches {
+            let passes = (next..next + count)
+                .map(|pass| (pass, BitReader::new(&[])))
+                .collect();
+            frame
+                .decode_jpeg_groups(&mut [(0, passes)], &mut Runner)
+                .unwrap();
+            next += count;
+            if next != 3 {
+                assert!(capture.finish().is_err());
+            }
+        }
+        capture.finish().unwrap();
+        assert!(frame.render_pipeline.is_none());
+        frame.finalize_lf(&mut Runner).unwrap();
+        let buffers = frame.buffer_recycler.vardct_buffers.get();
+        assert!(buffers.scratch.is_empty());
+        assert!(buffers.transform_buffer.iter().all(Vec::is_empty));
+        assert!(buffers.lf_upsample_bufs.is_none());
+        let output = handle.take().unwrap();
+        let y = -(i32::from(nonzeros[0]) * 4 + i32::from(nonzeros[1]) * 2 + i32::from(nonzeros[2]));
+        let expected = [y, y + ((y + 1) >> 1), y + ((-y + 1) >> 1)];
+        for (component, ac) in output.components.iter().zip(expected) {
+            assert_eq!(component.coefficients[0], -3);
+            assert_eq!(i32::from(component.coefficients[8]), ac);
+            assert!(
+                component
+                    .coefficients
+                    .iter()
+                    .enumerate()
+                    .all(|(i, v)| i == 0 || i == 8 || *v == 0)
+            );
+        }
+    }
+}
+
+#[test]
+fn rgb_finish_is_transactional_and_removes_dc_offset_only_once() {
+    let header = header(8, 8, false, [0; 3]);
+    let capture = JpegCapture::new(&header, false).unwrap();
+    capture.set_quantization(&tables()).unwrap();
+    capture
+        .store_group(&header, 0, capture.new_group(&header, 0).unwrap())
+        .unwrap();
+    for invalid in [true, false] {
+        let input: [Image<i32>; 3] = std::array::from_fn(|m| {
+            let c = [1, 0, 2][m];
+            let value = if invalid && c == 1 { 2048 } else { 17 };
+            Image::new_with_value((1, 1), value + 1024 / (3 * c as i32 + 1)).unwrap()
+        });
+        let input = input.map(Image::into_raw);
+        capture
+            .capture_lf(
+                &header,
+                0,
+                [&input[0], &input[1], &input[2]].map(|p| p.as_rect()),
+                ModularStorage::I32,
+                0,
+            )
+            .unwrap();
+        if invalid {
+            assert!(capture.finish().is_err());
+            assert!(capture.take().is_none());
+            let state = capture.state.lock().unwrap();
+            assert_eq!(
+                state.output.as_ref().unwrap().components[0].coefficients[0],
+                1041
+            );
+        }
+    }
+    capture.finish().unwrap();
+    capture.finish().unwrap();
+    capture.abort(); // A later reset/error cannot alter a completed frame.
+    let output = capture.take().unwrap();
+    assert!(
+        output
+            .components
+            .iter()
+            .all(|component| component.coefficients[0] == 17)
+    );
+    assert!(capture.take().is_none());
 }

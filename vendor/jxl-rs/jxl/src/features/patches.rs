@@ -170,6 +170,19 @@ pub struct PatchesDictionary {
 }
 
 impl PatchesDictionary {
+    /// Whether any patch writes an extra channel or reads alpha to blend color.
+    /// Mirrors `uses_extra_channels` in libjxl/lib/jxl/dec_patch_dictionary.cc.
+    pub(crate) fn uses_extra_channels(&self) -> bool {
+        self.blendings
+            .chunks(self.blendings_stride.max(1))
+            .any(|blendings| {
+                blendings[0].mode.uses_alpha()
+                    || blendings[1..]
+                        .iter()
+                        .any(|b| b.mode != PatchBlendMode::None)
+            })
+    }
+
     pub fn new(num_extra_channels: usize) -> Self {
         Self {
             blendings_stride: num_extra_channels + 1,
@@ -726,7 +739,9 @@ impl PatchesDictionary {
             out.push(&mut s[..xsize]);
         }
         let num_ec = extra_channel_info.len();
-        assert!(num_ec + 1 == self.blendings_stride);
+        // Color-only rendering is also valid for dictionaries whose EC blend
+        // modes are all None and whose color blend does not read alpha.
+        assert!(num_ec + 1 <= self.blendings_stride);
 
         for pos_idx in patches_for_row_result.iter() {
             let pos = &self.positions[*pos_idx];

@@ -12,8 +12,74 @@ fn frame(width: usize, height: usize, layout: PixelLayout, pixels: PixelData) ->
         duration_ticks: 0,
         name: String::new(),
         index: 0,
+        header: header(width, height),
+        complete: true,
     }
 }
+
+fn header(width: usize, height: usize) -> rs_jxl::decode::JxlFrameHeader {
+    use rs_jxl::decode::{JxlBlendInfo, JxlBlendMode, JxlFrameHeader, JxlLayerInfo};
+    JxlFrameHeader {
+        name: String::new(),
+        duration: None,
+        size: (width, height),
+        duration_ticks: 0,
+        timecode: None,
+        is_last: true,
+        is_preview: false,
+        layer_info: JxlLayerInfo {
+            have_crop: false,
+            crop_origin: (0, 0),
+            size: (width, height),
+            blend_info: JxlBlendInfo {
+                mode: JxlBlendMode::Replace,
+                source: 0,
+                alpha_channel: 0,
+                clamp: false,
+            },
+            extra_channel_blend_info: Vec::new(),
+            save_as_reference: None,
+            save_before_color_transform: false,
+        },
+    }
+}
+
+fn fixture(frame: DecodedFrame) -> DecodedImage {
+    let source = rs_jxl::Image::new(1, 1, PixelLayout::Gray, PixelData::U8(vec![17])).unwrap();
+    let encoded = rs_jxl::encode(&source, &Default::default()).unwrap();
+    let mut image = decode::decode(&encoded, &DecodeOptions::default()).unwrap();
+    image.info.size = (frame.width, frame.height);
+    image.info.bit_depth = match &frame.pixels {
+        PixelData::F32(_) => JxlBitDepth::Float {
+            bits_per_sample: 32,
+            exponent_bits_per_sample: 8,
+        },
+        _ => JxlBitDepth::Int {
+            bits_per_sample: u32::from(frame.pixels.bits()),
+        },
+    };
+    image.frames = vec![frame];
+    image
+}
+
+fn extra(kind: ExtraChannel, bits: u32) -> rs_jxl::decode::JxlExtraChannel {
+    rs_jxl::decode::JxlExtraChannel {
+        ec_type: kind,
+        alpha_associated: false,
+        bit_depth: JxlBitDepth::Int {
+            bits_per_sample: bits,
+        },
+        dim_shift: 0,
+        name: String::new(),
+        spot_color: None,
+        cfa_channel: None,
+    }
+}
+
+#[path = "decode/control_tests.rs"]
+mod control_tests;
+#[path = "decode/writer_tests.rs"]
+mod writer_tests;
 
 #[test]
 fn png_8_and_16_bit_samples_roundtrip_through_png_reader() {
@@ -231,7 +297,7 @@ fn cli_and_writers_reject_incompatible_formats_without_sample_loss() {
     for extra in [
         vec!["--threads", "0"],
         vec!["--threads", "257"],
-        vec!["--bits", "12"],
+        vec!["--bits", "17"],
         vec!["--bits", "abc"],
         vec!["--frame", "-1"],
         vec!["--format", "invalid"],

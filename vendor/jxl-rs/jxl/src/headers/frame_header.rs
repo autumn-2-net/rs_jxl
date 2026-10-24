@@ -349,7 +349,7 @@ pub struct FrameHeader {
 
     #[default(false)]
     #[condition(frame_type != FrameType::LFFrame)]
-    have_crop: bool,
+    pub(crate) have_crop: bool,
 
     #[coder(u2S(Bits(8), Bits(11) + 256, Bits(14) + 2304, Bits(30) + 18688))]
     #[default(0)]
@@ -405,7 +405,7 @@ pub struct FrameHeader {
     #[default(0)]
     #[condition((frame_type == FrameType::RegularFrame ||
         frame_type == FrameType::SkipProgressive) && nonserialized.have_timecode)]
-    timecode: u32,
+    pub(crate) timecode: u32,
 
     #[default(frame_type == FrameType::RegularFrame)]
     #[condition(frame_type == FrameType::RegularFrame || frame_type == FrameType::SkipProgressive)]
@@ -693,24 +693,8 @@ impl FrameHeader {
             ));
         }
 
-        // `postprocess` shifts `ec_upsampling` by `dim_shift` after this runs, so compare
-        // against the effective upsampling the render pipeline will see. Otherwise a frame that
-        // declares matching upsampling passes here and still ends up with the extra channels
-        // upsampled before the patches stage and the color channels after it.
-        if self.has_patches()
-            && self.upsampling != 1
-            && let Some(ec_upsampling) = nonserialized
-                .extra_channel_info
-                .iter()
-                .zip(&self.ec_upsampling)
-                .map(|(info, ec_upsampling)| ec_upsampling << info.dim_shift())
-                .find(|&ec_upsampling| ec_upsampling != self.upsampling)
-        {
-            return Err(Error::PatchesUnsupportedMixedUpsampling(
-                self.upsampling,
-                ec_upsampling,
-            ));
-        }
+        // Mixed-resolution patch eligibility depends on whether the decoded
+        // dictionary reads/writes extra channels, checked before rendering.
 
         let num_extra_channels = nonserialized.extra_channel_info.len();
         let uses_alpha =
