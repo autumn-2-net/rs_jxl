@@ -45,7 +45,15 @@ pub(super) fn encode_prepared_shared_trial(
     bits: u8,
     budget: Option<&SectionBudget>,
 ) -> Result<TrialEncode<EncodedShared>> {
-    encode_prepared_shared_borrowed_trial(global.as_ref(), &groups, options, limit, patches, bits, budget)
+    encode_prepared_shared_borrowed_trial(
+        global.as_ref(),
+        &groups,
+        options,
+        limit,
+        patches,
+        bits,
+        budget,
+    )
 }
 
 pub(super) fn encode_prepared_shared_borrowed_trial(
@@ -62,8 +70,10 @@ pub(super) fn encode_prepared_shared_borrowed_trial(
     let budget = budget.filter(|_| !single);
     let mut prepared = Vec::with_capacity(groups.len() + 1);
     let empty = Prepared {
-        planes: Vec::new(), transforms: Vec::new(),
-        wp: weighted::Header::default(), stream_id: 0,
+        planes: Vec::new(),
+        transforms: Vec::new(),
+        wp: weighted::Header::default(),
+        stream_id: 0,
     };
     if !single {
         prepared.push(global.unwrap_or(&empty));
@@ -101,7 +111,10 @@ pub(super) fn encode_prepared_shared_borrowed_trial(
             )
         };
         let raw = if parallel_channels {
-            prepared.iter().map(|g| tokenize(g)).collect::<Result<Vec<_>>>()?
+            prepared
+                .iter()
+                .map(|g| tokenize(g))
+                .collect::<Result<Vec<_>>>()?
         } else {
             execution::try_map(&prepared, |_, g| tokenize(g))?
         };
@@ -135,7 +148,10 @@ pub(super) fn encode_prepared_shared_borrowed_trial(
             )
         };
         if parallel_channels {
-            prepared.iter().map(|g| encode(g)).collect::<Result<Vec<_>>>()?
+            prepared
+                .iter()
+                .map(|g| encode(g))
+                .collect::<Result<Vec<_>>>()?
         } else {
             execution::try_map(&prepared, |_, g| encode(g))?
         }

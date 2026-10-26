@@ -1088,7 +1088,8 @@ mod tests {
                 .unwrap();
             assert_eq!(serial.len(), 1);
             assert_eq!(serial[0].tasks, 0..4);
-            assert_eq!(serial[0].chunks, [0..4]);
+            assert_eq!(serial[0].chunks.len(), 1);
+            assert_eq!(serial[0].chunks[0], 0..4);
             assert_eq!(serial[0].estimated_bytes, 4.0 * large * bytes as f64);
             options.cache_hashes = false;
             let uncached = options

@@ -93,8 +93,10 @@ where
 fn parallel_finalists_are_opt_in_and_require_pilot_first() {
     assert!(!DriverOptions::default().scout_parallel_finalists);
     let image = image();
-    let mut options = DriverOptions::default();
-    options.scout_parallel_finalists = true;
+    let options = DriverOptions {
+        scout_parallel_finalists: true,
+        ..Default::default()
+    };
     let result = run_pixel_search::<_, _, ()>(
         &image,
         &CandidateParams::default().backend(9).unwrap(),

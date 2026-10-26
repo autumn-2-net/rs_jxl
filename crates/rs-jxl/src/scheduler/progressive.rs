@@ -800,54 +800,56 @@ pub(crate) fn try_encode(
             && contenders[index].candidate.params.predictor == Some(Predictor::Zero)
             && contenders[index].candidate.params.learning_fraction > 0.0;
         let can_refine = contenders[reference].completed_group_bytes.is_some();
-        while index != reference && !learned_witness {
-            let session = contenders[index].session.as_ref().unwrap();
-            if session.groups.completed_groups() == session.groups.group_count()
-                || search
-                    .best_before(10, false)
-                    .is_some_and(|b| session.groups.retained_bytes() >= b)
-            {
-                break;
+        if index != reference && !learned_witness {
+            loop {
+                let session = contenders[index].session.as_ref().unwrap();
+                if session.groups.completed_groups() == session.groups.group_count()
+                    || search
+                        .best_before(10, false)
+                        .is_some_and(|b| session.groups.retained_bytes() >= b)
+                {
+                    break;
+                }
+                let count = contenders[index].report.sampled_region_bytes.len();
+                let current = &regions[..count];
+                let scores = if can_refine {
+                    completed_scores(&contenders[reference], current, image)?
+                } else {
+                    contenders[reference].report.sampled_region_bytes.clone()
+                };
+                let margin = (options.discard_margin_basis_points
+                    / (count / sample_count).max(1) as u16)
+                    .max(25);
+                if dominated(
+                    &contenders[index].report.sampled_region_bytes,
+                    &scores,
+                    current,
+                    margin,
+                ) {
+                    contenders[index].report.state = CandidateState::Screened;
+                    contenders[index].session = None;
+                    break;
+                }
+                let end = (count + sample_count)
+                    .min(options.max_probe_regions)
+                    .min(regions.len());
+                if !can_refine
+                    || end <= count
+                    || contenders[index].report.estimated_bytes <= estimate(&scores, current)
+                {
+                    break;
+                }
+                sample(&mut contenders[index], &regions[count..end], image, &pool)?;
+                contenders[index].report.estimated_bytes = estimate(
+                    &contenders[index].report.sampled_region_bytes,
+                    &regions[..end],
+                );
+                peak = peak.max(retained(
+                    &contenders,
+                    search.best_before(10, false).unwrap_or(0),
+                    options,
+                )?);
             }
-            let count = contenders[index].report.sampled_region_bytes.len();
-            let current = &regions[..count];
-            let scores = if can_refine {
-                completed_scores(&contenders[reference], current, image)?
-            } else {
-                contenders[reference].report.sampled_region_bytes.clone()
-            };
-            let margin = (options.discard_margin_basis_points
-                / (count / sample_count).max(1) as u16)
-                .max(25);
-            if dominated(
-                &contenders[index].report.sampled_region_bytes,
-                &scores,
-                current,
-                margin,
-            ) {
-                contenders[index].report.state = CandidateState::Screened;
-                contenders[index].session = None;
-                break;
-            }
-            let end = (count + sample_count)
-                .min(options.max_probe_regions)
-                .min(regions.len());
-            if !can_refine
-                || end <= count
-                || contenders[index].report.estimated_bytes <= estimate(&scores, current)
-            {
-                break;
-            }
-            sample(&mut contenders[index], &regions[count..end], image, &pool)?;
-            contenders[index].report.estimated_bytes = estimate(
-                &contenders[index].report.sampled_region_bytes,
-                &regions[..end],
-            );
-            peak = peak.max(retained(
-                &contenders,
-                search.best_before(10, false).unwrap_or(0),
-                options,
-            )?);
         }
         if contenders[index].session.is_none() {
             continue;
@@ -1083,7 +1085,7 @@ mod tests {
         let mut regions = regions();
         regions[0].weight = 900.0;
         assert_eq!(estimate(&[100, 200, 300], &regions), 1400.0);
-        regions.push(regions[0].clone());
+        regions.push(regions[0]);
         assert_eq!(estimate(&[100, 200, 300, 100], &regions), 1400.0);
     }
 

@@ -81,69 +81,64 @@ fn initial_wave_stops_at_reject_then_reconsiders_it_after_palette_witness() {
     options.full_limits.max_full_encodes = 6;
     options.full_limits.max_full_pixels = 6 * (1 << 19);
     let mut waves = Vec::new();
-    let result =
-        run_pixel_search_with_batches(
-            &image,
-            &CandidateParams::default().backend(9).unwrap(),
-            &options,
-            |_, _, _| panic!("all selected candidates should use the supplied batch"),
-            |params, _| {
-                Ok(if params.predictor == Some(Predictor::Zero) {
-                    if params.learning_fraction == 0.0 {
-                        100
-                    } else {
-                        200
-                    }
+    let result = run_pixel_search_with_batches(
+        &image,
+        &CandidateParams::default().backend(9).unwrap(),
+        &options,
+        |_, _, _| panic!("all selected candidates should use the supplied batch"),
+        |params, _| {
+            Ok(if params.predictor == Some(Predictor::Zero) {
+                if params.learning_fraction == 0.0 {
+                    100
                 } else {
-                    201
-                })
-            },
-            BatchEncoders {
-                full: Some(Box::new(|_, tasks| {
-                    let initial = waves.is_empty();
-                    assert_eq!(tasks.len(), 2);
-                    assert!(tasks.iter().all(
+                    200
+                }
+            } else {
+                201
+            })
+        },
+        BatchEncoders {
+            full: Some(Box::new(|_, tasks| {
+                let initial = waves.is_empty();
+                assert_eq!(tasks.len(), 2);
+                assert!(tasks.iter().all(
                         |task| task.budget.beat_bytes == if initial { None } else { Some(98) }
                     ));
-                    if initial {
-                        assert!(
-                            tasks
-                                .iter()
-                                .all(|task| task.params.predictor == Some(Predictor::Zero))
-                        );
-                        assert_eq!(tasks[0].params.learning_fraction, 0.0);
-                        assert_eq!(tasks[1].params.learning_fraction, 0.01);
-                    }
-                    waves.push(
+                if initial {
+                    assert!(
                         tasks
                             .iter()
-                            .map(|task| family(task.params))
-                            .collect::<Vec<_>>(),
+                            .all(|task| task.params.predictor == Some(Predictor::Zero))
                     );
-                    Ok(tasks
+                    assert_eq!(tasks[0].params.learning_fraction, 0.0);
+                    assert_eq!(tasks[1].params.learning_fraction, 0.01);
+                }
+                waves.push(
+                    tasks
                         .iter()
-                        .map(|task| {
-                            complete(
-                                task.params,
-                                match task.params.predictor {
-                                    Some(Predictor::Zero)
-                                        if task.params.learning_fraction == 0.0 =>
-                                    {
-                                        99
-                                    }
-                                    Some(Predictor::Zero) => 98,
-                                    Some(Predictor::Variable) if task.params.rct == Some(6) => 80,
-                                    Some(Predictor::Variable) => 81,
-                                    _ => 100,
-                                },
-                            )
-                        })
-                        .collect())
-                })),
-                ..Default::default()
-            },
-        )
-        .unwrap();
+                        .map(|task| family(task.params))
+                        .collect::<Vec<_>>(),
+                );
+                Ok(tasks
+                    .iter()
+                    .map(|task| {
+                        complete(
+                            task.params,
+                            match task.params.predictor {
+                                Some(Predictor::Zero) if task.params.learning_fraction == 0.0 => 99,
+                                Some(Predictor::Zero) => 98,
+                                Some(Predictor::Variable) if task.params.rct == Some(6) => 80,
+                                Some(Predictor::Variable) => 81,
+                                _ => 100,
+                            },
+                        )
+                    })
+                    .collect())
+            })),
+            ..Default::default()
+        },
+    )
+    .unwrap();
     assert_eq!(waves, [vec![2, 2], vec![0, 1], vec![3, 4]]);
     assert_eq!(result.report.full_encodes, 6);
     assert_retained(&result, 4, 1, 80);

@@ -305,11 +305,9 @@ pub fn encode_sequential_block(
     }
     // Validate before any emission or predictor update, retaining nonzero
     // positions so entropy emission need not scan zero coefficients again.
-    let nonzero = sequential::nonzero_ac(coefficients).ok_or(
-        CoefficientWriteError::Invalid(
-            "AC coefficient exceeds supported precision",
-        ),
-    )?;
+    let nonzero = sequential::nonzero_ac(coefficients).ok_or(CoefficientWriteError::Invalid(
+        "AC coefficient exceeds supported precision",
+    ))?;
     if extra_zero_runs != 0 {
         let trailing = nonzero.leading_zeros().min(63) as usize;
         // Preserve the frozen reader's single final ZRL overshoot.
@@ -332,8 +330,14 @@ pub fn encode_sequential_block(
                     batch.write_symbol(ac, 0xf0)?;
                     zeros -= 16;
                 }
-                let (count, bits) = magnitude_bits(i32::from(coefficients[NATURAL_ORDER[k]])).ok()?;
-                batch.write_symbol_bits(ac, ((zeros as u8) << 4) | count, u32::from(bits), count)?;
+                let (count, bits) =
+                    magnitude_bits(i32::from(coefficients[NATURAL_ORDER[k]])).ok()?;
+                batch.write_symbol_bits(
+                    ac,
+                    ((zeros as u8) << 4) | count,
+                    u32::from(bits),
+                    count,
+                )?;
                 next = k + 1;
                 remaining &= remaining - 1;
             }

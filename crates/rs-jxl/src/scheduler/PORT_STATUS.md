@@ -17,6 +17,12 @@ LZ tool controls while replacing candidate and wire-format policy fields.
 See `docs/PARALLEL_EXECUTION.md` and `docs/SCHEDULER_PROBE_API.md` at repository
 root. Earlier implementation checkpoints below describe their historical state.
 
+Current resource policy supersedes the old 16384-leaf checkpoint below:
+`MAX_LEAVES` is the source-format bound (`MAX_TREE_NODES / 2`), further
+intersected with global/local decoder geometry limits. Caller ceilings remain
+explicit. See `docs/RESOURCE_LIMIT_AUDIT.md` and `docs/MA_TREE_BUDGET.md` for the
+removal of migration-era caps; do not restore an old numeric limit from this log.
+
 - `scan_lossless_input(&Image, ScanOptions) -> LosslessScan`: complete scalar
   coverage, bounded scratch, optional bounded RGB palette lower bound.
 - `scan_lossless_input_with_pool(&Image, ScanOptions, &rayon::ThreadPool)`:

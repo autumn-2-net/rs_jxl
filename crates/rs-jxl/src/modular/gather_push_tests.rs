@@ -253,11 +253,11 @@ fn static_bin_cache_keeps_wide_bins_and_exact_id_changes() {
         let properties = [value, value.wrapping_neg()];
         for _ in 0..2 {
             c.push(&properties, &[0], 1).unwrap();
-            for id in 0..2 {
+            for (id, &property) in properties.iter().enumerate() {
                 let p = 1 - id;
-                let bin = c.prepared.quantization.thresholds[p]
-                    .partition_point(|&t| properties[id] > t) as u32;
-                assert_eq!(c.static_bins[id], Some((properties[id], bin)));
+                let bin =
+                    c.prepared.quantization.thresholds[p].partition_point(|&t| property > t) as u32;
+                assert_eq!(c.static_bins[id], Some((property, bin)));
             }
         }
     }

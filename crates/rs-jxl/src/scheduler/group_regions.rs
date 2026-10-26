@@ -266,8 +266,8 @@ pub(super) fn groups_for_rect(
     let side = 128usize << shift;
     let (columns, _, _) = grid(width, height, side)?;
     let (right, bottom) = rect_end(rect, width, height)?;
-    if rect.x % side != 0
-        || rect.y % side != 0
+    if !rect.x.is_multiple_of(side)
+        || !rect.y.is_multiple_of(side)
         || (right != width && right % side != 0)
         || (bottom != height && bottom % side != 0)
     {

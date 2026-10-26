@@ -2,7 +2,6 @@
 //! No compressed results, learned trees or candidate-specific sample sets live here.
 #![forbid(unsafe_code)]
 
-use std::{marker::PhantomData, sync::{Arc, Mutex}};
 use super::{
     encode::{ModularOptions, Prepared},
     group::Transform,
@@ -12,6 +11,10 @@ use super::{
     predictor::Predictor,
 };
 use crate::{Image, Result};
+use std::{
+    marker::PhantomData,
+    sync::{Arc, Mutex},
+};
 
 const MAX_ENTRIES: usize = 16;
 
@@ -34,24 +37,44 @@ pub(super) struct PreparationKey {
 }
 
 impl PreparationKey {
-    pub(super) fn full(options: &ModularOptions, shift: u8, passes: &Passes, responsive: bool) -> Self {
+    pub(super) fn full(
+        options: &ModularOptions,
+        shift: u8,
+        passes: &Passes,
+        responsive: bool,
+    ) -> Self {
         Self {
-            area: None, group_size_shift: shift, passes: passes.clone(), responsive,
-            rct: options.rct, rct_candidates: options.rct_candidates,
-            weighted: options.predictor.has_weighted(), weighted_preset: options.weighted_preset,
-            weighted_candidates: options.weighted_candidates, parallel_weighted: options.parallel_weighted,
-            palette_colors: options.palette_colors, palette_predictor: options.palette_predictor,
-            palette_policy: options.palette_policy.clone(), squeeze: options.squeeze.clone(),
+            area: None,
+            group_size_shift: shift,
+            passes: passes.clone(),
+            responsive,
+            rct: options.rct,
+            rct_candidates: options.rct_candidates,
+            weighted: options.predictor.has_weighted(),
+            weighted_preset: options.weighted_preset,
+            weighted_candidates: options.weighted_candidates,
+            parallel_weighted: options.parallel_weighted,
+            palette_colors: options.palette_colors,
+            palette_predictor: options.palette_predictor,
+            palette_policy: options.palette_policy.clone(),
+            squeeze: options.squeeze.clone(),
         }
     }
 
     pub(super) fn area(options: &ModularOptions, shift: u8, area: Rect) -> Self {
-        Self { area: Some(area), ..Self::full(options, shift, &Passes::default(), false) }
+        Self {
+            area: Some(area),
+            ..Self::full(options, shift, &Passes::default(), false)
+        }
     }
 
     fn heap_bytes(&self) -> usize {
-        self.squeeze.capacity()
-            .saturating_add(self.passes.downsample.capacity().saturating_mul(size_of::<super::layout::Downsample>()))
+        self.squeeze.capacity().saturating_add(
+            self.passes
+                .downsample
+                .capacity()
+                .saturating_mul(size_of::<super::layout::Downsample>()),
+        )
     }
 }
 
@@ -88,7 +111,9 @@ pub struct CandidateCache {
 
 impl std::fmt::Debug for CandidateCache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CandidateCache").field("limit", &self.limit).finish_non_exhaustive()
+        f.debug_struct("CandidateCache")
+            .field("limit", &self.limit)
+            .finish_non_exhaustive()
     }
 }
 
@@ -111,9 +136,12 @@ impl CandidateCache {
     pub(crate) fn scope(image: &Image, limit: usize) -> CacheScope<'_> {
         CacheScope {
             cache: Arc::new(Self {
-                root: image as *const Image as usize, limit,
+                root: image as *const Image as usize,
+                limit,
                 state: Mutex::new(State {
-                    active: true, entries: std::array::from_fn(|_| None), stats: ReuseStats::default(),
+                    active: true,
+                    entries: std::array::from_fn(|_| None),
+                    stats: ReuseStats::default(),
                 }),
             }),
             _root: PhantomData,
@@ -127,7 +155,8 @@ impl CandidateCache {
     pub(super) fn matches(&self, image: &Image) -> bool {
         // Only identity is compared, never dereferenced. CacheScope's borrow
         // keeps this immutable Image alive; Drop disables retained handles.
-        self.root == image as *const Image as usize && self.limit != 0
+        self.root == image as *const Image as usize
+            && self.limit != 0
             && self.state.lock().unwrap_or_else(|e| e.into_inner()).active
     }
 
@@ -151,7 +180,9 @@ impl CandidateCache {
         // Never wait for a builder while occupying cooperative worker slots.
         // Simultaneous cold misses may compute twice, but never serialize Rayon.
         let prepared = Arc::new(build()?);
-        let bytes = size(&prepared).saturating_add(key.heap_bytes()).saturating_add(size_of::<Entry>());
+        let bytes = size(&prepared)
+            .saturating_add(key.heap_bytes())
+            .saturating_add(size_of::<Entry>());
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if !state.active {
             return Ok(prepared);
@@ -163,7 +194,10 @@ impl CandidateCache {
         if bytes <= self.limit.saturating_sub(state.stats.retained_bytes)
             && let Some(slot) = state.entries.iter_mut().find(|slot| slot.is_none())
         {
-            *slot = Some(Entry { key, prepared: Arc::clone(&prepared) });
+            *slot = Some(Entry {
+                key,
+                prepared: Arc::clone(&prepared),
+            });
             state.stats.entries += 1;
             state.stats.retained_bytes += bytes;
             state.stats.peak_bytes = state.stats.peak_bytes.max(state.stats.retained_bytes);
@@ -177,26 +211,57 @@ impl CandidateCache {
 pub(super) fn prepared_bytes(layout: &PreparedLayout) -> usize {
     fn payload(prepared: &Prepared) -> usize {
         let channels = prepared.planes.iter().fold(
-            prepared.planes.capacity().saturating_mul(size_of::<super::group::Channel>()),
-            |n, channel| n.saturating_add(channel.samples.capacity().saturating_mul(size_of::<i32>())),
+            prepared
+                .planes
+                .capacity()
+                .saturating_mul(size_of::<super::group::Channel>()),
+            |n, channel| {
+                n.saturating_add(channel.samples.capacity().saturating_mul(size_of::<i32>()))
+            },
         );
         prepared.transforms.iter().fold(
-            channels.saturating_add(prepared.transforms.capacity().saturating_mul(size_of::<Transform>())),
-            |n, transform| n.saturating_add(match transform {
-                Transform::SqueezeScript(parameters) => parameters.capacity().saturating_mul(size_of::<super::layout::SqueezeParams>()),
-                _ => 0,
-            }),
+            channels.saturating_add(
+                prepared
+                    .transforms
+                    .capacity()
+                    .saturating_mul(size_of::<Transform>()),
+            ),
+            |n, transform| {
+                n.saturating_add(match transform {
+                    Transform::SqueezeScript(parameters) => parameters
+                        .capacity()
+                        .saturating_mul(size_of::<super::layout::SqueezeParams>()),
+                    _ => 0,
+                })
+            },
         )
     }
-    let mut bytes = size_of::<PreparedLayout>().saturating_add(2 * size_of::<usize>())
+    let mut bytes = size_of::<PreparedLayout>()
+        .saturating_add(2 * size_of::<usize>())
         .saturating_add(payload(&layout.global))
-        .saturating_add(layout.streams.capacity().saturating_mul(size_of::<Prepared>()));
+        .saturating_add(
+            layout
+                .streams
+                .capacity()
+                .saturating_mul(size_of::<Prepared>()),
+        );
     for prepared in &layout.streams {
         bytes = bytes.saturating_add(payload(prepared));
     }
-    bytes = bytes.saturating_add(layout.partition.streams.capacity().saturating_mul(size_of::<super::layout::StreamPlan>()));
+    bytes = bytes.saturating_add(
+        layout
+            .partition
+            .streams
+            .capacity()
+            .saturating_mul(size_of::<super::layout::StreamPlan>()),
+    );
     for stream in &layout.partition.streams {
-        bytes = bytes.saturating_add(stream.channels.capacity().saturating_mul(size_of::<super::layout::ChannelTile>()));
+        bytes = bytes.saturating_add(
+            stream
+                .channels
+                .capacity()
+                .saturating_mul(size_of::<super::layout::ChannelTile>()),
+        );
     }
     bytes
 }

@@ -207,12 +207,11 @@ pub fn encode_with_options(
     let literal = super::scan::literal_evidence(image);
     let (driver, native) = policy(image, literal, base.threads, options);
     let base = execution_options(base, literal);
-    if let Some(group_options) = options.group_race {
-        if let Some(result) =
+    if let Some(group_options) = options.group_race
+        && let Some(result) =
             super::progressive::try_encode(image, params, &driver, &base, native, group_options)?
-        {
-            return Ok(result);
-        }
+    {
+        return Ok(result);
     }
     run_native_pixel_search(image, params, &driver, &base, native)
 }

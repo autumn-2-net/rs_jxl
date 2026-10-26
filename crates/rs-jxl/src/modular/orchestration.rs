@@ -20,6 +20,7 @@
 
 #![forbid(unsafe_code)]
 
+use super::candidate_cache::{PreparationKey, prepared_bytes};
 use super::cost::{self, ChannelView};
 use super::encode::receipt::RepresentationReceipt;
 use super::encode::{self, Group, ModularOptions, Prepared};
@@ -31,7 +32,6 @@ use crate::encode::budget::{self, SectionBudget, TrialEncode, complete_or_return
 use crate::execution;
 use crate::region_input::ImageDescriptor;
 use crate::{Error, Image, Result, tools::patches::PatchDictionary};
-use super::candidate_cache::{PreparationKey, prepared_bytes};
 use std::sync::Arc;
 
 pub(super) struct PreparedLayout {
@@ -770,10 +770,15 @@ fn encode_frame_areas(
             image,
             &local,
             || PreparationKey::area(&local, group_size_shift, area),
-            || prepare_frame_area_channels(
-                &descriptor, &local, group_size_shift, area,
-                read_image_area(image, &local, area)?,
-            ),
+            || {
+                prepare_frame_area_channels(
+                    &descriptor,
+                    &local,
+                    group_size_shift,
+                    area,
+                    read_image_area(image, &local, area)?,
+                )
+            },
         )?;
         let PreparedLayout {
             global,
@@ -797,7 +802,7 @@ fn encode_frame_areas(
             sections.resize_with(partition.num_dc_groups + partition.num_groups + 2, || None);
             script = Some(global.transforms.clone());
             let bytes = complete_or_return!(budget::section(budget, || {
-                frame::encode_prepared_independent(&global, &local, limit, true, None, image.bits())
+                frame::encode_prepared_independent(global, &local, limit, true, None, image.bits())
             }));
             insert_section(&mut sections, 0, bytes, &mut size, limit)?;
             insert_section(
@@ -814,7 +819,7 @@ fn encode_frame_areas(
         for (bytes, stream) in encoded.into_iter().zip(&partition.streams) {
             insert_section(
                 &mut sections,
-                section_index(stream.kind, &partition),
+                section_index(stream.kind, partition),
                 bytes,
                 &mut size,
                 limit,
@@ -951,7 +956,8 @@ pub(crate) fn encode_layout_trial(
     let prepared = {
         let _scope = crate::profile::scope("modular.prepare_layout");
         reuse_preparation(
-            image, options,
+            image,
+            options,
             || PreparationKey::full(options, group_size_shift, passes, responsive),
             || prepare_layout(image, options, group_size_shift, passes, responsive),
         )?
@@ -976,7 +982,7 @@ pub(crate) fn encode_layout_trial(
         ))
     } else {
         let global = complete_or_return!(budget::section(budget, || {
-            frame::encode_prepared_independent(&global, options, limit, true, patches, image.bits())
+            frame::encode_prepared_independent(global, options, limit, true, patches, image.bits())
         }));
         let encoded = complete_or_return!(budget::sections(budget, streams, |_, g| {
             frame::encode_prepared_independent(g, options, limit, false, None, image.bits())
@@ -984,7 +990,7 @@ pub(crate) fn encode_layout_trial(
         (global, encoded)
     };
     Ok(TrialEncode::Complete(toc_sections(
-        global, encoded, &partition, passes, limit,
+        global, encoded, partition, passes, limit,
     )?))
 }
 

@@ -88,6 +88,9 @@ fn reservation(
     }))
 }
 
+// Exactly two handoffs are retained; keep their artifacts inline without an
+// additional allocation on the encode/probe completion path.
+#[allow(clippy::large_enum_variant)]
 enum RootOutput {
     Full(Result<TrialOutput<NativeArtifact>>, Vec<NativeAdaptation>),
     Front(PilotFront, Vec<NativeAdaptation>),

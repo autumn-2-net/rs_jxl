@@ -19,9 +19,11 @@ fn encoding_defaults_have_no_extra_resource_ceiling() {
 
 #[test]
 fn modular_options_allow_larger_explicit_training_requests() {
-    let mut options = ModularOptions::default();
-    options.tree_samples = (1 << 20) + 1;
-    options.max_tree_leaves = 16_385;
+    let mut options = ModularOptions {
+        tree_samples: (1 << 20) + 1,
+        max_tree_leaves: 16_385,
+        ..Default::default()
+    };
     options.validate().unwrap();
     options.sample_limit = Some(1 << 20);
     options.validate().unwrap();
@@ -45,9 +47,11 @@ fn arbitrary_caps_are_not_replaced_by_other_hidden_caps() {
 fn palette_limits_follow_wire_fields_and_squeeze_counts_follow_actual_transforms() {
     use rs_jxl::modular::palette::PaletteOptions;
     for limit in [65_537, 70_001, 70_911] {
-        let mut options = ModularOptions::default();
-        options.palette_colors = Some(limit);
-        options.squeeze = vec![true; 64];
+        let options = ModularOptions {
+            palette_colors: Some(limit),
+            squeeze: vec![true; 64],
+            ..Default::default()
+        };
         options.validate().unwrap();
         PaletteOptions {
             palette_colors: limit as i32,
@@ -57,8 +61,10 @@ fn palette_limits_follow_wire_fields_and_squeeze_counts_follow_actual_transforms
         .validate()
         .unwrap();
     }
-    let mut options = ModularOptions::default();
-    options.palette_colors = Some(70_912);
+    let options = ModularOptions {
+        palette_colors: Some(70_912),
+        ..Default::default()
+    };
     assert!(options.validate().is_err());
     assert!(
         PaletteOptions {
@@ -77,10 +83,15 @@ fn palette_limits_follow_wire_fields_and_squeeze_counts_follow_actual_transforms
         rs_jxl::PixelData::U8((0..64).collect()),
     )
     .unwrap();
-    let mut options = EncodeOptions::default();
-    options.modular.palette_colors = Some(70_911);
-    // Most requests become no-ops once all channels are one sample wide.
-    options.modular.squeeze = vec![true; 64];
+    let options = EncodeOptions {
+        modular: ModularOptions {
+            palette_colors: Some(70_911),
+            // Most requests become no-ops once all channels are one sample wide.
+            squeeze: vec![true; 64],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
     let encoded = rs_jxl::encode(&image, &options).unwrap();
     let decoded = rs_jxl::decode::Decoder::new(Default::default())
         .unwrap()
