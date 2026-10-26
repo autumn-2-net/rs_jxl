@@ -3,7 +3,8 @@
 //! Experimental decision transcripts, ported from enc_final_plan.{h,cc} at
 //! b866b3defec13494bfbaf705db93581cda118e37. Not a codestream or encoded hash.
 //!
-//! I/O is explicit and bounded. No environment variables or paths are read.
+//! I/O and optional resource budgets are explicit. No environment variables
+//! or paths are read. Default budgets impose no transcript resource ceiling.
 //! Parent integration must install hooks in source call order and validate
 //! decisions against live codec state; parsing alone does not do that.
 //! This module does not activate codec capture/replay by itself.
@@ -18,13 +19,11 @@ pub mod schema;
 mod wire;
 
 pub const MAGIC: &str = "JXL_FINAL_PLAN_V1";
-pub const MAX_RECORDS: usize = 1_000_000;
-pub const MAX_VALUES: usize = 16_000_000;
-pub const MAX_NAME_BYTES: usize = 64;
+/// MA codec tree bound, independent of transcript record/value budgets.
 pub const MAX_TREE_NODES: usize = 1 << 22;
 
-/// Source record/value ceilings, plus an explicit serialized-byte budget.
-/// Callers may lower, but not raise, the source record/value ceilings.
+/// Caller-selected record/value/serialized-byte budgets, unlimited by default.
+/// Integer representability and fallible allocation checks always apply.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Limits {
     pub records: usize,
@@ -35,21 +34,16 @@ pub struct Limits {
 impl Default for Limits {
     fn default() -> Self {
         Self {
-            records: MAX_RECORDS,
-            values: MAX_VALUES,
-            bytes: 512 * 1024 * 1024,
+            records: usize::MAX,
+            values: usize::MAX,
+            bytes: u64::MAX,
         }
     }
 }
 
 impl Limits {
     fn validate(self) -> Result<Self> {
-        if self.records == 0
-            || self.records > MAX_RECORDS
-            || self.values > MAX_VALUES
-            || self.bytes == 0
-            || self.bytes == u64::MAX
-        {
+        if self.records == 0 || self.bytes == 0 {
             return Err(Error::Limit("invalid final-plan budgets"));
         }
         Ok(self)
@@ -68,9 +62,6 @@ impl Record {
     pub fn new(name: impl AsRef<[u8]>, values: Vec<i64>) -> Result<Self> {
         let name = name.as_ref();
         validate_name(name)?;
-        if values.len() > MAX_VALUES {
-            return Err(Error::Limit("final-plan record values"));
-        }
         Ok(Self {
             name: copy_slice(name)?,
             values,
@@ -133,7 +124,7 @@ impl FinalPlan {
     }
 
     /// Transactional constructor: a failed read cannot replace an active plan.
-    /// Reads at most limits.bytes + one EOF/over-budget probe byte.
+    /// Finite byte budgets read at most limits.bytes + one over-budget byte.
     pub fn read(reader: impl Read, limits: Limits) -> Result<Self> {
         wire::read(reader, limits.validate()?)
     }
@@ -409,7 +400,7 @@ fn whitespace(byte: u8) -> bool {
     matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c)
 }
 fn validate_name(name: &[u8]) -> Result<()> {
-    if name.is_empty() || name.len() > MAX_NAME_BYTES || name.iter().any(|&b| whitespace(b)) {
+    if name.is_empty() || name.iter().any(|&b| whitespace(b)) {
         return Err(invalid("invalid final-plan record name"));
     }
     Ok(())

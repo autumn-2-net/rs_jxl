@@ -626,7 +626,7 @@ mod tests {
             ..Default::default()
         };
         base.modular.max_tree_leaves = 1;
-        base.modular.sample_limit = 17;
+        base.modular.sample_limit = Some(17);
         let mut receipts = Vec::new();
         for literal in [false, true] {
             for leaves in [None, Some(7)] {
@@ -664,8 +664,8 @@ mod tests {
                             leaves.unwrap_or(crate::modular::ma_train::MAX_LEAVES);
                         assert_eq!(record.resources.max_tree_leaves, expected_leaves);
                         assert_eq!(artifact.options.modular.max_tree_leaves, expected_leaves);
-                        assert_eq!(record.resources.sample_limit, 17);
-                        assert_eq!(artifact.options.modular.sample_limit, 17);
+                        assert_eq!(record.resources.sample_limit, Some(17));
+                        assert_eq!(artifact.options.modular.sample_limit, Some(17));
                         assert_eq!(artifact.options.max_pixels, base.max_pixels);
                         assert_eq!(artifact.options.max_output_bytes, base.max_output_bytes);
                         assert_eq!(artifact.options.threads, base.threads);
@@ -692,7 +692,7 @@ mod tests {
             }
         }
         assert_eq!(base.modular.max_tree_leaves, 1);
-        assert_eq!(base.modular.sample_limit, 17);
+        assert_eq!(base.modular.sample_limit, Some(17));
         assert!(base.modular.source_lz77.is_none());
         assert!(base.modular.representation_receipt.is_none());
     }

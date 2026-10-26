@@ -343,19 +343,20 @@ fn linear_encoding(encoding: &JxlColorEncoding) -> Result<JxlColorEncoding> {
     Ok(result)
 }
 
+fn icc_parsing_options(limits: &DecodeLimits) -> ParsingOptions {
+    ParsingOptions {
+        // moxcms uses an exclusive profile-size bound; our budget is inclusive.
+        max_profile_size: limits.max_metadata_bytes.saturating_add(1),
+        max_allowed_clut_size: limits.max_metadata_bytes,
+        max_allowed_trc_size: limits.max_metadata_bytes / size_of::<u16>(),
+    }
+}
+
 fn parse_icc(bytes: &[u8], limits: &DecodeLimits) -> Result<CmsProfile> {
     if bytes.len() > limits.max_metadata_bytes {
         return Err(Error::Limit("color profile bytes"));
     }
-    CmsProfile::new_from_slice_with_options(
-        bytes,
-        ParsingOptions {
-            max_profile_size: limits.max_metadata_bytes,
-            max_allowed_clut_size: limits.max_metadata_bytes.min(10_000_000),
-            max_allowed_trc_size: (limits.max_metadata_bytes / 4).min(40_000),
-        },
-    )
-    .map_err(cms_error)
+    CmsProfile::new_from_slice_with_options(bytes, icc_parsing_options(limits)).map_err(cms_error)
 }
 
 impl Endpoint {

@@ -23,7 +23,6 @@ use rs_jxl::scheduler::{
 use rs_jxl::{EncodeOptions, encode};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
-const DEFAULT_SOURCE_SAMPLE_LIMIT: usize = 1_048_576;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -78,9 +77,9 @@ transform is performed; PNG tRNS is decoded pixel data.\n\
 Unsupported metadata such as EXIF/XMP/comments requires --strip-metadata. \
 Supported color metadata is retained even with --strip-metadata. Stripping \
 unsupported metadata can change displayed orientation without changing samples.\n\
-APNG, CMYK/YCCK JPEG and non-8-bit JPEG are unsupported. Limits: 512 MiB input, \
-16,384 pixels per dimension, 64,000,000 pixels and 512 MiB decoded samples. \
-The encoder applies its own resource limits as well.\n\
+APNG, CMYK/YCCK JPEG and non-8-bit JPEG are unsupported. No extra input-size \
+or pixel-count cap is imposed; format, allocation and overflow checks still apply. \
+Explicit encoder resource budgets are enforced as well.\n\
 Source mode is experimental and entirely Rust: --source-effort 1..11 encodes \
 one native candidate; --source-search additionally runs the existing native \
 pixel search driver (effort 11 uses its separate full-frame tournament). \
@@ -98,8 +97,9 @@ available, as do --ma-budget-mode strict|bounded, --ma-max-leaves N and \
 experimental --ma-prune (exact partition reuse and small-node dominance). \
 Omitting the MA budget mode keeps source strict and manual bounded. \
 Required MA partitions must fit even in bounded mode. \
---source-sample-limit bounds MA training samples independently of \
-the source sampling policy; exceeding it fails rather than reducing sampling.\n\
+Source sampling has no extra sample-count cap by default. An explicit \
+--source-sample-limit bounds training samples independently of the source \
+sampling policy; exceeding it fails rather than reducing sampling.\n\
 Use '-' for stdin/stdout. Diagnostics always go to stderr. \
 Existing output is not replaced unless --force is supplied."
 )]
@@ -125,9 +125,9 @@ struct EncodeArgs {
     /// Experimental original-group racing and continuation within source pilot
     #[arg(long, requires = "source_pilot")]
     source_progressive_groups: bool,
-    /// Hard MA training sample limit, not a source sampling target
-    #[arg(long, value_name = "N", default_value_t = DEFAULT_SOURCE_SAMPLE_LIMIT, requires = "source_effort", value_parser = parse_sample_limit)]
-    source_sample_limit: usize,
+    /// Optional hard MA training sample limit; omitted means no sample-count cap
+    #[arg(long, value_name = "N", requires = "source_effort", value_parser = parse_sample_limit)]
+    source_sample_limit: Option<usize>,
     /// PNG or JPEG input path, or '-' for stdin (detected by file signature)
     input: PathBuf,
     /// JXL output path, or '-' for binary stdout
@@ -187,7 +187,9 @@ fn encode_image(image: &rs_jxl::Image, args: &EncodeArgs) -> Result<Vec<u8>> {
     eprintln!(
         "note: experimental pure-Rust source mode: effort={effort} search={} \
          sample_limit={}; no byte-identity or performance-parity claim",
-        args.source_search, args.source_sample_limit,
+        args.source_search,
+        args.source_sample_limit
+            .map_or_else(|| "none".to_owned(), |limit| limit.to_string()),
     );
     if effort == 11 && !args.source_search {
         eprintln!(
@@ -315,7 +317,7 @@ mod tests {
         assert_eq!(args.source_effort, None);
         assert!(!args.source_search);
         assert!(!args.source_scout);
-        assert_eq!(args.source_sample_limit, DEFAULT_SOURCE_SAMPLE_LIMIT);
+        assert_eq!(args.source_sample_limit, None);
     }
 
     #[test]
@@ -333,6 +335,7 @@ mod tests {
             let args = expect_encode(cli.command);
             assert_eq!(args.source_effort, Some(effort));
             assert!(!args.source_search);
+            assert_eq!(args.source_sample_limit, None);
         }
         let cli = Cli::try_parse_from([
             "rs-jxl",
@@ -352,7 +355,7 @@ mod tests {
         .unwrap();
         let args = expect_encode(cli.command);
         assert!(args.source_search);
-        assert_eq!(args.source_sample_limit, DEFAULT_SOURCE_SAMPLE_LIMIT);
+        assert_eq!(args.source_sample_limit, Some(1_048_576));
         assert_eq!(args.threads, 2);
         for effort in ["0", "12", "-1", "abc", "256"] {
             assert!(

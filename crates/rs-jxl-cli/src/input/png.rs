@@ -10,7 +10,6 @@ use super::{checked_size, metadata, zeroed_bytes};
 use crate::Result;
 
 const SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
-const MAX_ICC_BYTES: usize = 16 * 1024 * 1024;
 const SRGB_CHROMATICITIES: [u32; 8] = [31270, 32900, 64000, 33000, 30000, 60000, 15000, 6000];
 
 #[derive(Debug, Default)]
@@ -40,20 +39,18 @@ impl PngColor {
     fn encoding(&self, bytes: &[u8], space: ColorSpace) -> Result<ColorEncoding> {
         self.validate()?;
         if self.icc {
-            // png's ICC inflater is bounded by Limits, but ignores malformed
-            // iCCP internally. Require an actual profile, never an sRGB fallback.
-            // A separate header-only reader isolates the profile allocation limit
-            // from the pixel decoder's row-buffer budget.
-            let reader = strict_decoder(bytes, MAX_ICC_BYTES, false).read_info()?;
+            // png ignores malformed iCCP internally. Require an actual profile,
+            // never an sRGB fallback. Decode it once, outside the pixel reader.
+            let reader = strict_decoder(bytes, false).read_info()?;
             let profile = reader
                 .info()
                 .icc_profile
                 .as_ref()
-                .ok_or("malformed or oversized PNG iCCP profile")?;
-            if profile.len() > MAX_ICC_BYTES {
-                return Err("PNG ICC exceeds 16 MiB".into());
-            }
-            return Ok(ColorEncoding::icc(space, profile.to_vec())?);
+                .ok_or("malformed PNG iCCP profile")?;
+            let mut copy = Vec::new();
+            copy.try_reserve_exact(profile.len())?;
+            copy.extend_from_slice(profile);
+            return Ok(ColorEncoding::icc(space, copy)?);
         }
         // Same unspecified-field defaults as libjxl extras/dec/apng.cc. Explicit
         // gAMA is a pure OETF power curve, NOT the piecewise sRGB transfer curve.
@@ -102,14 +99,16 @@ struct CheckedPng {
     color: PngColor,
 }
 
-fn strict_decoder(bytes: &[u8], limit: usize, ignore_icc: bool) -> png::Decoder<Cursor<&[u8]>> {
+fn strict_decoder(bytes: &[u8], ignore_icc: bool) -> png::Decoder<Cursor<&[u8]>> {
     let mut options = png::DecodeOptions::default();
     options.set_ignore_checksums(false);
     options.set_skip_ancillary_crc_failures(false);
     options.set_ignore_text_chunk(true);
     options.set_ignore_iccp_chunk(ignore_icc);
     let mut decoder = png::Decoder::new_with_options(Cursor::new(bytes), options);
-    decoder.set_limits(png::Limits { bytes: limit });
+    // This budget covers metadata and image buffers, not just ICC. It is a
+    // ceiling, not an allocation request; allocate pixels from checked geometry.
+    decoder.set_limits(png::Limits { bytes: usize::MAX });
     decoder
 }
 
@@ -129,6 +128,9 @@ fn preflight(bytes: &[u8], strip: bool) -> Result<CheckedPng> {
             .get(offset..offset + 8)
             .ok_or("truncated PNG chunk header")?;
         let length = u32::from_be_bytes(header[..4].try_into()?) as usize;
+        if length > i32::MAX as usize {
+            return Err("PNG chunk length exceeds the 31-bit format range".into());
+        }
         let kind: [u8; 4] = header[4..8].try_into()?;
         if !kind.iter().all(u8::is_ascii_alphabetic) || !kind[2].is_ascii_uppercase() {
             return Err("invalid PNG chunk name".into());
@@ -152,7 +154,10 @@ fn preflight(bytes: &[u8], strip: bool) -> Result<CheckedPng> {
                 }
                 let width = u32::from_be_bytes(data[..4].try_into()?);
                 let height = u32::from_be_bytes(data[4..8].try_into()?);
-                // Budget the largest possible expansion (palette/tRNS included).
+                if width > i32::MAX as u32 || height > i32::MAX as u32 {
+                    return Err("PNG dimensions exceed the 31-bit format range".into());
+                }
+                // Check the largest possible expansion (palette/tRNS included).
                 let sample_bytes = if data[8] == 16 { 2 } else { 1 };
                 checked_size(width, height, 4, sample_bytes)?;
                 dimensions = Some((width, height));
@@ -194,8 +199,8 @@ fn preflight(bytes: &[u8], strip: bool) -> Result<CheckedPng> {
                 color.chromaticities = Some(values);
             }
             b"iCCP" => {
-                if color.icc || data.len() > MAX_ICC_BYTES + 81 {
-                    return Err("duplicate or oversized PNG iCCP".into());
+                if color.icc {
+                    return Err("duplicate PNG iCCP".into());
                 }
                 let end = data
                     .iter()
@@ -246,9 +251,9 @@ fn preflight(bytes: &[u8], strip: bool) -> Result<CheckedPng> {
 pub(super) fn decode(bytes: &[u8], strip: bool) -> Result<Image> {
     let checked = preflight(bytes, strip)?;
     let dimensions = checked.dimensions;
-    let mut decoder = strict_decoder(bytes, 64 * 1024 * 1024, true);
+    let mut decoder = strict_decoder(bytes, true);
     // EXPAND handles packed gray, palettes and tRNS without STRIP_16 or
-    // premultiplication. ICC is inflated separately under its own smaller limit.
+    // premultiplication. ICC is inflated separately without an extra size cap.
     decoder.set_transformations(png::Transformations::EXPAND);
     decoder.set_ignore_text_chunk(true);
     decoder.set_ignore_iccp_chunk(true);
@@ -334,6 +339,44 @@ mod tests {
             writer.finish().unwrap();
         }
         bytes
+    }
+
+    #[test]
+    fn decodes_dimensions_above_the_former_cli_cap() {
+        let values = vec![71; 16_385];
+        let bytes = fixture(
+            ColorType::Grayscale,
+            BitDepth::Eight,
+            16_385,
+            &values,
+            None,
+            None,
+        );
+        let image = decode(&bytes, false).unwrap();
+        assert_eq!((image.width(), image.height()), (16_385, 1));
+        assert_eq!(image.pixels(), &PixelData::U8(values));
+    }
+
+    #[test]
+    fn large_png_headers_do_not_allocate_an_image_or_hit_a_metadata_budget() {
+        let mut bytes = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut bytes, 16_385, 16_385);
+            encoder.set_color(ColorType::Rgba);
+            encoder.set_depth(BitDepth::Eight);
+            let mut writer = encoder.write_header().unwrap();
+            // Header inspection does not need a complete pixel stream.
+            writer.write_chunk(png::chunk::IDAT, &[0x78, 0x01]).unwrap();
+            writer.finish().unwrap();
+        }
+        assert_eq!(
+            preflight(&bytes, false).unwrap().dimensions,
+            (16_385, 16_385)
+        );
+        for ignore_icc in [false, true] {
+            let reader = strict_decoder(&bytes, ignore_icc).read_info().unwrap();
+            assert_eq!(reader.output_buffer_size(), Some(16_385 * 16_385 * 4));
+        }
     }
 
     #[test]
@@ -714,13 +757,17 @@ mod tests {
     }
 
     #[test]
-    fn icc_inflation_has_a_separate_bounded_budget() {
+    fn icc_inflation_accepts_profiles_above_the_former_16_mib_cap() {
         let mut large = profile(b"RGB ");
-        large.resize(MAX_ICC_BYTES + 1, 0);
+        large.resize(16 * 1024 * 1024 + 4, 0);
         let size = large.len() as u32;
         large[..4].copy_from_slice(&size.to_be_bytes());
         let bytes = color_fixture(ColorType::Rgb, &[(*b"iCCP", icc_chunk(&large))]);
-        assert!(decode(&bytes, false).is_err());
+        let image = decode(&bytes, false).unwrap();
+        assert_eq!(
+            image.metadata().color_encoding.icc_profile(),
+            Some(large.as_slice())
+        );
     }
 
     #[test]

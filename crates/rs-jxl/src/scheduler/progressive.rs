@@ -48,6 +48,7 @@ pub struct GroupRaceOptions {
     pub discard_margin_basis_points: u16,
     /// Retained encoded payload/output bytes at checkpoints; not a process RSS
     /// ceiling (worker scratch and temporary framing copies are separate).
+    /// Exceeding this is an error, not a fallback; unlimited by default.
     pub max_retained_bytes: usize,
 }
 impl Default for GroupRaceOptions {
@@ -58,7 +59,7 @@ impl Default for GroupRaceOptions {
             probe_regions: 3,
             max_probe_regions: 9,
             discard_margin_basis_points: 100,
-            max_retained_bytes: 256 << 20,
+            max_retained_bytes: usize::MAX,
         }
     }
 }
@@ -900,6 +901,28 @@ pub(crate) fn try_encode(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retained_byte_defaults_are_unlimited_but_explicit_budgets_still_apply() {
+        let options = GroupRaceOptions::default();
+        options.validate().unwrap();
+        assert_eq!(options.max_retained_bytes, usize::MAX);
+        let beyond_old_cap = (256 << 20) + 1;
+        assert_eq!(
+            retained(&[], beyond_old_cap, options).unwrap(),
+            beyond_old_cap
+        );
+        assert_eq!(retained(&[], usize::MAX, options).unwrap(), usize::MAX);
+        let limited = GroupRaceOptions {
+            max_retained_bytes: 7,
+            ..options
+        };
+        assert_eq!(retained(&[], 7, limited).unwrap(), 7);
+        assert!(matches!(
+            retained(&[], 8, limited),
+            Err(Error::Limit("progressive retained bytes"))
+        ));
+    }
 
     #[test]
     fn cheap_admission_keeps_the_old_single_finalist_decision() {

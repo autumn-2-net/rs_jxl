@@ -54,17 +54,19 @@ Limits are local to the stated operation, not a process memory/time sandbox:
 | --- | --- |
 | `threads` | 1..256, default 1; validated before creating the owned pool |
 | Dimensions | Nonzero, <=2^30 per axis and <=2^40 pixels (Level 10); the lower explicit max_pixels resource limit still applies; construction separately checks the supplied buffer length |
-| `max_pixels` | Default 64,000,000 per canvas/frame image, including reference-only images; not a sum over frames or extra planes |
+| `max_pixels` | Default `u64::MAX` (no extra resource cap); explicit values apply per canvas/frame, including reference-only images, not summed over frames or extra planes |
 | Extra channels | Metadata construction <=4096; Level 10 encoding <=256 beyond the color channels, including interleaved alpha |
-| `max_output_bytes` | Default 512 MiB; inclusive total successful output including container, not peak scratch usage |
+| `max_output_bytes` | Default `usize::MAX` (no extra resource cap); explicit values bound total successful output including container, not peak scratch usage |
 | ICC | Encoding <=2^28 bytes; Level 5 additionally <=2^22; structural checks do not replace CMS validation |
-| `tree_samples` | 1..2^20 sampling target; `sample_limit` is a separate positive hard selected-sample ceiling, default 2^20 |
-| `max_tree_leaves` | 1..16384; shared learners share their sample allowance rather than multiplying it per worker |
+| `tree_samples` | Positive legacy sampling target, not a cap on source sampling; `sample_limit: Option<usize>` defaults to `None`. `Some(N)` requires positive N and is a hard selected-sample ceiling |
+| `max_tree_leaves` | 1..2097152 (decoder tree range); explicit shared sample allowance is not multiplied per worker. Source projection additionally applies the decoder's geometry-dependent tree bound |
 | Group shift / previous channels | 0..3 / <=60 |
-| Palette limit / explicit squeeze passes | 1..70000 / <=30 |
+| Palette limit / explicit squeeze requests | 1..70911 / no extra list-length cap; emitted transforms must fit the wire fields |
 
-Legacy sampling reserves the remaining selected-sample allowance before
-collection. Local groups need not share one image-wide sample allowance.
+If a sample ceiling is explicitly requested, legacy sampling reserves the
+remaining allowance before collection. Local groups need not share one
+image-wide sample allowance. Defaults no longer impose the former resource
+ceilings; see [the audit](RESOURCE_LIMIT_AUDIT.md).
 Caller-owned pixels, intermediate transforms, frame lists and output buffers
 can consume memory beyond these local ceilings. No recoverable-OOM, aggregate
 sequence budget or cancellation guarantee is provided.

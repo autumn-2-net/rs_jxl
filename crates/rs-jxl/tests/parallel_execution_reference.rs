@@ -121,7 +121,7 @@ fn ma_options(case: Case) -> EncodeOptions {
             rct: None,
             lz77: false,
             sampling: Some(sampling),
-            sample_limit: MA_WIDTH as usize * MA_HEIGHT as usize * 4,
+            sample_limit: Some(MA_WIDTH as usize * MA_HEIGHT as usize * 4),
             max_tree_leaves: MAX_LEAVES,
             source_channel_tree: ChannelTreeMode::ChannelsAndRowsTwice,
             source_ma_parallel: ParallelOptions {
@@ -1049,7 +1049,7 @@ fn fixtures_and_policies_reach_source_parallel_gates_with_bounded_inputs() {
         for property in 0..=3 {
             assert!(policy.properties.contains(&property));
         }
-        assert_eq!(options.modular.sample_limit, 196608);
+        assert_eq!(options.modular.sample_limit, Some(196608));
         assert!(!options.modular.source_ma_parallel.subtrees);
         let subtrees = subtree_options(case);
         subtrees.modular.validate().unwrap();

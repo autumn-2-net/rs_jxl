@@ -304,7 +304,7 @@ fn plan_exposes_absolute_topology_and_rejects_ineligible_options() {
             3 => options.source_patches = Some(Default::default()),
             4 => options.modular.squeeze.push(true),
             5 => options.max_pixels = 1,
-            6 => options.modular.sample_limit = 0,
+            6 => options.modular.sample_limit = Some(0),
             _ => unreachable!(),
         }
         assert!(FrameAreaPlan::new(descriptor(1025, 1), &options).is_err());

@@ -11,7 +11,7 @@ fn quarter_sampling_is_probe_only_reported_and_never_a_resource_relaxation() {
     )
     .unwrap();
     let mut base = EncodeOptions::default();
-    base.modular.sample_limit = 123;
+    base.modular.sample_limit = Some(123);
     let settings = NativeBackendOptions {
         acceptance: NativeAcceptance::AllowReportedGaps,
         probe_sampling_quarter: true,
@@ -47,7 +47,7 @@ fn quarter_sampling_is_probe_only_reported_and_never_a_resource_relaxation() {
                     .contains(&CapabilityGap::ReducedProbeTrainingSamples),
                 changed
             );
-            assert_eq!(artifact.options.modular.sample_limit, 123);
+            assert_eq!(artifact.options.modular.sample_limit, Some(123));
             assert_eq!(
                 artifact.options.modular.max_tree_leaves,
                 ordinary.options.modular.max_tree_leaves

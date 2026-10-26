@@ -313,7 +313,7 @@ pub(super) fn prepare(
             crate::profile::note(
                 "scheduler.native.sampling",
                 format_args!(
-                    "raw_fraction={} effective_fraction={} properties_count={} properties_first16={:?} previous_channels={} quantile_bins={} node_threshold={} tree_mode={:?} predictor_override={:?} max_channel_size={} sample_limit={} max_tree_leaves={}",
+                    "raw_fraction={} effective_fraction={} properties_count={} properties_first16={:?} previous_channels={} quantile_bins={} node_threshold={} tree_mode={:?} predictor_override={:?} max_channel_size={} sample_limit={:?} max_tree_leaves={}",
                     effective.learning_fraction,
                     sampling.nb_repeats,
                     sampling.properties.len(),

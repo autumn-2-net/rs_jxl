@@ -1099,10 +1099,12 @@ fn active_options(
         // default encoder leaf budget is a speed policy, not sufficient for
         // this deliberately adversarial full-word interoperability corpus.
         options.modular.max_tree_leaves = rs_jxl::modular::ma_train::MAX_LEAVES;
-        options.modular.sample_limit = (image.width() as usize)
-            .checked_mul(image.height() as usize)
-            .and_then(|n| n.checked_mul(image.channel_count()))
-            .expect("bounded active fixture population");
+        options.modular.sample_limit = Some(
+            (image.width() as usize)
+                .checked_mul(image.height() as usize)
+                .and_then(|n| n.checked_mul(image.channel_count()))
+                .expect("bounded active fixture population"),
+        );
         let group = 128usize << options.group_size_shift;
         let width = image.width() as usize;
         let height = image.height() as usize;
@@ -1739,7 +1741,7 @@ fn active_fixture_crosses_signed_word_boundaries_and_keeps_learning_enabled() {
             );
             assert_eq!(
                 options.modular.sample_limit,
-                image.width() as usize * image.height() as usize * image.channel_count()
+                Some(image.width() as usize * image.height() as usize * image.channel_count())
             );
         }
         options.modular.validate().unwrap();

@@ -1,6 +1,6 @@
 // Copyright (c) the JPEG XL Project Authors. All rights reserved.
 // BSD-3-Clause; retained notice in docs/PORTING_KERNELS.md.
-//! Bounded stream translation of enc_final_plan.cc Read/Write.
+//! Stream translation of enc_final_plan.cc Read/Write with opt-in budgets.
 
 use std::io::{BufRead, BufReader, Read, Take, Write};
 
@@ -45,13 +45,10 @@ impl<R: Read> Reader<R> {
 
     fn name(&mut self) -> Result<Vec<u8>> {
         let mut bytes = Vec::new();
-        bytes
-            .try_reserve_exact(MAX_NAME_BYTES)
-            .map_err(|_| Error::Limit("final-plan allocation"))?;
         self.token(|byte| {
-            if bytes.len() == MAX_NAME_BYTES {
-                return Err(Error::Limit("final-plan name bytes"));
-            }
+            bytes
+                .try_reserve(1)
+                .map_err(|_| Error::Limit("final-plan allocation"))?;
             bytes.push(byte);
             Ok(())
         })?;
@@ -60,7 +57,7 @@ impl<R: Read> Reader<R> {
 
     // No numeric-token allocation: signed decimal, optional plus/minus and
     // leading zeros, with checked magnitude even for INT64_MIN.
-    fn integer(&mut self, unsigned: bool) -> Result<i64> {
+    fn decimal(&mut self, unsigned: bool) -> Result<(bool, u64)> {
         let mut first = true;
         let mut negative = false;
         let mut digits = false;
@@ -83,7 +80,7 @@ impl<R: Read> Reader<R> {
                 .checked_mul(10)
                 .and_then(|v| v.checked_add(u64::from(byte - b'0')))
                 .ok_or_else(|| invalid("final-plan integer overflow"))?;
-            if magnitude > (i64::MAX as u64) + u64::from(negative) {
+            if !unsigned && magnitude > (i64::MAX as u64) + u64::from(negative) {
                 return Err(invalid("final-plan integer overflow"));
             }
             Ok(())
@@ -91,6 +88,11 @@ impl<R: Read> Reader<R> {
         if !digits {
             return Err(invalid("missing final-plan integer digits"));
         }
+        Ok((negative, magnitude))
+    }
+
+    fn integer(&mut self) -> Result<i64> {
+        let (negative, magnitude) = self.decimal(false)?;
         Ok(if negative {
             (magnitude as i64).wrapping_neg()
         } else {
@@ -99,7 +101,7 @@ impl<R: Read> Reader<R> {
     }
 
     fn size(&mut self) -> Result<usize> {
-        usize::try_from(self.integer(true)?).map_err(|_| Error::Limit("final-plan size"))
+        usize::try_from(self.decimal(true)?.1).map_err(|_| Error::Limit("final-plan size"))
     }
 
     fn end(&mut self) -> Result<()> {
@@ -114,11 +116,19 @@ impl<R: Read> Reader<R> {
 
 pub(super) fn read(input: impl Read, limits: Limits) -> Result<FinalPlan> {
     let mut reader = Reader {
-        input: BufReader::new(input.take(limits.bytes + 1)),
+        input: BufReader::new(input.take(limits.bytes.saturating_add(1))),
         consumed: 0,
         limit: limits.bytes,
     };
-    if reader.name()? != MAGIC.as_bytes() {
+    let mut magic_bytes = 0;
+    reader.token(|byte| {
+        if MAGIC.as_bytes().get(magic_bytes) != Some(&byte) {
+            return Err(invalid("invalid final-plan V1 magic"));
+        }
+        magic_bytes += 1;
+        Ok(())
+    })?;
+    if magic_bytes != MAGIC.len() {
         return Err(invalid("invalid final-plan V1 magic"));
     }
     let count = reader.size()?;
@@ -132,17 +142,21 @@ pub(super) fn read(input: impl Read, limits: Limits) -> Result<FinalPlan> {
         if n > limits.values - plan.total_values {
             return Err(Error::Limit("final-plan values"));
         }
-        // At least one digit per value plus separators must fit before reserve.
-        let minimum = (n as u64).saturating_mul(2).saturating_sub(1);
-        if minimum > limits.bytes - reader.consumed {
+        // At least one digit per value plus separators must fit. Compute in
+        // wider arithmetic so unlimited byte budgets cannot hide overflow.
+        let minimum = (n as u128 * 2).saturating_sub(1);
+        if minimum > u128::from(limits.bytes - reader.consumed) {
             return Err(Error::Limit("final-plan input bytes"));
         }
         let mut values = Vec::new();
-        values
-            .try_reserve_exact(n)
-            .map_err(|_| Error::Limit("final-plan allocation"))?;
+        // A declared count is not evidence that any values exist. Grow only
+        // after parsing each value, including with unlimited default budgets.
         for _ in 0..n {
-            values.push(reader.integer(false)?);
+            let value = reader.integer()?;
+            values
+                .try_reserve(1)
+                .map_err(|_| Error::Limit("final-plan allocation"))?;
+            values.push(value);
         }
         plan.append(Record { name, values })?;
     }

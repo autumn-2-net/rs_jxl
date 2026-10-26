@@ -191,3 +191,23 @@ minimal `util::box_array` and `api::DitherMode` adapters. `decode_dither` exerci
 the production decoder's per-instance state, output orientations, extra planes,
 native/float output and JPEG reconstruction. These changes require central
 build/test validation; no local verification result is implied by this ledger.
+
+## Decoder Resource Policy
+
+The parent decoder now defaults its caller budgets to `usize::MAX`. Two local
+backend corrections support that policy without changing format constraints:
+
+- `api/codestream_parser/mod.rs`: sample-budget comparisons are inclusive.
+  Checked channel/sample arithmetic rejects overflow even with an unlimited or
+  absent caller budget; overflow is not silently saturated to `usize::MAX`.
+  The existing minimum row width and extra-channel accounting are unchanged.
+- `icc/mod.rs`: remove the independent 16 MiB encoded-ICC stream cap. Its bound
+  is now derived from the retained 2^28 decoded ICC size limit plus the existing
+  65536-byte preamble allowance. Encoded bytes are still accumulated gradually
+  with fallible reservation; the initial buffer remains at most 64 KiB.
+
+The decoded ICC/geometry/profile limits and malformed-stream rules remain.
+Parent decoder unit tests cover large headers and declared ICC stream lengths
+without large allocations, exact small sample caps, and the wrapper's metadata,
+streaming and reconstruction budget plumbing. Central build/test validation is
+required; this change was not locally tested with Cargo.

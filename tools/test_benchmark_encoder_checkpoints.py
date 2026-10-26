@@ -19,6 +19,11 @@ from test_compare_cpp_port import fixture, make_png
 
 
 class CommandTests(unittest.TestCase):
+    def test_default_commands_leave_sample_budget_to_the_cli(self):
+        for kind in ("png", "jpeg"):
+            command = bench.encoder_command("rust", "in", "out", kind)
+            self.assertNotIn("--source-sample-limit", command)
+
     def test_explicit_threads_apply_to_both_pixel_and_jpeg_commands(self):
         for threads in (1, 16, 256):
             for kind in ("png", "jpeg"):
@@ -98,6 +103,20 @@ class HarnessTests(unittest.TestCase):
         args = bench.parser().parse_args(self.arguments("--threads", "16"))
         bench.validate_args(args)
 
+    def test_sample_budget_default_and_explicit_validation(self):
+        args = bench.parser().parse_args(self.arguments())
+        self.assertIsNone(args.source_sample_limit)
+        bench.validate_args(args)
+        for limit in (1, 12345):
+            args = bench.parser().parse_args(self.arguments("--source-sample-limit", str(limit)))
+            bench.validate_args(args)
+            command = bench.encoder_command("rust", "in", "out", "png", args.source_sample_limit)
+            self.assertEqual(command[command.index("--source-sample-limit") + 1], str(limit))
+        for limit in (0, -1):
+            args = bench.parser().parse_args(self.arguments("--source-sample-limit", str(limit)))
+            with self.assertRaises(ValueError):
+                bench.validate_args(args)
+
     def test_explicit_encoder_environment_is_applied_and_decoder_is_clean(self):
         with patch.dict(os.environ, {"RS_JXL_MA_AVX512": "1", "RS_JXL_PROFILE": "trace"}):
             report = self.run_benchmark("--after-env", "RS_JXL_MA_RCP=1")
@@ -141,7 +160,8 @@ class HarnessTests(unittest.TestCase):
             self.counts[name] += 1
             Path(command[3]).write_bytes(b"JXL" + Path(command[2]).read_bytes())
             if command[1] == "encode" and not self.no_search_evidence:
-                record["stderr"] = ("source mode: effort=9 search=true sample_limit=33554432\n"
+                limit = command[command.index("--source-sample-limit") + 1] if "--source-sample-limit" in command else "none"
+                record["stderr"] = (f"source mode: effort=9 search=true sample_limit={limit}\n"
                                     "source search: full_encodes=3 probe_encodes=4 winner=1\n"
                                     "scout: candidates=2\n")
         return record

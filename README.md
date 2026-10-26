@@ -151,8 +151,12 @@ candidate; adding `--source-search` runs the migrated scheduler and retains its
 winning output. These modes do not claim complete source/performance parity.
 Do not combine them with manual tool flags. `--source-sample-limit N` controls
 the hard MA sample resource ceiling, not the source sampling fraction; exceeding
-it produces an error rather than silently weakening training. The default is
-1,048,576 samples. Effort 11 alone selects the explicit signed-tier backend;
+it produces an error rather than silently weakening training. Omission imposes
+no extra sample-count ceiling and does not change the sampling fraction.
+The library uses `ModularOptions::sample_limit: Option<usize>` (`None` by default).
+See the [resource-limit audit](docs/RESOURCE_LIMIT_AUDIT.md) for removed default
+caps, retained format checks and opt-in limits for untrusted inputs.
+Effort 11 alone selects the explicit signed-tier backend;
 with `--source-search` it executes the separate source frame tournament (23 or
 27 complete encodes including its final encode). It can be substantially more
 expensive than lower efforts. Optional preflight/frontier/worker policies are
@@ -177,7 +181,7 @@ thread/pixel/output/sample limits remain explicit; the source MA leaf limit is
 not the direct encoder's `base.modular.max_tree_leaves`. For example:
 
 ```powershell
-.\target\release\rs-jxl.exe encode input.png output.jxl --source-effort 9 --source-search --source-pilot --threads 16 --source-sample-limit 33554432
+.\target\release\rs-jxl.exe encode input.png output.jxl --source-effort 9 --source-search --source-pilot --threads 16
 ```
 
 `--source-progressive-groups` optionally replaces eligible effort-9 pilot

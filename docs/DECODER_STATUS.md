@@ -205,11 +205,12 @@ transfer. JPEG reconstruction always requests all coefficient passes.
 
 ## Resource Scope
 
-Defaults: 512 MiB input, 512 MiB retained output samples, 64 MiB expanded
-metadata, 64 million pixels, 256 million backend samples and 10,000 visible
-frames. Thread count is 1..256 with an owned pool; one thread runs inline.
-Arithmetic and allocations are checked. Compressed auxiliary boxes are
-expanded with an explicit byte ceiling.
+`DecodeLimits` defaults to `usize::MAX` for input bytes, retained output,
+expanded metadata, pixels, backend samples and visible frames: no extra
+resource-policy ceiling. Thread count is 1..256 with an owned pool; one thread
+runs inline. Arithmetic, allocations and format checks remain. Explicit
+caller limits also apply to incremental input and auxiliary-box expansion.
+See the [resource-limit audit](RESOURCE_LIMIT_AUDIT.md).
 
 These are not a total process-memory or time sandbox. The backend also retains
 reference frames, entropy buffers, ICC data and parser state. Aligned working

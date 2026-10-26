@@ -102,21 +102,22 @@ JXL_FINAL_PLAN_V1 <record_count>
 The writer uses single ASCII spaces and LF after each line, with no extra
 fields, JSON, hashes, comments or dependencies. C++ text-mode CRLF is accepted
 on read. Classic-locale ASCII whitespace includes space, tab, LF, CR, VT, FF.
-Names preserve arbitrary non-whitespace bytes (including non-UTF-8), are
-nonempty and at most 64 bytes. Unknown names are preserved, not silently
+Names preserve arbitrary non-whitespace bytes (including non-UTF-8) and are
+nonempty, without a private 64-byte ceiling. Unknown names are preserved, not silently
 skipped; a consuming hook will reject an unexpected tag. Values accept signed
 decimal, optional plus/minus, leading zeros and the full i64 range.
 
-Source ceilings: 1..1,000,000 records, and at most 16,000,000 values summed
-across records. `Limits` can lower these but cannot raise them. The default
-serialized-byte budget is 512 MiB, sufficient for the maximal canonical V1
-representation under those ceilings; callers can choose their explicit byte
-budget. It bounds both actual input bytes (including whitespace/leading zeros)
+The source experiment's one-million-record, sixteen-million-value and 512 MiB
+ceilings are no longer imposed by default. `Limits` defaults to the corresponding
+integer maxima; callers can supply explicit record/value/byte budgets.
+The byte budget bounds actual input bytes (including whitespace/leading zeros)
 and canonical output bytes. Reading consumes at most one additional probe byte
 to distinguish exact-limit EOF from over-budget/trailing data. Numeric tokens
 are accumulated incrementally without unbounded string allocation; record
-names stop at 64 bytes. Declared counts and minimum possible input size are
-checked before value allocation; allocation errors are returned.
+names grow fallibly within the input byte budget. Declared counts and minimum
+possible input size are checked, but declared values are not preallocated:
+storage grows only after parsing actual values. Allocation errors are returned.
+See [the resource-limit audit](RESOURCE_LIMIT_AUDIT.md).
 
 Deliberate boundary hardening relative to C++ stream extraction: negative
 sizes (including `-0`), numeric suffixes/concatenated fields and overflow are
@@ -142,7 +143,7 @@ are retained without translating effort levels or inventing policy defaults.
 | 2 | colorspace | -1..41 |
 | 3 | responsive | -1..1 |
 | 4 | patches override | -1..1 |
-| 5 | palette_colors | -65536..70000 |
+| 5 | palette_colors | -70911..70911 |
 | 6 | options.predictor | -1..15 |
 | 7 | options.max_properties | -1..7 |
 | 8 | force_cfl_jpeg_recompression | 0/1 |
@@ -265,7 +266,7 @@ the final column remains a parent codec obligation, not a claimed hook port.
 | Tag | Implemented layout/checks | Remaining live-state work |
 | --- | --- | --- |
 | input | Four values exactly equal expected kind/width/height/channels; derived tree cap | Input eligibility above |
-| transforms | 0..512 rows of seven: id 0/1, nonnegative begin, RCT 0..41, nonnegative num_c, colors 0..65536, predictor 0..13, ordered 0/1 | Validate each row against evolving channel count; begin < channels, num_c <= channels, begin + (RCT ? 3 : num_c) <= channels, palette num_c > 0; require actual do_transform success, lossy_palette=false |
+| transforms | 0..273 rows of seven (group-header wire bound): id 0/1, nonnegative begin, RCT 0..41, nonnegative num_c, colors 0..65536, predictor 0..13, ordered 0/1 | Validate each row against evolving channel count; begin < channels, num_c <= channels, begin + (RCT ? 3 : num_c) <= channels, palette num_c > 0; require actual do_transform success, lossy_palette=false |
 | global_state | Three values: max_bitdepth 0..32, maxval i32, colorspace -1..41 | Restore those exact values |
 | wp | Two values: exact stream ID, mode 0..4 | Apply mode to that stream |
 | tree | Four-value BFS rows, nonempty odd node count <= input tree limit; property -1..255; offset/split i32; leaves predictor 0..13 and multiplier 1..2^31-1; splits require placeholders 0,1; connected queue topology | Translate validated nodes to existing MA type; capture must traverse source tree BFS, not dump storage order |

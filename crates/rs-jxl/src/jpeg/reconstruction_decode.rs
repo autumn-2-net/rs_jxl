@@ -21,6 +21,7 @@ use super::scan_writer::{ReconstructionError, WriteLimits, reconstruct_from_coef
 /// Independent limits for compressed input, expanded metadata and DCT storage.
 /// Brotli uses a standard window (at most 24 bits); its utility-crate workspace
 /// is additional to these limits. Writer/structural limits apply independently.
+/// Defaults impose no extra resource ceiling; field widths and overflow still apply.
 #[derive(Clone, Debug)]
 pub struct ReconstructionDecodeLimits {
     pub max_jbrd_bytes: usize,
@@ -34,9 +35,9 @@ pub struct ReconstructionDecodeLimits {
 impl Default for ReconstructionDecodeLimits {
     fn default() -> Self {
         Self {
-            max_jbrd_bytes: 64 * 1024 * 1024,
-            max_metadata_bytes: 64 * 1024 * 1024,
-            max_coefficient_values: 128 * 1024 * 1024,
+            max_jbrd_bytes: usize::MAX,
+            max_metadata_bytes: usize::MAX,
+            max_coefficient_values: usize::MAX,
             write: WriteLimits::default(),
         }
     }
@@ -323,9 +324,6 @@ pub fn decode_reconstruction_metadata(
         if !matches!(marker, 0xc0..=0xc2 | 0xc4 | 0xd9 | 0xda | 0xdb | 0xdd | 0xe0..=0xef | 0xfe | 0xff)
         {
             return Err(Error::Unsupported("JPEG marker"));
-        }
-        if m.markers.len() == 16_384 {
-            return Err(Error::Limit("marker count"));
         }
         add(
             &mut record_count,

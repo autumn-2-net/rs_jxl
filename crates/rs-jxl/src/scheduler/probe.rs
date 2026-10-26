@@ -16,7 +16,8 @@ use crate::{Error, Image, Result, modular::predictor::Predictor};
 
 #[derive(Clone, Copy, Debug)]
 pub struct ProbeLimits {
-    /// Rust resource ceilings, not C++ search-policy constants.
+    /// Opt-in resource ceilings, not C++ search-policy constants.
+    /// Defaults are unlimited apart from checked integer/allocation bounds.
     pub max_encodes: usize,
     pub max_encoded_pixels: u64,
     pub max_resident_sample_pixels: usize,
@@ -25,10 +26,10 @@ pub struct ProbeLimits {
 impl Default for ProbeLimits {
     fn default() -> Self {
         Self {
-            max_encodes: 512,
-            max_encoded_pixels: 128 << 20,
-            max_resident_sample_pixels: 8 << 20,
-            max_candidates: 128,
+            max_encodes: usize::MAX,
+            max_encoded_pixels: u64::MAX,
+            max_resident_sample_pixels: usize::MAX,
+            max_candidates: usize::MAX,
         }
     }
 }
@@ -553,3 +554,102 @@ pub fn promising(candidate: &[usize], incumbent: &[usize]) -> bool {
 #[cfg(test)]
 #[path = "probe_release_tests.rs"]
 mod release_tests;
+
+#[cfg(test)]
+mod limit_tests {
+    use super::*;
+    use crate::{PixelData, PixelLayout};
+
+    fn image() -> Image {
+        Image::new(
+            1024,
+            512,
+            PixelLayout::Gray,
+            PixelData::U8(vec![0; 1024 * 512]),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn defaults_allow_work_and_candidates_past_the_former_caps() {
+        let limits = ProbeLimits::default();
+        assert_eq!(limits.max_encodes, usize::MAX);
+        assert_eq!(limits.max_encoded_pixels, u64::MAX);
+        assert_eq!(limits.max_resident_sample_pixels, usize::MAX);
+        assert_eq!(limits.max_candidates, usize::MAX);
+        let image = image();
+        let mut screen =
+            CandidateScreen::new(&image, None, ScreenOptions::default(), |_, _| Ok(1)).unwrap();
+        // Seed cumulative work instead of performing hundreds of large probes.
+        screen.encodes = 512;
+        screen.sample_pixels = 128 << 20;
+        for index in 0..129 {
+            let params = CandidateParams {
+                palette_colors: 2000 + index,
+                ..Default::default()
+            };
+            assert!(!screen.score(&params).unwrap().is_empty());
+        }
+        assert_eq!(screen.cache.len(), 129);
+        assert!(screen.encodes() > 512);
+        assert!(screen.sample_pixels() > 128 << 20);
+    }
+
+    #[test]
+    fn explicit_probe_budgets_still_reject_before_encoding() {
+        let image = image();
+        for limits in [
+            ProbeLimits {
+                max_encodes: 0,
+                ..Default::default()
+            },
+            ProbeLimits {
+                max_encoded_pixels: 0,
+                ..Default::default()
+            },
+            ProbeLimits {
+                max_resident_sample_pixels: 0,
+                ..Default::default()
+            },
+            ProbeLimits {
+                max_candidates: 0,
+                ..Default::default()
+            },
+        ] {
+            let mut screen = CandidateScreen::new(
+                &image,
+                None,
+                ScreenOptions {
+                    limits,
+                    ..Default::default()
+                },
+                |_, _| panic!("over-budget probe was invoked"),
+            )
+            .unwrap();
+            assert!(matches!(
+                screen.score(&CandidateParams::default()),
+                Err(Error::Limit(_))
+            ));
+            assert_eq!(screen.encodes(), 0);
+            assert_eq!(screen.sample_pixels(), 0);
+        }
+    }
+
+    #[test]
+    fn unlimited_defaults_still_reject_unrepresentable_probe_work() {
+        let image = image();
+        for (encodes, pixels) in [(usize::MAX, 0), (0, u64::MAX)] {
+            let mut screen =
+                CandidateScreen::new(&image, None, ScreenOptions::default(), |_, _| {
+                    panic!("overflowing probe was invoked")
+                })
+                .unwrap();
+            screen.encodes = encodes;
+            screen.sample_pixels = pixels;
+            assert!(matches!(
+                screen.score(&CandidateParams::default()),
+                Err(Error::Limit("probe work budget"))
+            ));
+        }
+    }
+}

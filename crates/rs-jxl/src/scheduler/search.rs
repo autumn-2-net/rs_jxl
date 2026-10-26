@@ -47,18 +47,21 @@ impl TrialRecord {
     }
 }
 
+/// Caller-selected resource ceilings. Defaults impose no policy cap;
+/// checked accounting and addressable output sizes still apply.
 #[derive(Clone, Copy, Debug)]
 pub struct SearchLimits {
     pub max_full_encodes: usize,
     pub max_full_pixels: u64,
     pub max_output_bytes: usize,
 }
+
 impl Default for SearchLimits {
     fn default() -> Self {
         Self {
-            max_full_encodes: 128,
-            max_full_pixels: 8_192_000_000,
-            max_output_bytes: 512 << 20,
+            max_full_encodes: usize::MAX,
+            max_full_pixels: u64::MAX,
+            max_output_bytes: usize::MAX,
         }
     }
 }
@@ -321,5 +324,119 @@ impl<A> Search<A> {
             full_encodes: self.full_encodes,
             full_pixels: self.full_pixels,
         })
+    }
+}
+
+#[cfg(test)]
+mod limit_tests {
+    use super::*;
+
+    #[test]
+    fn defaults_allow_work_past_the_former_encode_and_pixel_caps() {
+        let limits = SearchLimits::default();
+        assert_eq!(limits.max_full_encodes, usize::MAX);
+        assert_eq!(limits.max_full_pixels, u64::MAX);
+        assert_eq!(limits.max_output_bytes, usize::MAX);
+        let mut search = Search::new(limits);
+        for _ in 0..129 {
+            search
+                .refine_pixels(
+                    8_192_000_001,
+                    1,
+                    CandidateParams::default(),
+                    true,
+                    false,
+                    &mut |_, budget| {
+                        assert_eq!(budget.max_output_bytes, usize::MAX);
+                        Ok(TrialOutput::Complete(EncodedOutput {
+                            bytes: vec![1],
+                            artifact: (),
+                        }))
+                    },
+                )
+                .unwrap();
+        }
+        let output = search.finish().unwrap();
+        assert_eq!(output.full_encodes, 129);
+        assert_eq!(output.full_pixels, 129 * 8_192_000_001);
+    }
+
+    #[test]
+    fn explicit_limits_reject_work_before_the_callback() {
+        for limits in [
+            SearchLimits {
+                max_full_encodes: 0,
+                ..Default::default()
+            },
+            SearchLimits {
+                max_full_pixels: 0,
+                ..Default::default()
+            },
+            SearchLimits {
+                max_output_bytes: 0,
+                ..Default::default()
+            },
+        ] {
+            let mut search = Search::<()>::new(limits);
+            assert!(matches!(
+                search.refine_pixels(
+                    1,
+                    1,
+                    CandidateParams::default(),
+                    true,
+                    false,
+                    &mut |_, _| panic!("over-budget encode was invoked"),
+                ),
+                Err(Error::Limit(_))
+            ));
+            assert!(search.trials().is_empty());
+        }
+    }
+
+    #[test]
+    fn explicit_output_limit_and_counter_overflow_are_still_checked() {
+        let mut search = Search::new(SearchLimits {
+            max_output_bytes: 1,
+            ..Default::default()
+        });
+        let mut encode = |_: &CandidateParams, budget: TrialBudget| {
+            assert_eq!(budget.max_output_bytes, 1);
+            Ok(TrialOutput::Complete(EncodedOutput {
+                bytes: vec![1],
+                artifact: (),
+            }))
+        };
+        search
+            .refine_pixels(
+                u64::MAX,
+                1,
+                CandidateParams::default(),
+                true,
+                false,
+                &mut encode,
+            )
+            .unwrap();
+        assert!(matches!(
+            search.refine_pixels(1, 1, CandidateParams::default(), true, false, &mut encode),
+            Err(Error::Limit("whole-frame search work"))
+        ));
+        let mut search = Search::new(SearchLimits {
+            max_output_bytes: 1,
+            ..Default::default()
+        });
+        assert!(matches!(
+            search.refine_pixels(
+                1,
+                1,
+                CandidateParams::default(),
+                true,
+                false,
+                &mut |_, _| Ok(TrialOutput::Complete(EncodedOutput {
+                    bytes: vec![1, 2],
+                    artifact: (),
+                })),
+            ),
+            Err(Error::Limit("whole-frame output bytes"))
+        ));
     }
 }

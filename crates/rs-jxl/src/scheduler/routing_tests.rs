@@ -124,7 +124,7 @@ fn root_stream_count_controls_properties_without_cropping_or_fraction_reduction(
     let base = EncodeOptions {
         modular: crate::modular::encode::ModularOptions {
             source_constant_channels: true,
-            sample_limit: 33554432,
+            sample_limit: Some(33554432),
             ..Default::default()
         },
         ..Default::default()
@@ -146,7 +146,7 @@ fn root_stream_count_controls_properties_without_cropping_or_fraction_reduction(
         let sampling = options.modular.sampling.as_ref().unwrap();
         assert_eq!(sampling.properties, vec![0, 1, 15, 9, 10]);
         assert_eq!(sampling.nb_repeats, 0.5f32 * 0.7f32);
-        assert_eq!(options.modular.sample_limit, 33554432);
+        assert_eq!(options.modular.sample_limit, Some(33554432));
         assert!(!options.modular.source_constant_channels);
     }
     assert!(base.modular.source_constant_channels);

@@ -17,7 +17,7 @@ import statistics
 import struct
 import tempfile
 
-from PIL import Image
+from PIL import JpegImagePlugin
 
 from compare_cpp_port import (
     binary_info, check_process, clean_environment, compare_pixels,
@@ -94,7 +94,7 @@ def decode_command(name, binary, source, *, kind, threads, reps=1, output=None, 
 def encode_command(name, binary, source, output, case, args):
     if case["kind"] == "png":
         return encoder_command("rust" if name == "rust" else "cpp", binary,
-                               source, output, args.threads, 9, "full-scheduler", 33_554_432)
+                               source, output, args.threads, 9, "full-scheduler", args.source_sample_limit)
     if name == "rust":
         return [str(binary), "transcode-jpeg", str(source), str(output), "--effort=9",
                 f"--threads={args.threads}", "--source-search"]
@@ -210,7 +210,7 @@ def markdown(report):
     return "\n".join(lines) + "\n"
 
 
-def main():
+def argument_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset-root", type=Path, required=True)
     for name in NAMES:
@@ -220,14 +220,22 @@ def main():
     parser.add_argument("--out", type=Path, required=True, help="NEW output directory")
     parser.add_argument("--seed", type=int, default=20261024)
     parser.add_argument("--threads", type=int, default=8)
+    parser.add_argument("--source-sample-limit", type=int, default=None,
+                        help="Optional positive Rust PNG MA sample cap; omitted uses the CLI default")
     parser.add_argument("--warmups", type=int, default=1)
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--decode-reps", type=int, default=10)
     parser.add_argument("--timeout", type=float, default=300)
     parser.add_argument("--limit", type=int, help="Smoke test first N preselected cases")
-    args = parser.parse_args()
+    return parser
+
+
+def main(argv=None):
+    parser = argument_parser()
+    args = parser.parse_args(argv)
     if (args.repeats < 1 or args.warmups < 0 or args.decode_reps < 1
             or not 1 <= args.threads <= 256 or not 0 < args.timeout < float("inf")
+            or (args.source_sample_limit is not None and args.source_sample_limit < 1)
             or (args.limit is not None and args.limit < 1)):
         parser.error("invalid measurement settings")
     encoders = {n: getattr(args, n).resolve(strict=True) for n in NAMES}
@@ -260,7 +268,7 @@ def main():
                         case.update(width=expected.width, height=expected.height, depth=expected.depth)
                     else:
                         payload, expected = original, None
-                        with Image.open(case["path"]) as image:
+                        with JpegImagePlugin.JpegImageFile(case["path"]) as image:
                             case.update(width=image.width, height=image.height, depth=8)
                     case["pixels"] = case["width"] * case["height"]
                     source = root / ("input.png" if case["kind"] == "png" else "input.jpg")

@@ -21,6 +21,7 @@ use super::reconstruction_validation::{append_record, reserve, validate};
 #[path = "scan_writer_parallel.rs"]
 mod parallel;
 
+/// Optional caller budgets; defaults impose no extra resource ceiling.
 #[derive(Clone, Debug)]
 pub struct WriteLimits {
     pub structural: ReadLimits,
@@ -35,11 +36,11 @@ impl Default for WriteLimits {
     fn default() -> Self {
         Self {
             structural: ReadLimits::default(),
-            max_output_bytes: 256 * 1024 * 1024,
-            max_block_visits: 64 * 1024 * 1024,
-            max_hint_entries: 1_048_576,
-            max_padding_bits: 8 * 1024 * 1024,
-            max_refinement_bits: 8 * 1024 * 1024,
+            max_output_bytes: usize::MAX,
+            max_block_visits: usize::MAX,
+            max_hint_entries: usize::MAX,
+            max_padding_bits: usize::MAX,
+            max_refinement_bits: usize::MAX,
         }
     }
 }

@@ -31,9 +31,9 @@ impl Default for AutoOptions {
             allow_multi_rect: true,
             tile_size: 32,
             max_rectangles: 32,
-            max_frames: 10_000,
-            max_total_trials: 100_000,
-            max_trial_pixels: 4_000_000_000,
+            max_frames: usize::MAX,
+            max_total_trials: usize::MAX,
+            max_trial_pixels: u64::MAX,
         }
     }
 }
@@ -96,9 +96,9 @@ pub fn encode_auto(
     if images.len() > auto.max_frames {
         return Err(Error::Limit("automatic logical frame count"));
     }
-    if auto.tile_size == 0 || auto.max_rectangles == 0 || auto.max_rectangles > 4096 {
+    if auto.tile_size == 0 || auto.max_rectangles == 0 {
         return Err(Error::InvalidInput(
-            "tile_size must be positive and max_rectangles must be 1..=4096".into(),
+            "tile_size and max_rectangles must be positive".into(),
         ));
     }
     let canvas = &images[0];

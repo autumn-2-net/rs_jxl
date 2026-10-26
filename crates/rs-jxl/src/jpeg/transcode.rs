@@ -37,6 +37,7 @@ pub struct Options {
     /// Default-off cooperative auxiliary learners; gathering remains serial.
     pub cooperative_ma: Option<WorkerLimits>,
     pub decoding_speed: u8,
+    /// `usize::MAX` means no ceiling on samples selected by the learning policy.
     pub sample_limit: usize,
     pub reconstruction_quality: u8,
     pub cfl: CflMode,
@@ -53,13 +54,13 @@ impl Default for Options {
             threads: 1,
             cooperative_ma: None,
             decoding_speed: 0,
-            sample_limit: 4 << 20,
+            sample_limit: usize::MAX,
             reconstruction_quality: 4,
             cfl: CflMode::Enabled,
             order: OrderPolicy::Source,
-            max_output_bytes: 256 << 20,
-            max_coefficients: 64 << 20,
-            max_tokens: 64 << 20,
+            max_output_bytes: usize::MAX,
+            max_coefficients: usize::MAX,
+            max_tokens: usize::MAX,
         }
     }
 }
@@ -330,7 +331,7 @@ impl Prepared {
         let geometry = FrameGeometry::new(jpeg.width, jpeg.height, layout.subsampling())?;
         let display = super::color_metadata::prepare_metadata(
             jpeg,
-            options.max_output_bytes.min(1 << 28),
+            options.max_output_bytes,
             crate::metadata::Orientation::Identity,
             true,
             options.max_output_bytes,
@@ -487,7 +488,8 @@ impl Prepared {
             &mut quant_options,
             &mut global_options,
         ] {
-            policy.sample_limit = options.sample_limit;
+            policy.sample_limit =
+                (options.sample_limit != usize::MAX).then_some(options.sample_limit);
         }
         let ac_metadata = (0..geometry.dc_group_count())
             .map(|index| {

@@ -18,6 +18,7 @@ use super::data::{
 
 /// Resource bounds are checked before retaining input-derived collections.
 /// No allocation is proportional to the image's pixel or MCU count.
+/// Defaults impose no extra resource ceiling; callers can opt into finite bounds.
 #[derive(Clone, Debug)]
 pub struct ReadLimits {
     /// Includes metadata, all scans and data following EOI.
@@ -34,12 +35,12 @@ pub struct ReadLimits {
 impl Default for ReadLimits {
     fn default() -> Self {
         Self {
-            max_input_bytes: 256 * 1024 * 1024,
-            max_records: 65_536,
-            max_scans: 4096,
-            max_quant_tables: 4096,
+            max_input_bytes: usize::MAX,
+            max_records: usize::MAX,
+            max_scans: usize::MAX,
+            max_quant_tables: usize::MAX,
             max_huffman_tables: MAX_DHT_MARKERS,
-            max_restart_markers: 1_048_576,
+            max_restart_markers: usize::MAX,
         }
     }
 }
@@ -1100,6 +1101,37 @@ mod tests {
             let mut bytes = header(0xc0, GRAY);
             scan(&mut bytes, &[1], [0, 63, 0], suffix);
             assert!(read_jpeg(&bytes).is_err(), "suffix {suffix:?}");
+        }
+    }
+
+    #[test]
+    fn default_table_definition_counts_are_not_capped() {
+        let mut bytes = header(0xc0, GRAY);
+        for _ in 0..4096 {
+            segment(&mut bytes, 0xdb, &quant(0, 0, 1));
+        }
+        for _ in 0..512 {
+            segment(&mut bytes, 0xc4, &huffman(0));
+        }
+        scan(&mut bytes, &[1], [0, 63, 0], &[0]);
+        bytes.extend([0xff, 0xd9]);
+        let jpeg = read_jpeg(&bytes).unwrap();
+        assert_eq!(jpeg.quant.len(), 4097);
+        assert_eq!(jpeg.huffman_code.len(), 514);
+        for limits in [
+            ReadLimits {
+                max_quant_tables: 4096,
+                ..Default::default()
+            },
+            ReadLimits {
+                max_huffman_tables: 512,
+                ..Default::default()
+            },
+        ] {
+            assert!(matches!(
+                read_jpeg_with_limits(&bytes, &limits),
+                Err(JpegError::LimitExceeded { .. })
+            ));
         }
     }
 

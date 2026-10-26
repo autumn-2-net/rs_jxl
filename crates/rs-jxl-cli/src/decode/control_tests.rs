@@ -330,7 +330,7 @@ fn all_serialization_and_alias_preflight_precedes_publication() {
     batch.add(Path::new("-"), vec![1], true).unwrap();
     batch.add(Path::new("-"), vec![2], true).unwrap();
     assert!(batch.add(Path::new("-"), vec![3], false).is_err());
-    assert_eq!(batch.remaining(), MAX_OUTPUT_BYTES - 2);
+    assert_eq!(batch.remaining(), usize::MAX - 2);
 }
 
 #[test]

@@ -62,8 +62,8 @@ def parser():
     result.add_argument("--warmups", type=int, default=1)
     result.add_argument("--threads", type=int, default=THREADS,
                         help="Same encoder worker limit for both checkpoints (1..256)")
-    result.add_argument("--source-sample-limit", type=int, default=33_554_432,
-                        help="PNG hard MA sample limit, matching compare_rust_checkpoints.py")
+    result.add_argument("--source-sample-limit", type=int, default=None,
+                        help="Optional positive PNG MA sample cap; omitted uses each CLI's default")
     result.add_argument("--timeout", type=float, default=300,
                         help="Positive per-subprocess guard in seconds; timeout means failure")
     return result
@@ -88,9 +88,10 @@ def validate_extra_args(tokens):
 def validate_args(args):
     if not 1 <= args.threads <= 256:
         raise ValueError("Threads must be in 1..256")
-    if (args.repeats < 1 or args.warmups < 0 or args.source_sample_limit < 1
+    if (args.repeats < 1 or args.warmups < 0
+            or (args.source_sample_limit is not None and args.source_sample_limit < 1)
             or not math.isfinite(args.timeout) or args.timeout <= 0):
-        raise ValueError("Repeats/sample limit must be positive, warmups nonnegative, timeout finite and positive")
+        raise ValueError("Repeats and explicit sample limit must be positive, warmups nonnegative, timeout finite and positive")
     for name in NAMES:
         validate_extra_args(getattr(args, name + "_arg"))
         validate_extra_args(getattr(args, name + "_jpeg_arg"))
@@ -98,9 +99,9 @@ def validate_args(args):
 
 
 def jpeg_dimensions(original):
-    from PIL import Image
+    from PIL import JpegImagePlugin
 
-    with Image.open(BytesIO(original)) as image:
+    with JpegImagePlugin.JpegImageFile(BytesIO(original)) as image:
         if image.format != "JPEG" or getattr(image, "n_frames", 1) != 1:
             raise ValueError("Expected a single-frame JPEG")
         return image.width, image.height
@@ -108,11 +109,9 @@ def jpeg_dimensions(original):
 
 def load_case(index, path):
     path = path.resolve(strict=True)
-    if path.stat().st_size > port.MAX_INPUT_BYTES:
-        raise ValueError(f"Input exceeds 512 MiB: {path}")
     original = path.read_bytes()
-    if not original or len(original) > port.MAX_INPUT_BYTES:
-        raise ValueError(f"Empty or oversized input: {path}")
+    if not original:
+        raise ValueError(f"Empty input: {path}")
     case = dict(index=index, path=str(path), label=path.name,
                 original_bytes=len(original), original_sha256=port.sha256(original))
     if original.startswith(port.PNG_SIGNATURE):
@@ -133,7 +132,7 @@ def load_case(index, path):
     return case, payload, original, expected
 
 
-def encoder_command(binary, source, output, kind, sample_limit, extra=(), threads=THREADS):
+def encoder_command(binary, source, output, kind, sample_limit=None, extra=(), threads=THREADS):
     if kind == "png":
         command = port.encoder_command("rust", binary, source, output, threads, EFFORT,
                                        "full-scheduler", sample_limit)

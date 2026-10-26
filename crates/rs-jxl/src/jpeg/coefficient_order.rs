@@ -59,9 +59,9 @@ pub enum OrderError {
 impl fmt::Display for OrderError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidGeometry => {
-                f.write_str("DCT8 geometry must be nonempty and within 2^34 blocks")
-            }
+            Self::InvalidGeometry => f.write_str(
+                "DCT8 geometry must be nonempty and fit its index and frequency counters",
+            ),
             Self::InvalidGroupCount => {
                 f.write_str("DCT8 group count does not match frame geometry")
             }
@@ -145,7 +145,8 @@ fn validate_geometry(width: usize, height: usize) -> Result<(), OrderError> {
     let blocks = width
         .checked_mul(height)
         .ok_or(OrderError::InvalidGeometry)?;
-    if blocks == 0 || blocks as u64 > 1u64 << 34 {
+    // Zero frequencies accumulate in signed 64-bit counters.
+    if blocks == 0 || i64::try_from(blocks).is_err() {
         return Err(OrderError::InvalidGeometry);
     }
     Ok(())
@@ -279,7 +280,8 @@ fn sort_order(zeros: &[i64; BLOCK_SIZE]) -> [u32; BLOCK_SIZE] {
         // Source int64 -> f32, multiplication and addition; no exact-integer
         // replacement or f64 promotion. -1 for DC truncates from -0.025 to 0.
         let quantized = (zeros[position as usize] as f32 * 0.125f32 + 0.1f32) as u64;
-        (quantized << 16) | u64::from(DEFAULT_DCT8_ORDER_LUT[position as usize])
+        // Keep the tie-break independent of the frequency's integer width.
+        (quantized, DEFAULT_DCT8_ORDER_LUT[position as usize])
     });
     positions
 }
@@ -701,6 +703,21 @@ mod tests {
         for counts in zero_counts(&image, SpeedTier::Tortoise) {
             assert_eq!(&counts[..5], &[-1, 1024, 32, 32, 1]);
         }
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn order_geometry_keeps_numeric_bounds_without_an_extra_block_cap() {
+        assert!(validate_geometry((1usize << 34) + 1, 1).is_ok());
+        assert!(validate_geometry(i64::MAX as usize, 1).is_ok());
+        assert!(validate_geometry(i64::MAX as usize + 1, 1).is_err());
+        assert!(validate_geometry(usize::MAX, 2).is_err());
+        let mut zeros = [i64::MAX; BLOCK_SIZE];
+        zeros[0] = -1;
+        zeros[1] = i64::MAX / 2;
+        let order = sort_order(&zeros);
+        assert_eq!(&order[..2], &[0, 1]);
+        validate_permutation(&order).unwrap();
     }
 
     #[test]

@@ -63,8 +63,7 @@ pub(in crate::decode) fn write_npy(output: &mut impl Write, frames: &[DecodedFra
         .and_then(|n| n.checked_mul(usize::from(storage_bits / 8)))
         .and_then(|n| n.checked_mul(frames.len()))
         .and_then(|n| n.checked_add(10 + header.len()))
-        .filter(|&n| n <= MAX_OUTPUT_BYTES)
-        .ok_or("NPY output exceeds the CLI's 512 MiB limit")?;
+        .ok_or("NPY output size overflow")?;
     output.write_all(b"\x93NUMPY\x01\x00")?;
     output.write_all(&header_len.to_le_bytes())?;
     output.write_all(header.as_bytes())?;

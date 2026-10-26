@@ -4,7 +4,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::Result;
-use crate::input::MAX_INPUT_BYTES;
 
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
@@ -70,7 +69,7 @@ fn read_limited(mut reader: impl Read, limit: usize) -> Result<Vec<u8>> {
             .checked_add(count)
             .is_none_or(|size| size > limit)
         {
-            return Err("input exceeds the configured byte limit (512 MiB for the CLI)".into());
+            return Err("input size overflows or exceeds the configured byte limit".into());
         }
         bytes.try_reserve(count)?;
         bytes.extend_from_slice(&chunk[..count]);
@@ -79,13 +78,10 @@ fn read_limited(mut reader: impl Read, limit: usize) -> Result<Vec<u8>> {
 
 pub(crate) fn read_input(path: &Path) -> Result<Vec<u8>> {
     if stdio(path) {
-        return read_limited(io::stdin().lock(), MAX_INPUT_BYTES);
+        return read_limited(io::stdin().lock(), usize::MAX);
     }
     let file = File::open(path)?;
-    if file.metadata()?.len() > MAX_INPUT_BYTES as u64 {
-        return Err("input exceeds the 512 MiB limit".into());
-    }
-    read_limited(file, MAX_INPUT_BYTES)
+    read_limited(file, usize::MAX)
 }
 
 struct TemporaryOutput {
@@ -194,6 +190,16 @@ mod tests {
     fn bounded_reads_reject_one_extra_byte() {
         assert_eq!(read_limited(&b"abcd"[..], 4).unwrap(), b"abcd");
         assert!(read_limited(&b"abcde"[..], 4).is_err());
+    }
+
+    #[test]
+    fn unlimited_reads_allocate_only_for_received_bytes() {
+        assert_eq!(read_limited(&b"abcd"[..], usize::MAX).unwrap(), b"abcd");
+        assert!(
+            read_limited(std::io::empty(), usize::MAX)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

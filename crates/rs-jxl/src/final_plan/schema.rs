@@ -5,7 +5,7 @@
 //! hooks. These schemas do not apply transforms, rebuild histograms, find
 //! matches, or generate pixels/coefficients. See FINAL_PLAN_PORT_STATUS.md.
 
-use super::{MAX_TREE_NODES, MAX_VALUES, invalid};
+use super::{MAX_TREE_NODES, invalid};
 use crate::{Error, Result};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -137,7 +137,7 @@ impl FrameParameters {
             (-1, 41),
             (-1, 1),
             (-1, 1),
-            (-65536, 70000),
+            (-70911, 70911),
             (-1, 15),
             (-1, 7),
             (0, 1),
@@ -279,8 +279,7 @@ pub fn clusters(
         previous_histograms == 0
             && context_offset == 0
             && !values.is_empty()
-            && values.len() == contexts
-            && values.len() <= MAX_VALUES,
+            && values.len() == contexts,
         Tag::Clusters,
     )?;
     ensure(values.iter().all(|&v| range(v, 0, 255)), Tag::Clusters)?;
@@ -306,7 +305,7 @@ impl<'a> UintConfigs<'a> {
             .checked_mul(3)
             .and_then(|v| v.checked_add(1))
             .ok_or(Error::Limit("final-plan uint schema size"))?;
-        ensure(values.len() == length && length <= MAX_VALUES, Tag::Uint)?;
+        ensure(values.len() == length, Tag::Uint)?;
         let log = values[0];
         ensure(
             log >= 5 && if prefix { log == 15 } else { log <= 8 },
@@ -383,8 +382,9 @@ pub struct Transforms<'a> {
 
 impl<'a> Transforms<'a> {
     pub fn from_values(values: &'a [i64]) -> Result<Self> {
+        // GroupHeader's U32(0, 1, Bits(4)+2, Bits(8)+18) represents 0..=273.
         ensure(
-            values.len().is_multiple_of(7) && values.len() <= 7 * 512,
+            values.len().is_multiple_of(7) && values.len() / 7 <= 273,
             Tag::Transforms,
         )?;
         for v in values.chunks_exact(7) {
@@ -440,7 +440,6 @@ pub fn tree(values: &[i64], tree_limit: usize) -> Result<Vec<TreeNode>> {
     let count = values.len() / 4;
     ensure(
         values.len().is_multiple_of(4)
-            && values.len() <= MAX_VALUES
             && count > 0
             && count % 2 == 1
             && count <= tree_limit
@@ -604,9 +603,7 @@ impl<'a> Matches<'a> {
     /// before replacing a span. Never search for a substitute match.
     pub fn from_values(values: &'a [i64], input_len: usize, min_length: u32) -> Result<Self> {
         ensure(
-            values.len().is_multiple_of(3)
-                && values.len() <= MAX_VALUES
-                && values.len() / 3 <= input_len,
+            values.len().is_multiple_of(3) && values.len() / 3 <= input_len,
             Tag::Matches,
         )?;
         let mut cursor = 0;
@@ -642,9 +639,7 @@ pub fn cfl(values: &[i64], width: usize, height: usize) -> Result<()> {
         .checked_mul(height)
         .ok_or(Error::Limit("final-plan CFL shape"))?;
     ensure(
-        values.len() == length
-            && length <= MAX_VALUES
-            && values.iter().all(|&v| range(v, -128, 127)),
+        values.len() == length && values.iter().all(|&v| range(v, -128, 127)),
         Tag::Cfl,
     )
 }

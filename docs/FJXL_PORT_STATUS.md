@@ -81,7 +81,9 @@ test coverage were outside this kernel slice and are not re-audited here.
 - `Backend::Auto` uses detected AVX2, otherwise scalar. `Scalar` fixes eight-sample
   chunks. AVX2 uses the source sixteen-sample chunk policy. Consequently sampling,
   RLE boundaries, trees and bytes may differ across these profiles.
-- Default `Limits`: 64 Mi pixels, 512 MiB returned output, 1 Mi total TOC entries.
+- Default `Limits`: no extra resource ceilings (`u64::MAX` pixels and
+  `usize::MAX` output/TOC entries). Explicit limits, format fields, overflow
+  and allocation checks remain enforced; see [the audit](RESOURCE_LIMIT_AUDIT.md).
   Dimensions must be nonzero and at most 2^30. Output accounting includes header
   and TOC. Up to sixteen AC groups are processed concurrently; this is not a
   strict total-allocation cap (retained sections, final output, DP scratch and

@@ -1,11 +1,33 @@
 import unittest
+from contextlib import redirect_stderr
+from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
 
-from benchmark_codec_subset import NAMES, aggregates, decode_command, encode_command
+from benchmark_codec_subset import NAMES, aggregates, argument_parser, decode_command, encode_command, main
 
 
 class BenchmarkContractTests(unittest.TestCase):
+    def arguments(self):
+        return ["--dataset-root", "data", "--official", "official", "--cpp", "cpp",
+                "--rust", "rust", "--official-decoder", "djxl", "--cpp-decoder", "cpp-djxl",
+                "--out", "out"]
+
+    def test_png_sample_budget_is_opt_in_and_rust_only(self):
+        args = argument_parser().parse_args(self.arguments())
+        self.assertIsNone(args.source_sample_limit)
+        for limit in (None, 1, 33_554_432):
+            args.source_sample_limit = limit
+            for name in NAMES:
+                command = encode_command(name, "codec", "in.png", "out.jxl", {"kind": "png"}, args)
+                self.assertEqual("--source-sample-limit" in command, name == "rust" and limit is not None)
+                if name == "rust" and limit is not None:
+                    self.assertEqual(command[command.index("--source-sample-limit") + 1], str(limit))
+        for limit in (0, -1):
+            with redirect_stderr(StringIO()), self.assertRaises(SystemExit) as caught:
+                main([*self.arguments(), "--source-sample-limit", str(limit)])
+            self.assertEqual(caught.exception.code, 2)
+
     def test_float_null_output_matches_djxl_contract(self):
         for name in NAMES:
             cmd = decode_command(name, Path('codec.exe'), Path('input.jxl'),

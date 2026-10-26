@@ -24,11 +24,13 @@ pub(in crate::decode) fn write_exr(output: &mut Output, image: &Raster<'_>) -> R
         .width
         .checked_mul(frame.height)
         .ok_or("EXR size overflow")?;
+    let channel_count = colors
+        .checked_add(frame.extra_planes.len())
+        .ok_or("EXR channel count overflow")?;
     count
-        .checked_mul(colors + frame.extra_planes.len())
+        .checked_mul(channel_count)
         .and_then(|n| n.checked_mul(4))
-        .filter(|&n| n <= MAX_OUTPUT_BYTES)
-        .ok_or("EXR channel staging exceeds 512 MiB")?;
+        .ok_or("EXR channel staging size overflow")?;
     if frame.extra_planes.len() != image.info.extra_channels.len() {
         return Err("EXR channel metadata mismatch".into());
     }
@@ -44,7 +46,7 @@ pub(in crate::decode) fn write_exr(output: &mut Output, image: &Raster<'_>) -> R
         return Err("EXR requires the separate primary alpha plane".into());
     }
     let mut channels = Vec::new();
-    channels.try_reserve_exact(colors + frame.extra_planes.len())?;
+    channels.try_reserve_exact(channel_count)?;
     for channel in 0..colors {
         let name = if colors == 1 {
             "Y"

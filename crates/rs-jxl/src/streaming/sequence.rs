@@ -23,8 +23,8 @@ pub struct FrameIndexOptions {
 impl Default for FrameIndexOptions {
     fn default() -> Self {
         Self {
-            max_entries: 4096,
-            max_payload_bytes: 1024 * 1024,
+            max_entries: usize::MAX,
+            max_payload_bytes: usize::MAX,
         }
     }
 }
@@ -55,7 +55,7 @@ impl Default for FrameEncoderOptions {
     fn default() -> Self {
         Self {
             threads: 1,
-            max_output_bytes: 512 * 1024 * 1024,
+            max_output_bytes: usize::MAX,
             buffering: FrameBuffering::StrictAreas,
             index: None,
         }

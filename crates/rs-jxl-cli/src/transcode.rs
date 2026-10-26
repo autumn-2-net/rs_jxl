@@ -27,9 +27,10 @@ budgets fail; no pixel fallback or metadata-stripping mode is provided.\n\
 Effort selects the coefficient backend policy unless --source-search is set. \
 Source search executes the JPEG-specific effort prefix and retains the smallest \
 complete result. It requires --decoding-speed=0.\n\
-Brotli quality defaults to min(effort + 1, 11). --sample-limit is a hard \
-selected-sample budget across shared auxiliary tree domains, not a sampling \
-target. The library's other input, output, coefficient and token limits apply.\n\
+Brotli quality defaults to min(effort + 1, 11). An explicit --sample-limit is a \
+hard selected-sample budget across shared auxiliary tree domains, not a sampling \
+target; omission adds no sample-count cap. No extra CLI input/output byte cap is \
+imposed. Format bounds, size-overflow checks and allocation failures still apply.\n\
 Use '-' for stdin/stdout. Diagnostics go to stderr. Encoding completes before \
 output is written. Existing output is not replaced unless --force is supplied."
 )]
@@ -67,8 +68,8 @@ pub(crate) struct TranscodeArgs {
         conflicts_with = "default_order"
     )]
     order: Order,
-    /// Hard shared MA selected-sample limit; failure does not reduce sampling
-    #[arg(long, value_name = "N", default_value_t = TranscodeLimits::default().sample_limit, value_parser = parse_sample_limit)]
+    /// Hard shared MA sample limit (omitted: unlimited); never reduces sampling
+    #[arg(long, value_name = "N", default_value_t = TranscodeLimits::default().sample_limit, hide_default_value = true, value_parser = parse_sample_limit)]
     sample_limit: usize,
     /// Replace an existing output file; input and output must still differ
     #[arg(long)]
@@ -199,6 +200,7 @@ mod tests {
         assert_eq!(options.cfl, defaults.cfl);
         assert_eq!(options.order, defaults.order);
         assert_eq!(options.limits.sample_limit, defaults.limits.sample_limit);
+        assert_eq!(options.limits.sample_limit, usize::MAX);
         assert_eq!(
             options.limits.max_output_bytes,
             defaults.limits.max_output_bytes

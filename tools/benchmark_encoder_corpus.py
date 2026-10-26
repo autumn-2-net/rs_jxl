@@ -288,8 +288,8 @@ def measure(row, args, env, phase):
             result['encode'] = process
             port.check_process(process)
             size = output.stat().st_size
-            if not 0 < size <= port.MAX_INPUT_BYTES:
-                raise ValueError('Empty or oversized JXL output')
+            if size <= 0:
+                raise ValueError('Empty JXL output')
             result.update(bytes=size, bpp=8 * size / info['pixels'],
                           wall_seconds=process['wall_seconds'], call_seconds=None)
             if info['kind'] == 'png':

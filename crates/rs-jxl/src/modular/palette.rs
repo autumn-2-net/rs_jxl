@@ -143,9 +143,9 @@ impl PaletteOptions {
                 ));
             }
         }
-        if self.force_palette && !(1..=65536).contains(&self.palette_colors) {
+        if self.force_palette && self.palette_colors <= 0 {
             return Err(Error::InvalidInput(
-                "forced palette requires a positive limit <=65536".into(),
+                "forced palette requires a positive limit".into(),
             ));
         }
         Ok(())
@@ -278,7 +278,10 @@ pub fn apply_palette_range_with_options(
         predictor: palette.predictor,
     };
     group::validate_transform(&transform)?;
-    if channels.len() - count + 2 > 8192 {
+    if (channels.len() - count)
+        .checked_add(2)
+        .is_none_or(|n| n > i32::MAX as usize)
+    {
         return Err(Error::Limit("palette channel count"));
     }
     let table = Channel {

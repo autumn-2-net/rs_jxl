@@ -16,6 +16,8 @@ pub mod compatibility;
 pub mod container;
 pub mod data;
 pub mod dc_streams;
+#[cfg(test)]
+mod default_budget_tests;
 pub mod entropy;
 pub mod entropy_writer;
 pub mod frame_header;

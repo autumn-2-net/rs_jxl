@@ -39,8 +39,8 @@ impl Default for EncodeOptions {
     fn default() -> Self {
         Self {
             threads: 1,
-            max_pixels: 64_000_000,
-            max_output_bytes: 512 << 20,
+            max_pixels: u64::MAX,
+            max_output_bytes: usize::MAX,
             modular: ModularOptions::default(),
             group_size_shift: 1,
             shared_tree: false,

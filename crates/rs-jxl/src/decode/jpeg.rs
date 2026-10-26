@@ -75,6 +75,20 @@ pub(super) fn prepare_backend(
     Ok(backend)
 }
 
+fn reconstruction_limits(options: &DecodeOptions) -> ReconstructionDecodeLimits {
+    let mut limits = ReconstructionDecodeLimits {
+        max_jbrd_bytes: options.limits.max_metadata_bytes,
+        max_metadata_bytes: options.limits.max_metadata_bytes,
+        max_coefficient_values: options
+            .limits
+            .max_samples
+            .min(options.limits.max_output_bytes / size_of::<i16>()),
+        ..Default::default()
+    };
+    limits.write.max_output_bytes = options.limits.max_output_bytes;
+    limits
+}
+
 pub(super) fn reconstruct_with_runner(
     mut input: &[u8],
     options: &DecodeOptions,
@@ -153,16 +167,7 @@ pub(super) fn reconstruct_with_runner(
     let boxes = boxes::extract(&decoder, input, options.limits.max_metadata_bytes)?;
     let jbrd = unique_box(&boxes, *b"jbrd")?
         .ok_or_else(|| failure("JXL has no original-JPEG reconstruction data"))?;
-    let mut limits = ReconstructionDecodeLimits {
-        max_jbrd_bytes: options.limits.max_metadata_bytes,
-        max_metadata_bytes: options.limits.max_metadata_bytes,
-        max_coefficient_values: options
-            .limits
-            .max_samples
-            .min(options.limits.max_output_bytes / 2),
-        ..Default::default()
-    };
-    limits.write.max_output_bytes = options.limits.max_output_bytes;
+    let limits = reconstruction_limits(options);
     let metadata = decode_reconstruction_metadata(jbrd, &limits).map_err(reconstruction_error)?;
     // Unreferenced display metadata is not an original-JPEG source. Multiple
     // boxes are ambiguous only when jbrd needs their bytes to restore an APP.
@@ -224,6 +229,49 @@ pub(super) fn reconstruct_with_runner(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reconstruction_dependencies_do_not_reintroduce_policy_caps() {
+        let limits = reconstruction_limits(&DecodeOptions::default());
+        assert_eq!(limits.max_jbrd_bytes, usize::MAX);
+        assert_eq!(limits.max_metadata_bytes, usize::MAX);
+        assert_eq!(limits.max_coefficient_values, usize::MAX / size_of::<i16>());
+        assert_eq!(limits.write.max_output_bytes, usize::MAX);
+        assert_eq!(limits.write.max_block_visits, usize::MAX);
+        assert_eq!(limits.write.max_hint_entries, usize::MAX);
+        assert_eq!(limits.write.max_padding_bits, usize::MAX);
+        assert_eq!(limits.write.max_refinement_bits, usize::MAX);
+        assert_eq!(limits.write.structural.max_input_bytes, usize::MAX);
+        assert_eq!(limits.write.structural.max_records, usize::MAX);
+        assert_eq!(limits.write.structural.max_scans, usize::MAX);
+        assert_eq!(limits.write.structural.max_quant_tables, usize::MAX);
+        assert_eq!(limits.write.structural.max_restart_markers, usize::MAX);
+        // The JPEG reconstruction representation still limits DHT definitions.
+        assert_eq!(
+            limits.write.structural.max_huffman_tables,
+            crate::jpeg::data::MAX_DHT_MARKERS
+        );
+    }
+
+    #[test]
+    fn reconstruction_preserves_explicit_metadata_sample_and_output_budgets() {
+        let mut options = DecodeOptions::default();
+        options.limits.max_metadata_bytes = 7;
+        options.limits.max_output_bytes = 19;
+        options.limits.max_samples = 3;
+        let limits = reconstruction_limits(&options);
+        assert_eq!(limits.max_jbrd_bytes, 7);
+        assert_eq!(limits.max_metadata_bytes, 7);
+        assert_eq!(limits.max_coefficient_values, 3);
+        assert_eq!(limits.write.max_output_bytes, 19);
+        options.limits.max_samples = usize::MAX;
+        assert_eq!(reconstruction_limits(&options).max_coefficient_values, 9);
+        options.limits.max_frames = 0;
+        assert!(matches!(
+            prepare_backend(JxlDecoderOptions::default(), &options),
+            Err(Error::Limit(_))
+        ));
+    }
 
     #[test]
     fn reconstruction_resource_errors_retain_their_public_classification() {

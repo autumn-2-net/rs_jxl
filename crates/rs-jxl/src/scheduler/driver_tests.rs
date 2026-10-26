@@ -729,13 +729,13 @@ fn native_resource_ceiling_is_explicit_and_not_inferred_from_direct_presets() {
     let image = image();
     let mut base = crate::EncodeOptions::default();
     base.modular.max_tree_leaves = 16;
-    base.modular.sample_limit = 123456;
+    base.modular.sample_limit = Some(123456);
     let projection = project_native(&params, &image, &base).unwrap();
     assert_eq!(
         projection.resources.max_tree_leaves,
         crate::modular::ma_train::MAX_LEAVES
     );
-    assert_eq!(projection.resources.sample_limit, 123456);
+    assert_eq!(projection.resources.sample_limit, Some(123456));
     let projection = project_native_with_resources(
         &params,
         &image,
@@ -748,7 +748,7 @@ fn native_resource_ceiling_is_explicit_and_not_inferred_from_direct_presets() {
     let options = projection.options.unwrap();
     assert_eq!(projection.resources.max_tree_leaves, 64);
     assert_eq!(options.modular.max_tree_leaves, 64);
-    assert_eq!(options.modular.sample_limit, 123456);
+    assert_eq!(options.modular.sample_limit, Some(123456));
     assert!(options.modular.sampling.is_some());
     for limit in [0, crate::modular::ma_train::MAX_LEAVES + 1] {
         assert!(

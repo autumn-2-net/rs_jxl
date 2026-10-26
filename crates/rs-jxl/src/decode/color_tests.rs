@@ -8,6 +8,38 @@ use jxl_decoder::api::{
 const SKCMS_SRGB_HALF: f32 = 0.213_997_84;
 
 #[test]
+fn icc_defaults_do_not_reintroduce_dependency_policy_caps() {
+    let defaults = icc_parsing_options(&DecodeLimits::default());
+    assert_eq!(defaults.max_profile_size, usize::MAX);
+    assert_eq!(defaults.max_allowed_clut_size, usize::MAX);
+    assert_eq!(defaults.max_allowed_trc_size, usize::MAX / size_of::<u16>());
+    let bounded = icc_parsing_options(&DecodeLimits {
+        max_metadata_bytes: 100,
+        ..Default::default()
+    });
+    assert_eq!(bounded.max_profile_size, 101);
+    assert_eq!(bounded.max_allowed_clut_size, 100);
+    assert_eq!(bounded.max_allowed_trc_size, 50);
+}
+
+#[test]
+fn icc_curve_above_old_cap_accepts_exact_metadata_budget() {
+    let mut cms = CmsProfile::new_srgb();
+    cms.red_trc = Some(moxcms::ToneReprCurve::Lut(vec![0; 40_001]));
+    let bytes = cms.encode().unwrap();
+    let defaults = DecodeLimits::default();
+    assert!(parse_icc(&bytes, &defaults).is_ok());
+    let mut limits = DecodeLimits {
+        max_metadata_bytes: bytes.len(),
+        ..defaults
+    };
+    assert!(parse_icc(&bytes, &limits).is_ok());
+    limits.max_metadata_bytes -= 1;
+    assert!(matches!(parse_icc(&bytes, &limits), Err(Error::Limit(_))));
+    assert!(parse_icc(&bytes[..16], &DecodeLimits::default()).is_err());
+}
+
+#[test]
 fn gamma_linear_conversion_matches_djxl_on_unquantized_pixels() {
     let mut input = image(
         PixelLayout::Rgb,

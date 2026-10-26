@@ -19,6 +19,7 @@ use crate::modular::group::Channel;
 /// Source Image::Create bit depth is nominal, not a signed sample range limit.
 pub const JPEG_STREAM_BITS: u8 = 8;
 
+/// Optional caller budgets; defaults impose no extra resource ceiling.
 #[derive(Clone, Copy, Debug)]
 pub struct PrepareLimits {
     /// Sum of all returned Channel samples and qdc entries, per call.
@@ -30,8 +31,8 @@ pub struct PrepareLimits {
 impl Default for PrepareLimits {
     fn default() -> Self {
         Self {
-            max_samples: 1_048_576,
-            max_output_bytes: 4 * 1024 * 1024,
+            max_samples: usize::MAX,
+            max_output_bytes: usize::MAX,
         }
     }
 }

@@ -10,8 +10,6 @@ use rs_jxl::{EncodeOptions, Image};
 
 use crate::{Result, input, io, options::Tools, parse_threads};
 
-const MAX_RETAINED_BYTES: usize = 512 * 1024 * 1024;
-
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum ReferenceArg {
     Auto,
@@ -65,14 +63,6 @@ fn positive_usize(value: &str) -> std::result::Result<usize, String> {
         .ok_or_else(|| "limit must be a positive integer fitting usize".into())
 }
 
-fn rectangle_limit(value: &str) -> std::result::Result<usize, String> {
-    let count = positive_usize(value)?;
-    if count > 4096 {
-        return Err("max-rectangles must be in 1..=4096".into());
-    }
-    Ok(count)
-}
-
 #[derive(Debug, Args)]
 #[command(
     after_long_help = "Inputs are processed in exactly the given order, without sorting. \
@@ -91,11 +81,10 @@ Automatic selection measures encoded bytes, not elapsed time. --reference auto \
 permits previous and first references. Mask and multi-rectangle candidates are \
 enabled by default when lossless and compatible. These are multiframe strategies, \
 not source-search or an effort mapping. Manual tool options and --threads apply.\n\
-Each input retains the existing limits: 512 MiB file, 16384 pixels per dimension, \
-64000000 pixels, 512 MiB decoded samples. Retained sequence samples plus ICC \
-profiles are additionally limited to 512 MiB; this is not a total RSS limit. \
-The encoder's frame/trial/pixel/output budgets also apply; errors do not silently \
-disable tools or discard frames.\n\
+No extra CLI input, decoded-sample or retained-sequence byte cap is imposed. \
+Frame, trial and trial-pixel budgets are unlimited unless explicitly supplied. \
+Format bounds, size-overflow checks and allocation failures still apply; errors \
+do not silently disable tools or discard frames.\n\
 Use '-' for at most one input from stdin, or -o - for binary stdout. Candidate \
 reports and warnings go to stderr. Encoding finishes before output is written. \
 Output must differ from every input, including with --force."
@@ -138,17 +127,17 @@ pub(crate) struct EncodeFramesArgs {
     /// Tile side length for multi-rectangle planning
     #[arg(long, default_value_t = AutoOptions::default().tile_size, value_parser = clap::value_parser!(u32).range(1..), value_name = "PIXELS")]
     tile_size: u32,
-    /// Maximum rectangles in a multi-rectangle candidate (1..=4096)
-    #[arg(long, default_value_t = AutoOptions::default().max_rectangles, value_parser = rectangle_limit, value_name = "N")]
+    /// Maximum rectangles in a multi-rectangle candidate (positive integer)
+    #[arg(long, default_value_t = AutoOptions::default().max_rectangles, value_parser = positive_usize, value_name = "N")]
     max_rectangles: usize,
-    /// Logical input frame budget (generated layers are not counted)
-    #[arg(long, default_value_t = AutoOptions::default().max_frames, value_parser = positive_usize, value_name = "N")]
+    /// Logical input frame budget (omitted: unlimited; generated layers not counted)
+    #[arg(long, default_value_t = AutoOptions::default().max_frames, hide_default_value = true, value_parser = positive_usize, value_name = "N")]
     max_frames: usize,
-    /// Hard total trial-encode budget
-    #[arg(long, default_value_t = AutoOptions::default().max_total_trials, value_parser = positive_usize, value_name = "N")]
+    /// Hard total trial-encode budget (omitted: unlimited)
+    #[arg(long, default_value_t = AutoOptions::default().max_total_trials, hide_default_value = true, value_parser = positive_usize, value_name = "N")]
     max_total_trials: usize,
-    /// Hard trial-pixel budget
-    #[arg(long, default_value_t = AutoOptions::default().max_trial_pixels, value_parser = clap::value_parser!(u64).range(1..), value_name = "N")]
+    /// Hard trial-pixel budget (omitted: unlimited)
+    #[arg(long, default_value_t = AutoOptions::default().max_trial_pixels, hide_default_value = true, value_parser = clap::value_parser!(u64).range(1..), value_name = "N")]
     max_trial_pixels: u64,
     /// Encoder worker count (1..=256)
     #[arg(long, default_value = "1", value_parser = parse_threads, value_name = "N")]
@@ -278,10 +267,7 @@ fn retained_bytes(image: &Image) -> Result<usize> {
 fn add_retained_bytes(total: usize, additional: usize) -> Result<usize> {
     total
         .checked_add(additional)
-        .filter(|&n| n <= MAX_RETAINED_BYTES)
-        .ok_or_else(|| {
-            "sequence samples and ICC profiles exceed the 512 MiB retained-input limit".into()
-        })
+        .ok_or_else(|| "retained sequence size overflow".into())
 }
 
 fn load_images(args: &EncodeFramesArgs) -> Result<Vec<Image>> {
@@ -418,15 +404,32 @@ mod tests {
         assert!(auto.allow_mask && auto.allow_multi_rect);
         assert_eq!(auto.tile_size, AutoOptions::default().tile_size);
         assert_eq!(auto.max_rectangles, AutoOptions::default().max_rectangles);
-        assert_eq!(auto.max_frames, AutoOptions::default().max_frames);
-        assert_eq!(
-            auto.max_total_trials,
-            AutoOptions::default().max_total_trials
-        );
-        assert_eq!(
-            auto.max_trial_pixels,
-            AutoOptions::default().max_trial_pixels
-        );
+        assert_eq!(auto.max_frames, usize::MAX);
+        assert_eq!(auto.max_total_trials, usize::MAX);
+        assert_eq!(auto.max_trial_pixels, u64::MAX);
+    }
+
+    #[test]
+    fn default_frame_budget_accepts_more_than_ten_thousand_input_paths() {
+        let mut args = parse(&[]);
+        args.inputs = vec![PathBuf::from("frame.png"); 10_001];
+        args.output = PathBuf::from("-");
+        args.check_paths().unwrap();
+        assert_eq!(args.frame_durations().unwrap().len(), 10_001);
+        args.max_frames = 10_000;
+        assert!(args.check_paths().is_err());
+    }
+
+    #[test]
+    fn rectangle_budget_accepts_values_above_the_former_4096_cap() {
+        for limit in [4097usize, usize::MAX] {
+            assert_eq!(
+                parse(&["--max-rectangles", &limit.to_string()])
+                    .auto_options()
+                    .max_rectangles,
+                limit
+            );
+        }
     }
 
     #[test]
@@ -541,7 +544,6 @@ mod tests {
         for extra in [
             vec!["--tile-size", "0"],
             vec!["--max-rectangles", "0"],
-            vec!["--max-rectangles", "4097"],
             vec!["--max-frames", "0"],
             vec!["--max-total-trials", "0"],
             vec!["--max-trial-pixels", "0"],
@@ -629,10 +631,10 @@ mod tests {
         assert!(with_animation(animated, animation).is_err());
         assert_eq!(retained_bytes(&original).unwrap(), 8);
         assert_eq!(
-            add_retained_bytes(MAX_RETAINED_BYTES - 8, 8).unwrap(),
-            MAX_RETAINED_BYTES
+            add_retained_bytes(512 * 1024 * 1024, 8).unwrap(),
+            512 * 1024 * 1024 + 8
         );
-        assert!(add_retained_bytes(MAX_RETAINED_BYTES, 1).is_err());
+        assert_eq!(add_retained_bytes(usize::MAX - 8, 8).unwrap(), usize::MAX);
         assert!(add_retained_bytes(usize::MAX, 1).is_err());
     }
 

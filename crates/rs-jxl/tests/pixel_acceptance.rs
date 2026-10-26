@@ -460,13 +460,13 @@ fn legacy_sample_limit_rejects_instead_of_silently_truncating() {
     opts.modular.fixed_tree = None;
     opts.modular.tree_samples = 64;
     opts.modular.max_tree_leaves = 1;
-    opts.modular.sample_limit = 1;
+    opts.modular.sample_limit = Some(1);
     assert!(matches!(
         rs_jxl::encode(&image, &opts),
         Err(Error::Limit(_))
     ));
     codec_error_without_writes(&image, &[Frame::new(&image)], &opts);
-    opts.modular.sample_limit = 64;
+    opts.modular.sample_limit = Some(64);
     assert!(rs_jxl::encode(&image, &opts).is_ok());
     // This does NOT prove pre-allocation enforcement. PA-03's original collector
     // created the complete batch before checking the cap; audit that separately.
@@ -487,7 +487,7 @@ fn legacy_sample_budget_rejection_must_not_overflow_on_32_bit_targets() {
     let mut opts = options();
     opts.modular.fixed_tree = None;
     opts.modular.tree_samples = 65536;
-    opts.modular.sample_limit = 1;
+    opts.modular.sample_limit = Some(1);
     assert!(matches!(
         rs_jxl::encode(&image, &opts),
         Err(Error::Limit(_))

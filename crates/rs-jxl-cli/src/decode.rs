@@ -15,7 +15,7 @@ mod writers;
 pub(crate) use controls::DecodeArgs;
 use controls::OutputFormat;
 
-const MAX_OUTPUT_BYTES: usize = 512 * 1024 * 1024;
+const MAX_OUTPUT_BYTES: usize = usize::MAX;
 
 #[cfg(test)]
 #[path = "decode_tests.rs"]
@@ -131,9 +131,6 @@ fn reconstruct(args: &DecodeArgs, bytes: &[u8], options: &DecodeOptions) -> Resu
     for _ in 0..args.num_reps {
         drop(std::mem::take(&mut output));
         output = decoder.reconstruct_jpeg(bytes)?;
-        if output.len() > MAX_OUTPUT_BYTES {
-            return Err("reconstructed JPEG exceeds 512 MiB".into());
-        }
     }
     let inspected = if args.print_read_bytes
         || (!args.disable_output

@@ -82,7 +82,7 @@ pub fn options_for_quant(tier: i8, decode_speed: u8) -> Result<ModularOptions> {
 /// policy and actual IDs/population, then give this value to the shared writer.
 /// In particular, never substitute options_for_quant: its local RLE and default
 /// histogram limits do not describe the shared frame. Existing resource fields
-/// (including sample_limit) remain explicit caller-adjustable hard ceilings.
+/// (including sample_limit) remain optional caller-adjustable hard ceilings.
 pub fn options_for_global_entropy(tier: i8, decode_speed: u8) -> Result<ModularOptions> {
     // Reuse the DC/AC ForModular mapping before any fixed-tree attachment.
     let mut options = StreamContext::default().options(tier, decode_speed, StreamKind::Dc)?;

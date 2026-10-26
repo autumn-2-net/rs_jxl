@@ -26,6 +26,7 @@ use tag::{read_single_command, read_tag_list};
 const ICC_CONTEXTS: usize = 41;
 const ICC_HEADER_SIZE: u64 = 128;
 const PREAMBLE_SIZE: usize = 20;
+const MAX_ICC_SIZE: u64 = 1 << 28;
 
 fn check_preamble(
     output_size: u64,
@@ -36,7 +37,7 @@ fn check_preamble(
     if bytes_read.saturating_add(commands_size) > total_len {
         return Err(Error::InvalidIccStream);
     }
-    if output_size > (1 << 28) || output_size.saturating_add(65536) < total_len {
+    if output_size > MAX_ICC_SIZE || output_size.saturating_add(65536) < total_len {
         return Err(Error::IccTooLarge);
     }
     Ok(())
@@ -127,7 +128,9 @@ pub struct IncrementalIccReader {
 impl IncrementalIccReader {
     pub fn new(br: &mut BitReader) -> Result<Self> {
         let len = u64::read_unconditional(&(), br, &Empty {})?;
-        if len > 1u64 << 24 {
+        // The decoded-size and preamble rules imply this encoded-size bound.
+        // A separate 16 MiB resource cap would reject otherwise valid profiles.
+        if len > MAX_ICC_SIZE + 65536 {
             return Err(Error::IccTooLarge);
         }
 

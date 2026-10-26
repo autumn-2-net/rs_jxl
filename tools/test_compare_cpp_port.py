@@ -45,6 +45,36 @@ def fixture(depth=16):
 
 
 class PngTests(unittest.TestCase):
+    def test_wide_rgba_preserves_eight_and_sixteen_bit_samples(self):
+        for depth, pixel in ((8, [19, 81, 253, 0]), (16, [259, 513, 65534, 0])):
+            with self.subTest(depth=depth):
+                data = make_png(depth, 6, [pixel * 16385], width=16385)
+                payload, info = port.png_payload(data)
+                self.assertEqual(payload, data)
+                self.assertEqual(info["width"], 16385)
+                decoded = port.png_samples(payload)
+                self.assertEqual((decoded.width, decoded.height, decoded.depth), (16385, 1, depth))
+                self.assertEqual(decoded.rgba[0, 0].tolist(), pixel)
+                self.assertEqual(decoded.rgba[0, -1].tolist(), pixel)
+
+    def test_payload_uses_format_bounds_without_pixel_allocation(self):
+        with patch.object(port, "pixel_libraries", side_effect=AssertionError("No pixel decode")):
+            for width, height in ((16385, 1), (1, 16385), (8001, 8000), (0x7fffffff, 1)):
+                header = struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0)
+                data = (port.PNG_SIGNATURE + chunk(b"IHDR", header)
+                        + chunk(b"IDAT", b"") + chunk(b"IEND", b""))
+                payload, info = port.png_payload(data)
+                self.assertEqual(payload, data)
+                self.assertEqual((info["width"], info["height"]), (width, height))
+            for width, height in ((0, 1), (1, 0), (0x80000000, 1), (1, 0x80000000)):
+                header = struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0)
+                data = (port.PNG_SIGNATURE + chunk(b"IHDR", header)
+                        + chunk(b"IDAT", b"") + chunk(b"IEND", b""))
+                with self.assertRaisesRegex(ValueError, "format range"):
+                    port.png_payload(data)
+            with self.assertRaisesRegex(ValueError, "chunk payload"):
+                port.png_payload(port.PNG_SIGNATURE + struct.pack(">I4sI", 0x80000000, b"IDAT", 0))
+
     def test_gray_ga_rgb_rgba_at_both_depths(self):
         for depth in (8, 16):
             top = (1 << depth) - 1
@@ -125,6 +155,17 @@ class PngTests(unittest.TestCase):
 
 
 class ProtocolTests(unittest.TestCase):
+    def test_sample_cap_is_omitted_unless_explicit_and_valid(self):
+        for mode in port.MODES:
+            command = port.encoder_command("rust", "rust", "in.png", "out.jxl", 1, 9, mode)
+            self.assertNotIn("--source-sample-limit", command)
+            for limit in (1, 12345, 2**64 - 1):
+                command = port.encoder_command("rust", "rust", "in.png", "out.jxl", 1, 9, mode, limit)
+                self.assertEqual(command[command.index("--source-sample-limit") + 1], str(limit))
+            for limit in (0, -1):
+                with self.assertRaises(ValueError):
+                    port.encoder_command("rust", "rust", "in.png", "out.jxl", 1, 9, mode, limit)
+
     def test_environments_are_clean_explicit_and_case_insensitive(self):
         parent = {"PATH": "bin", "JXL_MA_SEARCH": "1", "jxl_hidden": "1", "RS_JXL_PROFILE": "trace"}
         env, record = port.clean_environment(parent, ["JXL_LOSSLESS_CALIBRATE=1"], cpp=True)
@@ -241,7 +282,8 @@ class HarnessTests(unittest.TestCase):
         elif binary == "rust.exe":
             Path(command[3]).write_bytes(b"JXL" + Path(command[2]).read_bytes())
             search = "--source-search" in command
-            record["stderr"] = f"source mode: search={str(search).lower()} sample_limit=1048576\n"
+            limit = command[command.index("--source-sample-limit") + 1] if "--source-sample-limit" in command else "none"
+            record["stderr"] = f"source mode: search={str(search).lower()} sample_limit={limit}\n"
             if search:
                 record["stderr"] += "source search: full_encodes=2 probe_encodes=1 winner=0\n"
         else:
@@ -265,6 +307,8 @@ class HarnessTests(unittest.TestCase):
         with patch.dict(os.environ, {"JXL_BAD": "1", "RS_JXL_PROFILE": "trace"}):
             report = self.run_benchmark(["--repeats", "2", "--warmups", "1", "--threads", "1", "2"])
         self.assertEqual(report["status"], "passed")
+        self.assertIsNone(report["config"]["source_sample_limit"])
+        self.assertTrue(all("--source-sample-limit" not in command for command, _ in self.calls))
         self.assertEqual(len(report["rows"]), 24)
         self.assertEqual(len(report["summaries"]), 4)
         self.assertEqual([row["encoder"] for row in report["rows"][:4]], ["rust", "cpp", "cpp", "rust"])
@@ -280,6 +324,15 @@ class HarnessTests(unittest.TestCase):
         for _, environment in self.calls:
             self.assertNotIn("JXL_BAD", environment)
             self.assertNotIn("RS_JXL_PROFILE", environment)
+
+    def test_explicit_sample_cap_is_recorded_and_forwarded(self):
+        report = self.run_benchmark(["--source-sample-limit", "123"])
+        self.assertEqual(report["status"], "passed")
+        self.assertEqual(report["config"]["source_sample_limit"], 123)
+        commands = [command for command, _ in self.calls if "encode" in command]
+        self.assertTrue(commands)
+        for command in commands:
+            self.assertEqual(command[command.index("--source-sample-limit") + 1], "123")
 
     def test_both_encoders_matching_wrong_pixels_still_fail_against_source(self):
         self.mismatch = True
@@ -327,7 +380,7 @@ class HarnessTests(unittest.TestCase):
         for extra in (["--threads", "0"], ["--threads", "257"], ["--efforts", "11"],
                       ["--repeats", "0"], ["--warmups", "-1"], ["--timeout", "nan"],
                       ["--timeout", "inf"], ["--timeout", "0"], ["--threads", "1", "1"],
-                      ["--source-sample-limit", "0"]):
+                      ["--source-sample-limit", "0"], ["--source-sample-limit", "-1"]):
             args = port.parser().parse_args([*extra, *self.argv])
             with self.subTest(extra=extra), self.assertRaises(ValueError):
                 port.validate_args(args)

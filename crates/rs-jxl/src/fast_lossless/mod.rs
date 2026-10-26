@@ -61,9 +61,9 @@ pub struct Limits {
 impl Default for Limits {
     fn default() -> Self {
         Self {
-            max_pixels: 64 << 20,
-            max_output_bytes: 512 << 20,
-            max_groups: 1 << 20,
+            max_pixels: u64::MAX,
+            max_output_bytes: usize::MAX,
+            max_groups: usize::MAX,
         }
     }
 }

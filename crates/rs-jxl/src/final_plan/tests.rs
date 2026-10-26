@@ -85,7 +85,7 @@ fn reader_accepts_classic_whitespace_signs_zeros_and_byte_tags() {
     );
     assert!(Record::new("", vec![]).is_err());
     assert!(Record::new("two words", vec![]).is_err());
-    assert!(Record::new([b'a'; 65], vec![]).is_err());
+    assert!(Record::new([b'a'; 65], vec![]).is_ok());
     assert!(Record::new([b'a'; 64], vec![]).is_ok());
 }
 
@@ -117,8 +117,6 @@ fn malformed_truncated_and_trailing_data_are_rejected() {
             "{input}"
         );
     }
-    let long_name = format!("JXL_FINAL_PLAN_V1 1 {} 0", "a".repeat(65));
-    assert!(FinalPlan::read(long_name.as_bytes(), Limits::default()).is_err());
 }
 
 #[test]
@@ -129,19 +127,7 @@ fn budgets_are_checked_before_capture_mutation_or_output() {
             ..Limits::default()
         },
         Limits {
-            records: MAX_RECORDS + 1,
-            ..Limits::default()
-        },
-        Limits {
-            values: MAX_VALUES + 1,
-            ..Limits::default()
-        },
-        Limits {
             bytes: 0,
-            ..Limits::default()
-        },
-        Limits {
-            bytes: u64::MAX,
             ..Limits::default()
         },
     ] {
@@ -205,6 +191,102 @@ fn budgets_are_checked_before_capture_mutation_or_output() {
     cumulative.exchange("b", &mut vec![2]).unwrap();
     assert!(cumulative.exchange("c", &mut vec![3]).is_err());
     assert_eq!(cumulative.records().len(), 2);
+}
+
+#[test]
+fn defaults_and_explicit_budgets_can_exceed_the_former_transcript_caps() {
+    assert_eq!(
+        Limits::default(),
+        Limits {
+            records: usize::MAX,
+            values: usize::MAX,
+            bytes: u64::MAX,
+        }
+    );
+    for limits in [
+        Limits::default(),
+        Limits {
+            records: 1_000_001,
+            values: 16_000_001,
+            bytes: (512 << 20) + 1,
+        },
+    ] {
+        let mut plan = FinalPlan::capture(limits).unwrap();
+        plan.exchange("x", &mut vec![i64::MIN, i64::MAX]).unwrap();
+        let mut bytes = Vec::new();
+        plan.write(&mut bytes).unwrap();
+        let replay = FinalPlan::read(bytes.as_slice(), limits).unwrap();
+        assert_eq!(replay.records(), plan.records());
+    }
+}
+
+#[test]
+fn long_byte_names_round_trip_and_obey_explicit_byte_budgets() {
+    let name = vec![0xff; 8193];
+    let record = Record::new(&name, vec![7]).unwrap();
+    let bytes = wire::header_size(1) + wire::record_size(&name, &[7]).unwrap();
+    let limits = Limits {
+        records: 1,
+        values: 1,
+        bytes,
+    };
+    let mut plan = FinalPlan::capture(limits).unwrap();
+    plan.append(record).unwrap();
+    let mut encoded = Vec::new();
+    plan.write(&mut encoded).unwrap();
+    assert_eq!(encoded.len() as u64, bytes);
+    let replay = FinalPlan::read(encoded.as_slice(), limits).unwrap();
+    assert_eq!(replay.records(), plan.records());
+    assert!(matches!(
+        FinalPlan::read(
+            encoded.as_slice(),
+            Limits {
+                bytes: 80,
+                ..limits
+            }
+        ),
+        Err(Error::Limit("final-plan input bytes"))
+    ));
+    for byte in [b' ', b'\t', b'\r', b'\n', 0x0b, 0x0c] {
+        let mut invalid_name = name.clone();
+        invalid_name.push(byte);
+        assert!(Record::new(invalid_name, vec![]).is_err());
+    }
+}
+
+#[test]
+fn oversized_truncated_counts_do_not_preallocate_declared_storage() {
+    // These counts cannot be allocated as records/values, but the parser must
+    // reach EOF without attempting either allocation from a header alone.
+    for text in [
+        format!("{MAGIC} {}\n", usize::MAX),
+        format!("{MAGIC} 1 x {}\n", usize::MAX / 32),
+        format!("{MAGIC} 1000001\n"),
+        format!("{MAGIC} 1 x 16000001\n"),
+    ] {
+        assert!(matches!(
+            FinalPlan::read(text.as_bytes(), Limits::default()),
+            Err(Error::InvalidInput(message)) if message == "truncated final plan"
+        ));
+    }
+    let text = format!("{MAGIC} 1 x {}\n", usize::MAX / 32);
+    assert!(matches!(
+        FinalPlan::read(
+            text.as_bytes(),
+            Limits {
+                values: 1,
+                ..Limits::default()
+            }
+        ),
+        Err(Error::Limit("final-plan values"))
+    ));
+    assert!(
+        FinalPlan::read(
+            format!("{MAGIC} 18446744073709551616\n").as_bytes(),
+            Limits::default(),
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -380,7 +462,7 @@ fn frame_parameters_validate_each_source_field_and_invisible_equality() {
         (-1, 41),
         (-1, 1),
         (-1, 1),
-        (-65536, 70000),
+        (-70911, 70911),
         (-1, 15),
         (-1, 7),
         (0, 1),
@@ -536,6 +618,14 @@ fn transform_rows_require_validation_against_evolving_channels() {
     assert!(rows[0].validate_channels(2).is_err());
     assert!(rows[1].validate_channels(2).is_err());
     assert!(Transforms::from_values(&[]).is_ok());
+    assert_eq!(
+        Transforms::from_values(&vec![0; 7 * 273])
+            .unwrap()
+            .decisions()
+            .len(),
+        273
+    );
+    assert!(Transforms::from_values(&vec![0; 7 * 274]).is_err());
     assert!(Transforms::from_values(&[0; 8]).is_err());
     assert!(Transforms::from_values(&[2, 0, 0, 0, 0, 0, 0]).is_err());
     assert!(Transforms::from_values(&[0, 0, 42, 0, 0, 0, 0]).is_err());

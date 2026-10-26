@@ -13,9 +13,8 @@ import zlib
 import compare_cpp_port as port
 
 
-MAX_INPUT_BYTES = port.MAX_INPUT_BYTES
-MAX_PIXELS = port.MAX_PIXELS
-MAX_DIMENSION = 16384
+# Optional harness budget; normal corpus runs follow the CLI without a byte cap.
+MAX_INPUT_BYTES = None
 
 
 class UnsupportedInput(ValueError):
@@ -25,8 +24,6 @@ class UnsupportedInput(ValueError):
 def _dimensions(width, height):
     if width <= 0 or height <= 0:
         raise ValueError("Invalid zero or negative image dimensions")
-    if max(width, height) > MAX_DIMENSION or width * height > MAX_PIXELS:
-        raise UnsupportedInput("Dimensions exceed CLI limits: 16384 per axis / 64M pixels")
 
 
 def png_framing(data):
@@ -121,7 +118,7 @@ def _pixels(samples, depth):
 
 
 def _packed_png(original, payload, info):
-    from PIL import Image
+    from PIL import PngImagePlugin
 
     cv2, np = port.pixel_libraries()
     try:
@@ -139,7 +136,9 @@ def _packed_png(original, payload, info):
         scaled_key = key[0] * 255 // ((1 << info["bit_depth"]) - 1)
         expected.rgba[:, :, 3] = np.where(expected.rgba[:, :, 0] == scaled_key, 0, 255)
     try:
-        with Image.open(BytesIO(payload)) as image:
+        # Framing is already validated; use the format reader without Image.open's
+        # global pixel-count policy. Allocation still follows the actual image.
+        with PngImagePlugin.PngImageFile(BytesIO(payload)) as image:
             if info["color_type"] == 0:
                 image = image.convert("L")
                 # Pillow exposes the original packed tRNS key, not its 8-bit value.
@@ -157,7 +156,7 @@ def _packed_png(original, payload, info):
 
 
 def _jpeg_dimensions(data):
-    from PIL import Image
+    from PIL import JpegImagePlugin
 
     # Validate marker lengths and entropy framing, never entropy-decode pixels.
     offset, in_scan, scanned, ended = 2, False, False, False
@@ -194,12 +193,11 @@ def _jpeg_dimensions(data):
     if not ended or not scanned:
         raise ValueError("Truncated JPEG or missing scan/EOI")
     try:
-        with Image.open(BytesIO(data)) as image:
+        # Header-only parsing must not apply a decoded-pixel resource policy.
+        with JpegImagePlugin.JpegImageFile(BytesIO(data)) as image:
             if image.format != "JPEG":
                 raise ValueError("Invalid JPEG header")
             width, height = image.size
-    except Image.DecompressionBombError as error:
-        raise UnsupportedInput("JPEG dimensions exceed CLI limits: 64M pixels") from error
     except (OSError, SyntaxError) as error:
         raise ValueError(f"Invalid JPEG header: {error}") from error
     _dimensions(width, height)
@@ -312,12 +310,12 @@ def prepare(path, directory):
     for writing. UnsupportedInput distinguishes exclusions from malformed data.
     """
     path, directory = Path(path), Path(directory)
-    if path.stat().st_size > MAX_INPUT_BYTES:
-        raise UnsupportedInput("Input exceeds 512 MiB CLI limit")
+    if MAX_INPUT_BYTES is not None and path.stat().st_size > MAX_INPUT_BYTES:
+        raise UnsupportedInput("Input exceeds configured byte budget")
     with path.open("rb") as stream:
-        original = stream.read(MAX_INPUT_BYTES + 1)
-    if len(original) > MAX_INPUT_BYTES:
-        raise UnsupportedInput("Input exceeds 512 MiB CLI limit")
+        original = stream.read() if MAX_INPUT_BYTES is None else stream.read(MAX_INPUT_BYTES + 1)
+    if MAX_INPUT_BYTES is not None and len(original) > MAX_INPUT_BYTES:
+        raise UnsupportedInput("Input exceeds configured byte budget")
     removed = []
     if original.startswith(port.PNG_SIGNATURE):
         payload, framing = png_framing(original)
@@ -343,8 +341,8 @@ def prepare(path, directory):
         raise ValueError("Invalid or truncated image signature")
     else:
         raise UnsupportedInput("Unsupported input format; expected PNG, JPEG, or integer P5/P6/P7")
-    if len(payload) > MAX_INPUT_BYTES:
-        raise UnsupportedInput("Snapshot exceeds 512 MiB CLI limit")
+    if MAX_INPUT_BYTES is not None and len(payload) > MAX_INPUT_BYTES:
+        raise UnsupportedInput("Snapshot exceeds configured byte budget")
     if kind == "png":
         payload, _ = port.png_payload(payload)
         port.compare_pixels(expected, port.png_samples(payload))

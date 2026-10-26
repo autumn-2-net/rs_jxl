@@ -65,13 +65,14 @@ fn check_size_limit(
     (xs, ys): (usize, usize),
     num_ec: usize,
 ) -> Result<()> {
-    if let Some(limit) = pixel_limit {
-        let xs = xs.max(16); // xsize is always at least 64 bytes.
-        let total_pixels = xs.saturating_mul(ys).saturating_mul(3 + num_ec);
-        if total_pixels >= limit {
-            return Err(Error::ImageSizeTooLarge(xs, ys));
-        }
-    };
+    let xs = xs.max(16); // xsize is always at least 64 bytes.
+    let total_samples = num_ec
+        .checked_add(3)
+        .and_then(|channels| xs.checked_mul(ys)?.checked_mul(channels))
+        .ok_or(Error::ImageSizeTooLarge(xs, ys))?;
+    if pixel_limit.is_some_and(|limit| total_samples > limit) {
+        return Err(Error::ImageSizeTooLarge(xs, ys));
+    }
     Ok(())
 }
 

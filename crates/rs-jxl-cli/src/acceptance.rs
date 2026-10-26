@@ -93,7 +93,7 @@ fn source_cli_small_png_matches_native_candidate_and_search() -> Result<()> {
             let args = expect_encode(Cli::try_parse_from(argv)?.command);
             crate::run(args)?;
             let mut base = EncodeOptions::default();
-            base.modular.sample_limit = 4096;
+            base.modular.sample_limit = Some(4096);
             let params = CandidateParams::default().backend(3)?;
             let expected = if search {
                 let result = run_native_pixel_search(
@@ -108,7 +108,7 @@ fn source_cli_small_png_matches_native_candidate_and_search() -> Result<()> {
                     result
                         .adaptations
                         .iter()
-                        .all(|a| a.resources.sample_limit == 4096)
+                        .all(|a| a.resources.sample_limit == Some(4096))
                 );
                 result.output.bytes
             } else {
@@ -119,7 +119,7 @@ fn source_cli_small_png_matches_native_candidate_and_search() -> Result<()> {
                     NativeBackendOptions::default(),
                 )?;
                 assert!(result.artifact.gaps.is_empty());
-                assert_eq!(result.artifact.resources.sample_limit, 4096);
+                assert_eq!(result.artifact.resources.sample_limit, Some(4096));
                 result.bytes
             };
             assert!(!expected.is_empty());
@@ -266,7 +266,7 @@ fn real_image_oracle(path: PathBuf, source: bool, require_jpeg: bool) -> Result<
         let bpp = output_bytes as f64 * 8.0 / pixels as f64;
         eprintln!(
             "input={} width={width} height={height} threads={threads} \
-             source_effort={:?} source_search={} source_sample_limit={} \
+             source_effort={:?} source_search={} source_sample_limit={:?} \
              output_bytes={output_bytes} bpp={bpp:.6} pure_encode_ms={:.3}",
             path.display(),
             args.source_effort,

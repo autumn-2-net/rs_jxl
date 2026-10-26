@@ -191,8 +191,7 @@ pub(in crate::decode) fn write_png(
                 let length = values
                     .len()
                     .checked_mul(2)
-                    .filter(|&n| n <= MAX_OUTPUT_BYTES)
-                    .ok_or("PNG frame exceeds 512 MiB")?;
+                    .ok_or("PNG frame size overflow")?;
                 let mut bytes = Vec::new();
                 bytes.try_reserve_exact(length)?;
                 for value in values {

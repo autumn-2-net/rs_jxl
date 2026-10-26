@@ -66,7 +66,7 @@ pub fn apply_palette(
 }
 
 pub(crate) fn validate_layout(channels: &[Channel], meta: usize) -> Result<()> {
-    if meta > channels.len() || channels.len() > 8192 {
+    if meta > channels.len() || channels.len() > i32::MAX as usize {
         return Err(Error::InvalidInput(
             "invalid modular meta/channel count".into(),
         ));
@@ -203,7 +203,11 @@ pub fn apply_squeeze(
             first -= 1;
         }
         let count = end - first;
-        if channels.len() + count > 8192 {
+        if channels
+            .len()
+            .checked_add(count)
+            .is_none_or(|n| n > i32::MAX as usize)
+        {
             return Err(Error::Limit("squeeze channel count"));
         }
         let mut residuals = Vec::with_capacity(count);
@@ -420,6 +424,32 @@ pub(super) fn undo_palette_for_test(channels: &mut Vec<Channel>, transform: Tran
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transformed_channel_count_has_no_private_8192_cap() {
+        let channels = vec![
+            Channel {
+                width: 1,
+                height: 1,
+                hshift: 0,
+                vshift: 0,
+                samples: vec![0],
+            };
+            8193
+        ];
+        validate_layout(&channels, 0).unwrap();
+        // Palette's *per-transform* count is a different, real wire field.
+        assert!(
+            validate_transform(&Transform::Palette {
+                begin: 0,
+                channels: 8193,
+                colors: 1,
+                deltas: 0,
+                predictor: Predictor::Zero,
+            })
+            .is_err()
+        );
+    }
 
     #[test]
     fn applying_rct_reuses_original_channel_allocations() {

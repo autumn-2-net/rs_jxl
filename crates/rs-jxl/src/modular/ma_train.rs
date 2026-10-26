@@ -160,9 +160,9 @@ macro_rules! with_property_values {
 const PROPERTY_RANGE: i32 = 511;
 const QUANTILE_RANGE: i32 = 512;
 const WP_PROPERTY: usize = 15;
-/// Explicit training resource ceiling, NOT a bitstream/context-map limit.
+/// Maximum representable tree leaves, without the former 16,384 resource cap.
 /// Raw MA contexts may exceed 256; entropy clustering assigns final histogram IDs.
-pub const MAX_LEAVES: usize = 16_384;
+pub const MAX_LEAVES: usize = MAX_TREE_LEAVES;
 
 /// enc_ma.cc/dec_ma.cc kMaxTreeSize counts nodes, not leaf contexts.
 pub const MAX_TREE_NODES: usize = 1 << 22;

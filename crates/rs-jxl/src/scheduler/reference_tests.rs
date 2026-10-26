@@ -97,7 +97,7 @@ fn reference_recipe_retains_explicit_group_resource_limits_and_entropy_overrides
     let image = original();
     let atlas = image.with_modular_planes(1, 1, vec![vec![-1]; 4]).unwrap();
     let mut base = EncodeOptions::default();
-    base.modular.sample_limit = 12345;
+    base.modular.sample_limit = Some(12345);
     for (precise_entropy, probe_lz77, method) in [
         (false, 0, SourceLz77Method::Lz77b1w3t),
         (true, 0, SourceLz77Method::Optc256),
@@ -137,7 +137,7 @@ fn reference_recipe_retains_explicit_group_resource_limits_and_entropy_overrides
             method
         );
         assert_eq!(reference.modular.max_tree_leaves, 64);
-        assert_eq!(reference.modular.sample_limit, 12345);
+        assert_eq!(reference.modular.sample_limit, Some(12345));
         assert!(reference.modular.custom_tree.is_none());
         assert!(reference.modular.tree_groups.is_none());
         assert!(reference.modular.tree_group_splits.is_empty());

@@ -8,8 +8,9 @@ source candidate/search/scout/pilot) and `encoder_lab` (including content pilot)
 - `bounded`: stop adaptive splitting at the ceiling and keep valid lossless
   predictor leaves. Compression size may increase; pixel values do not change.
 - Omitted: preserve existing policy, strict for source sampling and bounded
-  for legacy/direct training, including its existing parallel merge errors.
-  No existing preset or sample limit changes.
+  for legacy/direct training. This mode does not change quality presets or
+  sampling fractions. Private resource ceilings have separately been removed;
+  see the sample-limit repair below.
 
 Required multiplier partitions, enabled channel/row partitions, and explicitly
 requested constant leaves must fit in either mode. Bounded mode does not prune
@@ -47,9 +48,9 @@ can allocate capacity differently from serial DFS, so tree bytes need not match.
 Strict independent-root parallelism is unchanged. Optional stream-tree grouping
 still has its own hard merged-tree limit; bounded mode does not relax that check.
 
-Source scheduler clones retain the new controls. Existing scheduler resource
-reports describe their projected ceilings, not this additional cap; the effective
-learner ceiling is their minimum. No scheduler files are modified for this API.
+Source scheduler clones retain these controls. Scheduler resource reports
+describe their projected ceilings, not this additional cap; the effective
+learner ceiling is their minimum.
 
 Dedicated tests cover defaults/overrides, tiny serial/parallel caps, mandatory
 partitions, detached seed retention, source/reference propagation, CLI parsing,
@@ -92,14 +93,14 @@ returned exit 1 with `MA leaf budget exhausted with beneficial splits remaining`
 as intended. Unit tests additionally check that failing operations do not turn
 into partially successful outputs.
 
-## Known Source-Effort 10 Sample Limit
+## Source-Effort 10 Sample-Limit Repair
 
 The leaf-budget repair above does not fix `grouped MA selected-sample budget
 exceeded`. That error is a separate hard ceiling on gathered training samples,
 before adaptive tree learning. `--ma-budget-mode bounded` only limits splitting;
 it does not cap or reduce sampling and cannot resolve this sample-limit error.
 
-The CLI and `ModularOptions` currently default to 1048576 selected samples.
+The CLI and `ModularOptions` previously defaulted to 1048576 selected samples.
 Both source effort 9 and 10 use a raw learning fraction of 0.5 scaled by 1.3
 (approximately 65%). A selected sample is a transformed channel value, not one
 whole RGB pixel. Palette transforms and constant channels affect the population.
@@ -111,7 +112,7 @@ fit effort 9's per-learning-domain limit but exceed the same ceiling in effort
 10's full-frame learning. The error text also serves the gather's local atomic
 budget; it does not by itself imply erroneous double charging across workers.
 
-On 2026-10-26 the current release CLI reproduced this on DIV2K `0716.png`
+On 2026-10-26 the pre-repair release CLI reproduced this on DIV2K `0716.png`
 (2040x2040, 8-bit), using 16 threads, `--strip-metadata`, no source search, and
 no budget override:
 
@@ -120,9 +121,22 @@ no budget override:
 - `--source-effort 10`: exit 1, `grouped MA selected-sample budget exceeded`;
   no output file was created.
 
-This is an unresolved default-resource-policy/acceptance gap, not a bitstream
-restriction and not evidence that all effort-9 inputs are safe. Explicitly
-raising `--source-sample-limit` is possible, but an appropriate cap and memory
-cost have not been validated for the reported corpus. Do not confuse an omitted
-default ceiling with an explicit caller limit when designing a future fix;
-neither silently reducing samples nor removing the memory guard is implemented.
+This ceiling was introduced by the Rust port, not by the JXL format. Local
+official `v0.12.0` source (`enc_encoding.cc::GatherTreeData`,
+`enc_ma.cc::PrepareForSamples`/`AddSample`) samples according to the requested
+fraction and grows/deduplicates storage without that fixed selected-count cap.
+
+The repaired library uses `ModularOptions::sample_limit: Option<usize>`, default
+`None`. The normal CLI and `encoder_lab` now agree: no hidden default override,
+no automatic cap and no sampling reduction. An explicit
+`--source-sample-limit N` / `Some(N)` still errors when exceeded, including an
+explicit 1048576. Checked arithmetic and allocation errors remain enforced.
+
+The former 16384 maximum configurable learner leaves and 131072 grouped-tree
+ceiling are also removed. Their allowed maximum is now the decoder tree bound;
+source integration still applies the tighter geometry-dependent global/local
+tree rules. Explicit caller leaf budgets and legacy quality presets remain.
+
+See [the resource-limit audit](RESOURCE_LIMIT_AUDIT.md) for the broader repair
+and its verification results. No claim is made that the original 67-image
+report corpus has been rerun unless listed there.

@@ -8,7 +8,7 @@ import unittest
 from unittest.mock import patch
 import zlib
 
-from PIL import Image, JpegImagePlugin
+from PIL import Image, JpegImagePlugin, PngImagePlugin
 
 import compare_cpp_port as port
 import corpus_inputs as inputs
@@ -187,7 +187,7 @@ class CorpusInputsTests(unittest.TestCase):
             with self.subTest(size=len(bad)):
                 self.reject(bad)
 
-    def test_jpeg_dimension_limits_without_pixel_decode(self):
+    def test_jpeg_large_dimensions_without_pixel_decode(self):
         buffer = BytesIO()
         Image.new("RGB", (1, 1)).save(buffer, "JPEG")
         original = buffer.getvalue()
@@ -197,7 +197,10 @@ class CorpusInputsTests(unittest.TestCase):
             data[sof + 5:sof + 9] = struct.pack(">HH", height, width)
             with self.subTest(width=width, height=height), patch.object(
                     JpegImagePlugin.JpegImageFile, "load", side_effect=AssertionError("No JPEG pixels")):
-                self.reject(bytes(data), inputs.UnsupportedInput, "limits")
+                info, snapshot, expected = self.prepare(bytes(data))
+                self.assertEqual((info["width"], info["height"]), (width, height))
+                self.assertEqual(snapshot.read_bytes(), bytes(data))
+                self.assertEqual(expected, bytes(data))
 
     def test_p5_p6_p7_every_integer_channel_and_depth(self):
         _, np = port.pixel_libraries()
@@ -237,23 +240,38 @@ class CorpusInputsTests(unittest.TestCase):
                     _, _, expected = self.prepare(b"P5\n1 1\n255" + separator + bytes([first]))
                     self.assertEqual(int(expected.rgba[0, 0, 0]), first)
 
-    def test_unsupported_formats_and_limits_are_not_success(self):
+    def test_unsupported_formats_and_explicit_budgets_are_not_success(self):
         for data, reason in ((b"PF\n1 1\n-1.0\n", "PFM"),
                              (b"P5\n1 1\n100\n\0", "MAXVAL"),
                              (b"P7\nWIDTH 1\nHEIGHT 1\nDEPTH 5\nMAXVAL 255\nENDHDR\n", "channels"),
-                             (b"P5\n16385 1\n255\n", "Dimensions"),
-                             (b"P5\n8001 8000\n255\n", "Dimensions"),
                              (b"P3\n1 1\n255\n0 0 0", "format")):
             with self.subTest(reason=reason):
                 self.reject(data, inputs.UnsupportedInput, reason)
         valid = png(1, 0, [[0]], 1)
         apng = valid[:33] + chunk(b"acTL", struct.pack(">II", 1, 0)) + valid[33:]
         self.reject(apng, inputs.UnsupportedInput, "APNG")
-        oversized = (port.PNG_SIGNATURE + chunk(b"IHDR", struct.pack(">IIBBBBB", 16385, 1, 1, 0, 0, 0, 0))
-                     + valid[33:])
-        self.reject(oversized, inputs.UnsupportedInput, "Dimensions")
         with patch.object(inputs, "MAX_INPUT_BYTES", 10):
-            self.reject(valid, inputs.UnsupportedInput, "512 MiB")
+            self.reject(valid, inputs.UnsupportedInput, "byte budget")
+
+    def test_wide_png_and_netpbm_use_normal_cli_geometry(self):
+        self.assertIsNone(inputs.MAX_INPUT_BYTES)
+        for data in (png(8, 0, [[19] * 16385], 16385),
+                     png(1, 0, [[1] * 16385], 16385),
+                     b"P5\n16385 1\n255\n" + bytes([19]) * 16385):
+            info, _, expected = self.prepare(data)
+            self.assertEqual((info["width"], info["height"]), (16385, 1))
+            self.assertEqual(expected.rgba.shape, (1, 16385, 4))
+
+    def test_large_geometry_is_checked_without_decoding_or_allocating_pixels(self):
+        inputs._dimensions(8001, 8000)
+        for width, height in ((16385, 1), (8001, 8000), (0x7fffffff, 1)):
+            header = struct.pack(">IIBBBBB", width, height, 1, 0, 0, 0, 0)
+            data = (port.PNG_SIGNATURE + chunk(b"IHDR", header)
+                    + chunk(b"IDAT", b"") + chunk(b"IEND", b""))
+            _, info = inputs.png_framing(data)
+            self.assertEqual((info["width"], info["height"]), (width, height))
+        for data in (b"P5\n16385 1\n255\n", b"P5\n8001 8000\n255\n"):
+            self.reject(data)
 
     def test_bad_png_framing_never_reaches_pillow(self):
         valid = png(2, 0, [[0, 1]], 2)
@@ -270,7 +288,7 @@ class CorpusInputsTests(unittest.TestCase):
                png(2, 3, [[0, 1]], 2, [(b"PLTE", b"\0" * 4)]),
                header + chunk(b"IDAT", b"") + chunk(b"tEXt", b"k\0v") + tail,
                header + chunk(b"IDAT", b"broken zlib") + chunk(b"IEND", b"")]
-        with patch.object(Image, "open", side_effect=AssertionError("Framing must be checked first")):
+        with patch.object(PngImagePlugin, "PngImageFile", side_effect=AssertionError("Framing must be checked first")):
             for data in bad:
                 with self.subTest(data=data[:40]):
                     self.reject(data)

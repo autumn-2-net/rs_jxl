@@ -5,10 +5,8 @@ use rs_jxl::{Image, PixelData, PixelLayout};
 use zune_jpeg::JpegDecoder;
 use zune_jpeg::zune_core::{bytestream::ZCursor, colorspace::ColorSpace, options::DecoderOptions};
 
-use super::{MAX_DIMENSION, checked_size, metadata, zeroed_bytes};
+use super::{checked_size, metadata, zeroed_bytes};
 use crate::Result;
-
-const MAX_ICC_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Debug)]
 struct CheckedJpeg<'a> {
@@ -79,7 +77,7 @@ fn preflight(bytes: &[u8], strip: bool) -> Result<CheckedJpeg<'_>> {
     }
     let mut offset = 2;
     let mut dimensions = None;
-    let mut scans = 0;
+    let mut scans = 0usize;
     let mut entropy = false;
     let mut filtered: Option<Vec<u8>> = None;
     let mut copied_until = 0;
@@ -160,10 +158,7 @@ fn preflight(bytes: &[u8], strip: bool) -> Result<CheckedJpeg<'_>> {
                 if count == 0 || count > components || data.len() != 4 + 2 * usize::from(count) {
                     return Err("invalid JPEG scan header".into());
                 }
-                scans += 1;
-                if scans > 100 {
-                    return Err("JPEG exceeds the 100 scan limit".into());
-                }
+                scans = scans.checked_add(1).ok_or("JPEG scan count overflow")?;
                 entropy = true;
                 false
             }
@@ -204,7 +199,9 @@ fn preflight(bytes: &[u8], strip: bool) -> Result<CheckedJpeg<'_>> {
                 if icc_parts.len() != count || icc_parts[sequence - 1].is_some() {
                     return Err("duplicate or inconsistent JPEG ICC split segments".into());
                 }
-                icc_bytes = icc_bytes.checked_add(data.len() - 14).filter(|&n| n <= MAX_ICC_BYTES).ok_or("JPEG ICC exceeds 16 MiB")?;
+                // The 16-bit marker length and 8-bit split count already bound
+                // a conforming profile to 255 * (65535 - 2 - 14) bytes.
+                icc_bytes = icc_bytes.checked_add(data.len() - 14).ok_or("JPEG ICC size overflow")?;
                 icc_parts[sequence - 1] = Some(&data[14..]);
                 // Keep ICC outside the pixel decoder to avoid its own partial
                 // APP2 assembly. Attach the original joined bytes to Image.
@@ -248,9 +245,9 @@ pub(super) fn decode(bytes: &[u8], strip: bool) -> Result<Image> {
     };
     let options = DecoderOptions::default()
         .set_strict_mode(true)
-        .set_max_width(MAX_DIMENSION as usize)
-        .set_max_height(MAX_DIMENSION as usize)
-        .jpeg_set_max_scans(100)
+        .set_max_width(usize::MAX)
+        .set_max_height(usize::MAX)
+        .jpeg_set_max_scans(usize::MAX)
         .jpeg_set_out_colorspace(output);
     let mut decoder = JpegDecoder::new_with_options(ZCursor::new(checked.bytes.as_ref()), options);
     decoder.decode_headers()?;
@@ -491,6 +488,35 @@ mod tests {
     }
 
     #[test]
+    fn decodes_progressive_jpeg_with_more_than_100_scans() {
+        let plain = fixture(3);
+        let sos = plain
+            .windows(2)
+            .position(|bytes| bytes == [0xff, 0xda])
+            .unwrap();
+        let mut bytes = plain[..sos].to_vec();
+        let sof = bytes
+            .windows(2)
+            .position(|bytes| bytes == [0xff, 0xc0])
+            .unwrap();
+        bytes[sof + 1] = 0xc2;
+        // Three DC-zero codes, followed by one EOB-only scan per AC coefficient
+        // and component: 190 scans with complete, non-overlapping coverage.
+        segment(&mut bytes, 0xda, &[3, 1, 0, 2, 0, 3, 0, 0, 0, 0]);
+        bytes.push(0x1f);
+        for component in 1..=3 {
+            for spectral in 1..=63 {
+                segment(&mut bytes, 0xda, &[1, component, 0, spectral, spectral, 0]);
+                bytes.push(0x7f);
+            }
+        }
+        bytes.extend_from_slice(&[0xff, 0xd9]);
+        let image = decode(&bytes, false).unwrap();
+        assert_eq!((image.width(), image.height()), (3, 2));
+        assert_eq!(image.pixels(), &PixelData::U8(vec![128; 3 * 2 * 3]));
+    }
+
+    #[test]
     fn validates_entropy_stuffing_and_multiple_scans() {
         let plain = fixture(1);
         let mut bytes = plain[..plain.len() - 2].to_vec();
@@ -517,10 +543,17 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unsupported_depth_components_and_limits_before_decode() {
+    fn rejects_unsupported_depth_components_and_invalid_sampling_before_decode() {
         assert!(frame(&[12, 0, 1, 0, 1, 1, 1, 0x11, 0]).is_err());
         assert!(frame(&[8, 0, 1, 0, 1, 4]).is_err());
-        assert!(frame(&[8, 0, 1, 0xff, 0xff, 1, 1, 0x11, 0]).is_err());
+        assert_eq!(
+            frame(&[8, 0, 1, 0xff, 0xff, 1, 1, 0x11, 0]).unwrap(),
+            (65_535, 1, 1)
+        );
+        assert_eq!(
+            frame(&[8, 0x40, 1, 0xff, 0xff, 1, 1, 0x11, 0]).unwrap(),
+            (65_535, 16_385, 1)
+        );
         assert!(frame(&[8, 0, 1, 0, 1, 1, 1, 0, 0]).is_err());
     }
 }

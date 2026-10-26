@@ -103,7 +103,7 @@ pub struct Tools {
     #[arg(long,value_parser=clap::value_parser!(u8).range(1..=5))]
     weighted_candidates: Option<u8>,
     /// Exact palette color budget; omitted disables palettes
-    #[arg(long,value_parser=clap::value_parser!(u32).range(1..=70000))]
+    #[arg(long,value_parser=clap::value_parser!(u32).range(1..=70911))]
     palette_colors: Option<u32>,
     /// Stateless delta-palette predictor ID; requires --palette-colors
     #[arg(long,requires="palette_colors",value_parser=clap::value_parser!(u32).range(0..=13))]
@@ -115,8 +115,10 @@ pub struct Tools {
     entropy: Entropy,
     #[arg(long, value_enum, default_value = "lazy")]
     lz77: Lz77,
+    /// Manual tree-training sample target (any positive usize)
     #[arg(long, default_value_t = 1024)]
     tree_samples: usize,
+    /// Manual learned tree leaf allowance (1..=2097152, the format bound)
     #[arg(long, default_value_t = 16)]
     tree_leaves: usize,
     #[arg(long, default_value_t = 48.0)]
@@ -195,5 +197,61 @@ impl Tools {
             ..Default::default()
         };
         options.modular.validate()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct TestCli {
+        #[command(flatten)]
+        tools: Tools,
+    }
+
+    #[test]
+    fn manual_tree_options_accept_large_targets_without_extra_caps() {
+        for samples in [1_048_577usize, usize::MAX] {
+            for leaves in [16_385, 131_073, rs_jxl::modular::ma_train::MAX_TREE_LEAVES] {
+                let args = TestCli::try_parse_from([
+                    "tools",
+                    "--tree-samples",
+                    &samples.to_string(),
+                    "--tree-leaves",
+                    &leaves.to_string(),
+                ])
+                .unwrap();
+                let mut options = EncodeOptions::default();
+                args.tools.apply(&mut options).unwrap();
+                assert_eq!(options.modular.tree_samples, samples);
+                assert_eq!(options.modular.max_tree_leaves, leaves);
+                assert_eq!(options.modular.sample_limit, None);
+            }
+        }
+    }
+
+    #[test]
+    fn manual_tree_options_keep_nonzero_and_format_checks() {
+        for (flag, value) in [
+            ("--tree-samples", "0"),
+            ("--tree-leaves", "0"),
+            ("--tree-leaves", "2097153"),
+        ] {
+            let args = TestCli::try_parse_from(["tools", flag, value]).unwrap();
+            assert!(args.tools.apply(&mut EncodeOptions::default()).is_err());
+        }
+    }
+
+    #[test]
+    fn manual_palette_options_use_the_complete_wire_range() {
+        for limit in ["70001", "70911"] {
+            let args = TestCli::try_parse_from(["tools", "--palette-colors", limit]).unwrap();
+            args.tools.apply(&mut EncodeOptions::default()).unwrap();
+        }
+        for limit in ["0", "70912"] {
+            assert!(TestCli::try_parse_from(["tools", "--palette-colors", limit]).is_err());
+        }
     }
 }

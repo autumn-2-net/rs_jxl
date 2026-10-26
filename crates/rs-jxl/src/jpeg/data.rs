@@ -9,7 +9,8 @@ pub const MAX_COMPONENTS: usize = 4;
 pub const BLOCK_SIZE: usize = 64;
 pub const MAX_QUANT_TABLES: usize = 4;
 pub const MAX_HUFFMAN_TABLES: usize = 4;
-pub const MAX_DHT_MARKERS: usize = 512;
+/// No cumulative DHT definition ceiling; table slot IDs remain format-bounded.
+pub const MAX_DHT_MARKERS: usize = usize::MAX;
 pub const MAX_DIM_PIXELS: u32 = 65535;
 
 /// Structural errors include the byte offset in the input JPEG.

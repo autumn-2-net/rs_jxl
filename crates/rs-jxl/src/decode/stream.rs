@@ -455,6 +455,10 @@ impl StreamDecoder {
     }
 }
 
+#[cfg(test)]
+#[path = "stream_limit_tests.rs"]
+mod limit_tests;
+
 fn append(output: &mut Vec<u8>, input: &[u8], allocation: &'static str) -> Result<()> {
     output
         .try_reserve(input.len())

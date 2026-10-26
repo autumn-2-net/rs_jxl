@@ -19,7 +19,7 @@ impl Output {
         Self {
             bytes: Vec::new(),
             position: 0,
-            limit: limit.min(MAX_OUTPUT_BYTES),
+            limit,
         }
     }
     pub(in crate::decode) fn into_bytes(self) -> Vec<u8> {
@@ -36,7 +36,7 @@ impl Write for Output {
             .position
             .checked_add(bytes.len())
             .filter(|&n| n <= self.limit)
-            .ok_or_else(|| io::Error::other("output exceeds the CLI's 512 MiB aggregate limit"))?;
+            .ok_or_else(|| io::Error::other("output size overflows or exceeds its byte budget"))?;
         if end > self.bytes.len() {
             self.bytes
                 .try_reserve(end - self.bytes.len())

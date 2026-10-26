@@ -45,8 +45,6 @@ CPP_COMMIT = "b866b3defec13494bfbaf705db93581cda118e37"
 CPP_SOURCE = Path(__file__).resolve().parents[2] / "jxl_python" / "libjxl"
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 MODES = ("single-candidate", "full-scheduler")
-MAX_INPUT_BYTES = 512 * 1024 * 1024
-MAX_PIXELS = 64_000_000
 
 
 def sha256(data):
@@ -74,8 +72,8 @@ def pixel_libraries():
 
 def png_payload(data):
     """Validate framing/CRC and remove metadata, never recompress pixel data."""
-    if not data.startswith(PNG_SIGNATURE) or len(data) > MAX_INPUT_BYTES:
-        raise ValueError("Only PNG input up to 512 MiB is allowed; JPEG is never accepted")
+    if not data.startswith(PNG_SIGNATURE):
+        raise ValueError("Only PNG input is allowed; JPEG is never accepted")
     offset = 8
     chunks, removed, seen = [], [], set()
     info = None
@@ -85,8 +83,10 @@ def png_payload(data):
             raise ValueError("Truncated PNG chunk")
         length, kind = struct.unpack_from(">I4s", data, offset)
         end = offset + length + 12
-        if end > len(data):
-            raise ValueError("Truncated PNG chunk payload")
+        if length > 0x7fffffff or end > len(data):
+            raise ValueError("Invalid or truncated PNG chunk payload")
+        if any(not (65 <= c <= 90 or 97 <= c <= 122) for c in kind) or kind[2] & 32:
+            raise ValueError("Invalid PNG chunk type")
         body = data[offset + 8:end - 4]
         crc = struct.unpack_from(">I", data, end - 4)[0]
         if zlib.crc32(kind + body) != crc:
@@ -102,9 +102,8 @@ def png_payload(data):
             if (depth not in (8, 16) or color not in (0, 2, 3, 4, 6)
                     or (color == 3 and depth != 8)):
                 raise ValueError("Only 8/16-bit gray/GA/RGB/RGBA and 8-bit palette PNG are supported")
-            if (not 0 < width <= 16384 or not 0 < height <= 16384
-                    or width * height > MAX_PIXELS):
-                raise ValueError("PNG dimensions exceed the Rust CLI limits")
+            if not 0 < width <= 0x7fffffff or not 0 < height <= 0x7fffffff:
+                raise ValueError("PNG dimensions exceed the nonzero 31-bit format range")
             if compression or filtering or interlace not in (0, 1):
                 raise ValueError("Unsupported PNG compression/filter/interlace method")
             info = dict(width=width, height=height, bit_depth=depth, color_type=color,
@@ -213,13 +212,16 @@ def clean_environment(parent, overrides=(), *, cpp=False):
     return environment, {"removed_inherited_names": removed, "explicit": explicit}
 
 
-def encoder_command(encoder, binary, source, output, threads, effort, mode, sample_limit):
+def encoder_command(encoder, binary, source, output, threads, effort, mode, sample_limit=None):
     if mode not in MODES:
         raise ValueError(f"Unknown mode: {mode}")
+    if sample_limit is not None and sample_limit < 1:
+        raise ValueError("Explicit sample limit must be positive")
     if encoder == "rust":
         command = [str(binary), "encode", str(source), str(output), "--threads", str(threads),
-                   "--strip-metadata", "--source-effort", str(effort),
-                   "--source-sample-limit", str(sample_limit)]
+                   "--strip-metadata", "--source-effort", str(effort)]
+        if sample_limit is not None:
+            command += ["--source-sample-limit", str(sample_limit)]
         if mode == "full-scheduler":
             command.append("--source-search")
         return command
@@ -437,7 +439,8 @@ def parser():
     result.add_argument("--threads", type=int, nargs="+", default=[1])
     result.add_argument("--repeats", type=int, default=1)
     result.add_argument("--warmups", type=int, default=0)
-    result.add_argument("--source-sample-limit", type=int, default=1_048_576)
+    result.add_argument("--source-sample-limit", type=int, default=None,
+                        help="Optional positive Rust MA sample cap; omitted uses the CLI default")
     result.add_argument("--timeout", type=float, default=120, help="Per subprocess seconds; no fallback after failure")
     result.add_argument("--cpp-env", action="append", default=[], metavar="JXL_NAME=value")
     result.add_argument("--rust-env", action="append", default=[], metavar="RS_JXL_NAME=value")
@@ -453,8 +456,9 @@ def validate_args(args):
         raise ValueError("--threads must be in 1..256")
     if any(not 1 <= value <= 10 for value in args.efforts):
         raise ValueError("--efforts must be in 1..10")
-    if args.repeats < 1 or args.warmups < 0 or args.source_sample_limit < 1:
-        raise ValueError("repeats/sample-limit must be positive; warmups must be nonnegative")
+    if (args.repeats < 1 or args.warmups < 0
+            or (args.source_sample_limit is not None and args.source_sample_limit < 1)):
+        raise ValueError("repeats and explicit sample-limit must be positive; warmups must be nonnegative")
     if not math.isfinite(args.timeout) or args.timeout <= 0:
         raise ValueError("--timeout must be finite and positive")
     for values in (args.threads, args.efforts):
@@ -505,8 +509,6 @@ def benchmark(args):
             pair_index = 0
             for input_index, path in enumerate(args.images):
                 path = path.resolve(strict=True)
-                if path.stat().st_size > MAX_INPUT_BYTES:
-                    raise ValueError(f"Input exceeds 512 MiB: {path}")
                 original = path.read_bytes()
                 payload, info = png_payload(original)
                 expected = png_samples(original)

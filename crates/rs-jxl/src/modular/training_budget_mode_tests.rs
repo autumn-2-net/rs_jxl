@@ -52,7 +52,7 @@ fn ma_budget_mode_source_and_legacy_defaults_and_overrides_reach_prepared_learni
         if source {
             // The exhaustion policy never changes selected-sample accounting.
             options.ma_budget_mode = Some(MaBudgetMode::Bounded);
-            options.sample_limit = 31;
+            options.sample_limit = Some(31);
             assert!(matches!(learn(&streams, &options), Err(Error::Limit(_))));
         }
     }

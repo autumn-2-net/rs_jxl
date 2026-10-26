@@ -201,7 +201,7 @@ impl Shared {
             return Err(Error::InvalidInput("empty auxiliary tree domains".into()));
         }
         splits.push(num_streams);
-        let budget = training::SampleBudget::new(options.sample_limit);
+        let budget = options.sample_limit.map(training::SampleBudget::new);
         let learn = |_: usize,
                      (range, policy): &(std::ops::Range<usize>, &ModularOptions),
                      parallel| {
@@ -221,7 +221,7 @@ impl Shared {
                 .collect();
             // The cooperative JPEG route lends only the split runner. Gathering
             // stays serial and selected pixels share the same frame ceiling.
-            training::learn_with_budget(&views, policy, Some(&budget), parallel)
+            training::learn_with_budget(&views, policy, budget.as_ref(), parallel)
         };
         let trees = if let Some(runner) = runner {
             runner.run(&useful, learn)?

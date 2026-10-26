@@ -392,6 +392,20 @@ fn ac_metadata_tiles_flattened_rows_and_epf_match_source_shapes() {
 }
 
 #[test]
+fn default_preparation_budget_checks_only_numeric_overflow() {
+    let limits = PrepareLimits::default();
+    assert!(check_budget(1_048_577, 0, &limits).is_ok());
+    assert!(matches!(
+        check_budget(usize::MAX, 1, &limits),
+        Err(DcStreamError::Limit("output sample count overflow"))
+    ));
+    assert!(matches!(
+        check_budget(usize::MAX / 4 + 1, 0, &limits),
+        Err(DcStreamError::Limit("output byte count overflow"))
+    ));
+}
+
+#[test]
 fn dc_and_control_output_budgets_are_exact_before_allocation() {
     let jpeg = fixture(8, 8, &[(1, 1)], &[1]);
     let layout = TranscodeLayout::new(&jpeg).unwrap();

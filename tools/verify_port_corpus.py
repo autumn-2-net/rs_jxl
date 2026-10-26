@@ -1,4 +1,4 @@
-"""Bounded pixel-only corpus acceptance; official djxl is a verification oracle.
+"""Pixel-only corpus acceptance; official djxl is a verification oracle.
 
 No build/download/discovery, C++ encoder, compressed hashes, resizing, or Pillow
 narrowing. Reuses the tested 8/16-bit PNG readers in compare_cpp_port, NOT its
@@ -8,6 +8,10 @@ verbatim; compare every original decoded sample, including invisible RGB.
 
 This does not certify metadata preservation, JPEG input, float/U31, or timing
 parity. --list and --self-test run no encoder and need no pixel dependencies.
+The built-in manifest is a default selection, not an input-size or case-count
+limit. Optional --max-* arguments impose caller-selected corpus/file budgets.
+Child/total timeouts and 1 MiB per diagnostic stream remain runner safeguards,
+not codec input/output limits. The oracle remains scoped to 8/16-bit PNG.
 """
 
 import argparse
@@ -24,11 +28,6 @@ from time import monotonic, sleep
 from compare_cpp_port import compare_pixels, pixel_libraries, png_payload, png_samples
 
 
-MAX_CASES = 8
-MAX_PIXELS = 2_100_000
-MAX_TOTAL_PIXELS = 5_000_000
-MAX_INPUT_BYTES = 16 << 20
-MAX_OUTPUT_BYTES = 32 << 20
 MAX_LOG_BYTES = 1 << 20
 REFERENCE_ROOT = Path(__file__).resolve().parents[2] / "jxl_python"
 MANIFEST = {
@@ -43,13 +42,15 @@ MANIFEST = {
 }
 
 
-def png_header(header):
+def png_header(header, max_pixels=None):
     if len(header) < 33 or header[:16] != b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR":
         raise ValueError("expected PNG IHDR")
     width, height, depth, color, compression, filtering, interlace = struct.unpack_from(
         ">IIBBBBB", header, 16
     )
-    if not 0 < width <= 16384 or not 0 < height <= 16384 or width * height > MAX_PIXELS:
+    if not 0 < width <= 0x7fffffff or not 0 < height <= 0x7fffffff:
+        raise ValueError(f"invalid PNG dimensions: {width}x{height}")
+    if max_pixels is not None and width * height > max_pixels:
         raise ValueError(f"per-image geometry budget exceeded: {width}x{height}")
     if depth not in (8, 16) or color not in (0, 2, 3, 4, 6) or (color == 3 and depth != 8):
         raise ValueError("corpus oracle accepts only 8/16-bit PNG (8-bit palette)")
@@ -63,11 +64,13 @@ def inside(path, roots):
     return any(path == root or root in path.parents for root in roots)
 
 
-def check_total(records):
-    if not 1 <= len(records) <= MAX_CASES:
-        raise ValueError(f"select 1..{MAX_CASES} images")
+def check_total(records, max_cases=None, max_total_pixels=None):
+    if not records:
+        raise ValueError("select at least one image")
+    if max_cases is not None and len(records) > max_cases:
+        raise ValueError(f"select at most {max_cases} images")
     total = sum(record["width"] * record["height"] for record in records)
-    if total > MAX_TOTAL_PIXELS:
+    if max_total_pixels is not None and total > max_total_pixels:
         raise ValueError(f"total corpus budget exceeded: {total} pixels")
     return total
 
@@ -76,8 +79,10 @@ def select_sources(args):
     roots = [args.testdata.resolve(strict=True), args.test_img.resolve(strict=True)]
     selected = ([(path.name, path) for path in args.image] if args.image else
                 [(key, roots[0] / MANIFEST[key]) for key in (args.case or MANIFEST)])
-    if not 1 <= len(selected) <= MAX_CASES:
-        raise ValueError(f"select 1..{MAX_CASES} images; no recursive discovery")
+    if not selected:
+        raise ValueError("select at least one image; no recursive discovery")
+    if args.max_cases is not None and len(selected) > args.max_cases:
+        raise ValueError(f"select at most {args.max_cases} images; no recursive discovery")
     records, seen = [], set()
     for label, path in selected:
         path = path.resolve(strict=True)
@@ -86,27 +91,33 @@ def select_sources(args):
         if path in seen:
             raise ValueError(f"duplicate input: {path}")
         seen.add(path)
-        if path.stat().st_size > MAX_INPUT_BYTES:
-            raise ValueError(f"input exceeds {MAX_INPUT_BYTES} bytes: {path}")
+        if args.max_input_bytes is not None and path.stat().st_size > args.max_input_bytes:
+            raise ValueError(f"input exceeds {args.max_input_bytes} bytes: {path}")
         with path.open("rb") as stream:
-            info = png_header(stream.read(33))
+            info = png_header(stream.read(33), args.max_pixels)
         records.append(dict(label=label, source=str(path), **info))
-    check_total(records)
+    check_total(records, args.max_cases, args.max_total_pixels)
     return roots, records
 
 
-def read_bounded(path, limit):
-    if path.stat().st_size > limit:
+def read_bounded(path, limit=None):
+    if limit is not None and path.stat().st_size > limit:
         raise ValueError(f"file budget exceeded: {path}")
     with path.open("rb") as stream:
-        data = stream.read(limit + 1)
-    if len(data) > limit:
-        raise ValueError(f"file grew beyond budget: {path}")
-    return data
+        if limit is None:
+            return stream.read()
+        # Read actual bytes in chunks; an explicit large cap is not an allocation size.
+        data = bytearray()
+        while chunk := stream.read(min(1 << 20, limit - len(data) + 1)):
+            data.extend(chunk)
+            if len(data) > limit:
+                raise ValueError(f"file grew beyond budget: {path}")
+    return bytes(data)
 
 
-def run_child(command, environment, directory, timeout, deadline, output=None):
-    """Bound each child and reap on failure; avoid unbounded PIPE capture."""
+def run_child(command, environment, directory, timeout, deadline, output=None,
+              max_output_bytes=None):
+    """Bound time/logs, optionally bound output, and reap each child on failure."""
     start = monotonic()
     end = min(start + timeout, deadline)
     if start >= end:
@@ -122,8 +133,9 @@ def run_child(command, environment, directory, timeout, deadline, output=None):
                 if monotonic() >= end:
                     raise TimeoutError(f"child/total deadline exhausted: {command}")
                 for path, limit in [(stdout, MAX_LOG_BYTES), (stderr, MAX_LOG_BYTES),
-                                    (output, MAX_OUTPUT_BYTES)]:
-                    if path is not None and path.exists() and path.stat().st_size > limit:
+                                    (output, max_output_bytes)]:
+                    if (path is not None and limit is not None and path.exists()
+                            and path.stat().st_size > limit):
                         raise ValueError(f"child file budget exceeded: {path}")
                 sleep(0.02)
         finally:
@@ -135,8 +147,11 @@ def run_child(command, environment, directory, timeout, deadline, output=None):
     )
     if child.returncode:
         raise RuntimeError(f"exit={child.returncode}, command={command!r}\n{text[-4000:]}")
-    if output is not None and (not output.is_file() or not 0 < output.stat().st_size <= MAX_OUTPUT_BYTES):
-        raise ValueError(f"missing, empty, or oversized output: {output}")
+    if output is not None:
+        if not output.is_file() or output.stat().st_size == 0:
+            raise ValueError(f"missing or empty output: {output}")
+        if max_output_bytes is not None and output.stat().st_size > max_output_bytes:
+            raise ValueError(f"oversized output: {output}")
     finished = monotonic()
     if finished >= end:
         raise TimeoutError(f"child/total deadline exhausted after exit: {command}")
@@ -158,7 +173,11 @@ def encoder_command(args, binary, source, output):
     command = [str(binary), "encode", str(source), str(output), "--strip-metadata",
                "--threads", str(args.threads)]
     if args.mode != "legacy":
-        command += ["--source-effort", str(args.effort), "--source-sample-limit", "1048576"]
+        command += ["--source-effort", str(args.effort)]
+        if args.source_sample_limit is not None:
+            if args.source_sample_limit < 1:
+                raise ValueError("Explicit source sample limit must be positive")
+            command += ["--source-sample-limit", str(args.source_sample_limit)]
         if args.mode == "source-search":
             command.append("--source-search")
     return command
@@ -195,12 +214,17 @@ def verify(args, roots, records):
                                    min(10, args.timeout), deadline)
             versions[str(binary)] = version.strip()
         print(json.dumps(dict(event="start", mode=args.mode, effort=args.effort,
-                              threads=args.threads, cases=len(records), pixels=check_total(records),
+                              threads=args.threads, cases=len(records),
+                              pixels=check_total(records, args.max_cases, args.max_total_pixels),
+                              limits=dict(max_cases=args.max_cases, max_pixels=args.max_pixels,
+                                          max_total_pixels=args.max_total_pixels,
+                                          max_input_bytes=args.max_input_bytes,
+                                          max_output_bytes=args.max_output_bytes),
                               binaries=versions, oracle_origin="caller-attested",
                               metadata_acceptance=False)), flush=True)
         for index, record in enumerate(records):
-            original = read_bounded(Path(record["source"]), MAX_INPUT_BYTES)
-            info = png_header(original[:33])
+            original = read_bounded(Path(record["source"]), args.max_input_bytes)
+            info = png_header(original[:33], args.max_pixels)
             if any(info[key] != record[key] for key in info):
                 raise ValueError("source geometry changed after manifest preflight")
             snapshot, png_info = png_payload(original)
@@ -211,7 +235,8 @@ def verify(args, roots, records):
             source.write_bytes(snapshot)
             jxl = directory / f"encoded-{index}.jxl"
             elapsed, diagnostics = run_child(encoder_command(args, encoder, source, jxl),
-                                             environment, directory, args.timeout, deadline, jxl)
+                                             environment, directory, args.timeout, deadline, jxl,
+                                             args.max_output_bytes)
             if args.mode != "legacy":
                 marker = f"search={str(args.mode == 'source-search').lower()} "
                 if marker not in diagnostics:
@@ -222,9 +247,10 @@ def verify(args, roots, records):
             for oracle, decoder in enumerate(decoders):
                 output = directory / f"decoded-{index}-{oracle}.png"
                 run_child(decoder_command(decoder, jxl, output, expected.depth),
-                          environment, directory, args.timeout, deadline, output)
-                decoded = read_bounded(output, MAX_OUTPUT_BYTES)
-                png_header(decoded[:33])
+                          environment, directory, args.timeout, deadline, output,
+                          args.max_output_bytes)
+                decoded = read_bounded(output, args.max_output_bytes)
+                png_header(decoded[:33], args.max_pixels)
                 compare_pixels(expected, png_samples(decoded))
                 output.unlink()
             if monotonic() > deadline:
@@ -264,16 +290,32 @@ def self_test():
 
         def test_hostile_dimensions_and_palette_depth(self):
             for header in [self.header(width=0), self.header(width=0xffffffff),
-                           self.header(width=16384, height=16384), self.header(color=3)]:
+                           self.header(height=0), self.header(height=0x80000000),
+                           self.header(color=3)]:
                 with self.assertRaises(ValueError):
                     png_header(header)
 
+        def test_geometry_limits_are_opt_in_and_format_bounds_remain(self):
+            for width, height in [(16385, 1), (16384, 16384), (0x7fffffff, 0x7fffffff)]:
+                with self.subTest(width=width, height=height):
+                    header = self.header(width=width, height=height)
+                    info = png_header(header)
+                    self.assertEqual((info["width"], info["height"]), (width, height))
+                    self.assertEqual(png_header(header, width * height), info)
+                    with self.assertRaises(ValueError):
+                        png_header(header, width * height - 1)
+            with self.assertRaises(ValueError):
+                png_header(self.header(width=16384, height=16384), 2_100_000)
+
         def test_count_and_total_budget(self):
             item = dict(width=1000, height=1000)
-            self.assertEqual(check_total([item] * 5), MAX_TOTAL_PIXELS)
+            self.assertEqual(check_total([item] * 9), 9_000_000)
+            self.assertEqual(check_total([item] * 5, 8, 5_000_000), 5_000_000)
+            with self.assertRaises(ValueError):
+                check_total([])
             for records in [[], [item] * 6, [dict(width=1, height=1)] * 9]:
                 with self.assertRaises(ValueError):
-                    check_total(records)
+                    check_total(records, 8, 5_000_000)
 
         def test_containment_is_not_string_prefix(self):
             root = Path("samples").resolve()
@@ -281,15 +323,26 @@ def self_test():
             self.assertFalse(inside(root.with_name(root.name + "-other") / "a.png", [root]))
 
         def test_encoder_commands_select_only_requested_rust_mode(self):
-            args = SimpleNamespace(threads=1, effort=7, mode="source-candidate")
+            args = SimpleNamespace(threads=1, effort=7, mode="source-candidate", source_sample_limit=None)
             command = encoder_command(args, Path("rs-jxl"), Path("a.png"), Path("a.jxl"))
             self.assertEqual(command[0:2], ["rs-jxl", "encode"])
             self.assertNotIn("--source-search", command)
+            self.assertNotIn("--source-sample-limit", command)
             self.assertNotIn("--bits_per_sample=8", command)
             args.mode = "source-search"
             self.assertIn("--source-search", encoder_command(args, "rs-jxl", "a", "b"))
             args.mode = "legacy"
             self.assertNotIn("--source-effort", encoder_command(args, "rs-jxl", "a", "b"))
+
+        def test_explicit_sample_budget_is_forwarded_without_reduction(self):
+            for mode in ("source-candidate", "source-search"):
+                args = SimpleNamespace(threads=1, effort=7, mode=mode, source_sample_limit=123)
+                command = encoder_command(args, "rs-jxl", "a", "b")
+                self.assertEqual(command[command.index("--source-sample-limit") + 1], "123")
+                for limit in (0, -1):
+                    args.source_sample_limit = limit
+                    with self.assertRaises(ValueError):
+                        encoder_command(args, "rs-jxl", "a", "b")
 
         def test_decoder_command_retains_original_precision(self):
             for depth in (8, 16):
@@ -310,7 +363,9 @@ def self_test():
                 source.write_bytes(self.header())
                 outside = root / "outside.png"
                 outside.write_bytes(self.header())
-                args = SimpleNamespace(testdata=data, test_img=images, case=None, image=[source])
+                args = argument_parser().parse_args([
+                    "--testdata", str(data), "--test-img", str(images), "--image", str(source)
+                ])
                 _, records = select_sources(args)
                 self.assertEqual(records[0]["bit_depth"], 16)
                 for selection in ([source, source], [data / ".." / outside.name]):
@@ -318,10 +373,40 @@ def self_test():
                     with self.assertRaises(ValueError):
                         select_sources(args)
                 args.image = [source]
-                with patch.object(module, "MAX_INPUT_BYTES", 32), self.assertRaises(ValueError):
+                args.max_input_bytes = 32
+                with self.assertRaises(ValueError):
                     select_sources(args)
                 self.assertEqual(source.read_bytes(), self.header())
                 self.assertEqual(outside.read_bytes(), self.header())
+
+        def test_explicit_images_do_not_inherit_manifest_budgets(self):
+            with tempfile.TemporaryDirectory(prefix="rs-jxl-corpus-selftest-") as tmp:
+                root = Path(tmp)
+                args = argument_parser().parse_args(["--testdata", tmp, "--test-img", tmp])
+                args.image = [root / f"wide-{index}.png" for index in range(9)]
+                for source in args.image:
+                    source.write_bytes(self.header(width=16385, height=129))
+                actual_stat = Path.stat
+
+                def reported_stat(path, *args, **kwargs):
+                    info = actual_stat(path, *args, **kwargs)
+                    if path in selection:
+                        return os.stat_result((*info[:6], 17 << 20, *info[7:]))
+                    return info
+
+                selection = set(args.image)
+                with patch.object(Path, "stat", reported_stat):
+                    _, records = select_sources(args)
+                    self.assertEqual(len(records), 9)
+                    self.assertEqual(check_total(records), 9 * 16385 * 129)
+                    for name, limit in [("max_cases", 8), ("max_pixels", 2_100_000),
+                                        ("max_total_pixels", 5_000_000),
+                                        ("max_input_bytes", 16 << 20)]:
+                        with self.subTest(name=name):
+                            setattr(args, name, limit)
+                            with self.assertRaises(ValueError):
+                                select_sources(args)
+                            setattr(args, name, None)
 
         def test_read_budget_checks_stat_and_actual_read(self):
             for reported_size, contents in [(4, b"abcd"), (1, b"abcd")]:
@@ -332,6 +417,17 @@ def self_test():
             path = SimpleNamespace(stat=lambda: SimpleNamespace(st_size=3),
                                    open=lambda _: BytesIO(b"abc"))
             self.assertEqual(read_bounded(path, 3), b"abc")
+
+        def test_read_has_no_default_budget_or_cap_sized_allocation(self):
+            path = SimpleNamespace(stat=lambda: SimpleNamespace(st_size=1 << 40),
+                                   open=lambda _: BytesIO(b"abc"))
+            self.assertEqual(read_bounded(path), b"abc")
+            stream = Mock(wraps=BytesIO(b"abc"))
+            stream.__enter__ = Mock(return_value=stream)
+            stream.__exit__ = Mock(return_value=False)
+            path.open = lambda _: stream
+            self.assertEqual(read_bounded(path, 1 << 100), b"abc")
+            self.assertTrue(all(0 < call.args[0] <= 1 << 20 for call in stream.read.call_args_list))
 
         def test_expired_deadline_and_stale_output_never_launch(self):
             with tempfile.TemporaryDirectory(prefix="rs-jxl-corpus-selftest-") as tmp:
@@ -380,10 +476,9 @@ def self_test():
                     with patch.object(subprocess, "Popen", side_effect=launch), \
                             patch.object(module, "monotonic", return_value=10), \
                             patch.object(module, "MAX_LOG_BYTES", 8), \
-                            patch.object(module, "MAX_OUTPUT_BYTES", 8), \
                             patch.object(module, "sleep") as pause:
                         with self.assertRaises(ValueError):
-                            run_child(["unused"], {}, root, 1, 100, output)
+                            run_child(["unused"], {}, root, 1, 100, output, max_output_bytes=8)
                     child.kill.assert_called_once_with()
                     child.wait.assert_called_once_with()
                     pause.assert_not_called()
@@ -406,14 +501,32 @@ def self_test():
                         return child
 
                     with patch.object(subprocess, "Popen", side_effect=launch), \
-                            patch.object(module, "monotonic", side_effect=[10, 10.25]), \
-                            patch.object(module, "MAX_OUTPUT_BYTES", 8):
+                            patch.object(module, "monotonic", side_effect=[10, 10.25]):
                         if error:
                             with self.assertRaises(error):
-                                run_child(["unused"], {}, root, 1, 100, output)
+                                run_child(["unused"], {}, root, 1, 100, output, max_output_bytes=8)
                         else:
-                            self.assertEqual(run_child(["unused"], {}, root, 1, 100, output),
-                                             (0.25, ""))
+                            self.assertEqual(run_child(["unused"], {}, root, 1, 100, output,
+                                                       max_output_bytes=8), (0.25, ""))
+                    child.kill.assert_not_called()
+                    child.wait.assert_called_once_with()
+
+        def test_child_output_has_no_default_size_budget(self):
+            for running in (False, True):
+                with self.subTest(running=running), \
+                        tempfile.TemporaryDirectory(prefix="rs-jxl-corpus-selftest-") as tmp:
+                    output = Mock()
+                    output.exists.side_effect = [False, True]
+                    output.is_file.return_value = True
+                    output.stat.return_value = SimpleNamespace(st_size=33 << 20)
+                    child = Mock(returncode=0)
+                    child.poll.side_effect = [None, 0, 0] if running else [0, 0]
+                    times = [10, 10, 10.25] if running else [10, 10.25]
+                    with patch.object(subprocess, "Popen", return_value=child), \
+                            patch.object(module, "monotonic", side_effect=times), \
+                            patch.object(module, "sleep"):
+                        self.assertEqual(run_child(["unused"], {}, Path(tmp), 1, 100, output),
+                                         (0.25, ""))
                     child.kill.assert_not_called()
                     child.wait.assert_called_once_with()
 
@@ -442,7 +555,7 @@ def self_test():
     return 0 if result.wasSuccessful() else 1
 
 
-def main():
+def argument_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--testdata", type=Path, default=REFERENCE_ROOT / "jxl_testdata")
     parser.add_argument("--test-img", type=Path, default=REFERENCE_ROOT / "test_img")
@@ -451,23 +564,50 @@ def main():
     select.add_argument("--image", action="append", type=Path, help="Explicit original PNG within either root")
     parser.add_argument("--encoder", type=Path)
     parser.add_argument("--decoder", action="append", type=Path, help="Caller-attested official djxl; at most two")
-    parser.add_argument("--threads", type=int, choices=range(1, 9), default=1)
+    parser.add_argument("--threads", type=int, choices=range(1, 257), default=1)
     parser.add_argument("--effort", type=int, choices=range(1, 11), default=7)
     parser.add_argument("--mode", choices=("legacy", "source-candidate", "source-search"), default="source-candidate")
-    parser.add_argument("--timeout", type=float, default=120, help="Per child, maximum 120 seconds")
-    parser.add_argument("--total-timeout", type=float, default=600, help="Orchestration budget, maximum 600 seconds")
+    parser.add_argument("--source-sample-limit", type=int, default=None,
+                        help="Optional positive source MA sample cap; omitted uses the CLI default")
+    parser.add_argument("--max-cases", type=int, default=None,
+                        help="Optional positive selected-image count cap; default: no cap")
+    parser.add_argument("--max-pixels", type=int, default=None,
+                        help="Optional positive per-image pixel cap; default: no cap")
+    parser.add_argument("--max-total-pixels", type=int, default=None,
+                        help="Optional positive total input pixel cap; default: no cap")
+    parser.add_argument("--max-input-bytes", type=int, default=None,
+                        help="Optional positive per-input byte cap; default: no cap")
+    parser.add_argument("--max-output-bytes", type=int, default=None,
+                        help="Optional positive per-encoded/decoded-file byte cap; default: no cap")
+    parser.add_argument("--timeout", type=float, default=120, help="Positive per-child timeout in seconds")
+    parser.add_argument("--total-timeout", type=float, default=600, help="Positive total timeout in seconds")
     parser.add_argument("--list", action="store_true", help="Read at most 33 bytes per file; no sample decode/encoding")
     parser.add_argument("--self-test", action="store_true", help="Test orchestration helpers only")
-    args = parser.parse_args()
+    return parser
+
+
+def main(argv=None):
+    parser = argument_parser()
+    args = parser.parse_args(argv)
     if args.self_test:
         return self_test()
-    if not all(math.isfinite(value) and 0 < value <= maximum
-               for value, maximum in [(args.timeout, 120), (args.total_timeout, 600)]):
-        parser.error("timeouts must be finite, positive, and within their stated caps")
+    if args.source_sample_limit is not None:
+        if args.source_sample_limit < 1:
+            parser.error("--source-sample-limit must be positive")
+        if args.mode == "legacy":
+            parser.error("--source-sample-limit requires a source mode")
+    for name in ("max_cases", "max_pixels", "max_total_pixels", "max_input_bytes", "max_output_bytes"):
+        value = getattr(args, name)
+        if value is not None and value < 1:
+            parser.error(f"--{name.replace('_', '-')} must be positive")
+    if not all(math.isfinite(value) and value > 0
+               for value in (args.timeout, args.total_timeout)):
+        parser.error("timeouts must be finite and positive")
     try:
         roots, records = select_sources(args)
         if args.list:
-            print(json.dumps(dict(cases=records, total_pixels=check_total(records)), indent=2))
+            print(json.dumps(dict(cases=records, total_pixels=check_total(
+                records, args.max_cases, args.max_total_pixels)), indent=2))
         else:
             verify(args, roots, records)
     except (ValueError, OSError, RuntimeError) as error:

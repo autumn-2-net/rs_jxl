@@ -14,6 +14,7 @@ use super::{
 };
 use crate::{Error, Result, entropy::options::SpeedTier, scheduler::WorkerLimits};
 
+/// Optional caller budgets; `usize::MAX` (the default) imposes no extra ceiling.
 #[derive(Clone, Debug)]
 pub struct TranscodeLimits {
     /// Structural, coefficient-read and scan-work limits, checked before
@@ -25,6 +26,7 @@ pub struct TranscodeLimits {
     pub max_coefficients: usize,
     pub max_tokens: usize,
     /// Hard selected-sample ceiling across auxiliary MA tree domains.
+    /// `usize::MAX` keeps all samples selected by the effort's learning policy.
     pub sample_limit: usize,
 }
 
@@ -32,10 +34,10 @@ impl Default for TranscodeLimits {
     fn default() -> Self {
         Self {
             input: CoefficientReadLimits::default(),
-            max_output_bytes: 256 << 20,
-            max_coefficients: 64 << 20,
-            max_tokens: 64 << 20,
-            sample_limit: 4 << 20,
+            max_output_bytes: usize::MAX,
+            max_coefficients: usize::MAX,
+            max_tokens: usize::MAX,
+            sample_limit: usize::MAX,
         }
     }
 }
@@ -193,6 +195,20 @@ mod tests {
         let error = transcode_to(&jpeg, &options, &mut sink).unwrap_err();
         assert!(matches!(error, Error::Limit(_)), "{error:?}");
         assert_eq!(sink, [19, 87]);
+    }
+
+    #[test]
+    fn public_sample_budget_is_opt_in_and_does_not_reduce_sampling() {
+        let jpeg = tiny_jpeg();
+        let mut options = TranscodeOptions {
+            effort: 8,
+            ..Default::default()
+        };
+        let uncapped = transcode(&jpeg, &options).unwrap();
+        options.limits.sample_limit = 1;
+        assert!(matches!(transcode(&jpeg, &options), Err(Error::Limit(_))));
+        options.limits.sample_limit = 1 << 20;
+        assert_eq!(transcode(&jpeg, &options).unwrap(), uncapped);
     }
 
     #[test]

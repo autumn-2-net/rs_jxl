@@ -13,25 +13,31 @@ from compare_cpp_port import (
 )
 
 
-def main():
+def argument_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--before", type=Path, required=True)
     parser.add_argument("--after", type=Path, required=True)
     parser.add_argument("--decoder", type=Path, action="append", required=True)
     parser.add_argument("--threads", type=int, default=8)
     parser.add_argument("--effort", type=int, default=9)
-    parser.add_argument("--sample-limit", type=int, default=33_554_432)
+    parser.add_argument("--sample-limit", type=int, default=None,
+                        help="Optional positive MA sample cap; omitted uses each CLI's default")
     parser.add_argument("--mode", choices=MODES, nargs="+", default=list(MODES))
     parser.add_argument("--warmups", type=int, default=1)
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--timeout", type=float, default=300)
     parser.add_argument("--json", type=Path, required=True)
     parser.add_argument("images", type=Path, nargs="+")
-    args = parser.parse_args()
+    return parser
+
+
+def main(argv=None):
+    parser = argument_parser()
+    args = parser.parse_args(argv)
     if (not 1 <= args.threads <= 256 or not 1 <= args.effort <= 10
             or args.repeats < 1 or args.warmups < 0
             or not math.isfinite(args.timeout) or args.timeout <= 0
-            or args.sample_limit < 1):
+            or (args.sample_limit is not None and args.sample_limit < 1)):
         parser.error("invalid effort, worker, repeat, sample or timeout limit")
     if args.json.exists():
         parser.error("refusing to overwrite an existing report")

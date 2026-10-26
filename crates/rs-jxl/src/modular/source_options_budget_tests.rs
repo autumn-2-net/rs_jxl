@@ -11,7 +11,7 @@ use crate::{EncodeOptions, PixelData, PixelLayout};
 
 const CANVAS_LEAVES: usize = 66_048;
 const ATLAS_LEAVES: usize = 520;
-const SAMPLE_LIMIT: usize = 1_234_567;
+const SAMPLE_LIMIT: Option<usize> = Some(1_234_567);
 
 fn canvas() -> Image {
     Image::new(
@@ -99,24 +99,29 @@ fn atlas_budget_explicit_caps_are_retained_including_max_leaves() {
         (ATLAS_LEAVES - 1, ATLAS_LEAVES - 1),
         (ATLAS_LEAVES, ATLAS_LEAVES),
         (ATLAS_LEAVES + 1, ATLAS_LEAVES),
+        (CANVAS_LEAVES - 1, ATLAS_LEAVES),
+        (CANVAS_LEAVES, ATLAS_LEAVES),
+        (CANVAS_LEAVES + 1, ATLAS_LEAVES),
         (MAX_LEAVES, ATLAS_LEAVES),
     ] {
         let policy = policy(&canvas, Some(limit));
         assert_eq!(policy.modular.max_tree_leaves, limit);
-        assert_eq!(policy.modular.max_merged_tree_leaves, Some(limit));
+        let canvas_limit = limit.min(CANVAS_LEAVES);
+        assert_eq!(policy.modular.max_merged_tree_leaves, Some(canvas_limit));
         let reference = policy.resolve(&atlas).unwrap();
         assert_eq!(reference.modular.max_tree_leaves, limit);
         assert_eq!(reference.modular.max_merged_tree_leaves, Some(atlas_limit));
         assert_eq!(reference.modular.sample_limit, SAMPLE_LIMIT);
-        assert_eq!(policy.modular.max_merged_tree_leaves, Some(limit));
-        // In particular, Some(MAX_LEAVES) must not become the auto canvas bound.
+        assert_eq!(policy.modular.max_merged_tree_leaves, Some(canvas_limit));
+        // Explicit caps below the decoder's geometry bound stay exact; larger
+        // requests cannot waive that bound or retain an atlas's smaller bound.
         assert_eq!(
             policy
                 .resolve(&canvas)
                 .unwrap()
                 .modular
                 .max_merged_tree_leaves,
-            Some(limit)
+            Some(canvas_limit)
         );
     }
 }

@@ -6,8 +6,6 @@ use crate::modular::layout::Rect;
 use crate::{Error, Result};
 use std::collections::VecDeque;
 
-const MAX_CELLS: usize = 1 << 20;
-
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) struct Region {
     pub rect: Rect,
@@ -28,6 +26,10 @@ fn grid(width: usize, height: usize, side: usize) -> Result<(usize, usize, usize
     if width == 0 || height == 0 {
         return Err(Error::InvalidInput("empty group sampling image".into()));
     }
+    // Image dimensions are u32; all grid coordinates therefore fit the
+    // 32-bit axes of the Morton key, independently of the number of cells.
+    u32::try_from(width).map_err(|_| Error::Limit("group sampling image dimensions"))?;
+    u32::try_from(height).map_err(|_| Error::Limit("group sampling image dimensions"))?;
     width
         .checked_mul(height)
         .ok_or(Error::Limit("group sampling pixel count"))?;
@@ -37,13 +39,6 @@ fn grid(width: usize, height: usize, side: usize) -> Result<(usize, usize, usize
         .checked_mul(rows)
         .ok_or(Error::Limit("group sampling grid size"))?;
     Ok((columns, rows, count))
-}
-
-fn bounded_count(count: usize) -> Result<()> {
-    if count > MAX_CELLS {
-        return Err(Error::Limit("group sampling cell count"));
-    }
-    Ok(())
 }
 
 fn rect_end(rect: Rect, width: usize, height: usize) -> Result<(usize, usize)> {
@@ -64,10 +59,10 @@ fn rect_end(rect: Rect, width: usize, height: usize) -> Result<(usize, usize)> {
 }
 
 // Morton order keeps midpoint sampling spatially useful inside activity ties.
-// The grid cap bounds both coordinates to fewer than MAX_CELLS.
-fn spatial_key(x: usize, y: usize) -> u64 {
+// Interleave both complete axes, including bits above the former cell cap.
+fn spatial_key(x: u32, y: u32) -> u64 {
     let mut key = 0;
-    for bit in 0..MAX_CELLS.trailing_zeros() {
+    for bit in 0..u32::BITS {
         key |= ((x >> bit & 1) as u64) << (2 * bit);
         key |= ((y >> bit & 1) as u64) << (2 * bit + 1);
     }
@@ -178,7 +173,6 @@ pub(super) fn plan(
         return Err(Error::InvalidInput("invalid sampling macro side".into()));
     }
     let (columns, rows, count) = grid(width, height, side)?;
-    bounded_count(count)?;
     if scan.available() && (scan.width != width || scan.height != height) {
         return Err(Error::InvalidInput(
             "scan dimensions do not match group sampling image".into(),
@@ -198,7 +192,7 @@ pub(super) fn plan(
                     height: side.min(height - y * side),
                 },
                 activity: 0.0,
-                spatial: spatial_key(x, y),
+                spatial: spatial_key(x as u32, y as u32),
             });
         }
     }
@@ -288,7 +282,6 @@ pub(super) fn groups_for_rect(
     let count = (x1 - x0)
         .checked_mul(y1 - y0)
         .ok_or(Error::Limit("sampled real-group count"))?;
-    bounded_count(count)?;
     let mut groups = Vec::new();
     groups
         .try_reserve_exact(count)
@@ -526,7 +519,7 @@ mod tests {
     }
 
     #[test]
-    fn plans_reject_invalid_geometry_scan_extents_and_resource_limits() {
+    fn plans_reject_invalid_geometry_scan_extents_and_arithmetic_overflow() {
         let scan = LosslessScan::default();
         for side in [0, 1, 127, 129, 384, 2048, usize::MAX] {
             assert!(matches!(
@@ -540,7 +533,7 @@ mod tests {
                 Err(Error::InvalidInput(_))
             ));
         }
-        for (width, height) in [(usize::MAX, 2), (usize::MAX, 1), ((MAX_CELLS + 1) * 128, 1)] {
+        for (width, height) in [(usize::MAX, 2), (usize::MAX, usize::MAX)] {
             assert!(matches!(
                 plan(width, height, 128, &scan),
                 Err(Error::Limit(_))
@@ -631,35 +624,50 @@ mod tests {
     }
 
     #[test]
-    fn group_allocation_cap_applies_to_the_selection_not_the_whole_image() {
-        let width = (MAX_CELLS + 1) * 128;
+    fn group_selections_can_exceed_the_former_cell_cap() {
+        let former_cap = 1 << 20;
+        let width = (former_cap + 1) * 128;
+        assert_eq!(
+            grid(width, 1, 128).unwrap(),
+            (former_cap + 1, 1, former_cap + 1)
+        );
         let rect = Rect {
-            x: MAX_CELLS * 128,
+            x: former_cap * 128,
             y: 0,
             width: 128,
             height: 1,
         };
-        assert_eq!(groups_for_rect(rect, width, 1, 0).unwrap(), [MAX_CELLS]);
+        assert_eq!(groups_for_rect(rect, width, 1, 0).unwrap(), [former_cap]);
         let whole = Rect {
             x: 0,
             y: 0,
             width,
             height: 1,
         };
-        assert!(matches!(
-            groups_for_rect(whole, width, 1, 0),
-            Err(Error::Limit(_))
-        ));
+        let groups = groups_for_rect(whole, width, 1, 0).unwrap();
+        assert_eq!(groups.len(), former_cap + 1);
+        assert!(groups.into_iter().eq(0..=former_cap));
+    }
 
+    #[test]
+    fn group_mapping_handles_the_last_u32_image_coordinate() {
+        let width = u32::MAX as usize;
         let rect = Rect {
-            x: usize::MAX - 127,
+            x: width - 127,
             y: 0,
             width: 127,
             height: 1,
         };
-        assert_eq!(
-            groups_for_rect(rect, usize::MAX, 1, 0).unwrap(),
-            [usize::MAX / 128]
-        );
+        assert_eq!(groups_for_rect(rect, width, 1, 0).unwrap(), [width / 128]);
+    }
+
+    #[test]
+    fn morton_keys_interleave_all_u32_coordinate_bits_without_collisions() {
+        for bit in 0..u32::BITS {
+            assert_eq!(spatial_key(1 << bit, 0), 1u64 << (2 * bit));
+            assert_eq!(spatial_key(0, 1 << bit), 1u64 << (2 * bit + 1));
+        }
+        assert_eq!(spatial_key(u32::MAX, u32::MAX), u64::MAX);
+        assert_eq!(spatial_key(0, 0), 0);
     }
 }

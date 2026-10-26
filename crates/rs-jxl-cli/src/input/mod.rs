@@ -5,20 +5,12 @@ use rs_jxl::Image;
 
 use crate::Result;
 
-pub(crate) const MAX_INPUT_BYTES: usize = 512 * 1024 * 1024;
-pub(super) const MAX_DIMENSION: u32 = 16_384;
-const MAX_PIXELS: u64 = 64_000_000;
-const MAX_DECODED_BYTES: usize = 512 * 1024 * 1024;
-
 pub(crate) struct Decoded {
     pub image: Image,
     pub jpeg: bool,
 }
 
 pub(crate) fn decode(bytes: &[u8], strip_metadata: bool) -> Result<Decoded> {
-    if bytes.len() > MAX_INPUT_BYTES {
-        return Err("input exceeds the 512 MiB limit".into());
-    }
     if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
         Ok(Decoded {
             image: png::decode(bytes, strip_metadata)?,
@@ -40,18 +32,15 @@ fn checked_size(
     channels: usize,
     bytes_per_sample: usize,
 ) -> Result<usize> {
-    if width == 0 || height == 0 || width > MAX_DIMENSION || height > MAX_DIMENSION {
-        return Err("image dimensions must be in 1..=16384".into());
+    if width == 0 || height == 0 {
+        return Err("image dimensions must be nonzero".into());
     }
     let pixels = u64::from(width) * u64::from(height);
-    if pixels > MAX_PIXELS {
-        return Err("image exceeds the 64000000 pixel limit".into());
-    }
     let size = usize::try_from(pixels)?
         .checked_mul(channels)
         .and_then(|n| n.checked_mul(bytes_per_sample))
-        .filter(|&n| n <= MAX_DECODED_BYTES)
-        .ok_or("decoded image exceeds the 512 MiB limit")?;
+        .filter(|&n| n <= isize::MAX as usize)
+        .ok_or("decoded image size exceeds addressable allocation size")?;
     Ok(size)
 }
 
@@ -90,7 +79,10 @@ mod tests {
         assert_eq!(checked_size(2, 3, 4, 2).unwrap(), 48);
         assert!(checked_size(0, 3, 1, 1).is_err());
         assert!(checked_size(u32::MAX, u32::MAX, 4, 2).is_err());
-        assert!(checked_size(16384, 16384, 1, 1).is_err());
+        assert_eq!(checked_size(16_385, 1, 1, 1).unwrap(), 16_385);
+        assert_eq!(checked_size(16_384, 16_384, 1, 1).unwrap(), 268_435_456);
+        assert_eq!(checked_size(16_384, 16_384, 4, 1).unwrap(), 1_073_741_824);
         assert!(checked_size(8192, 8192, usize::MAX, 2).is_err());
+        assert!(zeroed_bytes(usize::MAX).is_err());
     }
 }

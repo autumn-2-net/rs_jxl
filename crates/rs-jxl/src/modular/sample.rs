@@ -539,7 +539,7 @@ pub struct SampleLimits {
 impl Default for SampleLimits {
     fn default() -> Self {
         Self {
-            max_selected_samples: u64::from(u32::MAX),
+            max_selected_samples: u64::MAX,
             variable_channels: None,
         }
     }

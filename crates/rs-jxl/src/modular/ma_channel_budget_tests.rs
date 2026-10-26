@@ -229,17 +229,18 @@ fn balanced_tree(leaves: usize) -> Vec<Node> {
 
 #[test]
 fn ma_budget_merge_above_legacy_limit_preserves_explicit_ceiling_and_contexts() {
-    let part_leaves = MAX_LEAVES / 2 + 1;
+    const FORMER_LEARNER_LIMIT: usize = 16_384;
+    let part_leaves = FORMER_LEARNER_LIMIT / 2 + 1;
     let learned = balanced_tree(part_leaves);
     let mut nodes = vec![leaf(Predictor::Zero)];
     let (high, low) = split(&mut nodes, 0, 0, 0, Predictor::Zero, 2).unwrap();
-    graft(&mut nodes, high, learned.clone(), MAX_LEAVES).unwrap();
+    graft(&mut nodes, high, learned.clone(), FORMER_LEARNER_LIMIT).unwrap();
     let before = signature(nodes.clone());
-    assert!(graft(&mut nodes, low, learned.clone(), MAX_LEAVES).is_err());
+    assert!(graft(&mut nodes, low, learned.clone(), FORMER_LEARNER_LIMIT).is_err());
     assert_eq!(signature(nodes.clone()), before);
     graft(&mut nodes, low, learned, part_leaves * 2).unwrap();
     let tree = Tree::new(nodes).unwrap();
-    assert_eq!(tree.leaves(), MAX_LEAVES + 2);
+    assert_eq!(tree.leaves(), FORMER_LEARNER_LIMIT + 2);
     let mut contexts = std::collections::BTreeSet::new();
     for channel in 0..2 {
         for value in 0..part_leaves {
@@ -249,7 +250,7 @@ fn ma_budget_merge_above_legacy_limit_preserves_explicit_ceiling_and_contexts() 
             assert!(contexts.insert(tree.lookup(&properties).unwrap().0));
         }
     }
-    assert_eq!(contexts.len(), MAX_LEAVES + 2);
+    assert_eq!(contexts.len(), FORMER_LEARNER_LIMIT + 2);
 }
 
 #[test]

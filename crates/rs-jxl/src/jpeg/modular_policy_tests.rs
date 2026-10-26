@@ -314,7 +314,7 @@ fn shared_sampling_scales_once_and_small_quant_channels_remain_full_samples() {
         assert_eq!(tree_sample_fraction(area, repeats).unwrap(), fraction);
     }
     let mut capped = options;
-    capped.sample_limit = 1;
+    capped.sample_limit = Some(1);
     assert_eq!(
         capped.sampling.unwrap().nb_repeats.to_bits(),
         repeats.to_bits()

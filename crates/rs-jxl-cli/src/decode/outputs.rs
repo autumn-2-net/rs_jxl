@@ -25,15 +25,14 @@ impl<'a> Batch<'a> {
         }
     }
     pub(super) fn remaining(&self) -> usize {
-        MAX_OUTPUT_BYTES - self.used
+        MAX_OUTPUT_BYTES.saturating_sub(self.used)
     }
 
     pub(super) fn add(&mut self, path: &Path, bytes: Vec<u8>, primary: bool) -> Result<()> {
         let used = self
             .used
             .checked_add(bytes.len())
-            .filter(|&n| n <= MAX_OUTPUT_BYTES)
-            .ok_or("output set exceeds the CLI's 512 MiB aggregate limit")?;
+            .ok_or("output set size overflow")?;
         check_destination(self.args, path)?;
         for previous in &self.artifacts {
             if path == Path::new("-") && previous.path == Path::new("-") {

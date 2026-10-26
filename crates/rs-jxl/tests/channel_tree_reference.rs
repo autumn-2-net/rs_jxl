@@ -137,7 +137,7 @@ fn options(case: Case) -> EncodeOptions {
             rct: None,
             lz77: false,
             sampling: Some(policy),
-            sample_limit: case.width as usize * case.height as usize * 4,
+            sample_limit: Some(case.width as usize * case.height as usize * 4),
             max_tree_leaves: MAX_LEAVES,
             source_channel_tree: case.mode,
             source_channel_tree_final_only: false,
@@ -484,12 +484,16 @@ fn channel_tree_fixture_budgets_cover_both_row_levels_without_large_inputs() {
         assert_eq!(image.bits(), 8);
         assert_eq!(image.layout(), PixelLayout::Rgba);
         assert!(options.max_pixels <= 49152);
-        assert_eq!(options.modular.sample_limit as u64, 4 * options.max_pixels);
-        assert!(options.modular.sample_limit >= 8192);
+        let limit = options
+            .modular
+            .sample_limit
+            .expect("explicit fixture limit");
+        assert_eq!(limit as u64, 4 * options.max_pixels);
+        assert!(limit >= 8192);
         if case.row_depth != 0 {
-            assert_eq!(options.modular.sample_limit, 196608);
+            assert_eq!(limit, 196608);
             assert_eq!(case.jobs, 4 << case.row_depth);
-            assert!(options.modular.sample_limit / 8 >= 16384);
+            assert!(limit / 8 >= 16384);
         }
     }
 }

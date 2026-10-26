@@ -16,10 +16,11 @@ use super::data::{AppMarkerType, HuffmanCode, JpegData, JpegRecord, MarkerSegmen
 use super::reconstruction_validation::validate;
 use super::scan_writer::{ReconstructionError, WriteLimits};
 
-const MAX_MARKERS: usize = 16_384;
+// These are wire field maxima, not default resource budgets.
 const MAX_HUFFMAN_TABLES: usize = 89;
 const MAX_INTERMARKER: usize = 65_535;
 const MAX_TAIL: usize = 4_260_096;
+// Three 8x8 component block grids at the maximum 16-bit JPEG dimensions.
 const MAX_BLOCK_INDEX: u32 = 3 << 26;
 const ICC_TAG: &[u8; 12] = b"ICC_PROFILE\0";
 const EXIF_TAG: &[u8; 6] = b"Exif\0\0";
@@ -196,8 +197,8 @@ impl WireModel<'_> {
             if count > MAX_INTERMARKER {
                 return Err(MetadataError::Limit("inter-marker bytes exceed 65535"));
             }
-            push(&mut self.markers, 0xff, MAX_MARKERS)?;
-            push(&mut self.inter_lengths, count, MAX_MARKERS)?;
+            push(&mut self.markers, 0xff, usize::MAX)?;
+            push(&mut self.inter_lengths, count, usize::MAX)?;
         }
         self.add_payload(count, max_bytes)
     }
@@ -211,9 +212,6 @@ fn classify_apps(
     jpeg: &JpegData,
     sources: ReconstructionMetadataSources<'_>,
 ) -> Result<Vec<AppMarkerType>> {
-    if jpeg.app_data.len() > MAX_MARKERS {
-        return Err(MetadataError::Limit("APP marker count"));
-    }
     let mut kinds = Vec::new();
     kinds
         .try_reserve_exact(jpeg.app_data.len())
@@ -321,11 +319,8 @@ fn adapt<'a>(
         ));
     }
     let limits = WriteLimits::default();
-    if jpeg.records.len() > limits.structural.max_records
-        || jpeg.scan_info.len() > limits.structural.max_scans
-        || jpeg.huffman_code.len() > MAX_HUFFMAN_TABLES
-        || jpeg.padding_bits.len() > limits.max_padding_bits
-        || jpeg.padding_bits.len() >= 1 << 24
+    if jpeg.huffman_code.len() > MAX_HUFFMAN_TABLES
+        || (jpeg.has_zero_padding_bit && jpeg.padding_bits.len() >= 1 << 24)
         || jpeg.tail_data.len() > MAX_TAIL
     {
         return Err(MetadataError::Limit("source metadata fields"));
@@ -387,7 +382,7 @@ fn adapt<'a>(
                         "marker cannot be reconstructed by the source writer",
                     ));
                 }
-                push(&mut model.markers, segment.marker, MAX_MARKERS)?;
+                push(&mut model.markers, segment.marker, usize::MAX)?;
                 match segment.marker {
                     0xe0..=0xef => {
                         if !same_saved_marker(jpeg.app_data.get(app), segment) {
@@ -508,8 +503,8 @@ fn adapt<'a>(
         ));
     }
     choose(HUFFMAN_COUNT, length(model.huffman.len())?)?;
-    // This reparse is bounded by WriteLimits, independently of the encoded-byte
-    // cap: raw DQT/DHT records can be larger than their compact metadata header.
+    // Reparse without additional resource caps: raw DQT/DHT records can be
+    // larger than their compact metadata header.
     validate(jpeg, &limits).map_err(MetadataError::Validation)?;
     adapt_quantization(jpeg, &mut model)?;
     // Progressive DC refinement carries raw correction bits, not Huffman codes.
@@ -694,8 +689,8 @@ fn write_header(jpeg: &JpegData, model: &WireModel<'_>, max_bytes: usize) -> Res
 }
 
 /// Serialize only the reconstruction metadata prerequisite. `max_bytes` bounds
-/// the combined header and raw payload lengths; internal validation also uses
-/// the fixed default WriteLimits. Requires decoded coefficient buffers, but
+/// the combined header and raw payload lengths; internal validation imposes
+/// no additional resource ceilings. Requires decoded coefficient buffers, but
 /// never reads or clones coefficients or archived entropy payloads. All output
 /// is local until success. No Brotli, JXL frames, container boxes or I/O occur.
 pub fn serialize_reconstruction_metadata(

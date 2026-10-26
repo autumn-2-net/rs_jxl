@@ -354,7 +354,7 @@ fn actual_shared_tree_sample_limit_is_not_cancellation() {
     let mut options = options(true, false);
     options.modular.fixed_tree = None;
     options.modular.tree_samples = 64;
-    options.modular.sample_limit = 1;
+    options.modular.sample_limit = Some(1);
     assert!(matches!(
         encode::encode_trial_serial(&image, &options, Some(1)),
         Err(Error::Limit("legacy MA selected-sample budget exceeded"))

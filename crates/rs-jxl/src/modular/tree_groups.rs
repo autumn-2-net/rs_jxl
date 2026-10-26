@@ -10,7 +10,7 @@
 //! IDs represent zero work without allocating a dense ID-indexed array. Only a
 //! single useful group is sharded; existing multiple groups remain intact.
 //! Fixed-tree, JPEG/lossy routing and model/audit selection belong to the caller.
-//! All selected samples share one hard budget. At most eight learners execute
+//! An explicit selected-sample budget is shared by all learners. At most eight execute
 //! concurrently, each retaining its own bounded histogram cache. Merge never
 //! truncates a learned tree and reconstructs decoder context IDs via Tree::new.
 
@@ -26,8 +26,8 @@ use super::training::{self, SampleBudget, TrainingStream};
 use super::tree::{Node, Tree};
 
 pub const MAX_SHARDS: usize = 8;
-/// Resource ceiling for eight full learner budgets, not a bitstream limit.
-pub const MAX_MERGED_LEAVES: usize = MAX_SHARDS * ma_train::MAX_LEAVES;
+/// Decoder-compatible tree bound, independent of the number of learners.
+pub const MAX_MERGED_LEAVES: usize = ma_train::MAX_TREE_LEAVES;
 
 #[derive(Clone, Debug)]
 pub struct TreeGroupOptions {
@@ -366,14 +366,14 @@ pub(super) fn learn_with_gather(
     gather: Option<&super::sample::GatherOptions>,
 ) -> Result<Tree> {
     let plan = plan(streams, options, stream_splits, grouping)?;
-    let budget = SampleBudget::new(options.sample_limit);
+    let budget = options.sample_limit.map(SampleBudget::new);
     let mut trees = Vec::with_capacity(plan.ranges.len());
     let process = |range: &Range<usize>| {
         if let Some(gather) = gather {
             return training::learn_with_budget_and_gather(
                 &plan.streams[range.clone()],
                 options,
-                Some(&budget),
+                budget.as_ref(),
                 plan.ranges.len() == 1,
                 Some(gather),
             );
@@ -381,7 +381,7 @@ pub(super) fn learn_with_gather(
         training::learn_with_budget(
             &plan.streams[range.clone()],
             options,
-            Some(&budget),
+            budget.as_ref(),
             plan.ranges.len() == 1,
         )
     };
@@ -730,15 +730,15 @@ mod tests {
         let mut options = options();
         // The merge must still use property 1 when it is not a learned feature.
         options.sampling.as_mut().unwrap().properties = vec![3];
-        options.sample_limit = 256;
+        options.sample_limit = Some(256);
         let grouping = grouping();
         assert!(learn(&streams, &options, &[], &grouping).is_ok());
-        options.sample_limit = 255;
+        options.sample_limit = Some(255);
         assert!(matches!(
             learn(&streams, &options, &[], &grouping),
             Err(Error::Limit(_))
         ));
-        options.sample_limit = 256;
+        options.sample_limit = Some(256);
         assert!(matches!(
             learn(
                 &streams,
@@ -808,7 +808,7 @@ mod tests {
         let mut options = options();
         options.source_constant_channels = true;
         options.max_tree_leaves = 1;
-        options.sample_limit = 1;
+        options.sample_limit = Some(1);
         let tree = learn(&streams, &options, &[], &grouping()).unwrap();
         assert_eq!(tree.leaves(), 2);
         for (id, value) in [(21, -3), (1_000_000, 7)] {

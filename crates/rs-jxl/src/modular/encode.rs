@@ -89,8 +89,9 @@ pub struct ModularOptions {
     pub source_channel_tree_final_only: bool,
     /// Source opt-in shared-frame token-channel parallelism; default off.
     pub parallel_tokens: bool,
-    /// Hard resource ceiling, not a target or silent truncation of MA samples.
-    pub sample_limit: usize,
+    /// Optional hard selected-sample ceiling. None preserves the complete source
+    /// sampling policy without an additional count cap; Some never truncates it.
+    pub sample_limit: Option<usize>,
     pub entropy_options: crate::entropy::options::EntropyOptions,
     /// Score this many source RCT candidates; None uses the explicit rct.
     pub rct_candidates: Option<usize>,
@@ -152,7 +153,7 @@ impl Default for ModularOptions {
             source_channel_tree: Default::default(),
             source_channel_tree_final_only: false,
             parallel_tokens: false,
-            sample_limit: 1 << 20,
+            sample_limit: None,
             entropy_options: Default::default(),
             rct_candidates: None,
             weighted_candidates: None,
@@ -200,7 +201,6 @@ impl ModularOptions {
         if self.rct.is_some_and(|n| n >= 42)
             || self.weighted_preset > 4
             || self.tree_samples == 0
-            || self.tree_samples > 1 << 20
             || self.max_tree_leaves == 0
             || self.max_tree_leaves > ma_train::MAX_LEAVES
             || self
@@ -258,7 +258,7 @@ impl ModularOptions {
                 ));
             }
         }
-        if self.sample_limit == 0
+        if self.sample_limit == Some(0)
             || self.rct_candidates.is_some_and(|n| !(1..=19).contains(&n))
             || self
                 .weighted_candidates
@@ -271,9 +271,9 @@ impl ModularOptions {
         if self.previous_channels > 60 {
             return Err(Error::InvalidInput("previous_channels exceeds 60".into()));
         }
-        if self.palette_colors.is_some_and(|n| n == 0 || n > 70000) || self.squeeze.len() > 30 {
+        if self.palette_colors.is_some_and(|n| n == 0 || n > 70911) {
             return Err(Error::InvalidInput(
-                "palette limit must be 1..=70000; at most 30 squeeze passes".into(),
+                "palette limit must be 1..=70911 (the transform field range)".into(),
             ));
         }
         if self.palette_predictor.is_some_and(|p| p.has_weighted())
@@ -556,7 +556,7 @@ pub(super) fn collect_samples(
     stream_id: usize,
 ) -> Result<Vec<ma_train::Sample>> {
     let target = legacy_sample_count(planes, options)?;
-    if target > options.sample_limit {
+    if options.sample_limit.is_some_and(|limit| target > limit) {
         return Err(Error::Limit("legacy MA selected-sample budget exceeded"));
     }
     if target == 0 {
@@ -1018,7 +1018,7 @@ mod legacy_sampling_tests {
         }];
         let mut options = ModularOptions {
             tree_samples: 64,
-            sample_limit: 1,
+            sample_limit: Some(1),
             ..Default::default()
         };
         assert_eq!(legacy_sample_count(&planes, &options).unwrap(), 64);
@@ -1026,7 +1026,7 @@ mod legacy_sampling_tests {
             collect_samples(&planes, &options, &weighted::Header::default(), 0),
             Err(Error::Limit("legacy MA selected-sample budget exceeded"))
         ));
-        options.sample_limit = 64;
+        options.sample_limit = Some(64);
         assert_eq!(
             collect_samples(&planes, &options, &weighted::Header::default(), 0)
                 .unwrap()

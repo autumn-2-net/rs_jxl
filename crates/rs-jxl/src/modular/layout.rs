@@ -16,8 +16,8 @@
 //! TOC indices. Empty DC/AC streams remain in the plan. No local squeeze is
 //! substituted for the source's global transform. No lossy quantization,
 //! arbitrary unaligned frame-area crops, meta-channel squeezing, or VarDCT splitting.
-//! The planner bounds allocation to 2^20 streams; this is a resource limit,
-//! not a source heuristic. Forward scalar arithmetic limits are transforms.rs's.
+//! The planner checks representable stream IDs and fallible allocation, without
+//! an extra stream-count cap. Forward scalar arithmetic limits are transforms.rs's.
 
 #![forbid(unsafe_code)]
 
@@ -25,9 +25,18 @@ use super::group::{self, Channel};
 use super::transforms;
 use crate::{Error, Result};
 
-const MAX_CHANNELS: usize = 8192;
-const MAX_STREAMS: usize = 1 << 20;
 const QUANT_TABLES: usize = 17; // quant_weights.h::QuantTable::DCT128X256 + 1
+
+fn validate_stream_ids(groups: usize, dc_groups: usize, passes: usize) -> Result<()> {
+    // MA property 1 stores the stream ID as a signed 32-bit value.
+    dc_groups
+        .checked_mul(3)
+        .and_then(|n| n.checked_add(QUANT_TABLES))
+        .and_then(|n| groups.checked_mul(passes).and_then(|g| n.checked_add(g)))
+        .filter(|&last| last <= i32::MAX as usize)
+        .ok_or(Error::Limit("Modular stream IDs exceed i32"))?;
+    Ok(())
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ChannelShape {
@@ -49,7 +58,7 @@ impl From<&Channel> for ChannelShape {
 }
 
 fn validate_shapes(channels: &[ChannelShape], meta: usize) -> Result<()> {
-    if meta > channels.len() || channels.len() > MAX_CHANNELS {
+    if meta > channels.len() || channels.len() > i32::MAX as usize {
         return Err(Error::InvalidInput(
             "invalid Modular channel/meta count".into(),
         ));
@@ -192,7 +201,7 @@ fn squeeze_range(channels: &[ChannelShape], meta: usize, p: SqueezeParams) -> Re
     if channels
         .len()
         .checked_add(p.channels)
-        .filter(|&n| n <= MAX_CHANNELS)
+        .filter(|&n| n <= i32::MAX as usize)
         .is_none()
     {
         return Err(Error::Limit("squeeze channel count"));
@@ -521,8 +530,8 @@ fn partition(
     let total = num_groups
         .checked_mul(usize::from(passes.num_passes))
         .and_then(|n| n.checked_add(num_dc_groups))
-        .filter(|&n| n <= MAX_STREAMS)
         .ok_or(Error::Limit("Modular layout stream count"))?;
+    validate_stream_ids(num_groups, num_dc_groups, usize::from(passes.num_passes))?;
     let global_channels = if keep_small_global {
         channels
             .iter()
@@ -613,7 +622,6 @@ pub fn frame_areas(width: usize, height: usize, group_size_shift: u8) -> Result<
         .div_ceil(group_dim)
         .checked_mul(height.div_ceil(group_dim))
         .and_then(|n| n.checked_add(count))
-        .filter(|&n| n <= MAX_STREAMS)
         .ok_or(Error::Limit("Modular layout stream count"))?;
     let mut areas = Vec::new();
     areas
@@ -688,8 +696,8 @@ pub fn partition_frame_area(
     num_groups
         .checked_mul(usize::from(passes.num_passes))
         .and_then(|n| n.checked_add(num_dc_groups))
-        .filter(|&n| n <= MAX_STREAMS)
         .ok_or(Error::Limit("Modular layout stream count"))?;
+    validate_stream_ids(num_groups, num_dc_groups, usize::from(passes.num_passes))?;
     let dc_group = area.y / dc_dim * dc_columns + area.x / dc_dim;
     for stream in &mut plan.streams {
         match stream.kind {
@@ -1017,6 +1025,19 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn layout_no_longer_has_private_channel_and_stream_caps() {
+        let channels = vec![shape(1, 1, 0); 8193];
+        assert!(validate_shapes(&channels, 0).is_ok());
+        assert!(squeeze_shapes(&channels, 0, &[]).is_ok());
+        // More than a million AC groups, but only ~16K area descriptors.
+        let areas = frame_areas(131_200, 131_200, 0).unwrap();
+        assert_eq!(areas.len(), 129 * 129);
+        assert!(validate_stream_ids(1 << 20, 16_384, 1).is_ok());
+        assert!(validate_stream_ids(usize::MAX, 1, 1).is_err());
+        assert!(validate_stream_ids(i32::MAX as usize, 1, 1).is_err());
     }
 
     #[test]

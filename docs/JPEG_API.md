@@ -34,7 +34,7 @@ untouched. Destination I/O errors can still fail publication or a stdout write.
 | `--brotli-quality 0..11` | Unspecified uses `min(effort + 1, 11)` |
 | `--no-cfl` | Disable coefficient CfL prediction |
 | `--order source/default/adaptive` | `source`; `--default-order` aliases `--order default` |
-| `--sample-limit N` | 4,194,304; hard shared MA sample ceiling, not a sampling target |
+| `--sample-limit N` | No extra ceiling by default; explicit N is a hard shared MA sample ceiling, not a sampling target |
 | `--force` | Allow replacing an existing regular output file |
 
 The CLI applies the other library budgets below. It has no metadata-stripping
@@ -132,28 +132,22 @@ changes reconstruction compression between calls.
 
 ## Resource Limits
 
-The default `TranscodeLimits` contains:
+`TranscodeLimits` and nested parser/coefficient/reconstruction defaults now use
+the corresponding integer maximum, meaning no extra resource-policy ceiling.
+Format and numeric representation limits still apply. See the
+[resource-limit audit](RESOURCE_LIMIT_AUDIT.md).
 
-- `input`: `CoefficientReadLimits`, including a 256 MiB input byte ceiling,
-  256 MiB total i16 coefficient storage, 64 Mi decoded block visits across all
-  scans, 1,048,576 reconstruction hints and 8 Mi padding bits. Its nested
-  `structural` limits also bound records, scans, tables and restarts.
-- `max_output_bytes`: 256 MiB for the complete returned container, including
+- `input`: explicit limits can bound input bytes, coefficient storage, decoded
+  block visits, reconstruction hints, padding, records, scans and tables.
+- `max_output_bytes`: bounds the complete returned container, including
   reconstruction and display metadata boxes.
-- `max_coefficients`: 64 Mi i32 values in the JXL working layout. This includes
-  full three-plane group allocation, MCU padding and subsampled zero tails;
-  it is not the number of original JPEG coefficients or a byte count.
-- `max_tokens`: 64 Mi tokens for each bounded AC/auxiliary coding stage. AC
-  allocation reserves up to 64 tokens per component block; the sum of those
-  reservations is checked before dispatch, not multiplied by worker count.
-- `sample_limit`: 4,194,304 selected MA training samples, shared across the
-  auxiliary domains. It is an error ceiling, not a target or automatic
-  reduction in the source sampling rate.
-
-The shared JPEG-domain ceiling is deliberately larger than the pixel API's
-default 1,048,576: a 6144x3321 JPEG already exceeds one million selected
-auxiliary samples at the slow source tier. This is an explicit default budget,
-not a per-image retry that weakens training when the ceiling is reached.
+- `max_coefficients`: counts i32 values in the JXL working layout, including
+  MCU padding and subsampled zero tails, not bytes or original coefficients.
+- `max_tokens`: bounds each AC/auxiliary coding stage. Reservations are checked
+  before dispatch and are not multiplied by worker count.
+- `sample_limit`: selected MA samples across auxiliary domains. `usize::MAX`
+  means no extra ceiling; a finite explicit value errors rather than reducing
+  the sampling rate. There is no longer a hidden four-million-sample default.
 
 These are stage/resource ceilings, not a process-wide peak-memory sandbox.
 Original coefficient storage, JXL workspaces, token streams, histograms and

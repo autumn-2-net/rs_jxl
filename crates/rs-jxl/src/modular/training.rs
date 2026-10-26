@@ -7,7 +7,8 @@
 //!
 //! Source mode performs the geometric quantile pre-pass before opt-in constant bypass,
 //! then per-channel random training with complete predictor-state traversal.
-//! The selected-sample limit is an error ceiling, not a sampling target.
+//! An explicit selected-sample limit is an error ceiling, not a sampling target.
+//! By default there is no additional selected-sample count cap.
 //! Selected samples enter compact columns directly, using source-sized tables
 //! prepared at channel/stripe and wave-append boundaries. Source learning
 //! transfers those columns directly to ma_train::train_prepared; only legacy
@@ -236,7 +237,7 @@ pub(super) fn learn_with_budget_and_gather(
     crate::profile::note(
         "ma.domain",
         format_args!(
-            "streams={} views={} predictors={} properties={} sample_limit={} max_leaves={} max_merged_leaves={}",
+            "streams={} views={} predictors={} properties={} sample_limit={:?} max_leaves={} max_merged_leaves={}",
             ordered.len(),
             views.len(),
             train.predictors.len(),
@@ -305,7 +306,7 @@ pub(super) fn learn_with_budget_and_gather(
             policy,
             predictors: &train.predictors,
             variable_channels,
-            sample_limit: options.sample_limit,
+            sample_limit: options.sample_limit.unwrap_or(usize::MAX),
             quantization: &quantization,
             budget,
         }
@@ -351,7 +352,10 @@ fn gather_legacy(
     let mut samples = Vec::new();
     for stream in streams {
         let target = encode::legacy_sample_count(stream.channels, options)?;
-        if target > options.sample_limit.saturating_sub(samples.len()) {
+        if options
+            .sample_limit
+            .is_some_and(|limit| target > limit.saturating_sub(samples.len()))
+        {
             return Err(Error::Limit("legacy MA selected-sample budget exceeded"));
         }
         if let Some(budget) = budget {
@@ -2904,13 +2908,40 @@ mod tests {
             let leaf = tree.lookup(&[1, group]).unwrap();
             assert_eq!((leaf.1, leaf.2, leaf.3), (Predictor::Zero, 37, 1));
         }
-        options.sample_limit = 1535;
+        options.sample_limit = Some(1535);
         assert!(matches!(
             learn(&[stream(&first, 1000), stream(&last, 2000)], &options),
             Err(Error::Limit(_))
         ));
-        options.sample_limit = 1536;
+        options.sample_limit = Some(1536);
         assert!(learn(&[stream(&first, 1000), stream(&last, 2000)], &options).is_ok());
+    }
+
+    #[test]
+    fn source_default_samples_cross_old_million_cap_without_truncation() {
+        let count = (1 << 20) + 1024;
+        let channels = [Channel {
+            width: 1025,
+            height: 1024,
+            hshift: 0,
+            vshift: 0,
+            samples: vec![37; count],
+        }];
+        let streams = [stream(&channels, 0)];
+        let mut options = options();
+        assert_eq!(options.sample_limit, None);
+        options.predictor = Predictor::Zero;
+        let policy = options.sampling.as_mut().unwrap();
+        policy.nb_repeats = 1.0;
+        policy.properties = vec![0];
+        assert!(!options.source_constant_channels);
+        let tree = learn(&streams, &options).unwrap();
+        assert_eq!(tree.leaves(), 1);
+        // The same population must fail at an explicitly requested ceiling.
+        options.sample_limit = Some(1 << 20);
+        assert!(matches!(learn(&streams, &options), Err(Error::Limit(_))));
+        options.sample_limit = Some(count);
+        assert!(learn(&streams, &options).is_ok());
     }
 
     #[test]
@@ -2924,17 +2955,17 @@ mod tests {
         assert!(!ModularOptions::default().source_constant_channels);
         assert!(!options.source_constant_channels);
         options.predictor = Predictor::Zero;
-        options.sample_limit = 64;
+        options.sample_limit = Some(64);
         let policy = options.sampling.as_mut().unwrap();
         policy.nb_repeats = 1.0;
         policy.properties = vec![0];
         let ordinary = learn(&streams, &options).unwrap();
         let (_, predictor, offset, multiplier) = ordinary.lookup(&[0, 21]).unwrap();
         assert_eq!((predictor, offset, multiplier), (Predictor::Zero, 0, 1));
-        options.sample_limit = 63;
+        options.sample_limit = Some(63);
         assert!(matches!(learn(&streams, &options), Err(Error::Limit(_))));
         options.source_constant_channels = true;
-        options.sample_limit = 1;
+        options.sample_limit = Some(1);
         let bypassed = learn(&streams, &options).unwrap();
         let (_, predictor, offset, multiplier) = bypassed.lookup(&[0, 21]).unwrap();
         assert_eq!((predictor, offset, multiplier), (Predictor::Zero, 37, 1));
@@ -2977,7 +3008,7 @@ mod tests {
         options.source_constant_channels = true;
         let policy = options.sampling.as_mut().unwrap();
         policy.nb_repeats = 0.0;
-        options.sample_limit = 1;
+        options.sample_limit = Some(1);
         let tree = learn(&[stream(&channels, 81)], &options).unwrap();
         assert_eq!(tree.leaves(), 2);
         assert_eq!(tree.lookup(&[0, 81]).unwrap().1, Predictor::Weighted);
@@ -3034,7 +3065,7 @@ mod tests {
         let channels = [channel(16, 16, 0)];
         let options = ModularOptions {
             tree_samples: 8,
-            sample_limit: 8,
+            sample_limit: Some(8),
             ..ModularOptions::default()
         };
         assert!(learn(&[stream(&channels, 0)], &options).is_ok());
@@ -3063,7 +3094,7 @@ mod tests {
         let stream = stream(&channels, 0);
         let options = ModularOptions {
             tree_samples: 8,
-            sample_limit: 7,
+            sample_limit: Some(7),
             ..ModularOptions::default()
         };
         let budget = SampleBudget::new(32);
@@ -3075,7 +3106,7 @@ mod tests {
         ));
         assert_eq!(budget.remaining.load(Ordering::Relaxed), 32);
         let options = ModularOptions {
-            sample_limit: 8,
+            sample_limit: Some(8),
             ..options
         };
         let budget = SampleBudget::new(7);
@@ -3100,7 +3131,7 @@ mod tests {
         ] {
             let options = ModularOptions {
                 tree_samples: 8,
-                sample_limit: local_limit,
+                sample_limit: Some(local_limit),
                 ..ModularOptions::default()
             };
             let budget = SampleBudget::new(shared_limit);
@@ -3130,12 +3161,12 @@ mod tests {
     fn rejects_malformed_planes_duplicate_ids_and_hard_caps() {
         let channels = [channel(16, 16, 0)];
         let mut options = options();
-        options.sample_limit = 255;
+        options.sample_limit = Some(255);
         assert!(matches!(
             learn(&[stream(&channels, 5)], &options),
             Err(Error::Limit(_))
         ));
-        options.sample_limit = 256;
+        options.sample_limit = Some(256);
         assert!(learn(&[stream(&channels, 5), stream(&channels, 5)], &options).is_err());
         assert!(learn(&[stream(&channels, i32::MAX as usize + 1)], &options).is_err());
         let malformed = [Channel {
@@ -3160,7 +3191,7 @@ mod tests {
         ];
         let mut options = options();
         options.source_constant_channels = true;
-        options.sample_limit = 1;
+        options.sample_limit = Some(1);
         options.max_tree_leaves = 2;
         let tree = learn(&[stream(&channels, 17)], &options).unwrap();
         assert_eq!(tree.leaves(), 2);
@@ -3264,7 +3295,7 @@ mod tests {
         let mut options = options();
         options.predictor = Predictor::Zero;
         options.sampling = Some(policy);
-        options.sample_limit = 8192;
+        options.sample_limit = Some(8192);
         assert_eq!(
             signature(&learn(&[first, second], &options).unwrap()),
             signature(&reference)

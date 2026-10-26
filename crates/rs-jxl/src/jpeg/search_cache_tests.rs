@@ -291,7 +291,12 @@ fn search_cache_prefix_matches_uncached_coefficients_and_original_bytes() {
                         .iter()
                         .map(|group| group.bytes.len())
                         .sum::<usize>();
-                assert!(retained <= candidate.max_output_bytes + payload.groups.len());
+                assert!(
+                    retained
+                        <= candidate
+                            .max_output_bytes
+                            .saturating_add(payload.groups.len())
+                );
             }
             let (width, height) = geometry(&jpeg).dimensions_in_blocks();
             let builds = if width < 5 && height < 5 { 4 } else { 3 };

@@ -1,5 +1,9 @@
 # Pixel Acceptance Audit
 
+Historical audit: the default resource ceilings listed below were removed on
+2026-10-26. Current limits and verification are in
+[RESOURCE_LIMIT_AUDIT.md](RESOURCE_LIMIT_AUDIT.md) and [PIXEL_API.md](PIXEL_API.md).
+
 2026-10-23. **Complete pixel-lossless acceptance remains open.** This is a
 source audit and focused regression handoff, not a complete-acceptance declaration.
 The read-only C++ checkout HEAD was verified as

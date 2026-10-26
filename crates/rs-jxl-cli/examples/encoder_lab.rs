@@ -279,9 +279,7 @@ fn run(args: Args) -> Result<()> {
         return Err("benchmark output already exists".into());
     }
     let mut bytes = Vec::new();
-    fs::File::open(&args.input)?
-        .take(input::MAX_INPUT_BYTES as u64 + 1)
-        .read_to_end(&mut bytes)?;
+    fs::File::open(&args.input)?.read_to_end(&mut bytes)?;
     let decoded = input::decode(&bytes, true)?;
     let image = decoded.image;
     if args.scan_only {
@@ -352,7 +350,6 @@ fn run(args: Args) -> Result<()> {
         threads: usize::from(args.threads),
         ..Default::default()
     };
-    base.modular.sample_limit = 33_554_432;
     args.ma_budget.apply(&mut base.modular);
     if args.palette_order.is_some() || args.force_palette {
         base.modular.palette_policy = Some(rs_jxl::modular::palette::PaletteOptions {

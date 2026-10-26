@@ -7,7 +7,9 @@
 //! Floating-to-U8 output uses upstream jxl-rs dithering by default; select
 //! [`DitherMode::Libjxl`] for the libjxl output pattern. This does not change
 //! floating output, native integer output, JPEG bytes, or Modular smoothing.
-//! Budgets bound input, samples and retained output, not total decoder RSS.
+//! Caller-supplied budgets bound input, samples and retained output, not total
+//! decoder RSS. Defaults impose no resource policy caps; format, overflow and
+//! allocation checks still apply.
 
 mod boxes;
 mod buffers;
@@ -19,6 +21,8 @@ mod engine;
 mod error_tests;
 mod inspect;
 mod jpeg;
+#[cfg(test)]
+mod limit_tests;
 mod native;
 mod runner;
 mod stream;
@@ -32,9 +36,9 @@ pub use stream::{
 
 use crate::{Error, PixelData, PixelLayout, Result};
 pub use jxl_decoder::api::{
-    AlphaMode, DitherMode, ExtraChannel, JxlAnimation, JxlBasicInfo, JxlBitDepth, JxlBlendInfo, JxlBlendMode,
-    JxlColorEncoding, JxlColorProfile, JxlExtraChannel, JxlFrameHeader, JxlLayerInfo, JxlPrimaries,
-    JxlTransferFunction, JxlWhitePoint, Orientation, RenderingIntent,
+    AlphaMode, DitherMode, ExtraChannel, JxlAnimation, JxlBasicInfo, JxlBitDepth, JxlBlendInfo,
+    JxlBlendMode, JxlColorEncoding, JxlColorProfile, JxlExtraChannel, JxlFrameHeader, JxlLayerInfo,
+    JxlPrimaries, JxlTransferFunction, JxlWhitePoint, Orientation, RenderingIntent,
 };
 use jxl_decoder::api::{JxlDecoderOptions, ProfileLevel};
 
@@ -54,6 +58,11 @@ pub enum SampleFormat {
     F32,
 }
 
+/// Optional resource policy, expressed as inclusive upper bounds.
+///
+/// Defaults are `usize::MAX`, not recommended budgets for untrusted input.
+/// Format constraints, checked size arithmetic and allocation failures apply
+/// independently of these limits.
 #[derive(Debug, Clone)]
 pub struct DecodeLimits {
     pub max_input_bytes: usize,
@@ -67,12 +76,12 @@ pub struct DecodeLimits {
 impl Default for DecodeLimits {
     fn default() -> Self {
         Self {
-            max_input_bytes: 512 * 1024 * 1024,
-            max_output_bytes: 512 * 1024 * 1024,
-            max_metadata_bytes: 64 * 1024 * 1024,
-            max_pixels: 64_000_000,
-            max_samples: 256_000_000,
-            max_frames: 10_000,
+            max_input_bytes: usize::MAX,
+            max_output_bytes: usize::MAX,
+            max_metadata_bytes: usize::MAX,
+            max_pixels: usize::MAX,
+            max_samples: usize::MAX,
+            max_frames: usize::MAX,
         }
     }
 }

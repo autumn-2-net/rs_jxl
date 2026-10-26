@@ -464,7 +464,7 @@ fn cooperative_learning_preserves_domains_effective_trees_tokens_and_sample_ceil
             predictor: Predictor::Gradient,
             custom_tree: None,
             max_tree_leaves: super::super::ma_train::MAX_LEAVES,
-            sample_limit: 8192,
+            sample_limit: Some(8192),
             sampling: Some(
                 SamplingPolicy::from_source(&SourcePolicy {
                     speed_tier: 1,
@@ -557,7 +557,7 @@ fn cooperative_learning_preserves_domains_effective_trees_tokens_and_sample_ceil
         }
         if fraction == 1.0 {
             let mut limited = learned.clone();
-            limited.sample_limit = 8191;
+            limited.sample_limit = Some(8191);
             for borrowed in [None, Some(&pool)] {
                 let result = Shared::build_with_execution(
                     &domains,
@@ -575,7 +575,7 @@ fn cooperative_learning_preserves_domains_effective_trees_tokens_and_sample_ceil
                     Err(Error::Limit("grouped MA selected-sample budget exceeded"))
                 ));
             }
-            limited.sample_limit = 4095;
+            limited.sample_limit = Some(4095);
             let local_domains = [
                 Domain {
                     start: 1,

@@ -23,6 +23,7 @@ use super::scan_progression::ScanProgression;
 
 /// Structural limits also apply. Storage and total scan work are checked before
 /// ANY coefficient allocation, including padded blocks of every component.
+/// Defaults impose no extra resource ceiling; numeric and format checks remain.
 #[derive(Clone, Debug)]
 pub struct CoefficientReadLimits {
     pub structural: ReadLimits,
@@ -41,10 +42,10 @@ impl Default for CoefficientReadLimits {
     fn default() -> Self {
         Self {
             structural: ReadLimits::default(),
-            max_coefficient_bytes: 256 * 1024 * 1024,
-            max_block_visits: 64 * 1024 * 1024,
-            max_hint_entries: 1_048_576,
-            max_padding_bits: 8 * 1024 * 1024,
+            max_coefficient_bytes: usize::MAX,
+            max_block_visits: usize::MAX,
+            max_hint_entries: usize::MAX,
+            max_padding_bits: usize::MAX,
             padding_policy: PaddingPolicy::Preserve,
         }
     }

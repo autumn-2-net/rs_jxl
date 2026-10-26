@@ -495,12 +495,40 @@ fn exact_mixed_padding_at_restart_and_scan_end_and_strict_policy() {
 }
 
 #[test]
-fn huge_dimensions_are_rejected_before_allocating_and_scan_work_is_aggregate() {
+#[cfg(target_pointer_width = "64")]
+fn default_preflight_accepts_large_storage_without_allocating_coefficients() {
+    let mut bytes = header(u16::MAX, u16::MAX, 0xc0, YUV420);
+    scan(&mut bytes, &[1, 2, 3], [0, 63, 0], &[]);
+    let jpeg = read_jpeg(&end(bytes)).unwrap();
+    assert!(jpeg.components.iter().all(|c| c.coefficients.is_empty()));
+    let limits = CoefficientReadLimits::default();
+    let lengths = preflight(&jpeg, &limits).unwrap();
+    assert!(lengths.iter().sum::<usize>() * std::mem::size_of::<i16>() > 256 * 1024 * 1024);
+    assert!(matches!(
+        preflight(
+            &jpeg,
+            &CoefficientReadLimits {
+                max_block_visits: 64 * 1024 * 1024,
+                ..limits
+            }
+        ),
+        Err(JpegError::LimitExceeded {
+            resource: "scan block visits",
+            ..
+        })
+    ));
+}
+
+#[test]
+fn explicit_storage_budget_rejects_before_allocating_and_scan_work_is_aggregate() {
     let mut bytes = header(u16::MAX, u16::MAX - 8, 0xc0, GRAY);
     scan(&mut bytes, &[1], [0, 63, 0], &[]);
     assert_limit(
         &end(bytes),
-        &CoefficientReadLimits::default(),
+        &CoefficientReadLimits {
+            max_coefficient_bytes: 256 * 1024 * 1024,
+            ..Default::default()
+        },
         "coefficient bytes",
     );
     let bytes = hints_fixture(); // Four DC and four AC block visits.

@@ -43,6 +43,7 @@ pub enum CapabilityGap {
     GlobalAndChannelPaletteHeuristics,
     PaletteCostRejection,
     ExactZeroDeltaInsertion,
+    /// Legacy report value; request counts have no private 30-pass ceiling.
     MoreThanThirtySqueezePasses,
     PerChannelRandomTrainingSamples,
     TrainingPropertyOrderAndQuantiles,
@@ -97,8 +98,8 @@ pub struct NativeResourceLimits {
     pub max_tree_leaves: usize,
     /// Effective whole-tree ceiling after intersecting caller and decoder bounds.
     pub max_merged_tree_leaves: usize,
-    /// Source gathering hard ceiling inherited from base.modular.sample_limit.
-    pub sample_limit: usize,
+    /// Optional source gathering ceiling inherited from base.modular.sample_limit.
+    pub sample_limit: Option<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -341,10 +342,6 @@ fn project_native_metadata(
     options.modular.weighted_candidates =
         (params.weighted_modes() > 1).then_some(usize::from(params.weighted_modes()));
     options.modular.squeeze = params.squeeze.clone();
-    if params.squeeze.len() > 30 {
-        gaps.push(CapabilityGap::MoreThanThirtySqueezePasses);
-        representable = false;
-    }
     // The source policy owns both global/local stages and overrides legacy
     // all-channel palette fields, including when only channel compaction is on.
     options.modular.palette_colors = None;
@@ -1269,11 +1266,10 @@ mod responsive_tests {
                         .gaps
                         .contains(&CapabilityGap::ResponsiveTransformOrchestration)
                 );
-                assert_eq!(
-                    projection
+                assert!(
+                    !projection
                         .gaps
-                        .contains(&CapabilityGap::MoreThanThirtySqueezePasses),
-                    params.squeeze.len() > 30
+                        .contains(&CapabilityGap::MoreThanThirtySqueezePasses)
                 );
                 assert!(projection.exact_options().is_err());
                 assert!(

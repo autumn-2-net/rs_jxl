@@ -228,6 +228,58 @@ fn parser_rejects_invalid_wire_components_markers_tables_and_sentinels() {
 }
 
 #[test]
+fn many_markers_roundtrip_without_hidden_default_count_caps() {
+    let original = minimal(63, false);
+    let mut bytes = original[..2].to_vec();
+    for _ in 0..65_537 {
+        marker(&mut bytes, 0xe3, &[]);
+    }
+    bytes.extend_from_slice(&original[2..]);
+    let jpeg = read_coefficients(&bytes).unwrap();
+    let parts = serialize_reconstruction_metadata(&jpeg, usize::MAX).unwrap();
+    let encoded = compress_parts(&parts.header, &parts.payload, 3, usize::MAX).unwrap();
+    let limits = ReconstructionDecodeLimits::default();
+    assert_eq!(
+        reconstruct_jpeg(
+            &encoded,
+            captured(&jpeg),
+            ReconstructionMetadataSources::default(),
+            &limits
+        )
+        .unwrap(),
+        bytes
+    );
+    let mut limited = limits;
+    limited.write.structural.max_records = jpeg.records.len() - 1;
+    assert!(matches!(
+        decode_reconstruction_metadata(&encoded, &limited),
+        Err(Error::Limit("record count"))
+    ));
+    limited.write.structural.max_records += 1;
+    limited.max_metadata_bytes = parts.header.len() + parts.payload.len();
+    limited.write.max_output_bytes = bytes.len();
+    assert_eq!(
+        reconstruct_jpeg(
+            &encoded,
+            captured(&jpeg),
+            ReconstructionMetadataSources::default(),
+            &limited
+        )
+        .unwrap(),
+        bytes
+    );
+    assert!(serialize_reconstruction_metadata(&jpeg, limited.max_metadata_bytes - 1).is_err());
+}
+
+#[test]
+fn exact_brotli_length_overflow_is_rejected_before_allocation() {
+    assert!(matches!(
+        decompress_exact(&[], usize::MAX),
+        Err(Error::Limit("Brotli output"))
+    ));
+}
+
+#[test]
 fn parser_and_adapter_enforce_exact_limits_and_coefficient_geometry() {
     let jpeg = read_coefficients(&minimal(42, true)).unwrap();
     let parts = serialize_reconstruction_metadata(&jpeg, 4096).unwrap();

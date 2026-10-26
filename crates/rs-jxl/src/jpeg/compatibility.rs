@@ -8,6 +8,7 @@
 
 use std::fmt;
 
+/// Optional caller budgets; defaults impose no extra resource ceiling.
 #[derive(Clone, Debug)]
 pub struct ProbeLimits {
     /// Includes data after EOI, even though that data is not scanned.
@@ -22,10 +23,10 @@ pub struct ProbeLimits {
 impl Default for ProbeLimits {
     fn default() -> Self {
         Self {
-            max_input_bytes: 256 << 20,
-            max_markers: 1_114_112,
-            max_scans: 4096,
-            max_findings: 256,
+            max_input_bytes: usize::MAX,
+            max_markers: usize::MAX,
+            max_scans: usize::MAX,
+            max_findings: usize::MAX,
         }
     }
 }
@@ -650,6 +651,42 @@ mod tests {
             .findings
             .iter()
             .any(|finding| finding.feature == feature)
+    }
+
+    #[test]
+    fn default_findings_are_not_capped_or_truncated() {
+        let mut bytes = header(0xc0, 8, 1);
+        for _ in 0..257 {
+            segment(&mut bytes, 0xdc, &[0, 8]);
+        }
+        scan(&mut bytes, &[0x3f]);
+        bytes.extend([0xff, 0xd9]);
+        let report = probe(&bytes).unwrap();
+        assert_eq!(report.findings.len(), 257);
+        assert!(matches!(
+            probe_with_limits(
+                &bytes,
+                &ProbeLimits {
+                    max_findings: 256,
+                    ..Default::default()
+                }
+            ),
+            Err(ProbeError::Limit {
+                resource: "findings",
+                ..
+            })
+        ));
+        assert_eq!(
+            probe_with_limits(
+                &bytes,
+                &ProbeLimits {
+                    max_findings: 257,
+                    ..Default::default()
+                }
+            )
+            .unwrap(),
+            report
+        );
     }
 
     #[test]

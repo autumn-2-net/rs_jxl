@@ -167,11 +167,12 @@ and training modules handle RNG, quantiles and sampled split-cost correction.
 DC/metadata `max_channel_size` is 0xFFFFFF; Quant inherits 256. VarDCT group size
 stays 256 at all decoding speeds, unlike the pixel-Modular group-size override.
 
-`sample_limit` remains a hard error ceiling, not a target sampling count. Returned
-options default to 1,048,576 selected samples and 16,384 MA leaves. Propagate an
-explicit caller sample budget to BOTH the global carrier (shared budget) and
-every domain policy (per-learner ceiling); otherwise a smaller default domain
-limit may still reject. Source-mode learning errors if a beneficial split remains
+`sample_limit` is now an optional hard error ceiling, not a target sampling count.
+Returned options default to `None`; no selected-sample resource cap is imposed.
+The maximum configurable MA leaves is the decoder tree range, not the former
+16,384 private cap. Propagate an explicit caller sample budget to BOTH the global
+carrier (shared budget) and every domain policy (per-learner ceiling).
+Source-mode learning errors if a beneficial split remains
 at the leaf ceiling. No silent truncation or sampling adjustment is authorized.
 
 ## Global Versus Local Entropy

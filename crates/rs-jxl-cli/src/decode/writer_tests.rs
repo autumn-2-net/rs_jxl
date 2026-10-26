@@ -256,6 +256,19 @@ fn json_escapes_names_and_keeps_timing_crop_and_blend_metadata() {
 }
 
 #[test]
+fn default_output_has_no_extra_cap_and_seeks_do_not_allocate() {
+    assert_eq!(MAX_OUTPUT_BYTES, usize::MAX);
+    let mut output = Output::default();
+    output.seek(SeekFrom::Start(512 * 1024 * 1024 + 1)).unwrap();
+    assert!(output.into_bytes().is_empty());
+
+    let mut output = Output::with_limit(usize::MAX);
+    output.seek(SeekFrom::Start(usize::MAX as u64)).unwrap();
+    assert!(output.write_all(b"x").is_err());
+    assert!(output.into_bytes().is_empty());
+}
+
+#[test]
 fn seekable_output_enforces_budget_on_holes_rewrites_and_growth() {
     let mut output = Output::with_limit(8);
     output.write_all(b"abcd").unwrap();
