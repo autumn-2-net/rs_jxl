@@ -53,6 +53,9 @@ impl FrameScanInfo {
     /// Called after process_non_section() creates a Frame, for frame scanning.
     pub(super) fn record(&mut self, header: &FrameHeader, animation: &Option<Animation>) {
         let Some(box_parser_checkpoint) = self.current_frame_box_parser_checkpoint else {
+            // OOO container input can still decode sequentially. The box parser
+            // permanently disables new checkpoints once chunk order diverges,
+            // so this list remains a valid prefix, never a gap-filled seek index.
             return;
         };
 

@@ -364,7 +364,9 @@ fn cli_and_writers_reject_incompatible_formats_without_sample_loss() {
     assert!(write_portable(&mut Vec::new(), &alpha, OutputFormat::Pgm).is_err());
     assert!(write_npy(&mut Vec::new(), &[alpha.clone()]).is_err());
     alpha.extra_planes.push(PixelData::U16(vec![65535]));
-    assert!(write_npy(&mut Vec::new(), &[alpha]).is_err());
+    let mut widened = Vec::new();
+    write_npy(&mut widened, &[alpha]).unwrap();
+    assert!(widened.ends_with(&[17, 0, 255, 255]));
     let mut extra = frame(1, 1, PixelLayout::Gray, PixelData::U8(vec![17]));
     extra.extra_planes.push(PixelData::U8(vec![3]));
     assert!(write_portable(&mut Vec::new(), &extra, OutputFormat::Pgm).is_err());

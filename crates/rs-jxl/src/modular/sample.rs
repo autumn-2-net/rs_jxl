@@ -69,6 +69,11 @@ pub struct GatherOptions {
     /// Source JXL_MA_SPARSE_GATHER: discard unused property calculations while
     /// still advancing every RNG draw, WP prediction/error and gradient state.
     pub sparse: bool,
+    /// Opt-in full-hash cache, bounded to 16 MiB per collector.
+    pub cache_hashes: bool,
+    /// Experimental terminal concat for one parallel wave: at least 99% rows
+    /// per selected weight and at most 64 MiB of column/count payload.
+    pub concat_batches: bool,
 }
 
 impl Default for GatherOptions {
@@ -79,6 +84,8 @@ impl Default for GatherOptions {
             batch_budget_bytes: SOURCE_GATHER_BUDGET_BYTES,
             stripes: 1,
             sparse: false,
+            cache_hashes: false,
+            concat_batches: false,
         }
     }
 }
@@ -138,7 +145,10 @@ impl GatherOptions {
         }
         let static_properties = properties.iter().filter(|&&p| p < 2).count();
         let sample_bytes = 2 * predictors + 3 * static_properties + properties.len() + 2;
-        let record_bytes = (2 * sample_bytes + 16) as f64;
+        // Master and worker batches each retain up to 16 bytes of full hashes
+        // per record. Charge all records even beyond the bounded cache prefix.
+        let hash_bytes = if self.cache_hashes { 32 } else { 0 };
+        let record_bytes = (2 * sample_bytes + 16 + hash_bytes) as f64;
         let total_samples: f64 = expected.iter().sum();
         let total_bytes = total_samples * record_bytes;
         if !total_bytes.is_finite() {
@@ -932,6 +942,8 @@ mod tests {
         let mut options = GatherOptions::default();
         assert_eq!(options.stripes, 1);
         assert!(!options.sparse);
+        assert!(!options.cache_hashes);
+        assert!(!options.concat_batches);
         assert_eq!(
             options.rows(512, 1024).unwrap(),
             std::iter::once(0..1024).collect::<Vec<_>>()
@@ -1036,6 +1048,59 @@ mod tests {
             .unwrap();
         assert_eq!(small[0].chunks.len(), 1);
         assert_eq!(small[0].chunks[0], 0..8);
+    }
+
+    #[test]
+    fn gather_hash_budget_charges_both_copies_and_preserves_wave_order() {
+        for (property_count, bytes) in [(6, 84), (16, 104), (24, 120)] {
+            let properties: Vec<_> = (0..property_count).collect();
+            let per_task = 10_000 * bytes;
+            let mut options = GatherOptions {
+                mode: GatherMode::Waves,
+                batch_budget_bytes: 2 * per_task,
+                cache_hashes: true,
+                ..GatherOptions::default()
+            };
+            let waves = options
+                .plan(&[65_536; 4], &[10_000.0; 4], 2, &properties, true)
+                .unwrap();
+            assert_eq!(
+                waves.iter().map(|w| w.tasks.clone()).collect::<Vec<_>>(),
+                [0..2, 2..4]
+            );
+            for wave in waves {
+                assert_eq!(wave.estimated_bytes, (2 * per_task) as f64);
+                assert_eq!(wave.chunks.len(), 2);
+            }
+            options.batch_budget_bytes -= 1;
+            let waves = options
+                .plan(&[65_536; 4], &[10_000.0; 4], 2, &properties, true)
+                .unwrap();
+            assert_eq!(
+                waves.iter().map(|w| w.tasks.clone()).collect::<Vec<_>>(),
+                [0..1, 1..2, 2..3, 3..4]
+            );
+            // The estimate remains conservative above each collector's cache
+            // cap, and the serial path retains every task regardless of budget.
+            let large = (1 << 20) as f64 + 1.0;
+            let serial = options
+                .plan(&[65_536; 4], &[large; 4], 2, &properties, false)
+                .unwrap();
+            assert_eq!(serial.len(), 1);
+            assert_eq!(serial[0].tasks, 0..4);
+            assert_eq!(serial[0].chunks, [0..4]);
+            assert_eq!(serial[0].estimated_bytes, 4.0 * large * bytes as f64);
+            options.cache_hashes = false;
+            let uncached = options
+                .plan(&[65_536; 4], &[large; 4], 2, &properties, false)
+                .unwrap();
+            assert_eq!(
+                uncached[0].estimated_bytes,
+                4.0 * large * (bytes - 32) as f64
+            );
+            assert_eq!(uncached[0].tasks, serial[0].tasks);
+            assert_eq!(uncached[0].chunks, serial[0].chunks);
+        }
     }
 
     #[test]

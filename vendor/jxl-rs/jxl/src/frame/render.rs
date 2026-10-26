@@ -114,6 +114,10 @@ impl Frame {
         output_profile: &JxlColorProfile,
         parallel_runner: &mut dyn JxlParallelRunner,
     ) -> Result<bool> {
+        if self.native_integer_frame.is_some() {
+            self.decode_native_integer_groups(&mut groups, parallel_runner)?;
+            return Ok(false);
+        }
         if self.is_jpeg_reconstruction() {
             self.decode_jpeg_groups(&mut groups, parallel_runner)?;
             return Ok(false);
@@ -591,7 +595,8 @@ impl Frame {
             frame_header.upsampling.ilog2() as usize,
             frame_header.log_group_dim(),
             buffer_recycler,
-        );
+        )
+        .with_dither(decoder_state.dither);
 
         if frame_header.encoding == Encoding::Modular
             && decoder_state.file_header.image_metadata.xyb_encoded
@@ -956,6 +961,10 @@ impl Frame {
         output_profile: &JxlColorProfile,
         coalescing: bool,
     ) -> Result<()> {
+        if self.native_integer_frame.is_some() {
+            self.render_pipeline = None;
+            return Ok(());
+        }
         if self.is_jpeg_reconstruction() {
             self.render_pipeline = None;
             return Ok(());
@@ -1030,6 +1039,9 @@ impl Frame {
     /// Uses the existing blending/extension algorithms from libjxl's
     /// render_pipeline/stage_blending.cc, not output-format-converted pixels.
     pub(crate) fn coalesce_reference_for_raw_output(&mut self) -> Result<()> {
+        if self.native_integer_frame.is_some() {
+            return Ok(());
+        }
         if !self.header.can_be_referenced
             || self.header.save_before_ct
             || !self.header.needs_blending()

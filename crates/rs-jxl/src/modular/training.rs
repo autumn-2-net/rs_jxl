@@ -12,6 +12,9 @@
 //! prepared at channel/stripe and wave-append boundaries. Source learning
 //! transfers those columns directly to ma_train::train_prepared; only legacy
 //! learning and test oracles use raw Sample rows.
+//! Local sample charging is unnecessary when the checked visited-pixel upper
+//! bound fits the local limit. Shared ceilings still charge each selected pixel;
+//! tighter local ceilings retain the original per-sample failure accounting.
 //! Optional sparse traversal preserves causal state; optional stripes use the
 //! source sixteen-row learning-only WP warm-up. Both are disabled by default.
 //! Legacy mode retains collect_samples' explicit per-stream midpoint target.
@@ -47,6 +50,10 @@ use super::predictor::{Neighbors, Predictor, clamped_gradient, predict_one};
 use super::sample::{self, ChannelSampler, GatherOptions, SamplingPolicy, SamplingStats, TreeMode};
 use super::tree::{Properties, Tree};
 use super::weighted;
+
+#[cfg(test)]
+#[path = "training_budget_mode_tests.rs"]
+mod budget_mode_tests;
 
 #[path = "gather_samples.rs"]
 pub(crate) mod gather_samples;
@@ -87,6 +94,29 @@ pub(super) fn learn(streams: &[TrainingStream<'_>], options: &ModularOptions) ->
     learn_with_gather(streams, options, options.source_gather.as_ref())
 }
 
+/// ModularGenericCompress writes a local tree, including in a global stream
+/// without a shared tree. Its decoder bound uses transformed local samples.
+pub(super) fn learn_local(
+    streams: &[TrainingStream<'_>],
+    options: &ModularOptions,
+) -> Result<Tree> {
+    let samples =
+        streams
+            .iter()
+            .flat_map(|stream| stream.channels)
+            .try_fold(0usize, |sum, channel| {
+                sum.checked_add(channel.samples.len())
+                    .ok_or(Error::Limit("local MA tree population overflow"))
+            })?;
+    let mut local = options.clone();
+    local.max_merged_tree_leaves = Some(
+        options
+            .tree_leaf_limit()
+            .min(ma_train::local_tree_leaf_limit(samples)),
+    );
+    learn(streams, &local)
+}
+
 /// Explicit source gather policy passed through local and grouped learning.
 /// None retains the original serial gather, including grouped learning.
 pub(super) fn learn_with_gather(
@@ -102,19 +132,27 @@ pub(super) fn learn_with_gather(
             ));
         }
     }
-    if let Some(grouping) = &options.tree_groups {
+    let tree = if let Some(grouping) = &options.tree_groups {
         if let Some(gather) = gather {
-            return super::tree_groups::learn_with_gather(
+            super::tree_groups::learn_with_gather(
                 streams,
                 options,
                 &options.tree_group_splits,
                 grouping,
                 Some(gather),
-            );
+            )?
+        } else {
+            super::tree_groups::learn(streams, options, &options.tree_group_splits, grouping)?
         }
-        return super::tree_groups::learn(streams, options, &options.tree_group_splits, grouping);
+    } else {
+        learn_with_budget_and_gather(streams, options, None, true, gather)?
+    };
+    if (options.max_merged_tree_leaves.is_some() || options.ma_max_leaves.is_some())
+        && tree.leaves() > options.tree_leaf_limit()
+    {
+        return Err(Error::Limit("merged MA tree exceeds leaf budget"));
     }
-    learn_with_budget_and_gather(streams, options, None, true, gather)
+    Ok(tree)
 }
 
 pub(super) fn learn_with_budget(
@@ -198,13 +236,14 @@ pub(super) fn learn_with_budget_and_gather(
     crate::profile::note(
         "ma.domain",
         format_args!(
-            "streams={} views={} predictors={} properties={} sample_limit={} max_leaves={}",
+            "streams={} views={} predictors={} properties={} sample_limit={} max_leaves={} max_merged_leaves={}",
             ordered.len(),
             views.len(),
             train.predictors.len(),
             policy.map_or(train.properties.len(), |p| p.properties.len()),
             options.sample_limit,
             train.max_leaves,
+            train.tree_leaf_limit(),
         ),
     );
     let quantiles = {
@@ -230,8 +269,8 @@ pub(super) fn learn_with_budget_and_gather(
         }
         let required = train.constant_channels.len()
             + usize::from(train.constant_channels.len() < max_channels);
-        if required > train.max_leaves {
-            if policy.is_some() {
+        if required > train.tree_leaf_limit() {
+            if policy.is_some() || options.ma_budget_mode.is_some() {
                 return Err(Error::Limit(
                     "MA constant suffix exceeds explicit leaf budget",
                 ));
@@ -576,7 +615,8 @@ impl SourceGather<'_, '_> {
         options: &GatherOptions,
     ) -> Result<GatheredSamples<PreparedSamples>> {
         options.validate()?;
-        let mut master = SourceSampleCollector::new(self.predictors, self.quantization)?;
+        let mut master =
+            SourceSampleCollector::new(self.predictors, self.quantization, options.cache_hashes)?;
         let first_pixels = match self.streams.first() {
             Some(first) => prefix_population(
                 first,
@@ -644,7 +684,11 @@ impl SourceGather<'_, '_> {
             &self.policy.properties,
             execution::worker_count() > 1,
         )?;
-        let local_budget = SampleBudget::new(self.sample_limit);
+        // Tasks partition each eligible plane; warm-up rows never collect samples.
+        // Each visited pixel can therefore consume at most one local allowance.
+        let local_budget = (output.stats.visited_pixels > self.sample_limit as u64)
+            .then(|| SampleBudget::new(self.sample_limit));
+        let concat_batches = options.concat_batches && waves.len() == 1;
         for wave in waves {
             #[cfg(test)]
             {
@@ -660,16 +704,23 @@ impl SourceGather<'_, '_> {
                 }
                 // Indexed collection retains source chunk order irrespective of
                 // completion order. Only one wave's extra batches stay live.
-                let batches: Vec<Result<_>> = execution::map(&wave.chunks, |range| {
-                    let mut batch = SourceSampleCollector::new(self.predictors, self.quantization)?;
-                    let selected = self.collect_tasks(
-                        &tasks[range.clone()],
-                        &local_budget,
-                        &mut batch,
-                        options.sparse,
-                    )?;
-                    Ok((batch, selected))
-                });
+                let batches: Vec<Result<_>> = {
+                    let _scope = crate::profile::scope("gather.batch_collect");
+                    execution::map(&wave.chunks, |range| {
+                        let mut batch = SourceSampleCollector::new(
+                            self.predictors,
+                            self.quantization,
+                            options.cache_hashes,
+                        )?;
+                        let selected = self.collect_tasks(
+                            &tasks[range.clone()],
+                            local_budget.as_ref(),
+                            &mut batch,
+                            options.sparse,
+                        )?;
+                        Ok((batch, selected))
+                    })
+                };
                 let mut prepared_batches = Vec::new();
                 for batch in batches {
                     let (samples, selected) = batch?;
@@ -678,15 +729,31 @@ impl SourceGather<'_, '_> {
                 }
                 // Prepare once for the complete wave, not once per batch/row.
                 // The selected pixels were already charged in the gather tasks.
+                let _scope = crate::profile::scope("gather.append");
+                if concat_batches {
+                    let samples = master.finish_appended(prepared_batches)?;
+                    debug_assert_eq!(samples.total, output.stats.selected_samples);
+                    return Ok(GatheredSamples {
+                        samples,
+                        stats: output.stats,
+                        #[cfg(test)]
+                        parallel_waves: output.parallel_waves,
+                        #[cfg(test)]
+                        waves: output.waves,
+                        #[cfg(test)]
+                        serial_tasks: output.serial_tasks,
+                    });
+                }
                 master.append(prepared_batches)?;
             } else {
                 #[cfg(test)]
                 {
                     output.serial_tasks += wave.tasks.len();
                 }
+                let _scope = crate::profile::scope("gather.batch_collect");
                 output.stats.selected_samples += self.collect_tasks(
                     &tasks[wave.tasks],
-                    &local_budget,
+                    local_budget.as_ref(),
                     &mut master,
                     options.sparse,
                 )?;
@@ -709,7 +776,7 @@ impl SourceGather<'_, '_> {
     fn collect_tasks(
         &self,
         tasks: &[GatherTask],
-        local_budget: &SampleBudget,
+        local_budget: Option<&SampleBudget>,
         collector: &mut SourceSampleCollector,
         sparse: bool,
     ) -> Result<u64> {
@@ -735,7 +802,9 @@ impl SourceGather<'_, '_> {
                 task.rows.clone(),
                 sparse,
                 || {
-                    local_budget.consume(1)?;
+                    if let Some(budget) = local_budget {
+                        budget.consume(1)?;
+                    }
                     if let Some(budget) = self.budget {
                         budget.consume(1)?;
                     }
@@ -966,7 +1035,9 @@ fn visit_source_range_impl<const PAIR: bool, const INTERIOR: bool>(
                 // State's checked raster coordinates start at zero. Shifting
                 // both parity buffers by warm_begin only renames zeroed rows;
                 // all spatial neighbors/properties retain global coordinates.
-                state.predict(
+                // The local state is discarded if collection fails later.
+                state.predict_and_update(
+                    value,
                     x,
                     y - warm_begin,
                     n.top,
@@ -1034,9 +1105,6 @@ fn visit_source_range_impl<const PAIR: bool, const INTERIOR: bool>(
                     }
                 }
                 collect(&properties, &residuals[..predictors.len()])?;
-            }
-            if let Some(state) = &mut state {
-                state.update(value, x, y - warm_begin)?;
             }
             Ok(())
         };
@@ -2063,6 +2131,254 @@ mod tests {
                 }
             }
         });
+    }
+
+    #[test]
+    fn gather_concat_only_finishes_one_parallel_wave_and_keeps_sample_budgets() {
+        let plane = channel(256, 256, 7);
+        let channels = [plane.clone(), plane];
+        let input = stream(&channels, 23);
+        let streams = [&input];
+        let predictors = [Predictor::Zero];
+        let mut policy = options().sampling.unwrap();
+        policy.nb_repeats = 0.125;
+        policy.previous_channels = 0;
+        policy.properties = vec![2, 3];
+        // Exact x/y bins make each local batch unique, but identical channels
+        // still have duplicate quantized keys across the two worker batches.
+        let quantization = PropertyQuantization {
+            properties: policy.properties.clone(),
+            thresholds: vec![(0..255).collect(), (0..255).collect()],
+        };
+        let selected = 2 * ChannelSampler::new(256, 256, policy.nb_repeats)
+            .unwrap()
+            .filter(|&selected| selected)
+            .count();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        pool.install(|| {
+            for cache_hashes in [false, true] {
+                for (serial, mode, batch_budget_bytes) in [
+                    (false, sample::GatherMode::Channels, 1 << 30),
+                    (true, sample::GatherMode::Channels, 1 << 30),
+                    (false, sample::GatherMode::Waves, 250_000),
+                ] {
+                    let run = |concat_batches| {
+                        let shared = SampleBudget::new(selected + 7);
+                        let source = SourceGather {
+                            streams: &streams,
+                            policy: &policy,
+                            predictors: &predictors,
+                            variable_channels: 2,
+                            sample_limit: 2 * 256 * 256,
+                            quantization: &quantization,
+                            budget: Some(&shared),
+                        };
+                        let gather = GatherOptions {
+                            mode,
+                            workers: 2,
+                            batch_budget_bytes,
+                            cache_hashes,
+                            concat_batches,
+                            ..GatherOptions::default()
+                        };
+                        let result = if serial {
+                            execution::serial(|| source.collect(&gather))
+                        } else {
+                            source.collect(&gather)
+                        }
+                        .unwrap();
+                        assert_eq!(shared.remaining.load(Ordering::Relaxed), 7);
+                        result
+                    };
+                    let expected = run(false);
+                    let actual = run(true);
+                    assert_eq!(actual.stats, expected.stats);
+                    assert_eq!(actual.stats.selected_samples, selected as u64);
+                    assert_eq!(actual.waves, expected.waves);
+                    assert_eq!(actual.parallel_waves, expected.parallel_waves);
+                    if !serial && mode == sample::GatherMode::Channels {
+                        assert_eq!(actual.parallel_waves, 1);
+                        assert_eq!(actual.samples.len(), selected);
+                        assert!(expected.samples.len() < actual.samples.len());
+                        assert_eq!(
+                            weighted_population(&actual.samples, &quantization),
+                            weighted_population(&expected.samples, &quantization)
+                        );
+                    } else {
+                        if mode == sample::GatherMode::Waves {
+                            assert_eq!(actual.waves, 2);
+                        }
+                        assert_sample_sequences(&actual.samples, &expected.samples);
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn gather_local_budget_upper_bound_preserves_sample_sequence() {
+        let channels = [deep_channel(256, 256), channel(256, 256, 19)];
+        let input = stream(&channels, 51);
+        let streams = [&input];
+        let predictors = [Predictor::Weighted, Predictor::Gradient];
+        let mut policy = options().sampling.unwrap();
+        policy.nb_repeats = 0.125;
+        policy.properties = vec![0, 1, 9, 15];
+        let quantization = gather_quantization(&streams, &policy);
+        let selected = 2 * ChannelSampler::new(256, 256, policy.nb_repeats)
+            .unwrap()
+            .filter(|&selected| selected)
+            .count();
+        let visited = 2 * 256 * 256;
+        assert!(selected > 0 && selected < visited);
+        let source = SourceGather {
+            streams: &streams,
+            policy: &policy,
+            predictors: &predictors,
+            variable_channels: 2,
+            sample_limit: selected,
+            quantization: &quantization,
+            budget: None,
+        };
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        pool.install(|| {
+            let gather = GatherOptions {
+                workers: 2,
+                ..GatherOptions::default()
+            };
+            for serial in [false, true] {
+                let run = |source: &SourceGather<'_, '_>| {
+                    if serial {
+                        execution::serial(|| source.collect(&gather))
+                    } else {
+                        source.collect(&gather)
+                    }
+                };
+                // The tight but sufficient limit exercises the original CAS path.
+                let expected = run(&source).unwrap();
+                assert_eq!(expected.stats.selected_samples, selected as u64);
+                assert_eq!(expected.stats.visited_pixels, visited as u64);
+                assert_eq!(expected.parallel_waves > 0, !serial);
+                for limit in [visited, usize::MAX] {
+                    let actual = run(&SourceGather {
+                        sample_limit: limit,
+                        ..source
+                    })
+                    .unwrap();
+                    assert_eq!(actual.stats, expected.stats);
+                    assert_eq!(actual.parallel_waves, expected.parallel_waves);
+                    assert_sample_sequences(&actual.samples, &expected.samples);
+                }
+                let shared = SampleBudget::new(selected + 11);
+                let actual = run(&SourceGather {
+                    sample_limit: visited,
+                    budget: Some(&shared),
+                    ..source
+                })
+                .unwrap();
+                assert_eq!(actual.stats, expected.stats);
+                assert_sample_sequences(&actual.samples, &expected.samples);
+                assert_eq!(shared.remaining.load(Ordering::Relaxed), 11);
+            }
+        });
+    }
+
+    #[test]
+    fn gather_local_budget_upper_bound_tight_limit_keeps_failure_debits() {
+        let channels = [channel(32, 129, 7)];
+        let input = stream(&channels, 23);
+        let streams = [&input];
+        let predictors = [Predictor::Weighted, Predictor::Gradient];
+        let mut policy = options().sampling.unwrap();
+        policy.nb_repeats = 0.125;
+        policy.properties = vec![0, 1, 9, 15];
+        let quantization = gather_quantization(&streams, &policy);
+        let selected = ChannelSampler::new(32, 129, policy.nb_repeats)
+            .unwrap()
+            .filter(|&selected| selected)
+            .count();
+        assert!(selected > 1 && selected < 32 * 129);
+        let gather = GatherOptions {
+            workers: 1,
+            ..GatherOptions::default()
+        };
+        for limit in [0, 1, selected - 1] {
+            let shared = SampleBudget::new(selected + 11);
+            let source = SourceGather {
+                streams: &streams,
+                policy: &policy,
+                predictors: &predictors,
+                variable_channels: 1,
+                sample_limit: limit,
+                quantization: &quantization,
+                budget: Some(&shared),
+            };
+            assert!(matches!(
+                source.collect_prepared(&gather),
+                Err(Error::Limit("grouped MA selected-sample budget exceeded"))
+            ));
+            // Local failure must occur before charging the next shared sample.
+            assert_eq!(
+                shared.remaining.load(Ordering::Relaxed),
+                selected + 11 - limit
+            );
+        }
+    }
+
+    #[test]
+    fn gather_local_budget_upper_bound_still_charges_shared_samples() {
+        let channels = [channel(32, 129, 7)];
+        let input = stream(&channels, 23);
+        let streams = [&input];
+        let predictors = [Predictor::Weighted, Predictor::Gradient];
+        let mut policy = options().sampling.unwrap();
+        policy.nb_repeats = 0.125;
+        policy.properties = vec![0, 1, 9, 15];
+        let quantization = gather_quantization(&streams, &policy);
+        let selected = ChannelSampler::new(32, 129, policy.nb_repeats)
+            .unwrap()
+            .filter(|&selected| selected)
+            .count();
+        assert!(selected > 1 && selected < 32 * 129);
+        let gather = GatherOptions {
+            workers: 1,
+            ..GatherOptions::default()
+        };
+        for local_limit in [selected, 32 * 129, usize::MAX] {
+            for shared_limit in [0, 1, selected - 1, selected, selected + 11] {
+                let shared = SampleBudget::new(shared_limit);
+                let source = SourceGather {
+                    streams: &streams,
+                    policy: &policy,
+                    predictors: &predictors,
+                    variable_channels: 1,
+                    sample_limit: local_limit,
+                    quantization: &quantization,
+                    budget: Some(&shared),
+                };
+                let result = source.collect_prepared(&gather);
+                if shared_limit < selected {
+                    assert!(matches!(
+                        result,
+                        Err(Error::Limit("grouped MA selected-sample budget exceeded"))
+                    ));
+                } else {
+                    let actual = result.unwrap();
+                    assert_eq!(actual.stats.selected_samples, selected as u64);
+                    assert_eq!(actual.samples.total, selected as u64);
+                }
+                assert_eq!(
+                    shared.remaining.load(Ordering::Relaxed),
+                    shared_limit.saturating_sub(selected)
+                );
+            }
+        }
     }
 
     #[test]

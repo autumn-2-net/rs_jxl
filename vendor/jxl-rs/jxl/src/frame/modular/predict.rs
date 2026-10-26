@@ -11,6 +11,9 @@ use crate::headers::modular::WeightedHeader;
 use crate::image::Image;
 use crate::util::floor_log2_nonzero;
 
+#[path = "weighted_weights.rs"]
+mod weighted_weights;
+
 #[repr(u8)]
 #[derive(Debug, FromPrimitive, Clone, Copy, PartialEq, Eq)]
 pub enum Predictor {
@@ -309,6 +312,8 @@ impl<'a> WeightedPredictorState<'a> {
         pos: (usize, usize),
         data: &PredictionData,
     ) -> (i64, i32) {
+        #[cfg(feature = "decoder-profile")]
+        let _profile = crate::decoder_profile::sample_scope("sample.wp.predict", 0);
         assert!(pos.0 < self.xsize);
         // Safety note: the index arithmetic in this function is guaranteed
         // not to overflow thanks to the safety invariant and the check on `pos.0`
@@ -347,29 +352,7 @@ impl<'a> WeightedPredictorState<'a> {
         let err2 = err_n[2].wrapping_add(err_ne[2]).wrapping_add(err_nw[2]);
         let err3 = err_n[3].wrapping_add(err_ne[3]).wrapping_add(err_nw[3]);
 
-        let shift0 = (err0 as u64 + 1).ilog2().saturating_sub(5);
-        let shift1 = (err1 as u64 + 1).ilog2().saturating_sub(5);
-        let shift2 = (err2 as u64 + 1).ilog2().saturating_sub(5);
-        let shift3 = (err3 as u64 + 1).ilog2().saturating_sub(5);
-
-        debug_assert!(err0 >> shift0 < 64);
-        // SAFETY: x >> ((x+1).ilog2().saturating_sub(5)) < 64 for any x (see `error_weight_bounds`).
-        // (Note: the compiler doesn't seem to realize this)
-        let div0 = unsafe { *DIVLOOKUP.get_unchecked(err0 as usize >> shift0) };
-        debug_assert!(err1 >> shift1 < 64);
-        // SAFETY: same as div0
-        let div1 = unsafe { *DIVLOOKUP.get_unchecked(err1 as usize >> shift1) };
-        debug_assert!(err2 >> shift2 < 64);
-        // SAFETY: same as div0
-        let div2 = unsafe { *DIVLOOKUP.get_unchecked(err2 as usize >> shift2) };
-        debug_assert!(err3 >> shift3 < 64);
-        // SAFETY: same as div0
-        let div3 = unsafe { *DIVLOOKUP.get_unchecked(err3 as usize >> shift3) };
-
-        let w0 = 4u32 + ((self.w[0] as u32 * div0) >> shift0);
-        let w1 = 4u32 + ((self.w[1] as u32 * div1) >> shift1);
-        let w2 = 4u32 + ((self.w[2] as u32 * div2) >> shift2);
-        let w3 = 4u32 + ((self.w[3] as u32 * div3) >> shift3);
+        let [w0, w1, w2, w3] = weighted_weights::weights([err0, err1, err2, err3], self.w);
         // Safety note: we know that w0, w1, w2, w3 >= 4 because u8 * DIVLOOKUP[i] + 4 never
         // overflows.
         debug_assert!(w0 >= 4);
@@ -468,6 +451,8 @@ impl<'a> WeightedPredictorState<'a> {
     #[allow(unsafe_code)]
     #[inline(always)]
     pub fn update_errors(&mut self, correct_val: i32, pos: (usize, usize)) {
+        #[cfg(feature = "decoder-profile")]
+        let _profile = crate::decoder_profile::sample_scope("sample.wp.update_errors", 1);
         assert!(pos.0 < self.xsize);
         let (cur_row, prev_row) = if pos.1 & 1 != 0 {
             (0, self.xsize + 1)

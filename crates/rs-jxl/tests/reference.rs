@@ -207,6 +207,8 @@ fn striped_sparse_source_gather_matches_official_djxl() {
                 batch_budget_bytes: 16 << 20,
                 stripes,
                 sparse,
+                cache_hashes: false,
+                concat_batches: false,
             });
             options.modular.max_tree_leaves = rs_jxl::modular::ma_train::MAX_LEAVES;
             options.modular.source_tree_entropy = true;
@@ -1771,12 +1773,14 @@ fn check_source_ma_tools(profile: u8) {
                         DenseHistogram, HistogramOptions, PropertyBins,
                     };
                     options.modular.source_ma_histograms = HistogramOptions {
+                        early_cache_14: false,
                         shards: true,
                         padded: true,
                         dense: DenseHistogram::Extended,
                         property_bins: PropertyBins::All,
                         sparse: true,
                         paired: true,
+                        events: false,
                     };
                 }
                 use rs_jxl::modular::ma_train::{

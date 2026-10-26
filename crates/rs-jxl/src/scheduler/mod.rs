@@ -24,6 +24,7 @@ pub mod native;
 mod native_fast;
 mod native_tectonic;
 pub mod params;
+pub mod pilot;
 pub mod policy;
 pub mod prefix_screen;
 pub mod probe;

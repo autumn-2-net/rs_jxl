@@ -8,7 +8,7 @@ use crate::error::Result;
 use crate::image::Image;
 use crate::render::buffer_splitter::OutputChannelRef;
 use crate::render::save::{SaveChannelType, SaveStage};
-use crate::util::{DITHER_TABLE, f16};
+use crate::util::f16;
 
 impl SaveStage {
     pub(super) fn save_simple(
@@ -58,7 +58,8 @@ impl SaveStage {
                     match (ch_ty, self.data_format) {
                         (SaveChannelType::F32, JxlDataFormat::U8 { bit_depth }) => {
                             let max = ((1u32 << bit_depth) - 1) as f32;
-                            let dither = DITHER_TABLE[(y + chan * 13) % 32][(x + chan * 23) % 32];
+                            let dither =
+                                self.dither_table[(y + chan * 13) % 32][(x + chan * 23) % 32];
                             let v = ((px as f32) * max + dither).clamp(0.0, max).round() as u8;
                             write_pixel!(v, Endianness::LittleEndian);
                         }
@@ -135,6 +136,66 @@ mod test {
     use crate::tests::assert_close;
 
     #[test]
+    fn dither_modes_preserve_source_coordinates_for_extra_channels() -> Result<()> {
+        use crate::api::DitherMode;
+
+        let size = (35, 33);
+        let mut rng = XorShiftRng::seed_from_u64(17);
+        let src: Vec<Image<f64>> = (0..4)
+            .map(|_| Image::new_random(size, &mut rng))
+            .collect::<Result<_>>()?;
+        for mode in [DitherMode::JxlRs, DitherMode::Libjxl] {
+            for orientation in [
+                Orientation::Identity,
+                Orientation::FlipHorizontal,
+                Orientation::Rotate180,
+                Orientation::FlipVertical,
+                Orientation::Transpose,
+                Orientation::Rotate90Cw,
+                Orientation::AntiTranspose,
+                Orientation::Rotate90Ccw,
+            ] {
+                let stage = SaveStage::new(
+                    &[3],
+                    orientation,
+                    0,
+                    JxlColorType::Grayscale,
+                    JxlDataFormat::U8 { bit_depth: 8 },
+                    false,
+                )
+                .with_dither(mode);
+                let output_size = orientation.map_size(size);
+                let mut dst = Image::<u8>::new(output_size)?;
+                {
+                    let rect = Rect {
+                        origin: (0, 0),
+                        size: output_size,
+                    };
+                    let splitter = OutputChannelSplitter::new(
+                        JxlOutputBuffer::from_image_rect_mut(dst.get_rect_mut(rect).into_raw()),
+                    );
+                    stage.save_simple(&src, &mut [Some(splitter.borrow_rect(rect))])?;
+                }
+                for y in 0..size.1 {
+                    for x in 0..size.0 {
+                        let noise = stage.dither_table[(y + 3 * 13) % 32][(x + 3 * 23) % 32];
+                        let expected = ((src[3].row(y)[x] as f32) * 255.0 + noise)
+                            .clamp(0.0, 255.0)
+                            .round() as u8;
+                        let (dx, dy) = orientation.display_pixel((x, y), size);
+                        assert_eq!(
+                            dst.row(dy)[dx],
+                            expected,
+                            "{mode:?}, {orientation:?}, {x}, {y}"
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn save_stage() -> Result<()> {
         let save_stage = SaveStage::new(
             &[0],
@@ -161,7 +222,7 @@ mod test {
 
         for y in 0..128 {
             for x in 0..128 {
-                let dither = DITHER_TABLE[y % 32][x % 32];
+                let dither = save_stage.dither_table[y % 32][x % 32];
                 let expected = ((src[0].row(y)[x] as f32) * 255.0 + dither)
                     .clamp(0.0, 255.0)
                     .round() as u8;

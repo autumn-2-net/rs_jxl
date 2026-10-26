@@ -16,6 +16,10 @@ use crate::{
 };
 use std::collections::VecDeque;
 
+#[path = "token_tree.rs"]
+mod token_tree;
+pub(super) use token_tree::ChannelTree;
+
 /// context_predict.h: split value/property, predictor, offset, multiplier log
 /// and multiplier bits. An enabled LZ77 stream adds distance context six.
 pub const NUM_TREE_CONTEXTS: usize = 6;

@@ -41,7 +41,8 @@ impl Frame {
             color_type,
             data_format,
             color_type.has_alpha(),
-        );
+        )
+        .with_dither(self.decoder_state.dither);
         let len = rect.size.0;
         let ulen = len * 8;
         let mut scratch = [

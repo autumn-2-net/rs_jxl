@@ -12,6 +12,7 @@ mod data_types;
 mod decoder;
 mod input;
 mod jpeg;
+mod native_integer;
 mod options;
 mod signature;
 mod xyb_constants;
@@ -25,6 +26,7 @@ pub use data_types::*;
 pub use decoder::*;
 pub use input::*;
 pub use jpeg::*;
+pub use native_integer::*;
 pub use options::*;
 pub use signature::*;
 

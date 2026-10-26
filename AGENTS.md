@@ -18,8 +18,9 @@
 - Official `djxl` is a development-only independent decoder oracle. The user
   authorized maintaining official `jxl-rs` source under `vendor/jxl-rs` for
   runtime decoding. Keep its provenance and local patch ledger. It must not
-  replace encoder migration. First target djxl-equivalent functionality;
-  beyond-djxl raw-layer/native-U31 interfaces are later extensions.
+  replace encoder migration. Native 17..31-bit integer decoding and genuine
+  incremental input are now explicitly authorized beyond the rendered djxl API.
+  Do not pass wide integers through floating-point storage for exact decoding.
 - Work in stages. Do not expose a working encoder API until it actually emits
   complete standard-compatible JXL. Helper tests are not codec compatibility.
 - The first acceptance phase is the COMPLETE PIXEL-LOSSLESS PORT, not merely
@@ -31,6 +32,13 @@
   not phase acceptance.
 - Scope: pixel lossless, byte-reversible JPEG transcode, multiframe, and a future
   Python-facing C ABI. No lossy encoder, no neural scheduling, no CI changes.
+- macOS runtime work is out of the current acceptance scope. Do not start WSL
+  or install Linux toolchains without explicit user approval. Cross-platform
+  support does not authorize changing or starting a separate runtime environment.
+- For special JPEG inputs, distinguish a normative format limitation from a
+  reference implementation limitation. Standard-compatible extensions are
+  authorized; private archival boxes or pixel fallbacks are not a substitute for
+  byte-reversible JPEG recompression. Python integration remains deferred.
 - Pixel acceptance compares original decoded samples including invisible RGB;
   JPEG acceptance compares original reconstructed JPEG bytes. Identical JXL bytes
   are not a compression goal. Low-level primitive equivalence tests are allowed.

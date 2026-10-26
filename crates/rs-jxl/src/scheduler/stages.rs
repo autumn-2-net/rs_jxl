@@ -166,6 +166,9 @@ where
         Ok(())
     }
     pub(super) fn run(mut self) -> Result<SearchResult<A>> {
+        if self.run_scout()? {
+            return self.finish();
+        }
         if self.run_tournament()? {
             return self.finish();
         }

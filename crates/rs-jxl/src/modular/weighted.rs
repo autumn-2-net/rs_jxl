@@ -4,6 +4,8 @@
 //! baseline `b866b3defec13494bfbaf705db93581cda118e37`:
 //! `lib/jxl/modular/encoding/context_predict.h`, namespace `weighted`:
 //! `Header::VisitFields`, `State`, and `PredictorMode`.
+//! The exact flat shortcut follows `enc_predict.h::PredictWeightedFlat` in
+//! the supplied encoder tree; ordinary error updates are never skipped.
 //!
 //! Source arithmetic widths matter: predictions are i64, signed error history
 //! narrows to i32, and predictor error history AND its three-neighbor sum wrap
@@ -38,6 +40,36 @@ const fn division_table() -> [u32; 64] {
 }
 
 const DIV_LOOKUP: [u32; 64] = division_table();
+
+const fn error_weight(error: u32, weight: u32) -> u32 {
+    let log = 63 - (error as u64 + 1).leading_zeros();
+    let shift = log.saturating_sub(5);
+    4 + ((weight * DIV_LOOKUP[(error >> shift) as usize]) >> shift)
+}
+
+// Exact small-error weights, shared by all states and presets (16 KiB).
+static SMALL_WEIGHTS: [[u32; 256]; 16] = {
+    let mut table = [[0; 256]; 16];
+    let mut weight = 0;
+    while weight < 16 {
+        let mut error = 0;
+        while error < 256 {
+            table[weight][error] = error_weight(error as u32, weight as u32);
+            error += 1;
+        }
+        weight += 1;
+    }
+    table
+};
+
+#[inline]
+fn weights(errors: [u32; 4], max_weights: [u32; 4]) -> [u32; 4] {
+    if (errors[0] | errors[1] | errors[2] | errors[3]) < 256 {
+        std::array::from_fn(|i| SMALL_WEIGHTS[max_weights[i] as usize][errors[i] as usize])
+    } else {
+        std::array::from_fn(|i| error_weight(errors[i], max_weights[i]))
+    }
+}
 
 /// Source `weighted::Header`. `all_default` is derived, never cached.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -133,6 +165,7 @@ impl Header {
 
 /// Two rows of history, plus the source's two-pixel row margins.
 #[derive(Debug)]
+#[cfg_attr(test, derive(Clone, Eq, PartialEq))]
 pub struct State {
     header: Header,
     width: usize,
@@ -210,13 +243,6 @@ impl State {
         }
     }
 
-    fn error_weight(x: u32, max_weight: u32) -> u32 {
-        // x+1 is wide in C++, including when x == u32::MAX.
-        let log = 63 - (u64::from(x) + 1).leading_zeros();
-        let shift = log.saturating_sub(5);
-        4 + ((max_weight * DIV_LOOKUP[(x >> shift) as usize]) >> shift)
-    }
-
     fn weighted_average(p: [i64; 4], mut w: [u32; 4]) -> i64 {
         let weight_sum: u32 = w.iter().sum();
         let log_weight = 31 - weight_sum.leading_zeros();
@@ -232,6 +258,7 @@ impl State {
     }
 
     /// Return (rounded prediction, signed weighted-error tree property).
+    #[inline]
     #[allow(clippy::too_many_arguments)]
     pub fn predict(
         &mut self,
@@ -243,21 +270,59 @@ impl State {
         nw: i32,
         nn: i32,
     ) -> Result<(i32, i32)> {
+        self.predict_impl::<true>(x, y, n, w, ne, nw, nn)
+    }
+
+    /// Predict from the old history, then advance it with the actual sample.
+    /// Only use for local states that are discarded if subsequent work fails.
+    /// Invalid coordinates or a pending prediction leave the state unchanged.
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn predict_and_update(
+        &mut self,
+        value: i32,
+        x: usize,
+        y: usize,
+        n: i32,
+        w: i32,
+        ne: i32,
+        nw: i32,
+        nn: i32,
+    ) -> Result<(i32, i32)> {
         self.check_position(x, y, false)?;
-        let (cur_row, prev_row) = self.rows(y);
+        let rows = self.rows(y);
+        let result = self.predict_at::<true>(x, rows, [n, w, ne, nw, nn]);
+        self.update_at(value, x, y, rows);
+        Ok(result)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn predict_impl<const FLAT: bool>(
+        &mut self,
+        x: usize,
+        y: usize,
+        n: i32,
+        w: i32,
+        ne: i32,
+        nw: i32,
+        nn: i32,
+    ) -> Result<(i32, i32)> {
+        self.check_position(x, y, false)?;
+        let result = self.predict_at::<FLAT>(x, self.rows(y), [n, w, ne, nw, nn]);
+        self.pending = true;
+        Ok(result)
+    }
+
+    #[inline]
+    fn predict_at<const FLAT: bool>(
+        &mut self,
+        x: usize,
+        (cur_row, prev_row): (usize, usize),
+        [n, w, ne, nw, nn]: [i32; 5],
+    ) -> (i32, i32) {
         let pos_n = prev_row + x;
         let pos_ne = if x < self.width - 1 { pos_n + 1 } else { pos_n };
         let pos_nw = if x > 0 { pos_n - 1 } else { pos_n };
-        let mut weights = [0; NUM_PREDICTORS];
-        for (i, weight) in weights.iter_mut().enumerate() {
-            let errors = &self.pred_errors[i];
-            let sum = errors[pos_n]
-                .wrapping_add(errors[pos_ne])
-                .wrapping_add(errors[pos_nw]);
-            *weight = Self::error_weight(sum, self.header.w[i]);
-        }
-
-        let [n, w, ne, nw, nn] = [n, w, ne, nw, nn].map(|v| i64::from(v) << EXTRA_BITS);
         let te_w = if x == 0 {
             0
         } else {
@@ -266,6 +331,27 @@ impl State {
         let te_n = i64::from(self.error[pos_n]);
         let te_nw = i64::from(self.error[pos_nw]);
         let te_ne = i64::from(self.error[pos_ne]);
+        if FLAT
+            && ((n ^ w) | (n ^ ne) | (n ^ nw) | (n ^ nn)) == 0
+            && (te_w | te_n | te_nw | te_ne) == 0
+        {
+            // All sub-predictors equal N, and the signed-error clamp is [N, N],
+            // even with nonzero/wrapped unsigned weight history. Update still
+            // needs every sub-prediction when the actual sample differs.
+            self.pred = i64::from(n) << EXTRA_BITS;
+            self.prediction = [self.pred; NUM_PREDICTORS];
+            return (n, 0);
+        }
+        let mut errors = [0; NUM_PREDICTORS];
+        for (i, error) in errors.iter_mut().enumerate() {
+            let errors = &self.pred_errors[i];
+            *error = errors[pos_n]
+                .wrapping_add(errors[pos_ne])
+                .wrapping_add(errors[pos_nw]);
+        }
+        let weights = weights(errors, self.header.w);
+
+        let [n, w, ne, nw, nn] = [n, w, ne, nw, nn].map(|v| i64::from(v) << EXTRA_BITS);
         let sum_wn = te_n + te_w;
         let mut property = te_w;
         for e in [te_n, te_nw, te_ne] {
@@ -290,16 +376,20 @@ impl State {
         if ((te_n ^ te_w) | (te_n ^ te_nw)) <= 0 {
             self.pred = self.pred.clamp(w.min(ne).min(n), w.max(ne).max(n));
         }
-        self.pending = true;
-        Ok((
+        (
             ((self.pred + PREDICTION_ROUND) >> EXTRA_BITS) as i32,
             property as i32,
-        ))
+        )
     }
 
     pub fn update(&mut self, value: i32, x: usize, y: usize) -> Result<()> {
         self.check_position(x, y, true)?;
-        let (cur_row, prev_row) = self.rows(y);
+        self.update_at(value, x, y, self.rows(y));
+        Ok(())
+    }
+
+    #[inline]
+    fn update_at(&mut self, value: i32, x: usize, y: usize, (cur_row, prev_row): (usize, usize)) {
         let value = i64::from(value) << EXTRA_BITS;
         self.error[cur_row + x] = (self.pred - value) as i32;
         for i in 0..NUM_PREDICTORS {
@@ -314,13 +404,51 @@ impl State {
         } else {
             Some((x + 1, y))
         };
-        Ok(())
     }
 }
 
 #[cfg(test)]
+#[path = "weighted_fused_tests.rs"]
+mod fused_tests;
+
+#[cfg(test)]
+#[path = "weighted_flat_tests.rs"]
+mod flat_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn table_weights_match_integer_reference_at_all_exponent_boundaries() {
+        let mut errors: Vec<u32> = (0..1024).collect();
+        for bit in 10..=32 {
+            for delta in -2i64..=1 {
+                let value = (1i64 << bit) + delta;
+                if let Ok(value) = u32::try_from(value) {
+                    errors.push(value);
+                }
+            }
+        }
+        for error in errors {
+            for weight in 0..16 {
+                for lane in 0..4 {
+                    let mut input = [0, 255, 17, 63];
+                    input[lane] = error;
+                    let limits = [weight, 15 - weight, weight ^ 5, weight ^ 10];
+                    let expected = std::array::from_fn(|i| {
+                        let mut scale = 1u64;
+                        while u64::from(input[i]) + 1 >= 64 * scale {
+                            scale *= 2;
+                        }
+                        let reciprocal = (1u64 << 24) / (u64::from(input[i]) / scale + 1);
+                        (4 + u64::from(limits[i]) * reciprocal / scale) as u32
+                    });
+                    assert_eq!(weights(input, limits), expected);
+                }
+            }
+        }
+    }
 
     // These vectors were evaluated from the source equations with a separate
     // arbitrary-precision/full-history model, NOT captured from a C++ binary.
@@ -703,8 +831,8 @@ mod tests {
             state.pred_errors.each_ref().map(|p| p[1]),
             [u32::MAX, u32::MAX, 0, 0]
         );
-        assert_eq!(State::error_weight(u32::MAX, 15), 4);
-        assert_eq!(State::error_weight(0, 15), 4 + 15 * (1 << 24));
+        assert_eq!(error_weight(u32::MAX, 15), 4);
+        assert_eq!(error_weight(0, 15), 4 + 15 * (1 << 24));
         for (i, &value) in DIV_LOOKUP.iter().enumerate() {
             assert_eq!(value, (1 << 24) / (i as u32 + 1));
         }

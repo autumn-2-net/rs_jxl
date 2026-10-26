@@ -512,13 +512,16 @@ fn adapt<'a>(
     // cap: raw DQT/DHT records can be larger than their compact metadata header.
     validate(jpeg, &limits).map_err(MetadataError::Validation)?;
     adapt_quantization(jpeg, &mut model)?;
-    // VisitFields requires even DC refinement selectors to have a defined table.
+    // Progressive DC refinement carries raw correction bits, not Huffman codes.
+    // Preserve its original selector even when that unused table is undefined.
     for scan in &jpeg.scan_info {
         for component in &scan.components {
-            if scan.ss == 0 && scan.dc_huffman_indices[component.dc_table_index as usize].is_none()
+            if scan.ss == 0
+                && scan.ah == 0
+                && scan.dc_huffman_indices[component.dc_table_index as usize].is_none()
             {
                 return Err(MetadataError::Unsupported(
-                    "source requires a DC table for DC refinement",
+                    "initial DC scan requires a Huffman table",
                 ));
             }
         }

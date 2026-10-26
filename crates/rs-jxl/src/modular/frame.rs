@@ -143,8 +143,7 @@ pub(super) fn encode_prepared_shared_trial(
         crate::patch_frame::write_dictionary(&mut global, patches)?;
         global.write(1, 1)?;
         global.write(1, 1)?;
-        encode::write_tree(&tree, &mut global, options)?;
-        model.write_header(&mut global)?;
+        encode::write_tree_and_model(&tree, &model, &mut global, options)?;
         group::write_header(&mut global, &prepared[0].transforms, &prepared[0].wp, true)?;
         if !streams[0].is_empty() {
             model.write_stream(&streams[0], &mut global)?;
@@ -196,7 +195,7 @@ pub(super) fn encode_prepared_independent(
         let tree = if let Some(tree) = encode::predefined(g.planes.iter(), options, bits)? {
             tree
         } else {
-            training::learn(
+            training::learn_local(
                 &[training::TrainingStream {
                     channels: &g.planes,
                     wp: g.wp,
@@ -221,8 +220,7 @@ pub(super) fn encode_prepared_independent(
             options.entropy,
             &options.entropy_options,
         )?;
-        encode::write_tree(&tree, &mut writer, options)?;
-        model.write_header(&mut writer)?;
+        encode::write_tree_and_model(&tree, &model, &mut writer, options)?;
         model.write_stream(&streams[0], &mut writer)?;
     }
     writer.zero_pad_to_byte()?;

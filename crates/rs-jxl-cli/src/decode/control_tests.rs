@@ -32,6 +32,147 @@ fn args(tail: &[&str]) -> DecodeArgs {
     args
 }
 
+#[test]
+fn dither_defaults_and_exact_mode_names_parse() {
+    use rs_jxl::decode::DitherMode;
+
+    let default = args(&["in.jxl", "out.png"]);
+    assert_eq!(default.options(OutputFormat::Png).dither, DitherMode::JxlRs);
+    for (name, mode) in [
+        ("jxl-rs", DitherMode::JxlRs),
+        ("libjxl", DitherMode::Libjxl),
+    ] {
+        let a = args(&["in.jxl", "out.png", "--dither", name]);
+        assert_eq!(a.options(OutputFormat::Png).dither, mode);
+        // Output-only dithering must not reject byte reconstruction or metadata.
+        for path in ["out.jpg", "out.xmp"] {
+            let a = args(&["in.jxl", path, "--dither", name]);
+            let format = a.output_format().unwrap();
+            assert_eq!(a.options(format).dither, mode);
+        }
+        let a = args(&["in.jxl", "out.npy", "--stream-input", "--dither", name]);
+        assert_eq!(a.options(OutputFormat::Npy).dither, mode);
+    }
+    for name in ["djxl", "jxlrs", "lib-jxl", "none", "JxlRs"] {
+        assert!(
+            crate::Cli::try_parse_from(
+                ["rs-jxl", "decode", "in.jxl", "out.png", "--dither", name,]
+            )
+            .is_err()
+        );
+    }
+}
+
+#[test]
+fn dither_does_not_change_native_output_or_metadata_sidecars() {
+    let dir = Directory::new();
+    let input = dir.0.join("input.jxl");
+    let source = rs_jxl::Image::new(
+        3,
+        1,
+        PixelLayout::Gray,
+        PixelData::U16(vec![0, 32960, 65535]),
+    )
+    .unwrap();
+    fs::write(
+        &input,
+        rs_jxl::encode(&source, &Default::default()).unwrap(),
+    )
+    .unwrap();
+    let mut results = Vec::new();
+    for mode in ["jxl-rs", "libjxl"] {
+        let output = dir.0.join(format!("{mode}.npy"));
+        let metadata = dir.0.join(format!("{mode}.json"));
+        let icc = dir.0.join(format!("{mode}.icc"));
+        run(args(&[
+            input.to_str().unwrap(),
+            output.to_str().unwrap(),
+            "--dither",
+            mode,
+            "--metadata-out",
+            metadata.to_str().unwrap(),
+            "--orig-icc-out",
+            icc.to_str().unwrap(),
+            "--quiet",
+        ]))
+        .unwrap();
+        results.push((
+            fs::read(output).unwrap(),
+            fs::read(metadata).unwrap(),
+            fs::read(icc).unwrap(),
+        ));
+    }
+    assert_eq!(results[0], results[1]);
+}
+
+#[test]
+fn incremental_controls_are_explicit_and_bounded() {
+    let a = args(&[
+        "in.jxl",
+        "out.npy",
+        "--stream-input",
+        "--input-chunk-size",
+        "1",
+    ]);
+    assert!(a.stream_input);
+    assert_eq!(a.input_chunk_size, Some(1));
+    for tail in [
+        vec!["in.jxl", "out.npy", "--input-chunk-size", "32"],
+        vec![
+            "in.jxl",
+            "out.npy",
+            "--stream-input",
+            "--input-chunk-size",
+            "0",
+        ],
+        vec![
+            "in.jxl",
+            "out.npy",
+            "--stream-input",
+            "--input-chunk-size",
+            "1048577",
+        ],
+        vec!["in.jxl", "out.npy", "--stream-input", "--frame", "1"],
+        vec!["in.jxl", "out.npy", "--stream-input", "--num-reps", "2"],
+    ] {
+        assert!(crate::Cli::try_parse_from(["rs-jxl", "decode"].into_iter().chain(tail)).is_err());
+    }
+}
+
+#[test]
+fn incremental_cli_matches_whole_input_without_publishing_truncation() {
+    let dir = Directory::new();
+    let input = dir.0.join("input.jxl");
+    let normal = dir.0.join("normal.npy");
+    let streamed = dir.0.join("streamed.npy");
+    let source =
+        rs_jxl::Image::new(3, 2, PixelLayout::Rgb, PixelData::U8((0..18).collect())).unwrap();
+    let encoded = rs_jxl::encode(&source, &Default::default()).unwrap();
+    fs::write(&input, &encoded).unwrap();
+    run(args(&[input.to_str().unwrap(), normal.to_str().unwrap()])).unwrap();
+    run(args(&[
+        input.to_str().unwrap(),
+        streamed.to_str().unwrap(),
+        "--stream-input",
+        "--input-chunk-size",
+        "1",
+    ]))
+    .unwrap();
+    // Serialization identity is checked here, not compressed JXL identity.
+    assert_eq!(fs::read(&normal).unwrap(), fs::read(&streamed).unwrap());
+    fs::write(&input, &encoded[..encoded.len() / 2]).unwrap();
+    let failed = dir.0.join("failed.npy");
+    assert!(
+        run(args(&[
+            input.to_str().unwrap(),
+            failed.to_str().unwrap(),
+            "--stream-input"
+        ]))
+        .is_err()
+    );
+    assert!(!failed.exists());
+}
+
 struct Directory(PathBuf);
 impl Directory {
     fn new() -> Self {

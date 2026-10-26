@@ -8,6 +8,10 @@ mod transcode;
 #[cfg(test)]
 mod acceptance;
 
+#[cfg(test)]
+#[path = "ma_budget_parser_tests.rs"]
+mod ma_budget_parser_tests;
+
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -80,14 +84,21 @@ The encoder applies its own resource limits as well.\n\
 Source mode is experimental and entirely Rust: --source-effort 1..11 encodes \
 one native candidate; --source-search additionally runs the existing native \
 pixel search driver (effort 11 uses its separate full-frame tournament). \
+At effort 9/10, --source-scout selects an experimental coverage-guided frontier \
+with fewer full-frame candidates; it may change compression size. \
+--source-pilot selects a separate experimental content-aware pilot-first policy. \
 Optional routes are exposed through the Rust API; source-identical bytes or \
-performance are not claimed. Unsupported policies \
-and resource exhaustion are errors, not silent fallbacks.\n\
+performance are not claimed. Unsupported policies and resource exhaustion \
+are errors unless --ma-budget-mode bounded explicitly stops optional MA splits.\n\
 Effort 11 without --source-search selects the explicit TectonicPlate (-1) \
 backend policy, not the frame-level tournament.\n\
 Source mode cannot be combined with explicitly specified tool options \
 (even their default values). --threads, --strip-metadata and --force remain \
-available. --source-sample-limit bounds MA training samples independently of \
+available, as do --ma-budget-mode strict|bounded, --ma-max-leaves N and \
+experimental --ma-prune (exact partition reuse and small-node dominance). \
+Omitting the MA budget mode keeps source strict and manual bounded. \
+Required MA partitions must fit even in bounded mode. \
+--source-sample-limit bounds MA training samples independently of \
 the source sampling policy; exceeding it fails rather than reducing sampling.\n\
 Use '-' for stdin/stdout. Diagnostics always go to stderr. \
 Existing output is not replaced unless --force is supplied."
@@ -95,12 +106,22 @@ Existing output is not replaced unless --force is supplied."
 struct EncodeArgs {
     #[command(flatten)]
     tools: options::Tools,
+    #[command(flatten)]
+    ma_budget: options::MaBudgetOptions,
+    #[command(flatten)]
+    ma_pruning: options::MaPruningOptions,
     /// Experimental source policy: one native candidate at effort 1..=11
     #[arg(long, value_name = "N", conflicts_with = "manual_tools", value_parser = clap::value_parser!(u8).range(1..=11))]
     source_effort: Option<u8>,
     /// Run native pixel search instead of just one source candidate
     #[arg(long, requires = "source_effort")]
     source_search: bool,
+    /// Experimental coverage-guided search at source effort 9/10
+    #[arg(long, requires = "source_search")]
+    source_scout: bool,
+    /// Experimental content-aware pilot-first search at source effort 9/10
+    #[arg(long, requires = "source_search", conflicts_with = "source_scout")]
+    source_pilot: bool,
     /// Hard MA training sample limit, not a source sampling target
     #[arg(long, value_name = "N", default_value_t = DEFAULT_SOURCE_SAMPLE_LIMIT, requires = "source_effort", value_parser = parse_sample_limit)]
     source_sample_limit: usize,
@@ -145,10 +166,20 @@ fn encode_image(image: &rs_jxl::Image, args: &EncodeArgs) -> Result<Vec<u8>> {
     };
     let Some(effort) = args.source_effort else {
         args.tools.apply(&mut options)?;
+        args.ma_budget.apply(&mut options.modular);
+        args.ma_pruning.apply(&mut options.modular);
         return Ok(encode(image, &options)?);
     };
+    args.ma_budget.apply(&mut options.modular);
+    args.ma_pruning.apply(&mut options.modular);
     options.modular.sample_limit = args.source_sample_limit;
     let params = CandidateParams::default().backend(effort)?;
+    if args.source_scout && !(9..=10).contains(&effort) {
+        return Err("--source-scout requires --source-effort 9 or 10".into());
+    }
+    if args.source_pilot && !(9..=10).contains(&effort) {
+        return Err("--source-pilot requires --source-effort 9 or 10".into());
+    }
     let settings = NativeBackendOptions::default();
     eprintln!(
         "note: experimental pure-Rust source mode: effort={effort} search={} \
@@ -178,13 +209,16 @@ fn encode_image(image: &rs_jxl::Image, args: &EncodeArgs) -> Result<Vec<u8>> {
         );
         Ok(result.output.bytes)
     } else if args.source_search {
-        let result = run_native_pixel_search(
-            image,
-            &params,
-            &DriverOptions::default(),
-            &options,
-            settings,
-        )?;
+        let driver = if args.source_scout {
+            DriverOptions::scout()
+        } else {
+            DriverOptions::default()
+        };
+        let result = if args.source_pilot {
+            rs_jxl::scheduler::pilot::encode(image, &params, &options)?
+        } else {
+            run_native_pixel_search(image, &params, &driver, &options, settings)?
+        };
         eprintln!(
             "source search: full_encodes={} probe_encodes={} winner={} winner_effort={}",
             result.output.report.full_encodes,
@@ -192,6 +226,9 @@ fn encode_image(image: &rs_jxl::Image, args: &EncodeArgs) -> Result<Vec<u8>> {
             result.output.report.winner_index,
             10 - result.output.params.speed_tier,
         );
+        if args.source_scout || args.source_pilot {
+            eprintln!("source scout: winner_params={:?}", result.output.params);
+        }
         Ok(result.output.bytes)
     } else {
         Ok(encode_native_candidate(&params, image, &options, settings)?.bytes)
@@ -266,6 +303,7 @@ mod tests {
         assert!(!args.strip_metadata);
         assert_eq!(args.source_effort, None);
         assert!(!args.source_search);
+        assert!(!args.source_scout);
         assert_eq!(args.source_sample_limit, DEFAULT_SOURCE_SAMPLE_LIMIT);
     }
 
@@ -328,12 +366,107 @@ mod tests {
         }
         for extra in [
             vec!["--source-search"],
+            vec!["--source-scout"],
+            vec!["--source-pilot"],
             vec!["--source-sample-limit", "1048576"],
         ] {
             let mut argv = vec!["rs-jxl", "encode", "a", "b"];
             argv.extend(extra);
             assert!(Cli::try_parse_from(argv).is_err());
         }
+    }
+
+    #[test]
+    fn source_scout_is_explicit_and_rejects_unsupported_efforts() {
+        use rs_jxl::{Image, PixelData, PixelLayout};
+        let image = Image::new(1, 1, PixelLayout::Gray, PixelData::U8(vec![0])).unwrap();
+        for effort in ["8", "11"] {
+            let cli = Cli::try_parse_from([
+                "rs-jxl",
+                "encode",
+                "a",
+                "b",
+                "--source-effort",
+                effort,
+                "--source-search",
+                "--source-scout",
+            ])
+            .unwrap();
+            assert!(
+                encode_image(&image, &expect_encode(cli.command))
+                    .unwrap_err()
+                    .to_string()
+                    .contains("9 or 10")
+            );
+        }
+        let cli = Cli::try_parse_from([
+            "rs-jxl",
+            "encode",
+            "a",
+            "b",
+            "--source-effort",
+            "9",
+            "--source-search",
+            "--source-scout",
+        ])
+        .unwrap();
+        assert!(expect_encode(cli.command).source_scout);
+    }
+
+    #[test]
+    fn content_pilot_is_explicit_and_excludes_other_search_presets() {
+        let image = rs_jxl::Image::new(
+            1,
+            1,
+            rs_jxl::PixelLayout::Gray,
+            rs_jxl::PixelData::U8(vec![0]),
+        )
+        .unwrap();
+        for effort in ["8", "11"] {
+            let cli = Cli::try_parse_from([
+                "rs-jxl",
+                "encode",
+                "a",
+                "b",
+                "--source-effort",
+                effort,
+                "--source-search",
+                "--source-pilot",
+            ])
+            .unwrap();
+            assert!(
+                encode_image(&image, &expect_encode(cli.command))
+                    .unwrap_err()
+                    .to_string()
+                    .contains("9 or 10")
+            );
+        }
+        assert!(
+            Cli::try_parse_from([
+                "rs-jxl",
+                "encode",
+                "a",
+                "b",
+                "--source-effort",
+                "9",
+                "--source-search",
+                "--source-pilot",
+                "--source-scout"
+            ])
+            .is_err()
+        );
+        let cli = Cli::try_parse_from([
+            "rs-jxl",
+            "encode",
+            "a",
+            "b",
+            "--source-effort",
+            "9",
+            "--source-search",
+            "--source-pilot",
+        ])
+        .unwrap();
+        assert!(expect_encode(cli.command).source_pilot);
     }
 
     #[test]

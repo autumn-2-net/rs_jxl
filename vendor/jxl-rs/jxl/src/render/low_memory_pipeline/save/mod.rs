@@ -115,6 +115,7 @@ impl SaveStage {
                         (group_origin.0 + conv_start, frame_y),
                         ch,
                         conv_len,
+                        self.dither_table,
                     );
                 }
                 (SaveChannelType::F32, JxlDataFormat::U16 { bit_depth, .. }) => {

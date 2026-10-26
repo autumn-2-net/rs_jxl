@@ -26,6 +26,10 @@ use crate::{
     scheduler::WorkerLimits,
 };
 
+#[path = "search_cache.rs"]
+mod search_cache;
+pub(crate) use search_cache::SearchCache;
+
 #[derive(Clone, Debug)]
 pub struct Options {
     pub tier: SpeedTier,
@@ -235,6 +239,51 @@ pub fn encode_coefficients(jpeg: &JpegData, options: &Options) -> Result<Vec<u8>
     })
 }
 
+fn prepare_ac(
+    layout: &TranscodeLayout<'_>,
+    geometry: FrameGeometry,
+    cfl: &JpegCfl<'_, '_>,
+    dc: &[DcGroup],
+    model: BlockContextModel<'_>,
+    options: &Options,
+) -> Result<(Dct8Orders, CoefficientEntropy)> {
+    let groups = coefficient_groups(layout, geometry, cfl, options.max_coefficients)?;
+    let views: Vec<_> = groups
+        .iter()
+        .map(|p| Dct8Group::I32(p.each_ref().map(Vec::as_slice)))
+        .collect();
+    let (width, height) = geometry.dimensions_in_blocks();
+    let image = Dct8Image::new(width, height, &views).map_err(invalid)?;
+    let orders = Dct8Orders::compute(&image, options.tier, options.order);
+    let entropy = tokenize_groups(layout, geometry, &groups, dc, &orders, model, options)?;
+    Ok((orders, entropy))
+}
+
+enum AcData<'a> {
+    Direct(&'a Dct8Orders, &'a CoefficientEntropy),
+    Cached(&'a search_cache::AcPayload),
+}
+
+impl AcData<'_> {
+    fn write_global(&self, writer: &mut BitWriter, groups: usize) -> Result<()> {
+        match self {
+            Self::Direct(orders, entropy) => {
+                entropy::write_single_histogram_group(writer, groups)?;
+                entropy::write_orders(orders, writer)?;
+                entropy.write_model(writer)
+            }
+            Self::Cached(payload) => payload.write_global(writer),
+        }
+    }
+
+    fn write_group(&self, index: usize, writer: &mut BitWriter) -> Result<()> {
+        match self {
+            Self::Direct(_, entropy) => entropy.write_group(index, writer),
+            Self::Cached(payload) => payload.write_group(index, writer),
+        }
+    }
+}
+
 pub(crate) fn with_threads<T: Send>(
     options: &Options,
     work: impl FnOnce(Option<&rayon::ThreadPool>) -> Result<T> + Send,
@@ -351,6 +400,26 @@ impl Prepared {
         options: &Options,
         pool: Option<&rayon::ThreadPool>,
     ) -> Result<Vec<u8>> {
+        self.encode_inner(jpeg, options, pool, None)
+    }
+
+    pub(crate) fn encode_with_cache(
+        &self,
+        jpeg: &JpegData,
+        options: &Options,
+        pool: Option<&rayon::ThreadPool>,
+        cache: &mut SearchCache<'_>,
+    ) -> Result<Vec<u8>> {
+        self.encode_inner(jpeg, options, pool, Some(cache))
+    }
+
+    fn encode_inner(
+        &self,
+        jpeg: &JpegData,
+        options: &Options,
+        pool: Option<&rayon::ThreadPool>,
+        cache: Option<&mut SearchCache<'_>>,
+    ) -> Result<Vec<u8>> {
         let layout = TranscodeLayout::new(jpeg).map_err(invalid)?;
         let geometry = FrameGeometry::new(jpeg.width, jpeg.height, layout.subsampling())?;
         let cfl = JpegCfl::compute(&layout, options.cfl);
@@ -377,16 +446,14 @@ impl Prepared {
             )
             .map_err(dc_stream_error)
         })?;
-        let groups = coefficient_groups(&layout, geometry, &cfl, options.max_coefficients)?;
-        let views: Vec<_> = groups
-            .iter()
-            .map(|p| Dct8Group::I32(p.each_ref().map(Vec::as_slice)))
-            .collect();
-        let (width, height) = geometry.dimensions_in_blocks();
-        let image = Dct8Image::new(width, height, &views).map_err(invalid)?;
-        let orders = Dct8Orders::compute(&image, options.tier, options.order);
-        let entropy = tokenize_groups(&layout, geometry, &groups, &dc, &orders, model, options)?;
-        drop(groups);
+        let build_ac = || prepare_ac(&layout, geometry, &cfl, &dc, model, options);
+        let direct;
+        let ac = if let Some(cache) = cache {
+            AcData::Cached(cache.get_or_build(jpeg, geometry, options, build_ac)?)
+        } else {
+            direct = build_ac()?;
+            AcData::Direct(&direct.0, &direct.1)
+        };
         let maps = cfl.dimensions_in_tiles();
         let maps = CflMaps {
             width: maps.0 as usize,
@@ -515,11 +582,9 @@ impl Prepared {
         }
         let global_ac = &mut sections[section(1 + geometry.dc_group_count())];
         ac_quant.write_header(global_ac, |w, _| auxiliary.write_stream(quant_id, w))?;
-        entropy::write_single_histogram_group(global_ac, geometry.group_count())?;
-        entropy::write_orders(&orders, global_ac)?;
-        entropy.write_model(global_ac)?;
+        ac.write_global(global_ac, geometry.group_count())?;
         for index in 0..geometry.group_count() {
-            entropy.write_group(
+            ac.write_group(
                 index,
                 &mut sections[section(2 + geometry.dc_group_count() + index)],
             )?;

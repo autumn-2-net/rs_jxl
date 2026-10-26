@@ -107,6 +107,7 @@ fn fixture<'a>(
         search: Search::new(options.full_limits),
         encode,
         full_batch: None,
+        pilot_overlap: None,
         probe,
         probe_batch: None,
         prefix_batch: None,

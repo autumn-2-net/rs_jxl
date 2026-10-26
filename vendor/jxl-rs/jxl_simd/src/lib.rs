@@ -21,6 +21,7 @@ mod aarch64;
 mod wasm32;
 
 pub mod float16;
+pub mod jpeg_capture;
 pub mod scalar;
 
 #[cfg(all(target_arch = "aarch64", feature = "neon"))]

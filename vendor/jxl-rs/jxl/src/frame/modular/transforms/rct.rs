@@ -275,6 +275,8 @@ fn apply_rct_permutation(buffers: &mut [&mut ModularChannel], perm: RctPermutati
 #[allow(dead_code)]
 #[instrument(level = "debug", skip(buffers), ret)]
 pub fn do_rct_step_i16(buffers: &mut [&mut ModularChannel], op: RctOp) {
+    #[cfg(feature = "decoder-profile")]
+    let _profile = crate::decoder_profile::scope("transform.rct.i16");
     let [r, g, b] = buffers else {
         unreachable!("incorrect buffer count for RCT");
     };
@@ -290,6 +292,8 @@ pub fn do_rct_step_i16(buffers: &mut [&mut ModularChannel], op: RctOp) {
 // Applies a RCT in-place to the given i32 buffers.
 #[instrument(level = "debug", skip(buffers), ret)]
 pub fn do_rct_step_i32(buffers: &mut [&mut ModularChannel], op: RctOp) {
+    #[cfg(feature = "decoder-profile")]
+    let _profile = crate::decoder_profile::scope("transform.rct.i32");
     let [r, g, b] = buffers else {
         unreachable!("incorrect buffer count for RCT");
     };

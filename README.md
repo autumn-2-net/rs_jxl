@@ -59,6 +59,12 @@ diagnostics, not a requirement to reproduce C++ arithmetic bit for bit.
   See [automatic frames](docs/MULTIFRAME_AUTO.md) and
   [encode-frames CLI](docs/MULTIFRAME_AUTO_CLI.md).
 - Owned thread pools, byte-vector/writer APIs, file/stdin/stdout CLI.
+- Incremental pixel decoding with push/EOF, early frame delivery and blocking
+  readers; CLI opt-in `decode --stream-input`. See
+  [streaming input](docs/STREAMING_INPUT.md).
+- Exact native 17..31-bit Modular integer output without floating-point
+  normalization, including extra planes and integer-compatible frame references.
+  See [native integers](docs/NATIVE_INTEGER_DECODE.md).
 - Cooperative source task queues share that pool across search roots, MA
   partitions/subtrees and LZ77 work. Scoped borrowing and failure draining are
   documented in [parallel execution](docs/PARALLEL_EXECUTION.md).
@@ -113,6 +119,17 @@ implementation dependency.
 
 ## Build and Run
 
+The decoder's AVX-512 kernels are optional: add `--features decoder-avx512`
+to the build command below. This retains runtime CPU detection and AVX2/SSE/
+scalar fallback; the default build stays AVX2-capable. It does not change the
+encoder. See [decoder SIMD measurements](docs/DECODER_SINGLE_20261024.md)
+and the [paired-AVX2 and targeted-AVX512 experiments](docs/DECODER_SIMD_20261025.md).
+The [entropy follow-up](docs/DECODER_ENTROPY_20261025.md) records five measured
+candidates that were not retained and the added ANS regression coverage.
+The [multithreaded pixel follow-up](docs/DECODER_THREADS_20261025.md) describes
+direct output-buffer ownership, 1/8/16-thread measurements, and rejected
+scheduling/lookup experiments.
+
 ```powershell
 cargo build --locked --release -p rs-jxl-cli
 .\target\release\rs-jxl.exe encode input.png output.jxl --threads 8
@@ -141,6 +158,45 @@ with `--source-search` it executes the separate source frame tournament (23 or
 expensive than lower efforts. Optional preflight/frontier/worker policies are
 available through `scheduler::DriverOptions`, not automatically enabled.
 
+`--source-scout` is an explicit experimental frontier for source search at
+effort 9/10; it can change compression size and is not the default scheduler.
+`--source-pilot` is a separate opt-in content-aware pilot-first experiment at
+effort 9/10 (requires `--source-search`, conflicts with `--source-scout`). It
+keeps full candidate outputs, reports the winning parameters, and uses sampled
+evidence only to decide which candidates to run. It does not promise the result
+of exhaustive search or a throughput floor on arbitrary images. The Rust entry
+points are `scheduler::pilot::encode` and `encode_with_options`; `PilotOptions`
+exposes source MA leaf resource limits and representation receipts. The pilot
+preset uses bounded initial candidate waves, content-gated overlap of a reusable
+automatic result, and continuous-tone near-tie challenger screening. Flat and
+low-color images retain the original candidate checks. These are individually
+controlled by `parallel_initial`, `overlap_automatic` and `near_tie_consensus`.
+Ordinary source search is unchanged. Probe quarter-sampling and experimental
+SIMD/cache alternatives remain disabled. Encoder
+thread/pixel/output/sample limits remain explicit; the source MA leaf limit is
+not the direct encoder's `base.modular.max_tree_leaves`. For example:
+
+```powershell
+.\target\release\rs-jxl.exe encode input.png output.jxl --source-effort 9 --source-search --source-pilot --threads 16 --source-sample-limit 33554432
+```
+
+`--ma-budget-mode strict|bounded` explicitly selects whether learned MA leaf
+exhaustion errors or stops optional splitting while retaining lossless pixels.
+`--ma-max-leaves N` adds a cap that survives source/pilot projection. Omission
+preserves the existing defaults. Required partitions and decoder limits still
+apply; see [MA tree budgets](docs/MA_TREE_BUDGET.md).
+
+Development measurements in `docs/ENCODER_SCOUT_20261025.md` distinguish complete
+encoder-call time (including the pilot) from CLI wall time. The call excludes
+input decoding and output I/O; report milliseconds alongside MPix/s for small
+images. `tools/benchmark_encoder_tools.py --repeats 3 --warmups 1` verifies every
+output with official `djxl` and reports medians separately from process timing.
+
+The ordinary JPEG source search now reuses matching AC payloads between
+candidates without removing trials. See the
+[encoder scout experiment](docs/ENCODER_SCOUT_20261025.md) for measurements,
+rejected variants, limits, and current MA parallel/SIMD port coverage.
+
 PNG sRGB/gAMA/cHRM/iCCP and JPEG ICC are retained. Unsupported ancillary metadata
 requires explicit `--strip-metadata`; supported color metadata is still retained,
 and no color conversion is performed. Untagged input defaults to sRGB. CLI input
@@ -154,6 +210,10 @@ API additionally exposes explicit layer headers and extra planes.
 back to pixel encoding. It preserves the original JPEG byte stream through
 standard JXL reconstruction data. Its separate controls and explicit budgets
 are documented in [JPEG_API.md](docs/JPEG_API.md).
+The bounded `jpeg::compatibility::probe` diagnoses special JPEG headers without
+decoding pixels. See [JPEG compatibility](docs/JPEG_COMPATIBILITY.md) for the
+distinction between format limits and implementation gaps; a successful probe
+does not certify transcode support.
 
 ## Verification
 
@@ -191,10 +251,16 @@ not verified. Later changes must repeat the checks; see the checkpoint document.
 - [Verification checkpoints and profiling](docs/PORT_VERIFICATION.md)
 - [Source map and migration order](docs/MIGRATION.md)
 - [Rust pixel API](docs/PIXEL_API.md)
+- [MA tree budget modes and CLI controls](docs/MA_TREE_BUDGET.md)
+- [Exact MA partition reuse and dominance pruning](docs/MA_SEARCH_PRUNING.md)
 - [Incremental output and frame indexes](docs/STREAMING_OUTPUT.md)
 - [Fast lossless source port](docs/FJXL_PORT_STATUS.md)
 - [Byte-reversible JPEG API](docs/JPEG_API.md)
 - [Maintained Rust decoder and API](docs/DECODER_STATUS.md)
+- [Lossless codec performance baseline](docs/PERFORMANCE_BASELINE_20261024.md)
+- [JPEG reconstruction optimization](docs/DECODER_PERFORMANCE_20261024.md)
+- [Parallel JPEG reconstruction](docs/DECODER_PARALLEL_20261024.md)
+- [Single-thread and pixel decoder follow-up](docs/DECODER_SINGLE_20261024.md)
 - [Integer, floating-point and SIMD contracts](docs/INTEGER_AND_FLOAT_PATHS.md)
 - [Historical bitstream bring-up](docs/PIXEL_LOSSLESS_MILESTONE.md)
 - [Kernel provenance and upstream BSD notice](docs/PORTING_KERNELS.md)

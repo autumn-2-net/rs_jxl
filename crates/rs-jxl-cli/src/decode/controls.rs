@@ -1,7 +1,16 @@
 //! Decoder controls and djxl-compatible option spellings.
 use super::*;
 use clap::{Args, ValueEnum};
-use rs_jxl::decode::{AlphaMode, ColorProfile};
+use rs_jxl::decode::{AlphaMode, ColorProfile, DitherMode};
+
+#[derive(Clone, Copy, Debug, Default, ValueEnum)]
+pub(super) enum DitherControl {
+    #[default]
+    #[value(name = "jxl-rs")]
+    JxlRs,
+    #[value(name = "libjxl")]
+    Libjxl,
+}
 
 #[derive(Clone, Copy, Debug, Default, ValueEnum)]
 pub(super) enum AlphaControl {
@@ -60,11 +69,17 @@ impl OutputFormat {
 
 #[derive(Debug, Args)]
 #[command(
-    after_long_help = "PNG stores all displayed frames as APNG; NPY stores all frames and extra planes. Other pixel formats require --frame or --output-frames for multiple frames. Output never silently drops extra planes: use --output-extra-channels for separate -ecN files. Numbered files use -N before the extension. Multiple primary streams are concatenated on stdout; sidecars must have distinct destinations.\nPNM/PPM/PGM/PAM/PGX default to original integer depth (1..16); PNG defaults to full-range 8/16-bit storage. --bits 32 means float32, not uint32. EXR uses float32 linear sRGB; no lossy JPEG encoder is included. JPEG output always requires successful original-byte reconstruction.\nUse '-' for stdin/stdout; stdout requires --format. Diagnostics go to stderr. All serialization completes before publication; each file uses transactional io.rs publication. The output set has a 512 MiB byte budget; publishing multiple files is not a filesystem-wide atomic transaction."
+    after_long_help = "PNG stores all displayed frames as APNG; NPY stores all frames and extra planes. Other pixel formats require --frame or --output-frames for multiple frames. Output never silently drops extra planes: use --output-extra-channels for separate -ecN files. Numbered files use -N before the extension. Multiple primary streams are concatenated on stdout; sidecars must have distinct destinations.\nPNM/PPM/PGM/PAM/PGX default to original integer depth (1..16); PNG defaults to full-range 8/16-bit storage. --bits 32 means float32, not uint32. NPY preserves native wide integers and widens mixed integer planes without normalization. EXR uses float32 linear sRGB; no lossy JPEG encoder is included. JPEG output always requires successful original-byte reconstruction.\n--stream-input feeds one persistent pixel decoder from bounded reads; PNG then requires explicit --bits 8/16. It does not support JPEG reconstruction, metadata-only output, frame selection or repetitions. The CLI retains decoded frames for transactional publication; use the Rust streaming API to consume frames as they arrive.\nUse '-' for stdin/stdout; stdout requires --format. Diagnostics go to stderr. All serialization completes before publication; each file uses transactional io.rs publication. The output set has a 512 MiB byte budget; publishing multiple files is not a filesystem-wide atomic transaction."
 )]
 pub(crate) struct DecodeArgs {
     /// JPEG XL input path, or '-' for stdin
     pub(super) input: PathBuf,
+    /// Decode pixel input incrementally without retaining the complete JXL file
+    #[arg(long, conflicts_with_all = ["frame", "num_reps", "reconstruct_jpeg"])]
+    pub(super) stream_input: bool,
+    /// Incremental input read size (1..=1048576 bytes)
+    #[arg(long, requires = "stream_input", value_parser = clap::value_parser!(u32).range(1..=1_048_576))]
+    pub(super) input_chunk_size: Option<u32>,
     /// Output path, or '-'; optional with --disable-output or sidecars
     pub(super) output: Option<PathBuf>,
     /// Output format, otherwise inferred from the extension
@@ -81,6 +96,9 @@ pub(crate) struct DecodeArgs {
     /// Sample depth: -1 format default, 0 original, 1..16 integer, 32 float
     #[arg(long, aliases = ["bits_per_sample", "bits-per-sample"], allow_hyphen_values = true, value_parser = parse_bits)]
     pub(super) bits: Option<i16>,
+    /// Floating-to-U8 output pattern; does not affect JPEG reconstruction or native integers
+    #[arg(long, value_enum, default_value = "jxl-rs")]
+    pub(super) dither: DitherControl,
     #[arg(long, alias = "keep_orientation")]
     pub(super) keep_orientation: bool,
     #[arg(long)]
@@ -283,6 +301,10 @@ impl DecodeArgs {
         DecodeOptions {
             threads: self.num_threads.unwrap_or(self.threads),
             format: samples,
+            dither: match self.dither {
+                DitherControl::JxlRs => DitherMode::JxlRs,
+                DitherControl::Libjxl => DitherMode::Libjxl,
+            },
             allow_implicit_main10: self.allow_implicit_level10,
             adjust_orientation: !self.keep_orientation,
             render_spot_colors: !self.norender_spotcolors && format != OutputFormat::Npy,

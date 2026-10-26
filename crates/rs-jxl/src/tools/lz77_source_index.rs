@@ -292,6 +292,7 @@ impl<'a> StaticIndex<'a> {
     }
 
     pub(super) fn new(values: &'a [u32], width: usize, config: &SourceConfig) -> Result<Self> {
+        let _profile = crate::profile::scope("lz77.source.static_index_build");
         // All source dispatches cap indexed streams at 2^24. Keep every
         // u32 slot conversion and optional 2-byte/token allocation bounded.
         if values.len() > 1 << 24 {

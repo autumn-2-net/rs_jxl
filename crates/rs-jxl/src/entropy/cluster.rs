@@ -19,7 +19,8 @@
 //! and retain their indices during incremental clustering/refit. Seed distances
 //! and initial refinement rows use the caller's Rayon pool at the source work
 //! thresholds, without the C++ experimental environment gates. Ordered reduction
-//! preserves scalar ties; assignment and subsequent merges remain sequential.
+//! preserves scalar ties; assignment and merge decisions remain sequential,
+//! while independent post-merge pair costs can use the same caller pool.
 //!
 //! Native AVX2 conditioning, entropy, distance and KL dispatch lives in simd.rs,
 //! with source FMA distinctions and portable scalar fallback. Source audit
@@ -29,7 +30,7 @@
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 
-use super::ans_histogram::{AnsHistogramStrategy, NormalizedHistogram};
+use super::ans_histogram::{MAX_ALPHABET_SIZE as ANS_MAX_ALPHABET, fast_population_cost};
 use crate::{Error, Result};
 
 const MAX_ALPHABET: usize = super::prefix_code::MAX_ALPHABET_SIZE;
@@ -91,10 +92,10 @@ impl Histogram {
     fn population_cost(&self) -> Result<f32> {
         // Histogram::ANSPopulationCost deliberately excludes wide prefix
         // histograms from its ANS population estimate, even in prefix mode.
-        if self.counts.len() > 256 {
+        if self.counts.len() > ANS_MAX_ALPHABET {
             return Ok(f32::MAX);
         }
-        Ok(NormalizedHistogram::compute(&self.counts, AnsHistogramStrategy::Fast)?.cost)
+        fast_population_cost(&self.counts)
     }
 }
 
@@ -266,35 +267,90 @@ fn fast_cluster(
     );
     drop(seed_profile);
     let _assign_profile = crate::profile::scope("entropy.cluster.assign");
-    for i in 0..input.len() {
-        if symbols[i] != limit {
-            continue;
-        }
-        let mut best = 0;
-        let mut best_distance = f32::MAX;
-        for (j, histogram) in output.iter().enumerate() {
-            let candidate = if j < previous {
-                kl_divergence(&input[i], histogram)
-            } else {
-                distance(&input[i], histogram, prefix_codes)
-            };
-            if candidate < best_distance {
-                best = j;
-                best_distance = candidate;
-            }
-        }
-        if !best_distance.is_finite() || best_distance == f32::MAX {
-            return Err(Error::Encoding(
-                "no finite histogram cluster distance".into(),
-            ));
-        }
-        if best >= previous {
-            output[best].add(&input[i])?;
-            output[best].entropy = shannon_entropy(&output[best].counts, output[best].total);
-        }
-        symbols[i] = best;
-    }
+    assign_histograms(
+        input,
+        &mut output,
+        &mut symbols,
+        previous,
+        limit,
+        prefix_codes,
+        workers,
+    )?;
     Ok((output, symbols))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn assign_histograms(
+    input: &[Histogram],
+    output: &mut [Histogram],
+    symbols: &mut [usize],
+    previous: usize,
+    unassigned: usize,
+    prefix_codes: bool,
+    workers: usize,
+) -> Result<()> {
+    const BLOCK: usize = 64;
+    let parallel = input.len() >= 2048
+        && output.len() >= 32
+        && super::jobs::task_count(BLOCK, workers, BLOCK * MAX_CLUSTERS * 4) >= 4;
+    let cost = |i: usize, j: usize, histogram: &Histogram| {
+        if j < previous {
+            kl_divergence(&input[i], histogram)
+        } else {
+            distance(&input[i], histogram, prefix_codes)
+        }
+    };
+    for begin in (0..input.len()).step_by(BLOCK) {
+        let end = (begin + BLOCK).min(input.len());
+        let cached = if parallel {
+            // Costs against the frozen centers can run ahead. A center modified
+            // by an earlier assignment is always recomputed before use below.
+            let order: Vec<_> = (begin..end).collect();
+            super::jobs::map(&order, workers, BLOCK * MAX_CLUSTERS * 4, |i| {
+                if symbols[i] != unassigned {
+                    return Vec::new();
+                }
+                output
+                    .iter()
+                    .enumerate()
+                    .map(|(j, h)| cost(i, j, h))
+                    .collect()
+            })
+        } else {
+            Vec::new()
+        };
+        let mut changed = [false; MAX_CLUSTERS];
+        for i in begin..end {
+            if symbols[i] != unassigned {
+                continue;
+            }
+            let mut best = 0;
+            let mut best_distance = f32::MAX;
+            for (j, histogram) in output.iter().enumerate() {
+                let candidate = if parallel && !changed[j] {
+                    cached[i - begin][j]
+                } else {
+                    cost(i, j, histogram)
+                };
+                if candidate < best_distance {
+                    best = j;
+                    best_distance = candidate;
+                }
+            }
+            if !best_distance.is_finite() || best_distance == f32::MAX {
+                return Err(Error::Encoding(
+                    "no finite histogram cluster distance".into(),
+                ));
+            }
+            if best >= previous {
+                output[best].add(&input[i])?;
+                output[best].entropy = shannon_entropy(&output[best].counts, output[best].total);
+                changed[best] = true;
+            }
+            symbols[i] = best;
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -328,37 +384,37 @@ impl Ord for Pair {
     }
 }
 
+fn pair_population_cost(a: &Histogram, b: &Histogram) -> Result<f32> {
+    a.total
+        .checked_add(b.total)
+        .filter(|&sum| sum <= i32::MAX as u64)
+        .ok_or(Error::Limit("merged histogram weight exceeds i32::MAX"))?;
+    let length = a.counts.len().max(b.counts.len());
+    if length > ANS_MAX_ALPHABET {
+        return Ok(f32::MAX);
+    }
+    let mut combined = [0u64; ANS_MAX_ALPHABET];
+    combined[..a.counts.len()].copy_from_slice(&a.counts);
+    for (destination, &source) in combined.iter_mut().zip(&b.counts) {
+        *destination += source;
+    }
+    fast_population_cost(&combined[..length])
+}
+
 fn pair_cost(
     histograms: &[Histogram],
     versions: &[u32],
     first: usize,
     second: usize,
 ) -> Result<Option<Pair>> {
-    let mut combined = histograms[first].clone();
-    combined.add(&histograms[second])?;
-    let cost =
-        combined.population_cost()? - (histograms[first].entropy + histograms[second].entropy);
+    let cost = pair_population_cost(&histograms[first], &histograms[second])?
+        - (histograms[first].entropy + histograms[second].entropy);
     Ok((cost < 0.0).then_some(Pair {
         cost,
         first,
         second,
         version: versions[first].max(versions[second]),
     }))
-}
-
-fn enqueue_pair(
-    histograms: &[Histogram],
-    versions: &[u32],
-    first: usize,
-    second: usize,
-    heap: &mut BinaryHeap<Pair>,
-) -> Result<()> {
-    if let Some(pair) = pair_cost(histograms, versions, first, second)? {
-        heap.try_reserve(1)
-            .map_err(|_| Error::Limit("histogram merge queue"))?;
-        heap.push(pair);
-    }
-    Ok(())
 }
 
 type EntropySketch = [f64; 16];
@@ -419,8 +475,19 @@ fn refine_with_workers(
         "entropy.cluster.refine",
         format_args!("centers={}", histograms.len()),
     );
-    for histogram in histograms.iter_mut() {
-        histogram.entropy = histogram.population_cost()?;
+    let parallel = !crate::execution::is_serial() && workers > 1 && histograms.len() >= 32;
+    if parallel {
+        let order: Vec<_> = (0..histograms.len()).collect();
+        let costs = super::jobs::map(&order, workers, 1 << 20, |i| {
+            histograms[i].population_cost()
+        });
+        for (histogram, cost) in histograms.iter_mut().zip(costs) {
+            histogram.entropy = cost?;
+        }
+    } else {
+        for histogram in histograms.iter_mut() {
+            histogram.entropy = histogram.population_cost()?;
+        }
     }
     let mut sketches: Option<Vec<_>> = use_bound.then(|| {
         histograms
@@ -456,7 +523,6 @@ fn refine_with_workers(
         }
         Ok((row, bounded))
     };
-    let parallel = !crate::execution::is_serial() && workers > 1 && histograms.len() >= 32;
     let rows: Vec<_> = if parallel {
         #[cfg(test)]
         probe.record("cluster.refine.parallel_dispatch");
@@ -505,22 +571,38 @@ fn refine_with_workers(
         versions[second] = 0;
         versions[first] = next_version;
         next_version += 1;
-        for j in 0..histograms.len() {
-            if j != first && versions[j] != 0 {
-                if sketches.as_ref().is_some_and(|s| {
-                    merge_lower_bound(&s[first], &s[j])
-                        >= f64::from(histograms[first].entropy) + f64::from(histograms[j].entropy)
-                }) {
-                    bounded_pairs += 1;
-                    continue;
-                }
-                enqueue_pair(
-                    histograms,
-                    &versions,
-                    first.min(j),
-                    first.max(j),
-                    &mut pairs,
-                )?;
+        let active: Vec<_> = (0..histograms.len())
+            .filter(|&j| j != first && versions[j] != 0)
+            .collect();
+        let update = |j: usize| -> Result<(Option<Pair>, usize)> {
+            if sketches.as_ref().is_some_and(|s| {
+                merge_lower_bound(&s[first], &s[j])
+                    >= f64::from(histograms[first].entropy) + f64::from(histograms[j].entropy)
+            }) {
+                return Ok((None, 1));
+            }
+            Ok((
+                pair_cost(histograms, &versions, first.min(j), first.max(j))?,
+                0,
+            ))
+        };
+        // The selected merge is already committed. These distances are
+        // independent; publish in the old j order before selecting another pair.
+        let updates: Vec<_> = if parallel && active.len() >= 32 {
+            #[cfg(test)]
+            probe.record("cluster.refine.update_dispatch");
+            super::jobs::map(&active, workers, 1 << 20, update)
+        } else {
+            active.into_iter().map(update).collect()
+        };
+        for update in updates {
+            let (pair, bounded) = update?;
+            bounded_pairs += bounded;
+            if let Some(pair) = pair {
+                pairs
+                    .try_reserve(1)
+                    .map_err(|_| Error::Limit("histogram merge queue"))?;
+                pairs.push(pair);
             }
         }
     }
@@ -673,6 +755,135 @@ pub fn cluster_with_preexisting(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::entropy::ans_histogram::{AnsHistogramStrategy, NormalizedHistogram};
+
+    fn cloned_pair_population_cost(a: &Histogram, b: &Histogram) -> Result<f32> {
+        let mut combined = a.clone();
+        combined.add(b)?;
+        if combined.counts.len() > ANS_MAX_ALPHABET {
+            Ok(f32::MAX)
+        } else {
+            Ok(NormalizedHistogram::compute(&combined.counts, AnsHistogramStrategy::Fast)?.cost)
+        }
+    }
+
+    #[test]
+    fn stack_pair_population_cost_matches_clone_compute_and_heap_keys() {
+        let mut inputs = vec![vec![], vec![0], vec![7], vec![0, 7], vec![2048, 2047, 1]];
+        for length in [3, 15, 16, 17, 31, 32, 33, 127, 128, 255, 256, 257, 513] {
+            inputs.push(
+                (0..length)
+                    .map(|i| {
+                        if i % 5 == 0 {
+                            0
+                        } else {
+                            (i * 701 + 37) as u64 % 1013
+                        }
+                    })
+                    .collect(),
+            );
+        }
+        let mut histograms: Vec<_> = inputs
+            .iter()
+            .map(|counts| Histogram::new(counts).unwrap())
+            .collect();
+        for histogram in &mut histograms {
+            histogram.entropy = histogram.population_cost().unwrap();
+        }
+        let original = histograms.clone();
+        let versions: Vec<_> = (0..histograms.len()).map(|i| i as u32 + 1).collect();
+        let mut actual_heap = BinaryHeap::new();
+        let mut expected_heap = BinaryHeap::new();
+        for first in 0..histograms.len() {
+            for second in first + 1..histograms.len() {
+                let a = &histograms[first];
+                let b = &histograms[second];
+                let expected = cloned_pair_population_cost(a, b).unwrap();
+                assert_eq!(
+                    pair_population_cost(a, b).unwrap().to_bits(),
+                    expected.to_bits()
+                );
+                let cost = expected - (a.entropy + b.entropy);
+                let expected_pair = (cost < 0.0).then_some(Pair {
+                    cost,
+                    first,
+                    second,
+                    version: versions[first].max(versions[second]),
+                });
+                let actual_pair = pair_cost(&histograms, &versions, first, second).unwrap();
+                assert_eq!(actual_pair, expected_pair);
+                if let Some(pair) = actual_pair {
+                    assert_eq!(pair.cost.to_bits(), expected_pair.unwrap().cost.to_bits());
+                    actual_heap.push(pair);
+                }
+                if let Some(pair) = expected_pair {
+                    expected_heap.push(pair);
+                }
+            }
+        }
+        assert!(!actual_heap.is_empty());
+        while let Some(expected) = expected_heap.pop() {
+            assert_eq!(actual_heap.pop(), Some(expected));
+        }
+        assert!(actual_heap.is_empty());
+        assert_same_histograms(&histograms, &original);
+    }
+
+    #[test]
+    fn stack_pair_population_cost_preserves_weight_limits_before_wide_guard() {
+        let mut wide = vec![0; ANS_MAX_ALPHABET + 1];
+        wide[ANS_MAX_ALPHABET] = i32::MAX as u64;
+        let large = Histogram::new(&[i32::MAX as u64]).unwrap();
+        let wide = Histogram::new(&wide).unwrap();
+        let one = Histogram::new(&[1]).unwrap();
+        let empty = Histogram::new(&[]).unwrap();
+        let mut overflow = one.clone();
+        overflow.total = u64::MAX;
+        for (a, b) in [
+            (&large, &one),
+            (&one, &large),
+            (&wide, &one),
+            (&overflow, &one),
+        ] {
+            let expected = cloned_pair_population_cost(a, b).unwrap_err();
+            let actual = pair_population_cost(a, b).unwrap_err();
+            assert_eq!(actual.to_string(), expected.to_string());
+        }
+        let almost = Histogram::new(&[i32::MAX as u64 - 1]).unwrap();
+        for (a, b) in [(&large, &empty), (&almost, &one), (&wide, &empty)] {
+            assert_eq!(
+                pair_population_cost(a, b).unwrap().to_bits(),
+                cloned_pair_population_cost(a, b).unwrap().to_bits()
+            );
+        }
+    }
+
+    #[test]
+    fn stack_pair_cost_preserves_zero_ties_versions_and_wide_infinity() {
+        let mut histograms = vec![
+            Histogram::new(&[17]).unwrap(),
+            Histogram::new(&[17]).unwrap(),
+        ];
+        let population = cloned_pair_population_cost(&histograms[0], &histograms[1]).unwrap();
+        histograms[0].entropy = population;
+        histograms[1].entropy = 0.0;
+        assert!(pair_cost(&histograms, &[7, 3], 0, 1).unwrap().is_none());
+        histograms[1].entropy = 1.0;
+        let pair = pair_cost(&histograms, &[7, 3], 0, 1).unwrap().unwrap();
+        assert_eq!(pair.cost.to_bits(), (-1.0f32).to_bits());
+        assert_eq!(pair.version, 7);
+
+        let mut counts = vec![0; ANS_MAX_ALPHABET + 1];
+        counts[ANS_MAX_ALPHABET] = 1;
+        let mut wide = Histogram::new(&counts).unwrap();
+        wide.entropy = wide.population_cost().unwrap();
+        let histograms = [wide.clone(), wide];
+        let expected = cloned_pair_population_cost(&histograms[0], &histograms[1]).unwrap()
+            - (histograms[0].entropy + histograms[1].entropy);
+        let pair = pair_cost(&histograms, &[1, 2], 0, 1).unwrap().unwrap();
+        assert_eq!(pair.cost.to_bits(), expected.to_bits());
+        assert_eq!(pair.cost, f32::NEG_INFINITY);
+    }
 
     #[test]
     fn serial_scope_inside_pool_keeps_seed_and_refine_on_caller_thread() {
@@ -754,6 +965,298 @@ mod tests {
             assert_eq!(a.counts, b.counts);
             assert_eq!(a.total, b.total);
             assert_eq!(a.entropy.to_bits(), b.entropy.to_bits());
+        }
+    }
+
+    #[test]
+    fn speculative_assignment_rechecks_changed_centers_and_preserves_pinned_ones() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        let input: Vec<_> = (0..2113)
+            .map(|i| {
+                let counts: Vec<_> = (0..17)
+                    .map(|j| ((i * 31 + j * 19 + i * j * 7) % 23) as u64)
+                    .collect();
+                Histogram::new(&counts).unwrap()
+            })
+            .collect();
+        for previous in [0, 7, 32] {
+            for prefix in [false, true] {
+                let mut serial = input[..32].to_vec();
+                let mut parallel = serial.clone();
+                let pinned = serial[..previous].to_vec();
+                let mut serial_map = vec![32; input.len()];
+                for (i, slot) in serial_map.iter_mut().take(32).enumerate() {
+                    *slot = i;
+                }
+                let mut parallel_map = serial_map.clone();
+                assign_histograms(
+                    &input,
+                    &mut serial,
+                    &mut serial_map,
+                    previous,
+                    32,
+                    prefix,
+                    1,
+                )
+                .unwrap();
+                pool.install(|| {
+                    assign_histograms(
+                        &input,
+                        &mut parallel,
+                        &mut parallel_map,
+                        previous,
+                        32,
+                        prefix,
+                        4,
+                    )
+                })
+                .unwrap();
+                assert_eq!(serial_map, parallel_map);
+                assert_same_histograms(&parallel, &serial);
+                assert_same_histograms(&parallel[..previous], &pinned);
+            }
+        }
+    }
+
+    fn check_speculative_assignment(
+        pool: &rayon::ThreadPool,
+        centers: &[Histogram],
+        previous: usize,
+        prefix: bool,
+        active: &[(usize, Histogram)],
+    ) -> (Vec<Histogram>, Vec<usize>, Result<()>) {
+        assert!(centers.len() >= 32 && centers.len() <= MAX_CLUSTERS);
+        let unassigned = centers.len();
+        // Empty inputs are already assigned, as in fast_cluster. The last row
+        // also exercises a one-item final block after 33 complete blocks.
+        let mut input = vec![Histogram::new(&[]).unwrap(); 2113];
+        let mut symbols = vec![0; input.len()];
+        for (i, histogram) in active {
+            assert_eq!(input[*i].total, 0);
+            input[*i] = histogram.clone();
+            symbols[*i] = unassigned;
+        }
+        let mut serial = centers.to_vec();
+        let mut parallel = centers.to_vec();
+        let mut parallel_symbols = symbols.clone();
+        let expected = assign_histograms(
+            &input,
+            &mut serial,
+            &mut symbols,
+            previous,
+            unassigned,
+            prefix,
+            1,
+        );
+        let actual = pool.install(|| {
+            assert!(super::super::jobs::task_count(64, 4, 64 * MAX_CLUSTERS * 4) >= 4);
+            assign_histograms(
+                &input,
+                &mut parallel,
+                &mut parallel_symbols,
+                previous,
+                unassigned,
+                prefix,
+                4,
+            )
+        });
+        assert_eq!(
+            actual.as_ref().map_err(|e| e.to_string()),
+            expected.as_ref().map_err(|e| e.to_string()),
+        );
+        assert_eq!(parallel_symbols, symbols);
+        assert_same_histograms(&parallel, &serial);
+        assert_same_histograms(&parallel[..previous], &centers[..previous]);
+        (parallel, parallel_symbols, actual)
+    }
+
+    #[test]
+    fn speculative_assignment_stale_costs_provably_choose_the_wrong_center() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        let mut centers = vec![Histogram::new(&[0, 0, 100_000]).unwrap(); 32];
+        centers[0] = Histogram::new(&[100]).unwrap();
+        centers[1] = Histogram::new(&[90, 10]).unwrap();
+        let first = Histogram::new(&[1000, 1000]).unwrap();
+        let probe = Histogram::new(&[90, 10]).unwrap();
+        assert!(distance(&first, &centers[1], false) + 1.0 < distance(&first, &centers[0], false));
+        let frozen_probe = distance(&probe, &centers[1], false);
+        let alternative = distance(&probe, &centers[0], false);
+        assert!(frozen_probe + 1.0 < alternative);
+        let mut grown = centers[1].clone();
+        grown.add(&first).unwrap();
+        grown.entropy = shannon_entropy(&grown.counts, grown.total);
+        assert!(alternative + 1.0 < distance(&probe, &grown, false));
+        for center in &centers[2..] {
+            assert!(distance(&first, center, false) > distance(&first, &centers[1], false));
+            assert!(distance(&probe, center, false) > alternative);
+        }
+        // Same-block stale reuse would pick 1 for the probe, not 0. Cross-block
+        // cases additionally require fresh costs after resetting changed[].
+        for (a, b) in [(0, 1), (62, 63), (63, 64), (2111, 2112)] {
+            let (actual, symbols, result) = check_speculative_assignment(
+                &pool,
+                &centers,
+                0,
+                false,
+                &[(a, first.clone()), (b, probe.clone())],
+            );
+            result.unwrap();
+            assert_eq!((symbols[a], symbols[b]), (1, 0));
+            assert_eq!(actual[0].counts, [190, 10]);
+            assert_same_histograms(&actual[1..2], std::slice::from_ref(&grown));
+        }
+    }
+
+    #[test]
+    fn speculative_assignment_missing_kl_support_keeps_error_order() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        let supported = Histogram::new(&[7]).unwrap();
+        let unsupported = Histogram::new(&[0, 0, 11]).unwrap();
+        for prefix in [false, true] {
+            let mut centers = vec![Histogram::new(&[4096]).unwrap(); 32];
+            centers[2] = Histogram::new(&[]).unwrap();
+            assert!(
+                centers
+                    .iter()
+                    .all(|h| kl_divergence(&unsupported, h).is_infinite())
+            );
+            let (_, symbols, result) = check_speculative_assignment(
+                &pool,
+                &centers,
+                32,
+                prefix,
+                &[
+                    (62, supported.clone()),
+                    (63, unsupported.clone()),
+                    (64, supported.clone()),
+                ],
+            );
+            assert!(matches!(result, Err(Error::Encoding(_))));
+            assert_eq!((symbols[62], symbols[63], symbols[64]), (0, 32, 32));
+            // Missing support and empty coding tables must lose to a finite
+            // pinned center; no old center is allowed to absorb any input.
+            centers[1] = Histogram::new(&[0, 0, 4096]).unwrap();
+            let (_, symbols, result) = check_speculative_assignment(
+                &pool,
+                &centers,
+                32,
+                prefix,
+                &[
+                    (63, unsupported.clone()),
+                    (64, supported.clone()),
+                    (2112, unsupported.clone()),
+                ],
+            );
+            result.unwrap();
+            assert_eq!((symbols[63], symbols[64], symbols[2112]), (1, 0, 1));
+        }
+    }
+
+    #[test]
+    fn speculative_assignment_preserves_singleton_penalty_winner() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        let mut centers = vec![Histogram::new(&[0, 0, 100_000]).unwrap(); 32];
+        centers[0] = Histogram::new(&[100]).unwrap();
+        centers[1] = Histogram::new(&[1000, 1000]).unwrap();
+        let input = Histogram::new(&[0, 1000]).unwrap();
+        assert!(distance(&input, &centers[0], false) + 1.0 < distance(&input, &centers[1], false));
+        assert_eq!(distance(&input, &centers[0], true), 1100.0);
+        assert_eq!(distance(&input, &centers[1], true), 1000.0);
+        for prefix in [false, true] {
+            let (_, symbols, result) =
+                check_speculative_assignment(&pool, &centers, 0, prefix, &[(63, input.clone())]);
+            result.unwrap();
+            assert_eq!(symbols[63], usize::from(prefix));
+        }
+        let aligned = Histogram::new(&[1000]).unwrap();
+        assert_eq!(distance(&aligned, &centers[0], true), 0.0);
+        let (_, symbols, result) =
+            check_speculative_assignment(&pool, &centers, 0, true, &[(2112, aligned)]);
+        result.unwrap();
+        assert_eq!(symbols[2112], 0);
+    }
+
+    #[test]
+    fn speculative_assignment_center_growth_crosses_vector_and_batch_tails() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        let mut centers = vec![Histogram::new(&[0, 0, 4096]).unwrap(); 32];
+        centers[31] = Histogram::new(&[100]).unwrap();
+        let mut active = Vec::new();
+        for (i, symbol) in [(62, 8), (63, 16), (64, 32)] {
+            let mut counts = vec![0; symbol + 1];
+            counts[0] = 100;
+            counts[symbol] = 1;
+            active.push((i, Histogram::new(&counts).unwrap()));
+        }
+        active.push((2112, Histogram::new(&[100]).unwrap()));
+        for prefix in [false, true] {
+            let (actual, symbols, result) =
+                check_speculative_assignment(&pool, &centers, 31, prefix, &active);
+            result.unwrap();
+            for (i, _) in &active {
+                assert_eq!(symbols[*i], 31);
+            }
+            let mut expected = vec![0; 33];
+            expected[0] = 500;
+            for symbol in [8, 16, 32] {
+                expected[symbol] = 1;
+            }
+            assert_eq!(actual[31].counts, expected);
+            assert_eq!(actual[31].total, 503);
+        }
+    }
+
+    #[test]
+    fn speculative_assignment_weight_limits_preserve_exact_counts_and_partial_commit() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        for ceiling in [(1u64 << 24) - 1, 1 << 24, (1 << 24) + 1, i32::MAX as u64] {
+            let mut centers = vec![Histogram::new(&[0, 4096]).unwrap(); MAX_CLUSTERS];
+            centers[255] = Histogram::new(&[ceiling - 3]).unwrap();
+            for prefix in [false, true] {
+                let mut active = vec![
+                    (62, Histogram::new(&[1]).unwrap()),
+                    (63, Histogram::new(&[2]).unwrap()),
+                ];
+                let (actual, symbols, result) =
+                    check_speculative_assignment(&pool, &centers, 255, prefix, &active);
+                result.unwrap();
+                assert_eq!((symbols[62], symbols[63]), (255, 255));
+                assert_eq!(actual[255].counts, [ceiling]);
+                assert_eq!(actual[255].total, ceiling);
+                if ceiling == i32::MAX as u64 {
+                    // The first failing add must not mutate the center or map,
+                    // even though later rows have already been speculated.
+                    active.push((64, Histogram::new(&[1]).unwrap()));
+                    active.push((65, Histogram::new(&[2]).unwrap()));
+                    let (actual, symbols, result) =
+                        check_speculative_assignment(&pool, &centers, 255, prefix, &active);
+                    assert!(matches!(result, Err(Error::Limit(_))));
+                    assert_eq!(
+                        (symbols[62], symbols[63], symbols[64], symbols[65]),
+                        (255, 255, 256, 256)
+                    );
+                    assert_eq!(actual[255].counts, [ceiling]);
+                    assert_eq!(actual[255].total, ceiling);
+                }
+            }
         }
     }
 

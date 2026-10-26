@@ -7,9 +7,11 @@ use crate::jpeg::reconstruction_decode::{
     ReconstructionDecodeLimits, decode_reconstruction_metadata,
 };
 use crate::jpeg::reconstruction_metadata::ReconstructionMetadataSources;
-use crate::jpeg::scan_writer::{ReconstructionError, reconstruct_from_coefficients};
+use crate::jpeg::scan_writer::{ReconstructionError, reconstruct_with_pool};
 use crate::{Error, Result};
-use jxl_decoder::api::{Event, JxlColorProfile, JxlDecoder, JxlJpegCoefficientCapture};
+use jxl_decoder::api::{
+    Event, JxlColorProfile, JxlDecoder, JxlDecoderOptions, JxlJpegCoefficientCapture,
+};
 
 fn unique_box(boxes: &[DecodedBox], kind: [u8; 4]) -> Result<Option<&[u8]>> {
     let mut found = boxes.iter().filter(|entry| entry.kind == kind);
@@ -48,8 +50,17 @@ fn reconstruction_error(error: ReconstructionDecodeError) -> Error {
 /// JPEG RAW tables and JPEG-compatible CfL. Other transforms, non-RAW tables,
 /// fractional/clamped DC, animations, LF frames, crops and extra channels are
 /// rejected; an arbitrary pixel JXL is not an original-JPEG source.
-pub fn reconstruct_jpeg(mut input: &[u8], options: &DecodeOptions) -> Result<Vec<u8>> {
-    let mut backend = backend_options(input, options)?;
+pub fn reconstruct_jpeg(input: &[u8], options: &DecodeOptions) -> Result<Vec<u8>> {
+    let _total = crate::profile::scope("decode.jpeg.total");
+    let backend = prepare_backend(backend_options(input, options)?, options)?;
+    let mut runner = runner::Runner::new(options.threads)?;
+    reconstruct_with_runner(input, options, backend, &mut runner)
+}
+
+pub(super) fn prepare_backend(
+    mut backend: JxlDecoderOptions,
+    options: &DecodeOptions,
+) -> Result<JxlDecoderOptions> {
     if options.limits.max_frames == 0 {
         return Err(Error::Limit("JPEG frame count"));
     }
@@ -61,14 +72,23 @@ pub fn reconstruct_jpeg(mut input: &[u8], options: &DecodeOptions) -> Result<Vec
     backend.coalescing = true;
     backend.scan_frames_only = false;
     backend.request_aux_boxes = boxes::REQUESTED.to_vec();
+    Ok(backend)
+}
+
+pub(super) fn reconstruct_with_runner(
+    mut input: &[u8],
+    options: &DecodeOptions,
+    backend: JxlDecoderOptions,
+    runner: &mut runner::Runner,
+) -> Result<Vec<u8>> {
+    let coefficient_stage = crate::profile::scope("decode.jpeg.coefficients");
     let mut decoder = JxlDecoder::new(backend);
     decoder.close_input();
-    let mut pool = runner::Runner::new(options.threads)?;
     let mut capture: Option<JxlJpegCoefficientCapture> = None;
     let mut frame_complete = false;
     loop {
         match decoder
-            .process(&mut input, None, Some(&mut pool))
+            .process(&mut input, None, Some(&mut *runner))
             .map_err(backend_error)?
         {
             Event::BasicInfo => {
@@ -128,6 +148,8 @@ pub fn reconstruct_jpeg(mut input: &[u8], options: &DecodeOptions) -> Result<Vec
     let recovered = capture
         .and_then(|capture| capture.take())
         .ok_or_else(|| failure("JPEG coefficient capture incomplete"))?;
+    drop(coefficient_stage);
+    let metadata_stage = crate::profile::scope("decode.jpeg.metadata");
     let boxes = boxes::extract(&decoder, input, options.limits.max_metadata_bytes)?;
     let jbrd = unique_box(&boxes, *b"jbrd")?
         .ok_or_else(|| failure("JXL has no original-JPEG reconstruction data"))?;
@@ -180,6 +202,8 @@ pub fn reconstruct_jpeg(mut input: &[u8], options: &DecodeOptions) -> Result<Vec
             })
         })
         .collect::<Result<_>>()?;
+    drop(metadata_stage);
+    let model_stage = crate::profile::scope("decode.jpeg.writer_model");
     let jpeg = metadata
         .into_jpeg(
             CapturedJpegCoefficients {
@@ -191,7 +215,8 @@ pub fn reconstruct_jpeg(mut input: &[u8], options: &DecodeOptions) -> Result<Vec
             &limits,
         )
         .map_err(reconstruction_error)?;
-    reconstruct_from_coefficients(&jpeg, &limits.write)
+    drop(model_stage);
+    reconstruct_with_pool(&jpeg, &limits.write, runner.pool())
         .map_err(ReconstructionDecodeError::Reconstruction)
         .map_err(reconstruction_error)
 }

@@ -66,6 +66,20 @@ pub(super) fn match_length<Value: PartialEq>(a: &[Value], b: &[Value]) -> usize 
     length
 }
 
+// Fast seeds mostly stop in the first eight extension values. Word comparison
+// locates that first mismatch without rescanning a failed eight-value block.
+#[inline]
+pub(super) fn fast_match_length(a: &[u32], b: &[u32]) -> usize {
+    debug_assert_eq!(a.len(), b.len());
+    let head = a.len().min(8);
+    let matched = word_length(&a[..head], &b[..head]);
+    if matched < head || head == a.len() {
+        matched
+    } else {
+        head + match_length(&a[head..], &b[head..])
+    }
+}
+
 pub(super) struct MatchCache {
     ends: Vec<u32>,
     distances: Vec<u32>,

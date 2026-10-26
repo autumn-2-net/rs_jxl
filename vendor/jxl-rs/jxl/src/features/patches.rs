@@ -76,6 +76,13 @@ pub enum PatchBlendMode {
 impl PatchBlendMode {
     pub const NUM_BLEND_MODES: u8 = 8;
 
+    fn from_encoded(value: u32) -> Result<Self> {
+        Self::from_u32(value).ok_or_else(|| match u8::try_from(value) {
+            Ok(value) => Error::PatchesInvalidBlendMode(value, Self::NUM_BLEND_MODES),
+            Err(_) => Error::InvalidEnum(value, "PatchBlendMode".to_string()),
+        })
+    }
+
     #[cfg(test)]
     fn try_from(i: u8) -> Result<PatchBlendMode> {
         match i {
@@ -133,18 +140,31 @@ pub struct PatchBlending {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PatchReferencePosition {
     // Not using `ref` like in the spec here, because it is a keyword.
-    reference: usize,
-    x0: usize,
-    y0: usize,
-    xsize: usize,
-    ysize: usize,
+    pub(crate) reference: usize,
+    pub(crate) x0: usize,
+    pub(crate) y0: usize,
+    pub(crate) xsize: usize,
+    pub(crate) ysize: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PatchPosition {
-    x: usize,
-    y: usize,
-    ref_pos_idx: usize,
+    pub(crate) x: usize,
+    pub(crate) y: usize,
+    pub(crate) ref_pos_idx: usize,
+}
+
+fn checked_patch_offset(axis: &str, previous: usize, delta: i32) -> Result<usize> {
+    // Coordinates are unsigned, but offsets span the entire signed 32-bit range.
+    i64::try_from(previous)
+        .ok()
+        .and_then(|previous| previous.checked_add(i64::from(delta)))
+        .and_then(|position| usize::try_from(position).ok())
+        .ok_or_else(|| Error::PatchesInvalidDelta(axis.to_string(), previous, delta))
+}
+
+fn patch_range_fits(origin: usize, length: usize, limit: usize) -> bool {
+    origin.checked_add(length).is_some_and(|end| end <= limit)
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -160,8 +180,8 @@ struct PatchTreeNode {
 pub struct PatchesDictionary {
     pub positions: Vec<PatchPosition>,
     pub ref_positions: Vec<PatchReferencePosition>,
-    blendings: Vec<PatchBlending>,
-    blendings_stride: usize,
+    pub(crate) blendings: Vec<PatchBlending>,
+    pub(crate) blendings_stride: usize,
     patch_tree: Vec<PatchTreeNode>,
     // Number of patches for each row.
     num_patches: Vec<usize>,
@@ -393,7 +413,38 @@ impl PatchesDictionary {
         level5_limits: bool,
         lz77_scratch: &mut Vec<u32>,
     ) -> Result<PatchesDictionary> {
-        let blendings_stride = num_extra_channels + 1;
+        let info: Vec<_> = reference_frames
+            .iter()
+            .map(|reference| {
+                reference
+                    .as_ref()
+                    .map(|r| (r.frame[0].size(), r.saved_before_color_transform))
+            })
+            .collect();
+        Self::read_with_reference_info(
+            br,
+            xsize,
+            ysize,
+            num_extra_channels,
+            &info,
+            level5_limits,
+            lz77_scratch,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn read_with_reference_info(
+        br: &mut BitReader,
+        xsize: usize,
+        ysize: usize,
+        num_extra_channels: usize,
+        reference_frames: &[Option<((usize, usize), bool)>],
+        level5_limits: bool,
+        lz77_scratch: &mut Vec<u32>,
+    ) -> Result<PatchesDictionary> {
+        let blendings_stride = num_extra_channels
+            .checked_add(1)
+            .ok_or(Error::SizeOverflow)?;
         let patches_histograms = Histograms::decode(PatchContext::NUM, br, true, lz77_scratch)?;
         let mut patches_reader = SymbolReader::new(&patches_histograms, br, None, lz77_scratch)?;
         let num_ref_patch = patches_reader.read_unsigned(
@@ -401,10 +452,12 @@ impl PatchesDictionary {
             br,
             PatchContext::NumRefPatch as usize,
         ) as usize;
-        let num_pixels = xsize * ysize;
-        let max_ref_patches = 1024 + num_pixels / 4;
-        let max_patches = max_ref_patches * 4;
-        let max_blending_infos = max_patches * 4;
+        let num_pixels = xsize.checked_mul(ysize).ok_or(Error::SizeOverflow)?;
+        let max_ref_patches = (num_pixels / 4)
+            .checked_add(1024)
+            .ok_or(Error::SizeOverflow)?;
+        let max_patches = max_ref_patches.checked_mul(4).ok_or(Error::SizeOverflow)?;
+        let max_blending_infos = max_patches.checked_mul(4).ok_or(Error::SizeOverflow)?;
         if num_ref_patch > max_ref_patches {
             return Err(Error::PatchesTooMany(
                 "reference patches".to_string(),
@@ -412,8 +465,8 @@ impl PatchesDictionary {
                 max_ref_patches,
             ));
         }
-        let mut total_patches = 0;
-        let mut next_size = 1;
+        let mut total_patches = 0usize;
+        let mut next_size = 1usize;
         let mut positions: Vec<PatchPosition> = Vec::new();
         let mut blendings = Vec::new();
         let mut ref_positions = Vec::new_with_capacity(num_ref_patch)?;
@@ -442,51 +495,54 @@ impl PatchesDictionary {
                 br,
                 PatchContext::PatchReferencePosition as usize,
             ) as usize;
-            let ref_pos_xsize = patches_reader.read_unsigned(
+            let ref_pos_xsize = (patches_reader.read_unsigned(
                 &patches_histograms,
                 br,
                 PatchContext::PatchSize as usize,
-            ) as usize
-                + 1;
-            let ref_pos_ysize = patches_reader.read_unsigned(
+            ) as usize)
+                .checked_add(1)
+                .ok_or(Error::SizeOverflow)?;
+            let ref_pos_ysize = (patches_reader.read_unsigned(
                 &patches_histograms,
                 br,
                 PatchContext::PatchSize as usize,
-            ) as usize
-                + 1;
-            let reference_frame = &reference_frames[reference];
+            ) as usize)
+                .checked_add(1)
+                .ok_or(Error::SizeOverflow)?;
+            let reference_frame = reference_frames.get(reference).and_then(Option::as_ref);
             // TODO(firsching): make sure this check is correct in the presence of downsampled extra channels (also in libjxl).
             match reference_frame {
                 None => return Err(Error::PatchesInvalidReference(reference)),
-                Some(reference) => {
-                    if !reference.saved_before_color_transform {
+                Some((size, saved_before_color_transform)) => {
+                    if !saved_before_color_transform {
                         return Err(Error::PatchesPostColorTransform());
                     }
-                    if x0 + ref_pos_xsize > reference.frame[0].size().0 {
+                    if !patch_range_fits(x0, ref_pos_xsize, size.0) {
                         return Err(Error::PatchesInvalidPosition(
                             "x".to_string(),
                             x0,
                             ref_pos_xsize,
-                            reference.frame[0].size().0,
+                            size.0,
                         ));
                     }
-                    if y0 + ref_pos_ysize > reference.frame[0].size().1 {
+                    if !patch_range_fits(y0, ref_pos_ysize, size.1) {
                         return Err(Error::PatchesInvalidPosition(
                             "y".to_string(),
                             y0,
                             ref_pos_ysize,
-                            reference.frame[0].size().1,
+                            size.1,
                         ));
                     }
                 }
             }
 
-            let id_count = patches_reader.read_unsigned(
+            let id_count = (patches_reader.read_unsigned(
                 &patches_histograms,
                 br,
                 PatchContext::PatchCount as usize,
-            ) as usize
-                + 1;
+            ) as usize)
+                .checked_add(1)
+                .ok_or(Error::SizeOverflow)?;
             if id_count > max_patches + 1 {
                 return Err(Error::PatchesTooMany(
                     "patches".to_string(),
@@ -494,7 +550,9 @@ impl PatchesDictionary {
                     max_patches,
                 ));
             }
-            total_patches += id_count;
+            total_patches = total_patches
+                .checked_add(id_count)
+                .ok_or(Error::SizeOverflow)?;
             let patch_area = id_count.saturating_mul(ref_pos_xsize.saturating_mul(ref_pos_ysize));
             total_patch_area = total_patch_area.saturating_add(patch_area);
             if total_patch_area > max_patch_area {
@@ -515,10 +573,14 @@ impl PatchesDictionary {
             }
 
             if next_size < total_patches {
-                next_size *= 2;
+                next_size = next_size.checked_mul(2).ok_or(Error::SizeOverflow)?;
                 next_size = std::cmp::min(next_size, max_patches);
             }
-            if next_size * blendings_stride > max_blending_infos {
+            if next_size
+                .checked_mul(blendings_stride)
+                .ok_or(Error::SizeOverflow)?
+                > max_blending_infos
+            {
                 return Err(Error::PatchesTooMany(
                     "blending_info".to_string(),
                     total_patches,
@@ -527,7 +589,9 @@ impl PatchesDictionary {
             }
             positions.try_reserve(next_size.saturating_sub(positions.len()))?;
             blendings.try_reserve(
-                (next_size * PatchBlendMode::NUM_BLEND_MODES as usize)
+                next_size
+                    .checked_mul(PatchBlendMode::NUM_BLEND_MODES as usize)
+                    .ok_or(Error::SizeOverflow)?
                     .saturating_sub(blendings.len()),
             )?;
 
@@ -556,31 +620,17 @@ impl PatchesDictionary {
                         br,
                         PatchContext::PatchOffset as usize,
                     );
-                    if delta_x < 0 && (-delta_x as usize) > positions.last().unwrap().x {
-                        return Err(Error::PatchesInvalidDelta(
-                            "x".to_string(),
-                            positions.last().unwrap().x,
-                            delta_x,
-                        ));
-                    }
-                    pos.x = (positions.last().unwrap().x as i32 + delta_x) as usize;
+                    pos.x = checked_patch_offset("x", positions.last().unwrap().x, delta_x)?;
 
                     let delta_y = patches_reader.read_signed(
                         &patches_histograms,
                         br,
                         PatchContext::PatchOffset as usize,
                     );
-                    if delta_y < 0 && (-delta_y as usize) > positions.last().unwrap().y {
-                        return Err(Error::PatchesInvalidDelta(
-                            "y".to_string(),
-                            positions.last().unwrap().y,
-                            delta_y,
-                        ));
-                    }
-                    pos.y = (positions.last().unwrap().y as i32 + delta_y) as usize;
+                    pos.y = checked_patch_offset("y", positions.last().unwrap().y, delta_y)?;
                 }
 
-                if pos.x + ref_pos_xsize > xsize {
+                if !patch_range_fits(pos.x, ref_pos_xsize, xsize) {
                     return Err(Error::PatchesOutOfBounds(
                         "x".to_string(),
                         pos.x,
@@ -588,7 +638,7 @@ impl PatchesDictionary {
                         xsize,
                     ));
                 }
-                if pos.y + ref_pos_ysize > ysize {
+                if !patch_range_fits(pos.y, ref_pos_ysize, ysize) {
                     return Err(Error::PatchesOutOfBounds(
                         "y".to_string(),
                         pos.y,
@@ -604,16 +654,8 @@ impl PatchesDictionary {
                         &patches_histograms,
                         br,
                         PatchContext::PatchBlendMode as usize,
-                    ) as u8;
-                    let blend_mode = match PatchBlendMode::from_u8(maybe_blend_mode) {
-                        None => {
-                            return Err(Error::PatchesInvalidBlendMode(
-                                maybe_blend_mode,
-                                PatchBlendMode::NUM_BLEND_MODES,
-                            ));
-                        }
-                        Some(blend_mode) => blend_mode,
-                    };
+                    );
+                    let blend_mode = PatchBlendMode::from_encoded(maybe_blend_mode)?;
 
                     if PatchBlendMode::uses_alpha(blend_mode) && blendings_stride > 2 {
                         alpha_channel = patches_reader.read_unsigned(
@@ -654,6 +696,7 @@ impl PatchesDictionary {
             })
         }
         patches_reader.reclaim_lz77_scratch(lz77_scratch);
+        patches_reader.check_final_state(&patches_histograms, br)?;
 
         let mut patches_dict = PatchesDictionary {
             positions,
@@ -808,6 +851,10 @@ impl PatchesDictionary {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "patches_validation_tests.rs"]
+mod validation_tests;
 
 #[cfg(test)]
 mod tests {

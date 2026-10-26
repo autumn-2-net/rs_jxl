@@ -43,6 +43,10 @@ pub struct JxlDecoderOptions {
     /// Controls how alpha premultiplication is handled for output color channels.
     /// Default: [`AlphaMode::AsIs`].
     pub alpha_mode: AlphaMode,
+    /// Dithering pattern for floating-point samples saved as U8.
+    /// Does not affect floating-point output, native integer output, JPEG
+    /// reconstruction, or Modular smooth-squeeze reconstruction.
+    pub dither: DitherMode,
     /// If true, only parse frame headers/TOC and skip every frame's sections,
     /// including hidden reference/LF frames. No pixel or reference data is decoded.
     ///
@@ -86,6 +90,16 @@ pub enum AlphaMode {
     Unpremultiplied,
 }
 
+/// Dithering pattern for floating-point samples saved as U8.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum DitherMode {
+    /// Preserve the upstream jxl-rs blue-noise pattern.
+    #[default]
+    JxlRs,
+    /// Use the libjxl reference output dithering pattern.
+    Libjxl,
+}
+
 /// Profile and level for JPEG XL complexity constraints (ISO/IEC 18181-1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub enum ProfileLevel {
@@ -116,6 +130,7 @@ impl Default for JxlDecoderOptions {
             sample_limit: None,
             high_precision: false,
             alpha_mode: AlphaMode::AsIs,
+            dither: DitherMode::JxlRs,
             scan_frames_only: false,
             max_downsampling: 1,
             request_aux_boxes: Vec::new(),

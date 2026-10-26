@@ -3,10 +3,11 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-use crate::api::{JxlColorType, JxlDataFormat, JxlOutputBuffer};
+use crate::api::{DitherMode, JxlColorType, JxlDataFormat, JxlOutputBuffer};
 use crate::error::{Error, Result};
 use crate::headers::Orientation;
 use crate::image::DataTypeTag;
+use crate::util::{DitherTable, dither_table};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SaveChannelType {
@@ -33,6 +34,7 @@ pub struct SaveStage {
     pub(super) output_buffer_index: usize,
     pub(super) color_type: JxlColorType,
     pub(super) data_format: JxlDataFormat,
+    pub(super) dither_table: &'static DitherTable,
     /// When true, fill alpha channel with opaque (1.0) values.
     /// Used when RGBA output is requested but image has no alpha channel.
     pub(super) fill_opaque_alpha: bool,
@@ -64,8 +66,14 @@ impl SaveStage {
             output_buffer_index,
             color_type,
             data_format,
+            dither_table: dither_table(DitherMode::default()),
             fill_opaque_alpha,
         }
+    }
+
+    pub fn with_dither(mut self, mode: DitherMode) -> Self {
+        self.dither_table = dither_table(mode);
+        self
     }
 
     pub fn set_channel_type(&mut self, c: usize, ty: SaveChannelType) {

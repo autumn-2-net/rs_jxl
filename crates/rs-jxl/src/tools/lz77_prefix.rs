@@ -98,18 +98,13 @@ impl SpecialPrefixGroup {
         self.valid
     }
 
+    #[inline]
     fn eligible_mask(&self, position: usize, safe_distance: usize) -> u16 {
-        let mut mask = 0;
-        for bit in 0..16 {
-            if self.valid & (1 << bit) == 0 {
-                continue;
-            }
-            let distance = self.maximum_distance - bit;
-            if distance > safe_distance && distance <= position {
-                mask |= 1 << bit;
-            }
-        }
-        mask
+        // distance = maximum_distance - bit, so safe < distance <= position
+        // becomes begin <= bit < end. Use u32 masks so shifting by 16 is valid.
+        let begin = self.maximum_distance.saturating_sub(position).min(16);
+        let end = self.maximum_distance.saturating_sub(safe_distance).min(16);
+        self.valid & (((1u32 << end) - 1) & !((1u32 << begin) - 1)) as u16
     }
 }
 
@@ -563,6 +558,70 @@ mod tests {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn clipped_group_masks_match_scalar_at_every_lane_boundary() {
+        let scalar = |group: &SpecialPrefixGroup, position, safe| {
+            let mut mask = 0;
+            for bit in 0..16 {
+                if group.valid & (1 << bit) != 0 {
+                    let distance = group.maximum_distance - bit;
+                    if safe < distance && distance <= position {
+                        mask |= 1 << bit;
+                    }
+                }
+            }
+            mask
+        };
+        for maximum in [16, 17, 31, 32, 65536, usize::MAX - 15, usize::MAX] {
+            let mut bounds: Vec<_> = (0..=17).map(|d| maximum.saturating_sub(d)).collect();
+            bounds.extend([0, 1, maximum.saturating_add(1), usize::MAX]);
+            for valid in
+                (0..16)
+                    .map(|bit| 1u16 << bit)
+                    .chain([0, u16::MAX, 0xaaaa, 0x5555, 0x8001, 0x7ffe])
+            {
+                let group = SpecialPrefixGroup {
+                    maximum_distance: maximum,
+                    valid,
+                };
+                for &position in &bounds {
+                    for &safe in &bounds {
+                        assert_eq!(
+                            group.eligible_mask(position, safe),
+                            scalar(&group, position, safe),
+                            "max={maximum} valid={valid:04x} position={position} safe={safe}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn clipped_group_masks_preserve_pending_work_and_candidate_order() {
+        let tokens = [0; 97];
+        let distances = [1, 2, 15, 16, 17, 18, 31, 32, 33, 48, 64, usize::MAX];
+        let groups = group_distances(&distances).unwrap();
+        for position in [0, 1, 15, 16, 17, 31, 32, 33, 64, 95, 96] {
+            for safe in [0, 1, 15, 16, 17, 31, 32, 63, 64, 96, usize::MAX] {
+                let mut filter = PrefixFilter::new(&tokens, FilterPolicy::Lazy);
+                let expected: Vec<_> = distances
+                    .into_iter()
+                    .filter(|&d| safe < d && d <= position)
+                    .collect();
+                let mut actual = Vec::new();
+                filter
+                    .visit_special(position, safe, MANDATORY_PREFIX, &groups, |d| {
+                        actual.push(d)
+                    })
+                    .unwrap();
+                assert_eq!(actual, expected);
+                assert_eq!(filter.candidate_work(), expected.len() as u64);
+                assert_eq!(filter.activation(), Activation::Pending);
             }
         }
     }

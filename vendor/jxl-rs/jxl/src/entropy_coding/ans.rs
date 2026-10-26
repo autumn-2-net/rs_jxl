@@ -507,6 +507,106 @@ mod test {
         assert_eq!(codes.buckets[20].dist, SUM_PROBS - 256);
     }
 
+    // Retain the pre-optimization symbol/state/reader update as an oracle.
+    fn reference_read(codes: &AnsCodes, br: &mut BitReader, state: &mut u32) -> u32 {
+        let idx = *state & 0xfff;
+        let i = (idx >> codes.log_bucket_size) as usize;
+        let pos = idx & codes.bucket_mask;
+        let bucket = codes.buckets[i];
+        let select = (pos >= u32::from(bucket.alias_cutoff)) as u32;
+        let dist = u32::from(bucket.dist) ^ (u32::from(bucket.alias_dist_xor) * select);
+        let symbol = (u32::from(bucket.alias_symbol) * select) | (i as u32 * (1 - select));
+        let next = (*state >> LOG_SUM_PROBS) * dist + u32::from(bucket.alias_offset) * select + pos;
+        let append = (next < (1 << 16)) as u32;
+        let appended = (next << 16) | br.peek(16) as u32;
+        *state = (appended * append) | (next * (1 - append));
+        br.consume_optimistic((16 * append) as usize);
+        symbol
+    }
+
+    fn compare_reader(actual: &BitReader, expected: &BitReader) {
+        assert_eq!(actual.total_bits_read(), expected.total_bits_read());
+        assert_eq!(
+            actual.total_bits_available(),
+            expected.total_bits_available()
+        );
+        match (actual.check_for_error(), expected.check_for_error()) {
+            (Ok(()), Ok(())) => {}
+            (Err(Error::OutOfBounds(a)), Err(Error::OutOfBounds(b))) => assert_eq!(a, b),
+            results => panic!("ANS reader error mismatch: {results:?}"),
+        }
+    }
+
+    fn compare_stream(codes: &AnsCodes, bytes: &[u8], offset: usize, initial: u32, count: usize) {
+        let mut expected = BitReader::new(bytes);
+        expected.skip_bits(offset).unwrap();
+        let mut actual = expected.clone();
+        let mut expected_state = initial;
+        let mut actual_state = initial;
+        for _ in 0..count {
+            assert_eq!(
+                codes.read(&mut actual, &mut actual_state, 0),
+                reference_read(codes, &mut expected, &mut expected_state),
+            );
+            assert_eq!(actual_state, expected_state);
+            compare_reader(&actual, &expected);
+        }
+        // Subsequent extra bits must not depend on the amount of lookahead.
+        for bits in [0, 1, 16, 31, 56] {
+            assert_eq!(actual.read_optimistic(bits), expected.read_optimistic(bits));
+            compare_reader(&actual, &expected);
+        }
+    }
+
+    #[test]
+    fn symbol_state_and_bit_position_match_reference() {
+        let bytes: Vec<u8> = (0..192).map(|i| (i * 73 + 19) as u8).collect();
+        for log_alpha_size in 5..=8 {
+            let mut single = BitReader::new(&[0b00100101, 0b01]);
+            let single = AnsCodes::decode(1, log_alpha_size, &mut single).unwrap();
+            let mut pair = BitReader::new(&[0b10011111, 0b10010010, 0b00000000, 0b00010]);
+            let pair = AnsCodes::decode(1, log_alpha_size, &mut pair).unwrap();
+            let size = 1 << log_alpha_size;
+            let mut dist = vec![0u16; size];
+            // A mixed distribution complements the sparse single/pair histograms.
+            for i in 0..4096usize {
+                dist[(i * i + i / 5) % size] += 1;
+            }
+            let mut buckets = vec![Bucket::default(); size];
+            AnsHistogramInfo::build_alias_map(
+                size,
+                12 - log_alpha_size,
+                &dist,
+                &mut [WorkingBucket::default(); 256],
+                &mut buckets,
+            );
+            let mixed = AnsCodes {
+                buckets,
+                histogram_info: vec![AnsHistogramInfo {
+                    single_symbol: None,
+                    alphabet_size: size as u16,
+                }],
+                log_alpha_size,
+                log_bucket_size: 12 - log_alpha_size,
+                bucket_mask: (1 << (12 - log_alpha_size)) - 1,
+            };
+            for codes in [&single, &pair, &mixed] {
+                for hi in [0, 1, 15, 16, 255, 256, 65535, 1048575] {
+                    for idx in 0..4096 {
+                        compare_stream(codes, &bytes, idx as usize % 64, (hi << 12) | idx, 1);
+                    }
+                }
+                for len in [0, 1, 2, 3, 7, 8, 9, 16, 192] {
+                    for offset in 0..=(len * 8).min(63) {
+                        for state in [0, 1, 65535, 65536, 65537, 0x130000, u32::MAX] {
+                            compare_stream(codes, &bytes[..len], offset, state, 128);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn decode_arb() {
         arbtest::arbtest(|u| {

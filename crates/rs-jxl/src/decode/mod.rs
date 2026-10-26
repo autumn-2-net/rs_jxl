@@ -1,8 +1,12 @@
 //! Pure Rust decoding, backed by maintained official sources in `vendor/jxl-rs`.
 //!
 //! By default output is full-canvas, coalesced display frames. Raw layers and
-//! previews are explicit options. Native samples retain integer ranges through
-//! 16 bits; wider integers become normalized F32, not exact native U31.
+//! previews are explicit options. Native wide integers use an exact Modular
+//! capture path, not a floating-point roundtrip. Unsupported render operations
+//! require explicitly selecting floating output.
+//! Floating-to-U8 output uses upstream jxl-rs dithering by default; select
+//! [`DitherMode::Libjxl`] for the libjxl output pattern. This does not change
+//! floating output, native integer output, JPEG bytes, or Modular smoothing.
 //! Budgets bound input, samples and retained output, not total decoder RSS.
 
 mod boxes;
@@ -15,15 +19,20 @@ mod engine;
 mod error_tests;
 mod inspect;
 mod jpeg;
+mod native;
 mod runner;
+mod stream;
 pub use color::{ColorOptions, ColorProfile, parse_background, parse_color_description};
 pub use engine::{decode, decode_frame};
 pub use inspect::{ImageInspection, inspect, read_basic_info};
 pub use jpeg::reconstruct_jpeg;
+pub use stream::{
+    StreamDecoder, StreamSummary, decode_reader, decode_reader_with, decode_reader_with_chunk_size,
+};
 
 use crate::{Error, PixelData, PixelLayout, Result};
 pub use jxl_decoder::api::{
-    AlphaMode, ExtraChannel, JxlAnimation, JxlBasicInfo, JxlBitDepth, JxlBlendInfo, JxlBlendMode,
+    AlphaMode, DitherMode, ExtraChannel, JxlAnimation, JxlBasicInfo, JxlBitDepth, JxlBlendInfo, JxlBlendMode,
     JxlColorEncoding, JxlColorProfile, JxlExtraChannel, JxlFrameHeader, JxlLayerInfo, JxlPrimaries,
     JxlTransferFunction, JxlWhitePoint, Orientation, RenderingIntent,
 };
@@ -72,6 +81,10 @@ impl Default for DecodeLimits {
 pub struct DecodeOptions {
     pub threads: usize,
     pub format: SampleFormat,
+    /// Backend floating-to-U8 output dithering; default preserves upstream jxl-rs.
+    /// Floating output, native integer output and JPEG reconstruction ignore it.
+    /// Explicit color postprocessing retains its existing nondithered quantizer.
+    pub dither: DitherMode,
     /// Allow legacy Main10 complexity without a jxll box; budgets still apply.
     pub allow_implicit_main10: bool,
     pub adjust_orientation: bool,
@@ -94,6 +107,7 @@ impl Default for DecodeOptions {
         Self {
             threads: 1,
             format: SampleFormat::Native,
+            dither: DitherMode::JxlRs,
             allow_implicit_main10: false,
             adjust_orientation: true,
             render_spot_colors: true,
@@ -106,6 +120,68 @@ impl Default for DecodeOptions {
             color: ColorOptions::default(),
             limits: DecodeLimits::default(),
         }
+    }
+}
+
+/// Reusable decoder resources for independent complete inputs.
+///
+/// Owns one thread pool (none for `threads == 1`) and immutable options. Every
+/// call creates fresh parser, frame and reference state; neither decoded data
+/// nor input buffers are retained, including after an error. Limits apply per
+/// input, not cumulatively across calls. Calls require exclusive access.
+pub struct Decoder {
+    options: DecodeOptions,
+    runner: runner::Runner,
+}
+
+impl Decoder {
+    /// Validate options and create the caller-owned worker pool once.
+    /// Input-dependent limits are checked by each decoding operation.
+    pub fn new(options: DecodeOptions) -> Result<Self> {
+        validate_options(&options)?;
+        let runner = runner::Runner::new(options.threads)?;
+        Ok(Self { options, runner })
+    }
+
+    pub fn options(&self) -> &DecodeOptions {
+        &self.options
+    }
+
+    /// Decode every display frame, or every regular layer without coalescing.
+    pub fn decode(&mut self, input: &[u8]) -> Result<DecodedImage> {
+        self.decode_impl(input, None)
+    }
+
+    /// Decode a zero-based display frame (or raw layer without coalescing),
+    /// reconstructing references as needed.
+    /// Later data is not checked, and the returned image is marked incomplete.
+    pub fn decode_frame(&mut self, input: &[u8], index: usize) -> Result<DecodedImage> {
+        if index >= self.options.limits.max_frames {
+            return Err(Error::Limit("requested frame index"));
+        }
+        self.decode_impl(input, Some(index))
+    }
+
+    fn decode_impl(&mut self, input: &[u8], target: Option<usize>) -> Result<DecodedImage> {
+        let _total = crate::profile::scope("decode.pixels.total");
+        check_input_limit(input, &self.options)?;
+        engine::decode_with_runner(
+            input,
+            target,
+            &self.options,
+            backend_options_from_validated(&self.options),
+            &mut self.runner,
+        )
+    }
+
+    /// Reconstruct original JPEG bytes under the same requirements as
+    /// [`reconstruct_jpeg`], reusing this context's pool for capture and writing.
+    pub fn reconstruct_jpeg(&mut self, input: &[u8]) -> Result<Vec<u8>> {
+        let _total = crate::profile::scope("decode.jpeg.total");
+        check_input_limit(input, &self.options)?;
+        let backend =
+            jpeg::prepare_backend(backend_options_from_validated(&self.options), &self.options)?;
+        jpeg::reconstruct_with_runner(input, &self.options, backend, &mut self.runner)
     }
 }
 
@@ -188,9 +264,19 @@ fn check_info(info: &JxlBasicInfo, options: &DecodeOptions) -> Result<()> {
 }
 
 fn backend_options(input: &[u8], options: &DecodeOptions) -> Result<JxlDecoderOptions> {
+    check_input_limit(input, options)?;
+    validate_options(options)?;
+    Ok(backend_options_from_validated(options))
+}
+
+fn check_input_limit(input: &[u8], options: &DecodeOptions) -> Result<()> {
     if input.len() > options.limits.max_input_bytes {
         return Err(Error::Limit("JXL input bytes"));
     }
+    Ok(())
+}
+
+fn validate_options(options: &DecodeOptions) -> Result<()> {
     if !(1..=256).contains(&options.threads) {
         return Err(Error::InvalidInput(
             "decoder threads must be in 1..=256".into(),
@@ -217,17 +303,40 @@ fn backend_options(input: &[u8], options: &DecodeOptions) -> Result<JxlDecoderOp
             "raw layers must keep source color and alpha association to preserve blend/reference semantics; coalesce before transforming".into(),
         ));
     }
+    Ok(())
+}
+
+fn backend_options_from_validated(options: &DecodeOptions) -> JxlDecoderOptions {
     let mut backend = JxlDecoderOptions::default();
     backend.adjust_orientation = options.adjust_orientation;
     backend.render_spot_colors = options.render_spot_colors;
     backend.coalescing = options.coalescing;
     backend.skip_preview = !options.include_preview;
     backend.alpha_mode = options.alpha_mode;
+    backend.dither = options.dither;
     backend.max_downsampling = usize::from(options.downsampling);
     backend.sample_limit = Some(options.limits.max_samples);
     backend.max_profile_level = ProfileLevel::Main10;
     backend.allow_implicit_main10 = options.allow_implicit_main10;
     // libjxl/common.h defaults JXL_HIGH_PRECISION to 1; upstream Rust does not.
     backend.high_precision = true;
-    Ok(backend)
+    backend
+}
+
+#[cfg(test)]
+mod dither_tests {
+    use super::*;
+
+    #[test]
+    fn dither_defaults_and_backend_options() {
+        assert_eq!(DecodeOptions::default().dither, DitherMode::JxlRs);
+        assert_eq!(JxlDecoderOptions::default().dither, DitherMode::JxlRs);
+        for dither in [DitherMode::JxlRs, DitherMode::Libjxl] {
+            let options = DecodeOptions {
+                dither,
+                ..DecodeOptions::default()
+            };
+            assert_eq!(backend_options_from_validated(&options).dither, dither);
+        }
+    }
 }

@@ -6,8 +6,8 @@
 
 use super::{
     batch::{
-        BatchEncoders, FullBatchEncoder, FullTask, PlannedProbeBatchEncoder, PrefixBatchEncoder,
-        ProbeTask, initial_concurrency,
+        BatchEncoders, FullBatchEncoder, FullTask, PilotOverlapEncoder, PlannedProbeBatchEncoder,
+        PrefixBatchEncoder, ProbeTask, initial_concurrency,
     },
     calibration::{CalibrationFeedback, diverse_frontier},
     params::{Candidate, CandidateParams, PlanOptions, lossless_probe_plan},
@@ -23,14 +23,26 @@ use super::{
 use crate::{Error, Image, Result};
 use std::{cell::RefCell, rc::Rc};
 
+#[path = "compact_pilot.rs"]
+mod compact_pilot;
+#[path = "finalists.rs"]
+mod finalists;
 #[path = "frontiers.rs"]
 mod frontiers;
+#[path = "pilot_overlap.rs"]
+mod pilot_overlap;
+#[path = "pilot_witness.rs"]
+mod pilot_witness;
 #[path = "preflight_stages.rs"]
 mod preflight_stages;
 #[path = "refinement.rs"]
 mod refinement;
 #[path = "routes.rs"]
 mod routes;
+#[path = "scout.rs"]
+mod scout;
+#[path = "scout_pilot.rs"]
+pub(crate) mod scout_pilot;
 #[path = "stages.rs"]
 mod stages;
 use super::worker_pool::{ProbeBatchKind, WorkerExecution};
@@ -63,6 +75,39 @@ pub struct CalibrationOptions {
 
 #[derive(Clone, Debug, Default)]
 pub struct DriverOptions {
+    /// Experimental region-agreement frontier. Full candidates retain their
+    /// backend strength; probe estimates are never encoded-byte bounds.
+    pub adaptive_scout: bool,
+    /// Experimental full-strength family probes before any full-frame encode.
+    /// This is a search heuristic, not a compressed-size bound.
+    pub scout_pilot_first: bool,
+    /// Opt-in probe-free tournament when a full frame fits within three legacy
+    /// screening crops. Requires pilot-first; candidates retain backend effort.
+    pub scout_small_full: bool,
+    /// Native-only RCT0/6 aliases for Variable candidates with <3 total channels.
+    /// Generic callbacks must leave this off unless they guarantee equivalence.
+    pub scout_native_rct_aliases: bool,
+    /// Opt-in cooperative finalist batches after a completed pilot baseline.
+    pub scout_parallel_finalists: bool,
+    /// Opt-in small-input initial wave of at most three complete encodes.
+    /// Requires pilot-first and parallel finalists; never uses probe byte bounds.
+    pub scout_initial_wave: bool,
+    /// Experimental automatic full encode overlapping the complete pilot front.
+    /// Requires pilot-first and an overlap callback; default remains serial.
+    pub scout_overlap_automatic: bool,
+    /// Opt-in consensus after explicit model-cost-adjusted pilot ranking.
+    pub scout_pilot_consensus: bool,
+    /// Independent opt-in near-tie consensus for e9 automatic pilot leaders.
+    /// Allows regional wins of at most 1%; never supplies an encoded-byte bound.
+    pub scout_near_tie_consensus: bool,
+    /// Confirm representations whose global palette/patch capacity is absent
+    /// from crop scores. Opt-in for the native content-pilot preset.
+    pub scout_representation_witness: bool,
+    /// Opt-in small regional first round for continuous-tone inputs only.
+    pub scout_staged_probes: bool,
+    /// Experimental: three coarse regions may unanimously select a clear
+    /// natural-image leader without the second probe scale. Never an output bound.
+    pub scout_coarse_consensus: bool,
     /// Source scan is opt-in, and only runs at level>=2 and >=2^19 pixels.
     pub coverage_scan: bool,
     pub scan: ScanOptions,
@@ -95,6 +140,25 @@ pub struct DriverOptions {
     pub data_parallel_probes: bool,
     pub longest_first_probes: bool,
     pub probe_workers: Option<usize>,
+}
+
+impl DriverOptions {
+    /// Bounded full-frame search with coverage-selected, full-fidelity witnesses.
+    /// Source effort 9/10 only; small/unsupported frame geometry keeps the source route.
+    pub fn scout() -> Self {
+        Self {
+            adaptive_scout: true,
+            coverage_scan: true,
+            scan: ScanOptions {
+                palette_scope: true,
+            },
+            screen: ScreenOptions {
+                cheap_control: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -242,6 +306,7 @@ struct Driver<'a, F, P, A> {
     search: Search<A>,
     encode: F,
     full_batch: Option<FullBatchEncoder<'a, A>>,
+    pilot_overlap: Option<PilotOverlapEncoder<'a, A>>,
     probe: Rc<RefCell<ProbeWork<P>>>,
     probe_batch: Option<Rc<RefCell<PlannedProbeBatchEncoder<'a>>>>,
     prefix_batch: Option<PrefixBatchEncoder<'a>>,
@@ -300,6 +365,49 @@ where
     P: FnMut(&CandidateParams, &Image) -> Result<usize>,
 {
     params.validate()?;
+    if options.scout_initial_wave
+        && !(options.scout_pilot_first && options.scout_parallel_finalists)
+    {
+        return Err(Error::InvalidInput(
+            "initial wave requires pilot-first and parallel finalists".into(),
+        ));
+    }
+    if options.scout_coarse_consensus
+        && !(options.scout_pilot_consensus && options.scout_staged_probes)
+    {
+        return Err(Error::InvalidInput(
+            "coarse consensus requires staged probes and model consensus".into(),
+        ));
+    }
+    if (options.scout_pilot_consensus
+        || options.scout_small_full
+        || options.scout_near_tie_consensus
+        || options.scout_representation_witness
+        || options.scout_staged_probes
+        || options.scout_parallel_finalists
+        || options.scout_overlap_automatic
+        || options.scout_native_rct_aliases)
+        && !options.scout_pilot_first
+    {
+        return Err(Error::InvalidInput(
+            "pilot refinements require pilot-first".into(),
+        ));
+    }
+    if options.scout_pilot_first && !options.adaptive_scout {
+        return Err(Error::InvalidInput(
+            "pilot-first requires adaptive scout".into(),
+        ));
+    }
+    if options.scout_pilot_first && options.screen.training_cap.is_some() {
+        return Err(Error::InvalidInput(
+            "pilot-first requires full-strength probe training".into(),
+        ));
+    }
+    if options.adaptive_scout && !matches!(params.speed_tier, 0 | 1) {
+        return Err(Error::InvalidInput(
+            "adaptive scout requires source effort 9 or 10".into(),
+        ));
+    }
     options.workers.validate()?;
     WorkerExecution {
         limits: options.workers,
@@ -320,8 +428,8 @@ where
     }
     // These switches change additional control flow, not merely crop geometry.
     if (options.screen.adaptive_coverage && !options.preflight.enabled)
-        || options.screen.regions.context_side != 0
-        || options.screen.regions.full_width_strips
+        || (options.screen.regions.context_side != 0 && !options.scout_pilot_first)
+        || (options.screen.regions.full_width_strips && !options.adaptive_scout)
     {
         return Err(Error::InvalidInput("driver probe overrides require preflight coverage or explicit probe APIs; context/full-width routes are selected through DriverOptions".into()));
     }
@@ -330,14 +438,21 @@ where
         && params.speed_tier == 1
         && refinable(image)
         && (pixels >= 2 << 20 || (options.frontier.compact && pixels >= 1 << 19));
-    let scan = if direct || (options.coverage_scan && params.speed_tier <= 8 && pixels >= 1 << 19) {
-        Some(match batches.scan_pool {
-            Some(pool) => scan_lossless_input_with_pool(image, options.scan, pool),
-            None => scan_lossless_input(image, options.scan),
-        })
+    let adaptive_coverage = options.screen.adaptive_coverage || options.preflight.enabled;
+    let coverage_min = if options.scout_pilot_first && adaptive_coverage {
+        1 << 17
     } else {
-        None
+        1 << 19
     };
+    let scan =
+        if direct || (options.coverage_scan && params.speed_tier <= 8 && pixels >= coverage_min) {
+            Some(match batches.scan_pool {
+                Some(pool) => scan_lossless_input_with_pool(image, options.scan, pool),
+                None => scan_lossless_input(image, options.scan),
+            })
+        } else {
+            None
+        };
     let scan = scan.as_ref().filter(|s| s.available());
     let probe = Rc::new(RefCell::new(ProbeWork {
         callback: encode_probe,
@@ -348,12 +463,26 @@ where
     let shared = Rc::clone(&probe);
     let callback: ProbeCallback<'_> = Box::new(move |p, sample| shared.borrow_mut().run(p, sample));
     let mut screen_options = options.screen.clone();
-    screen_options.adaptive_coverage |= options.preflight.enabled;
+    screen_options.adaptive_coverage = adaptive_coverage;
     let mut screen = CandidateScreen::new(image, scan, screen_options.clone(), callback)?;
     let shared = Rc::clone(&probe);
     let callback: ProbeCallback<'_> = Box::new(move |p, sample| shared.borrow_mut().run(p, sample));
     screen_options.regions.context_side = 128;
-    let mut context_screen = CandidateScreen::new(image, None, screen_options, callback)?;
+    if options.scout_staged_probes {
+        screen_options.regions.context_side = 0;
+        screen_options.regions.full_width_strips = true;
+        screen_options.regions.strip_rows = Some(8);
+    }
+    let mut context_screen = CandidateScreen::new(
+        image,
+        if options.scout_staged_probes {
+            scan
+        } else {
+            None
+        },
+        screen_options,
+        callback,
+    )?;
     let planned = batches.planned_probe.take().or_else(|| {
         batches.probe.take().map(|mut legacy| {
             let callback: PlannedProbeBatchEncoder<'_> = Box::new(move |tasks, _| legacy(tasks));
@@ -432,6 +561,7 @@ where
         search: Search::new(options.full_limits),
         encode: encode_full,
         full_batch: batches.full,
+        pilot_overlap: batches.pilot_overlap,
         probe,
         probe_batch,
         prefix_batch,

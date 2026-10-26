@@ -5,7 +5,12 @@ edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
+[features]
+decoder-avx512 = ["jxl-decoder/avx512"]
+decoder-profile = ["jxl-decoder/decoder-profile"]
+
 [dependencies]
+bytemuck = { version = "=1.25.2", features = ["extern_crate_alloc"] }
 libsais-rs = { version = "=0.2.2", default-features = false }
 rayon.workspace = true
 brotli.workspace = true
@@ -13,6 +18,7 @@ jxl-decoder.workspace = true
 moxcms.workspace = true
 
 [dev-dependencies]
+arbtest = "0.3.2"
 png.workspace = true
 
 [lints]

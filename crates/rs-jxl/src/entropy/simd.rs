@@ -323,7 +323,7 @@ mod x86 {
 
     #[inline]
     #[target_feature(enable = "avx2")]
-    unsafe fn counts8(counts: &[u64], i: usize) -> __m256i {
+    pub(super) unsafe fn counts8(counts: &[u64], i: usize) -> __m256i {
         // SAFETY: complete loads checked locally. We pack validated u64 counts
         // to source i32 lanes without changing the public histogram layout.
         unsafe {
@@ -342,11 +342,27 @@ mod x86 {
                     _mm256_castsi256_si128(hi),
                 )
             } else {
-                let mut tail = [0i32; 8];
-                for (lane, value) in tail.iter_mut().enumerate() {
-                    *value = counts.get(i + lane).copied().unwrap_or(0) as i32;
+                if i >= counts.len() {
+                    return _mm256_setzero_si256();
                 }
-                _mm256_loadu_si256(tail.as_ptr().cast())
+                let remaining = counts.len() - i;
+                let lanes = _mm256_setr_epi64x(0, 1, 2, 3);
+                let mask = _mm256_cmpgt_epi64(_mm256_set1_epi64x(remaining as i64), lanes);
+                let lo = _mm256_maskload_epi64(counts.as_ptr().add(i).cast(), mask);
+                let hi = if remaining > 4 {
+                    let mask =
+                        _mm256_cmpgt_epi64(_mm256_set1_epi64x((remaining - 4) as i64), lanes);
+                    _mm256_maskload_epi64(counts.as_ptr().add(i + 4).cast(), mask)
+                } else {
+                    _mm256_setzero_si256()
+                };
+                let indices = _mm256_setr_epi32(0, 2, 4, 6, 0, 2, 4, 6);
+                let lo = _mm256_permutevar8x32_epi32(lo, indices);
+                let hi = _mm256_permutevar8x32_epi32(hi, indices);
+                _mm256_inserti128_si256::<1>(
+                    _mm256_castsi128_si256(_mm256_castsi256_si128(lo)),
+                    _mm256_castsi256_si128(hi),
+                )
             }
         }
     }
@@ -511,6 +527,39 @@ mod x86 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    fn histogram_tails_preserve_every_lane_and_zero_padding() {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        for length in 0..=19 {
+            let counts: Vec<_> = (0..length).map(|i| i32::MAX as u64 - i as u64).collect();
+            for offset in 0..=length + 1 {
+                let mut lanes = [0i32; 8];
+                // SAFETY: feature detected; helper bounds-checks all loads.
+                unsafe {
+                    #[cfg(target_arch = "x86_64")]
+                    std::arch::x86_64::_mm256_storeu_si256(
+                        lanes.as_mut_ptr().cast(),
+                        x86::counts8(&counts, offset),
+                    );
+                    #[cfg(target_arch = "x86")]
+                    std::arch::x86::_mm256_storeu_si256(
+                        lanes.as_mut_ptr().cast(),
+                        x86::counts8(&counts, offset),
+                    );
+                }
+                for (lane, actual) in lanes.into_iter().enumerate() {
+                    assert_eq!(
+                        actual,
+                        counts.get(offset + lane).copied().unwrap_or(0) as i32
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn token_dispatch_matches_scalar_all_configs_boundaries_and_tails() {

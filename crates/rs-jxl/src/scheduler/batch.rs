@@ -9,6 +9,15 @@ use super::{
 };
 use crate::{Image, Result};
 
+#[path = "pilot_handoff.rs"]
+pub mod pilot_handoff;
+
+/// Synchronous, drained handoff from an optional full/front overlap executor.
+pub type PilotOverlapEncoder<'a, A> = Box<
+    dyn FnMut(&pilot_handoff::PilotRequest<'_>) -> Result<Option<pilot_handoff::PilotHandoff<A>>>
+        + 'a,
+>;
+
 #[derive(Clone, Copy)]
 pub struct ProbeTask<'a> {
     pub params: &'a CandidateParams,
@@ -44,6 +53,8 @@ pub struct BatchEncoders<'a, A> {
     pub planned_probe: Option<PlannedProbeBatchEncoder<'a>>,
     /// Optional asynchronous screen/shortlist; legacy FnMut callbacks stay valid.
     pub prefix: Option<PrefixBatchEncoder<'a>>,
+    /// Optional pilot-only overlap. None keeps the original callback schedule.
+    pub pilot_overlap: Option<PilotOverlapEncoder<'a, A>>,
     /// Coverage remains opt-in; this only supplies its ScanPlane runner.
     pub scan_pool: Option<&'a rayon::ThreadPool>,
 }
@@ -55,6 +66,7 @@ impl<A> Default for BatchEncoders<'_, A> {
             probe: None,
             planned_probe: None,
             prefix: None,
+            pilot_overlap: None,
             scan_pool: None,
         }
     }

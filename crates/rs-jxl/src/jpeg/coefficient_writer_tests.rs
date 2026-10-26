@@ -63,6 +63,1158 @@ fn ac_band(low_bit: u8) -> ScanBand {
     }
 }
 
+fn sequential_matches_initial(
+    writer: &mut EntropyBitWriter,
+    dc: &HuffmanTable,
+    ac: &HuffmanTable,
+    extra_zero_runs: u32,
+    previous: &mut i16,
+    block: &[i16; BLOCK_SIZE],
+) -> Result<(), CoefficientWriteError> {
+    let mut expected_writer = writer.clone();
+    let mut expected_previous = *previous;
+    let expected = encode_initial_block(
+        &mut expected_writer,
+        Some(dc),
+        Some(ac),
+        ScanBand {
+            start: 0,
+            end: 63,
+            low_bit: 0,
+        },
+        extra_zero_runs,
+        &mut DctCodingState::new(0),
+        &mut expected_previous,
+        block,
+    );
+    let actual = encode_sequential_block(writer, dc, ac, extra_zero_runs, previous, block);
+    assert_eq!(actual, expected, "extra={extra_zero_runs}, block={block:?}");
+    assert_eq!(*previous, expected_previous);
+    assert_eq!(*writer, expected_writer);
+    // Compare exact stuffed JPEG bytes, including pending bits and mixed padding,
+    // rather than just decoded coefficients. Also compare alignment-limit errors.
+    let count = writer.padding_bits_needed();
+    let mask = ((1u16 << count) - 1) as u8;
+    for pattern in [0, 0x55, 0xff] {
+        let mut padded = writer.clone();
+        let mut expected_padded = expected_writer.clone();
+        assert_eq!(
+            padded.align_with(pattern & mask, count),
+            expected_padded.align_with(pattern & mask, count)
+        );
+        assert_eq!(padded, expected_padded);
+    }
+    actual
+}
+
+// Pre-batch emission references. Fixtures below use validated coefficients;
+// all entropy writes still happen at their original symbol boundaries.
+fn scalar_sequential(
+    writer: &mut EntropyBitWriter,
+    dc: &HuffmanTable,
+    ac: &HuffmanTable,
+    extra: u32,
+    previous: &mut i16,
+    block: &[i16; BLOCK_SIZE],
+) -> Result<(), CoefficientWriteError> {
+    let (count, bits) = magnitude_bits(i32::from(block[0]) - i32::from(*previous))?;
+    writer.write_symbol_bits(dc, count, u32::from(bits), count)?;
+    *previous = block[0];
+    let mut zeros = 0i32;
+    for &natural in &NATURAL_ORDER[1..BLOCK_SIZE] {
+        let value = i32::from(block[natural]);
+        if value == 0 {
+            zeros += 1;
+            continue;
+        }
+        while zeros > 15 {
+            writer.write_symbol(ac, 0xf0)?;
+            zeros -= 16;
+        }
+        let (count, bits) = magnitude_bits(value)?;
+        writer.write_symbol_bits(ac, ((zeros as u8) << 4) | count, u32::from(bits), count)?;
+        zeros = 0;
+    }
+    for _ in 0..extra {
+        writer.write_symbol(ac, 0xf0)?;
+        zeros -= 16;
+    }
+    if zeros > 0 {
+        writer.write_symbol(ac, 0)?;
+    }
+    Ok(())
+}
+
+fn scalar_flush(
+    state: &mut DctCodingState,
+    writer: &mut EntropyBitWriter,
+) -> Result<(), CoefficientWriteError> {
+    if state.eob_run == 0 {
+        return Ok(());
+    }
+    let count = (15 - state.eob_run.leading_zeros()) as u8;
+    let code =
+        state.eob_codes[usize::from(count)].ok_or(WriteError::MissingHuffmanSymbol(count << 4))?;
+    let suffix = u32::from(state.eob_run) & ((1 << count) - 1);
+    writer.write_bits(
+        (u32::from(code.bits) << count) | suffix,
+        code.bit_length + count,
+    )?;
+    let mut remaining = state.refinement_bits;
+    for &word in &state.refinement_words {
+        let count = remaining.min(16) as u8;
+        writer.write_bits(u32::from(word), count)?;
+        remaining -= usize::from(count);
+    }
+    state.eob_run = 0;
+    state.eob_codes = [None; 15];
+    state.refinement_words.clear();
+    state.refinement_bits = 0;
+    Ok(())
+}
+
+fn scalar_buffer_end_of_band(
+    state: &mut DctCodingState,
+    writer: &mut EntropyBitWriter,
+    ac: &HuffmanTable,
+    bits: u64,
+    count: u8,
+) -> Result<(), CoefficientWriteError> {
+    let codes = std::array::from_fn(|i| ac.code((i as u8) << 4));
+    if state.eob_run != 0 && codes != state.eob_codes {
+        return Err(CoefficientWriteError::Invalid(
+            "AC table changed inside a pending EOB run",
+        ));
+    }
+    let total = state
+        .refinement_bits
+        .checked_add(usize::from(count))
+        .ok_or(CoefficientWriteError::RefinementLimit {
+            limit: state.max_refinement_bits,
+        })?;
+    if total > state.max_refinement_bits {
+        return Err(CoefficientWriteError::RefinementLimit {
+            limit: state.max_refinement_bits,
+        });
+    }
+    let words = total.div_ceil(16);
+    if words > state.refinement_words.len() {
+        state
+            .refinement_words
+            .try_reserve_exact(words - state.refinement_words.len())
+            .map_err(|_| CoefficientWriteError::AllocationFailed)?;
+    }
+    if state.eob_run == 0 {
+        state.eob_codes = codes;
+    }
+    state.eob_run += 1;
+    // Intentionally bit-at-a-time, independent of the production chunk packer.
+    for bit in (0..count).rev() {
+        if state.refinement_bits.is_multiple_of(16) {
+            state.refinement_words.push(0);
+        }
+        let word = state.refinement_words.last_mut().unwrap();
+        *word = (*word << 1) | ((bits >> bit) & 1) as u16;
+        state.refinement_bits += 1;
+    }
+    if state.eob_run == MAX_EOB_RUN {
+        scalar_flush(state, writer)?;
+    }
+    Ok(())
+}
+
+fn scalar_prepare_refinement_band(
+    block: &[i16; BLOCK_SIZE],
+    band: ScanBand,
+    magnitudes: &mut [i32; BLOCK_SIZE],
+) -> Result<usize, CoefficientWriteError> {
+    let mut last_new = 0;
+    for k in usize::from(band.start.max(1))..=usize::from(band.end) {
+        let value = shifted_ac(block[NATURAL_ORDER[k]], band.low_bit);
+        let (category, _) = magnitude_bits(value)?;
+        if category != 0 && category + band.low_bit >= 12 {
+            return Err(CoefficientWriteError::Invalid(
+                "AC coefficient exceeds supported precision",
+            ));
+        }
+        magnitudes[k] = value.abs();
+        if magnitudes[k] == 1 {
+            last_new = k;
+        }
+    }
+    Ok(last_new)
+}
+
+fn assert_refinement_preparation_matches_scalar(block: &[i16; BLOCK_SIZE], band: ScanBand) {
+    let mut magnitudes = [0; BLOCK_SIZE];
+    let expected = scalar_prepare_refinement_band(block, band, &mut magnitudes);
+    match (prepare_refinement_band(block, band), expected) {
+        (Err(actual), Err(expected)) => assert_eq!(actual, expected),
+        (Ok((masks, last_new, tail)), Ok(expected_last)) => {
+            let mut nonzero = 0u64;
+            let mut newly_nonzero = 0u64;
+            let mut correction = 0u64;
+            let mut positive = 0u64;
+            for k in usize::from(band.start.max(1))..=usize::from(band.end) {
+                nonzero |= u64::from(magnitudes[k] != 0) << k;
+                newly_nonzero |= u64::from(magnitudes[k] == 1) << k;
+                correction |= ((magnitudes[k] & 1) as u64) << k;
+                positive |= u64::from(block[NATURAL_ORDER[k]] > 0) << k;
+            }
+            assert_eq!(
+                (
+                    masks.nonzero,
+                    masks.newly_nonzero,
+                    masks.correction,
+                    masks.positive,
+                ),
+                (nonzero, newly_nonzero, correction, positive),
+                "band={band:?}, block={block:?}"
+            );
+            assert_eq!(last_new, expected_last);
+            let tail_start = (expected_last + 1).max(usize::from(band.start.max(1)));
+            let mut zeros = 0;
+            let mut bits = 0u64;
+            let mut count = 0;
+            for &value in &magnitudes[tail_start..=usize::from(band.end)] {
+                if value == 0 {
+                    zeros += 1;
+                } else {
+                    assert!(value > 1);
+                    bits = (bits << 1) | (value as u64 & 1);
+                    count += 1;
+                }
+            }
+            assert_eq!((tail.zeros, tail.bits, tail.count), (zeros, bits, count));
+        }
+        _ => panic!("refinement validation differs for band={band:?}, block={block:?}"),
+    }
+}
+
+fn scalar_refinement_ac(
+    writer: &mut EntropyBitWriter,
+    ac: &HuffmanTable,
+    band: ScanBand,
+    state: &mut DctCodingState,
+    block: &[i16; BLOCK_SIZE],
+) -> Result<(), CoefficientWriteError> {
+    state.healthy()?;
+    let result = (|| {
+        validate_band(band)?;
+        if band.start == 0 && state.eob_run != 0 {
+            return Err(CoefficientWriteError::Invalid(
+                "pending AC state before DC refinement",
+            ));
+        }
+        let mut magnitudes = [0; BLOCK_SIZE];
+        let last_new = if band.end == 0 {
+            0
+        } else {
+            scalar_prepare_refinement_band(block, band, &mut magnitudes)?
+        };
+        if band.start == 0 {
+            writer.write_bits(((i32::from(block[0]) >> band.low_bit) & 1) as u32, 1)?;
+        }
+        if band.end == 0 {
+            return Ok(());
+        }
+        let mut zeros = 0u8;
+        let mut bits = 0u64;
+        let mut count = 0u8;
+        for k in usize::from(band.start.max(1))..=usize::from(band.end) {
+            let magnitude = magnitudes[k];
+            if magnitude == 0 {
+                zeros += 1;
+                continue;
+            }
+            while zeros > 15 && k <= last_new {
+                scalar_flush(state, writer)?;
+                writer.write_symbol(ac, 0xf0)?;
+                zeros -= 16;
+                write_corrections(writer, bits, count)?;
+                bits = 0;
+                count = 0;
+            }
+            if magnitude > 1 {
+                bits = (bits << 1) | (magnitude as u64 & 1);
+                count += 1;
+                continue;
+            }
+            scalar_flush(state, writer)?;
+            let sign = u32::from(block[NATURAL_ORDER[k]] > 0);
+            writer.write_symbol_bits(ac, (zeros << 4) | 1, sign, 1)?;
+            write_corrections(writer, bits, count)?;
+            bits = 0;
+            count = 0;
+            zeros = 0;
+        }
+        if zeros != 0 || count != 0 {
+            scalar_buffer_end_of_band(state, writer, ac, bits, count)?;
+            if band.start == 0 {
+                scalar_flush(state, writer)?;
+            }
+        }
+        Ok(())
+    })();
+    state.finish_operation(result)
+}
+
+#[test]
+fn initial_precision_bound_matches_category_validation_for_every_i16() {
+    for low_bit in 0..=10 {
+        let band = ScanBand {
+            start: 23,
+            end: 23,
+            low_bit,
+        };
+        // Invalid coefficients outside the selected band must remain ignored.
+        let mut block = [i16::MIN; BLOCK_SIZE];
+        for value in i16::MIN..=i16::MAX {
+            block[NATURAL_ORDER[23]] = value;
+            let shifted = shifted_ac(value, low_bit);
+            let (category, _) = magnitude_bits(shifted).unwrap();
+            let expected = if category != 0 && category + low_bit >= 12 {
+                Err(CoefficientWriteError::Invalid(
+                    "AC coefficient exceeds supported precision",
+                ))
+            } else {
+                Ok(usize::from(shifted == 0))
+            };
+            assert_eq!(validate_ac_band(&block, band), expected);
+        }
+    }
+}
+
+#[test]
+fn refinement_preparation_preserves_band_validation_and_tail_order() {
+    let mut rng = 0x42ec_9765u32;
+    for low_bit in 0..=10 {
+        for (start, end) in [(1, 63), (2, 19), (17, 47), (63, 63)] {
+            let band = ScanBand {
+                start,
+                end,
+                low_bit,
+            };
+            for sample in 0..80 {
+                let mut block = [i16::MIN; BLOCK_SIZE];
+                for &natural in &NATURAL_ORDER[usize::from(start)..=usize::from(end)] {
+                    rng ^= rng << 13;
+                    rng ^= rng >> 17;
+                    rng ^= rng << 5;
+                    block[natural] = (rng % 4095) as i16 - 2047;
+                }
+                if sample < 4 {
+                    block[NATURAL_ORDER[usize::from(end)]] =
+                        [-2048, 2048, i16::MIN, i16::MAX][sample];
+                }
+                assert_refinement_preparation_matches_scalar(&block, band);
+            }
+        }
+    }
+}
+
+#[test]
+fn correction_word_append_matches_bitwise_reference_at_every_word_offset() {
+    let ac = ac_table();
+    for prefix in 0..16u8 {
+        for count in 0..=63u8 {
+            for pattern in [0, u64::MAX, 0x5a5a_ff00_1234_abcd] {
+                let bits = pattern & ((1u64 << count) - 1);
+                let total = usize::from(prefix) + usize::from(count);
+                for limit in [total, total.saturating_sub(1)] {
+                    if limit < usize::from(prefix) {
+                        continue;
+                    }
+                    let mut scalar = EntropyBitWriter::new(128);
+                    scalar.write_bits(5, 3).unwrap();
+                    let mut expected = DctCodingState::new(limit);
+                    scalar_buffer_end_of_band(
+                        &mut expected,
+                        &mut scalar,
+                        &ac,
+                        (1u64 << prefix) - 1,
+                        prefix,
+                    )
+                    .unwrap();
+                    let mut actual = expected.clone();
+                    let mut writer = scalar.clone();
+                    let expected_result =
+                        scalar_buffer_end_of_band(&mut expected, &mut scalar, &ac, bits, count);
+                    let actual_result = actual.buffer_end_of_band(&mut writer, &ac, bits, count);
+                    assert_eq!(actual_result, expected_result);
+                    assert_eq!(actual, expected);
+                    assert_eq!(writer, scalar);
+                    if actual_result.is_ok() {
+                        assert_eq!(
+                            actual.flush(&mut writer),
+                            scalar_flush(&mut expected, &mut scalar)
+                        );
+                        assert_eq!(actual, expected);
+                        assert_eq!(writer, scalar);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn refinement_suffix_fast_path_matches_scalar_limits_and_maximum_eob_run() {
+    let ac = ac_table();
+    for low_bit in [0, 3, 10] {
+        for (start, end) in [(0, 63), (1, 63), (17, 47), (63, 63)] {
+            let band = ScanBand {
+                start,
+                end,
+                low_bit,
+            };
+            let first = usize::from(start.max(1));
+            let end = usize::from(end);
+            for last_new in [None, Some(first), Some((first + end) / 2), Some(end)] {
+                let mut block = [i16::MIN; BLOCK_SIZE];
+                block[0] = -3;
+                for (k, &natural) in NATURAL_ORDER.iter().enumerate().take(end + 1).skip(first) {
+                    let value = [0i32, 2, -3, 3][k % 4] << low_bit;
+                    block[natural] = if value.abs() < 2048 { value as i16 } else { 0 };
+                }
+                if let Some(k) = last_new {
+                    block[NATURAL_ORDER[k]] = -(1 << low_bit);
+                }
+                for prior_run in [0, 1, MAX_EOB_RUN - 1] {
+                    if start == 0 && prior_run != 0 {
+                        continue;
+                    }
+                    for refinement_limit in [0, 63] {
+                        let mut seed = DctCodingState::new(refinement_limit);
+                        if prior_run != 0 {
+                            scalar_buffer_end_of_band(
+                                &mut seed,
+                                &mut EntropyBitWriter::new(0),
+                                &ac,
+                                0,
+                                0,
+                            )
+                            .unwrap();
+                            seed.eob_run = prior_run;
+                        }
+                        for pending in [0, 3, 7] {
+                            for limit in [0, 1, 2, 7, 8, 15, 16, 31, 128] {
+                                let mut scalar = EntropyBitWriter::new(limit);
+                                scalar.write_bits((1 << pending) - 1, pending).unwrap();
+                                let mut writer = scalar.clone();
+                                let mut expected = seed.clone();
+                                let mut actual = seed.clone();
+                                let expected_result = scalar_refinement_ac(
+                                    &mut scalar,
+                                    &ac,
+                                    band,
+                                    &mut expected,
+                                    &block,
+                                );
+                                let actual_result = encode_refinement_block(
+                                    &mut writer,
+                                    Some(&ac),
+                                    band,
+                                    &mut actual,
+                                    &block,
+                                );
+                                assert_eq!(actual_result, expected_result);
+                                assert_eq!(writer, scalar);
+                                assert_eq!(actual, expected);
+                                if actual_result.is_ok() {
+                                    let result = scalar_flush(&mut expected, &mut scalar);
+                                    let result = expected.finish_operation(result);
+                                    assert_eq!(actual.flush(&mut writer), result);
+                                    assert_eq!(writer, scalar);
+                                    assert_eq!(actual, expected);
+                                } else {
+                                    assert_eq!(
+                                        actual.flush(&mut writer),
+                                        Err(CoefficientWriteError::FailedState)
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn pending_eob_checks_every_code_even_after_same_variable_table_replacement() {
+    for pending_corrections in [0, 63] {
+        for changed in 0..15 {
+            let symbols: Vec<_> = (0..15).map(|i| i << 4).collect();
+            let mut ac = table(&symbols, 4);
+            let mut writer = EntropyBitWriter::new(128);
+            writer.write_bits(5, 3).unwrap();
+            let mut state = DctCodingState::new(pending_corrections);
+            let coefficient = if pending_corrections == 0 { 0 } else { 3 };
+            encode_refinement_block(
+                &mut writer,
+                Some(&ac),
+                ac_band(0),
+                &mut state,
+                &[coefficient; BLOCK_SIZE],
+            )
+            .unwrap();
+            assert_eq!(state.pending_refinement_bits(), pending_corrections);
+            let before = state.clone();
+            let before_writer = writer.clone();
+            let mut changed_symbols = symbols;
+            changed_symbols[changed] = 1;
+            ac = table(&changed_symbols, 4);
+            let mut scalar = writer.clone();
+            let mut scalar_state = state.clone();
+            let expected_result = scalar_refinement_ac(
+                &mut scalar,
+                &ac,
+                ac_band(0),
+                &mut scalar_state,
+                &[3; BLOCK_SIZE],
+            );
+            // Table mismatch must win over the exhausted refinement budget,
+            // without flushing or discarding any pending correction words.
+            assert_eq!(
+                expected_result,
+                Err(CoefficientWriteError::Invalid(
+                    "AC table changed inside a pending EOB run"
+                ))
+            );
+            assert_eq!(
+                encode_refinement_block(
+                    &mut writer,
+                    Some(&ac),
+                    ac_band(0),
+                    &mut state,
+                    &[3; BLOCK_SIZE]
+                ),
+                expected_result
+            );
+            assert_eq!(state, scalar_state);
+            assert_eq!(writer, scalar);
+            let mut expected = before;
+            expected.failed = true;
+            assert_eq!(state, expected);
+            assert_eq!(writer, before_writer);
+            assert_eq!(
+                state.flush(&mut writer),
+                Err(CoefficientWriteError::FailedState)
+            );
+            assert_eq!(writer, before_writer);
+        }
+    }
+    let mut ac = table(&[0, 0x10, 1, 2], 3);
+    let mut writer = EntropyBitWriter::new(128);
+    let mut state = DctCodingState::new(0);
+    encode_refinement_block(
+        &mut writer,
+        Some(&ac),
+        ac_band(0),
+        &mut state,
+        &[0; BLOCK_SIZE],
+    )
+    .unwrap();
+    ac = table(&[0, 0x10, 2, 1], 3);
+    encode_refinement_block(
+        &mut writer,
+        Some(&ac),
+        ac_band(0),
+        &mut state,
+        &[0; BLOCK_SIZE],
+    )
+    .unwrap();
+    state.flush(&mut writer).unwrap();
+    assert_eq!(aligned(writer), packed(&[(1, 3), (0, 1)]));
+}
+
+#[test]
+fn batched_sequential_matches_scalar_at_limits_and_missing_code_boundaries() {
+    let dc = dc_table();
+    let ac = ac_table();
+    let incomplete = table(&[0, 1, 0x0b, 0xf0], 16);
+    let mut sparse = [0; BLOCK_SIZE];
+    sparse[0] = -1023;
+    sparse[NATURAL_ORDER[1]] = 2047;
+    sparse[NATURAL_ORDER[19]] = -1;
+    sparse[NATURAL_ORDER[31]] = 255;
+    let mut dense = [2047; BLOCK_SIZE];
+    for k in (1..BLOCK_SIZE).step_by(2) {
+        dense[k] = -2047;
+    }
+    for ac in [&ac, &incomplete] {
+        for (block, extra) in [(&dense, 0), (&sparse, 2), (&[0; BLOCK_SIZE], 4)] {
+            for pending in 0..8 {
+                for limit in 0..=520 {
+                    let mut scalar = EntropyBitWriter::new(limit);
+                    scalar.write_bits((1 << pending) - 1, pending).unwrap();
+                    let mut batched = scalar.clone();
+                    let mut expected_dc = 0;
+                    let mut actual_dc = 0;
+                    let expected =
+                        scalar_sequential(&mut scalar, &dc, ac, extra, &mut expected_dc, block);
+                    let actual = encode_sequential_block(
+                        &mut batched,
+                        &dc,
+                        ac,
+                        extra,
+                        &mut actual_dc,
+                        block,
+                    );
+                    assert_eq!(actual, expected, "pending={pending}, limit={limit}");
+                    assert_eq!(actual_dc, expected_dc);
+                    assert_eq!(batched, scalar);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn batched_refinement_matches_scalar_with_pending_runs_and_partial_errors() {
+    let full_ac = ac_table();
+    let incomplete = table(&[0, 0x10, 0x20, 0xf0], 16);
+    for ac in [&full_ac, &incomplete] {
+        for low_bit in [0, 1, 6] {
+            let band = ac_band(low_bit);
+            let mut seed = DctCodingState::new(1024);
+            let mut unused = EntropyBitWriter::new(0);
+            // Pending EOB plus 126 correction bits exercises batching during
+            // flush as well as the new block's sign/ZRL/correction emissions.
+            for _ in 0..2 {
+                encode_refinement_block(
+                    &mut unused,
+                    Some(ac),
+                    band,
+                    &mut seed,
+                    &[3 << low_bit; BLOCK_SIZE],
+                )
+                .unwrap();
+            }
+            for layout in 0..3 {
+                let mut block = [0; BLOCK_SIZE];
+                for (k, &natural) in NATURAL_ORDER[..BLOCK_SIZE].iter().enumerate().skip(1) {
+                    let magnitude = match layout {
+                        0 => [0, 1, 3, -2, -1][k % 5],
+                        1 => {
+                            if k == 18 || k == 63 {
+                                -1
+                            } else {
+                                0
+                            }
+                        }
+                        _ => {
+                            if k == 62 {
+                                1
+                            } else {
+                                3
+                            }
+                        }
+                    };
+                    block[natural] = magnitude << low_bit;
+                }
+                for pending in 0..8 {
+                    for limit in 0..=160 {
+                        let mut scalar = EntropyBitWriter::new(limit);
+                        scalar.write_bits((1 << pending) - 1, pending).unwrap();
+                        let mut batched = scalar.clone();
+                        let mut expected_state = seed.clone();
+                        let mut actual_state = seed.clone();
+                        let expected = scalar_refinement_ac(
+                            &mut scalar,
+                            ac,
+                            band,
+                            &mut expected_state,
+                            &block,
+                        );
+                        let actual = encode_refinement_block(
+                            &mut batched,
+                            Some(ac),
+                            band,
+                            &mut actual_state,
+                            &block,
+                        );
+                        assert_eq!(
+                            actual, expected,
+                            "layout={layout}, pending={pending}, limit={limit}"
+                        );
+                        assert_eq!(batched, scalar);
+                        assert_eq!(actual_state, expected_state);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn refinement_adversarial_subbands_match_scalar_across_all_bit_planes() {
+    let ac = ac_table();
+    for low_bit in 0..=10 {
+        let unit = 1i16 << low_bit;
+        for (start, end) in [(1, 63), (2, 62), (7, 55), (16, 49), (32, 63), (63, 63)] {
+            let band = ScanBand {
+                start,
+                end,
+                low_bit,
+            };
+            let width = usize::from(end - start + 1);
+            for negative_first in [false, true] {
+                let mut writer = EntropyBitWriter::new(4096);
+                writer.write_bits(0x7f, 7).unwrap();
+                let mut scalar = writer.clone();
+                let mut actual_state = DctCodingState::new(1024);
+                let mut expected_state = actual_state.clone();
+                for layout in 0..9 {
+                    let last_new = match layout {
+                        3 | 6 | 8 => Some(width - 1),
+                        4 => Some(0),
+                        5 => Some(width / 2),
+                        _ => None,
+                    };
+                    let mut block = [i16::MIN; BLOCK_SIZE];
+                    for (offset, &natural) in NATURAL_ORDER[usize::from(start)..=usize::from(end)]
+                        .iter()
+                        .enumerate()
+                    {
+                        let old = 2 + (offset & 1) as i16;
+                        let mut magnitude = match layout {
+                            0 | 7 | 8 => 0,
+                            1 | 6 => old,
+                            2 | 4 | 5 => {
+                                if offset % 3 == 1 {
+                                    0
+                                } else {
+                                    old
+                                }
+                            }
+                            // Old coefficients straddle 15/16-zero boundaries;
+                            // the full band needs three ZRLs before its new value.
+                            3 => {
+                                if [0, 16, 18, 35, 37, 53].contains(&offset) {
+                                    old
+                                } else {
+                                    0
+                                }
+                            }
+                            _ => unreachable!(),
+                        };
+                        // At bit 10 no old coefficient fits the AC precision.
+                        if low_bit == 10 && magnitude > 1 {
+                            magnitude = 0;
+                        }
+                        if last_new == Some(offset) {
+                            magnitude = 1;
+                        }
+                        let residue = if (offset + layout) % 3 == 0 {
+                            0
+                        } else {
+                            unit - 1
+                        };
+                        let value = magnitude * unit + residue;
+                        block[natural] = if ((offset + layout) % 2 == 0) == negative_first {
+                            -value
+                        } else {
+                            value
+                        };
+                    }
+                    let expected =
+                        scalar_refinement_ac(&mut scalar, &ac, band, &mut expected_state, &block);
+                    let actual = encode_refinement_block(
+                        &mut writer,
+                        Some(&ac),
+                        band,
+                        &mut actual_state,
+                        &block,
+                    );
+                    assert_eq!(
+                        actual, expected,
+                        "band={band:?}, layout={layout}, negative_first={negative_first}"
+                    );
+                    assert_eq!(actual, Ok(()));
+                    assert_eq!(writer, scalar, "band={band:?}, layout={layout}");
+                    assert_eq!(
+                        actual_state, expected_state,
+                        "band={band:?}, layout={layout}"
+                    );
+                }
+                actual_state.flush(&mut writer).unwrap();
+                scalar_flush(&mut expected_state, &mut scalar).unwrap();
+                assert_eq!(actual_state, expected_state);
+                assert_eq!(aligned(writer), aligned(scalar));
+            }
+        }
+    }
+}
+
+#[test]
+fn refinement_precision_bounds_validate_before_pending_flush_or_dc_emission() {
+    let ac = ac_table();
+    for low_bit in 0..=10 {
+        for (start, end) in [(0, 63), (1, 63), (9, 42), (63, 63)] {
+            let band = ScanBand {
+                start,
+                end,
+                low_bit,
+            };
+            let first = usize::from(start.max(1));
+            let end = usize::from(end);
+            for position in first..=end {
+                if position != first && position != (first + end) / 2 && position != end {
+                    continue;
+                }
+                for value in [-2047, 2047, -2048, 2048, i16::MIN, i16::MAX] {
+                    let mut block = [i16::MIN; BLOCK_SIZE];
+                    for (k, &natural) in NATURAL_ORDER.iter().enumerate().take(end + 1).skip(first)
+                    {
+                        block[natural] = if k % 2 == 0 {
+                            1 << low_bit
+                        } else {
+                            -(1 << low_bit)
+                        };
+                    }
+                    block[NATURAL_ORDER[position]] = value;
+                    let mut writer = EntropyBitWriter::new(1024);
+                    writer.write_bits(0x7f, 7).unwrap();
+                    let mut actual_state = DctCodingState::new(128);
+                    if start != 0 {
+                        scalar_buffer_end_of_band(
+                            &mut actual_state,
+                            &mut writer,
+                            &ac,
+                            0x5a5a_ffff_1234_5678,
+                            63,
+                        )
+                        .unwrap();
+                    }
+                    let before_writer = writer.clone();
+                    let before_state = actual_state.clone();
+                    let mut scalar = writer.clone();
+                    let mut expected_state = actual_state.clone();
+                    let expected =
+                        scalar_refinement_ac(&mut scalar, &ac, band, &mut expected_state, &block);
+                    let actual = encode_refinement_block(
+                        &mut writer,
+                        Some(&ac),
+                        band,
+                        &mut actual_state,
+                        &block,
+                    );
+                    assert_eq!(
+                        actual, expected,
+                        "band={band:?}, k={position}, value={value}"
+                    );
+                    assert_eq!(writer, scalar);
+                    assert_eq!(actual_state, expected_state);
+                    if (-2047..=2047).contains(&value) {
+                        assert_eq!(actual, Ok(()));
+                        actual_state.flush(&mut writer).unwrap();
+                        scalar_flush(&mut expected_state, &mut scalar).unwrap();
+                        assert_eq!(actual_state, expected_state);
+                        assert_eq!(aligned(writer), aligned(scalar));
+                    } else {
+                        assert_eq!(
+                            actual,
+                            Err(CoefficientWriteError::Invalid(
+                                "AC coefficient exceeds supported precision"
+                            ))
+                        );
+                        let mut poisoned = before_state;
+                        poisoned.failed = true;
+                        assert_eq!(actual_state, poisoned);
+                        assert_eq!(writer, before_writer);
+                        assert_eq!(
+                            actual_state.flush(&mut writer),
+                            Err(CoefficientWriteError::FailedState)
+                        );
+                        assert_eq!(
+                            encode_refinement_block(
+                                &mut writer,
+                                Some(&ac),
+                                band,
+                                &mut actual_state,
+                                &[0; BLOCK_SIZE],
+                            ),
+                            Err(CoefficientWriteError::FailedState)
+                        );
+                        assert_eq!(actual_state, poisoned);
+                        assert_eq!(writer, before_writer);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn sequential_randomized_dense_sparse_and_zero_blocks_match_initial_bytes() {
+    let dc = dc_table();
+    let ac = ac_table();
+    let long_dc = table(&(0..12).rev().collect::<Vec<_>>(), 16);
+    let mut counts = [0; 16];
+    counts[7] = 254;
+    counts[8] = 1;
+    counts[15] = 1;
+    let mut symbols: Vec<_> = (1..=255).collect();
+    symbols.push(0); // The EOB takes the longest (16-bit) code.
+    let long_ac = HuffmanTable::new(&counts, &symbols).unwrap();
+    let mut rng = 0x42ec_9765u32;
+    let mut random = || {
+        rng ^= rng << 13;
+        rng ^= rng >> 17;
+        rng ^= rng << 5;
+        rng
+    };
+    let mut saw_stuffing = false;
+    for (dc, ac) in [(&dc, &ac), (&long_dc, &long_ac)] {
+        for layout in 0..3 {
+            for last in 0..BLOCK_SIZE {
+                let mut block = [0; BLOCK_SIZE];
+                block[0] = match last % 4 {
+                    0 => i16::MIN,
+                    1 => i16::MAX,
+                    2 => 0,
+                    _ => random() as i16,
+                };
+                let previous = (i32::from(block[0]) + (random() % 4095) as i32 - 2047)
+                    .clamp(i32::from(i16::MIN), i32::from(i16::MAX))
+                    as i16;
+                for (k, &natural) in NATURAL_ORDER[..BLOCK_SIZE].iter().enumerate().skip(1) {
+                    if layout == 2 || k > last || (layout == 1 && k != last && random() % 8 != 0) {
+                        continue;
+                    }
+                    let high_bit = 1 << (random() % 11);
+                    let magnitude = (high_bit | (random() & (high_bit - 1))) as i16;
+                    block[natural] = if random() & 1 == 0 {
+                        magnitude
+                    } else {
+                        -magnitude
+                    };
+                }
+                let trailing = if layout == 2 { 63 } else { 63 - last };
+                for extra in 0..=trailing.div_ceil(16) as u32 {
+                    for pending in 0..8 {
+                        let mut writer = EntropyBitWriter::new(4096);
+                        writer.write_bits(0x12ff, 16).unwrap();
+                        let mask = (1 << pending) - 1;
+                        let prefix = match last % 3 {
+                            0 => 0,
+                            1 => mask,
+                            _ => random() & mask,
+                        };
+                        writer.write_bits(prefix, pending).unwrap();
+                        let mut predictor = previous;
+                        sequential_matches_initial(
+                            &mut writer,
+                            dc,
+                            ac,
+                            extra,
+                            &mut predictor,
+                            &block,
+                        )
+                        .unwrap();
+                        writer.align_ones().unwrap();
+                        saw_stuffing |= writer.bytes()[3..].windows(2).any(|pair| pair == [255, 0]);
+                    }
+                }
+            }
+        }
+    }
+    assert!(saw_stuffing);
+}
+
+#[test]
+fn sequential_consumed_or_overshot_trailing_zeros_need_no_eob_symbol() {
+    let dc = dc_table();
+    let ac = table(&(1..=255).collect::<Vec<_>>(), 9);
+    for last in 0..BLOCK_SIZE {
+        let mut block = [0; BLOCK_SIZE];
+        if last != 0 {
+            block[NATURAL_ORDER[last]] = 1;
+        }
+        let extra = (63 - last).div_ceil(16) as u32;
+        sequential_matches_initial(
+            &mut EntropyBitWriter::new(128),
+            &dc,
+            &ac,
+            extra,
+            &mut 0,
+            &block,
+        )
+        .unwrap();
+    }
+}
+
+#[test]
+fn sequential_invalid_categories_and_hints_leave_existing_bits_and_predictor_untouched() {
+    let dc = dc_table();
+    let ac = ac_table();
+    let check = |block: &[i16; BLOCK_SIZE], previous: i16, extra, reason| {
+        let mut writer = EntropyBitWriter::new(0);
+        writer.write_bits(5, 3).unwrap();
+        let before = writer.clone();
+        let mut predictor = previous;
+        assert_eq!(
+            sequential_matches_initial(&mut writer, &dc, &ac, extra, &mut predictor, block),
+            Err(CoefficientWriteError::Invalid(reason))
+        );
+        assert_eq!(predictor, previous);
+        assert_eq!(writer, before);
+    };
+    for (value, previous) in [
+        (2048, 0),
+        (-2048, 0),
+        (i16::MAX, i16::MIN),
+        (i16::MIN, i16::MAX),
+    ] {
+        let mut block = [0; BLOCK_SIZE];
+        block[0] = value;
+        check(&block, previous, 0, "DC difference exceeds 11 bits");
+    }
+    for natural in 1..BLOCK_SIZE {
+        for value in [-2048, 2048, i16::MIN, i16::MAX] {
+            let mut block = [0; BLOCK_SIZE];
+            block[0] = 18;
+            block[natural] = value;
+            check(&block, 17, 0, "AC coefficient exceeds supported precision");
+        }
+    }
+    for last in 0..BLOCK_SIZE {
+        let mut block = [0; BLOCK_SIZE];
+        block[0] = 18;
+        if last != 0 {
+            block[NATURAL_ORDER[last]] = 1;
+        }
+        for extra in [(63 - last).div_ceil(16) as u32 + 1, u32::MAX] {
+            check(
+                &block,
+                17,
+                extra,
+                "extra zero runs exceed trailing spectral band",
+            );
+        }
+    }
+    // Preserve DC-before-AC-before-hint validation even when all are malformed.
+    let mut block = [2048; BLOCK_SIZE];
+    check(&block, 0, u32::MAX, "DC difference exceeds 11 bits");
+    block[0] = 1;
+    check(
+        &block,
+        0,
+        u32::MAX,
+        "AC coefficient exceeds supported precision",
+    );
+    block[1..].fill(0);
+    check(
+        &block,
+        0,
+        u32::MAX,
+        "extra zero runs exceed trailing spectral band",
+    );
+}
+
+#[test]
+fn sequential_missing_symbols_preserve_initial_partial_failure_state() {
+    let dc = dc_table();
+    let ac = ac_table();
+    let dc_zero = table(&[0], 1);
+    let ac_zero = table(&[0], 1);
+    let ac_no_eob = table(&[1, 0xf0], 2);
+    let mut empty = [0; BLOCK_SIZE];
+    empty[0] = 1;
+    let mut nonzero = empty;
+    nonzero[NATURAL_ORDER[1]] = 1;
+    let mut interior_zrl = empty;
+    interior_zrl[NATURAL_ORDER[17]] = 1;
+    for (dc, ac, block, extra, missing, expected_previous) in [
+        (&dc_zero, &ac, &empty, 0, 1, 0),
+        (&dc, &ac_zero, &nonzero, 0, 1, 1),
+        (&dc, &ac_zero, &interior_zrl, 0, 0xf0, 1),
+        (&dc, &ac_zero, &empty, 1, 0xf0, 1),
+        (&dc, &ac_no_eob, &nonzero, 0, 0, 1),
+    ] {
+        let mut writer = EntropyBitWriter::new(128);
+        writer.write_bits(0xff, 8).unwrap();
+        writer.write_bits(5, 3).unwrap();
+        let mut previous = 0;
+        assert_eq!(
+            sequential_matches_initial(&mut writer, dc, ac, extra, &mut previous, block),
+            Err(CoefficientWriteError::Entropy(
+                WriteError::MissingHuffmanSymbol(missing)
+            ))
+        );
+        assert_eq!(previous, expected_previous);
+    }
+}
+
+#[test]
+fn sequential_output_limits_match_initial_at_every_byte_boundary() {
+    let dc = dc_table();
+    let ac = ac_table();
+    let positive = [2047; BLOCK_SIZE];
+    let negative = [-2047; BLOCK_SIZE];
+    let mut sparse = [0; BLOCK_SIZE];
+    sparse[0] = -12;
+    sparse[NATURAL_ORDER[18]] = -1024;
+    sparse[NATURAL_ORDER[47]] = 2047;
+    let mut empty = [0; BLOCK_SIZE];
+    empty[0] = 1;
+    for (block, extra, previous) in [
+        (&positive, 0, 0),
+        (&negative, 0, 0),
+        (&sparse, 1, 7),
+        (&empty, 0, -2046),
+        (&empty, 3, 0),
+        (&empty, 4, 0),
+    ] {
+        for pending in 0..8 {
+            let prefix = (1 << pending) - 1;
+            let mut complete = EntropyBitWriter::new(4096);
+            complete.write_bits(prefix, pending).unwrap();
+            let mut predictor = previous;
+            sequential_matches_initial(&mut complete, &dc, &ac, extra, &mut predictor, block)
+                .unwrap();
+            let emitted = complete.bytes().len();
+            for limit in 0..=emitted + 2 {
+                let mut writer = EntropyBitWriter::new(limit);
+                writer.write_bits(prefix, pending).unwrap();
+                let mut predictor = previous;
+                let result =
+                    sequential_matches_initial(&mut writer, &dc, &ac, extra, &mut predictor, block);
+                let expected = if limit < emitted {
+                    Err(CoefficientWriteError::Entropy(WriteError::OutputLimit {
+                        limit,
+                    }))
+                } else {
+                    Ok(())
+                };
+                assert_eq!(
+                    result, expected,
+                    "limit={limit}, pending={pending}, extra={extra}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn prepared_refinement_matches_category_validation_for_every_i16_and_bit_plane() {
+    for low_bit in 0..=10 {
+        let band = ScanBand {
+            start: 17,
+            end: 17,
+            low_bit,
+        };
+        for value in i16::MIN..=i16::MAX {
+            let mut block = [0; BLOCK_SIZE];
+            block[NATURAL_ORDER[17]] = value;
+            assert_refinement_preparation_matches_scalar(&block, band);
+        }
+    }
+}
+
 #[test]
 fn sequential_known_negative_difference_and_ac_bits() {
     let dc = table(&[0, 1, 2], 2);
@@ -570,6 +1722,74 @@ fn refinement_limit_rejects_instead_of_changing_eob_grouping() {
     )
     .unwrap();
     assert!(coding.refinement_words.capacity() <= MAX_BUFFERED_BITS.div_ceil(16));
+}
+
+#[test]
+fn empty_flush_is_a_noop_before_and_after_buffering_but_checks_failed_state() {
+    let ac = ac_table();
+    let mut coding = DctCodingState::new(63);
+    let mut writer = EntropyBitWriter::new(128);
+    writer.write_bits(5, 3).unwrap();
+    for buffered in [false, true] {
+        if buffered {
+            encode_refinement_block(
+                &mut writer,
+                Some(&ac),
+                ac_band(0),
+                &mut coding,
+                &[3; BLOCK_SIZE],
+            )
+            .unwrap();
+            assert_eq!(coding.pending_eob_run(), 1);
+            assert_eq!(coding.pending_refinement_bits(), 63);
+            coding.flush(&mut writer).unwrap();
+            assert!(coding.refinement_words.capacity() > 0);
+        }
+        assert_eq!(coding.pending_eob_run(), 0);
+        assert_eq!(coding.pending_refinement_bits(), 0);
+        assert!(coding.refinement_words.is_empty());
+        let before_writer = writer.clone();
+        let before_coding = coding.clone();
+        coding.flush(&mut writer).unwrap();
+        assert_eq!(writer, before_writer);
+        assert_eq!(coding, before_coding);
+    }
+    let before = writer.clone();
+    assert_eq!(
+        encode_refinement_block(&mut writer, None, ac_band(0), &mut coding, &[0; BLOCK_SIZE]),
+        Err(CoefficientWriteError::Invalid(
+            "missing refinement AC table"
+        ))
+    );
+    assert_eq!(coding.pending_eob_run(), 0);
+    assert_eq!(
+        coding.flush(&mut writer),
+        Err(CoefficientWriteError::FailedState)
+    );
+    assert_eq!(
+        encode_initial_block(
+            &mut writer,
+            None,
+            Some(&ac),
+            ac_band(0),
+            0,
+            &mut coding,
+            &mut 0,
+            &[0; BLOCK_SIZE],
+        ),
+        Err(CoefficientWriteError::FailedState)
+    );
+    assert_eq!(
+        encode_refinement_block(
+            &mut writer,
+            Some(&ac),
+            ac_band(0),
+            &mut coding,
+            &[0; BLOCK_SIZE],
+        ),
+        Err(CoefficientWriteError::FailedState)
+    );
+    assert_eq!(writer, before);
 }
 
 #[test]

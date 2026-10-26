@@ -215,6 +215,18 @@ impl Frame {
             && !image_metadata.xyb_encoded
             && image_metadata.color_encoding.color_space == ColorSpace::Gray;
         let color_channels = if is_gray { 1 } else { 3 };
+        let native_integer_frame = decoder_state
+            .native_integer_capture
+            .as_ref()
+            .map(|capture| {
+                capture.begin_frame();
+                super::native_integer::NativeIntegerFrameBuffer::new(
+                    &frame_header,
+                    &decoder_state.file_header,
+                    decoder_state.render_spotcolors,
+                )
+            })
+            .transpose()?;
         let size_blocks = frame_header.size_blocks();
         let lf_image = if frame_header.encoding == Encoding::VarDCT {
             if frame_header.has_lf_frame() {
@@ -250,24 +262,25 @@ impl Frame {
             None
         };
 
-        let reference_frame_data = if frame_header.can_be_referenced {
-            let image_size = &decoder_state.file_header.size;
-            let image_size = (image_size.xsize() as usize, image_size.ysize() as usize);
-            let sz = if frame_header.save_before_ct {
-                frame_header.size_upsampled()
-            } else {
-                image_size
-            };
+        let reference_frame_data =
+            if frame_header.can_be_referenced && native_integer_frame.is_none() {
+                let image_size = &decoder_state.file_header.size;
+                let image_size = (image_size.xsize() as usize, image_size.ysize() as usize);
+                let sz = if frame_header.save_before_ct {
+                    frame_header.size_upsampled()
+                } else {
+                    image_size
+                };
 
-            let num_ref_channels = 3 + image_metadata.extra_channel_info.len();
-            Some(
-                (0..num_ref_channels)
-                    .map(|_| Image::new(sz))
-                    .collect::<Result<Vec<_>>>()?,
-            )
-        } else {
-            None
-        };
+                let num_ref_channels = 3 + image_metadata.extra_channel_info.len();
+                Some(
+                    (0..num_ref_channels)
+                        .map(|_| Image::new(sz))
+                        .collect::<Result<Vec<_>>>()?,
+                )
+            } else {
+                None
+            };
 
         let lf_frame_data = if frame_header.lf_level != 0 {
             Some(
@@ -296,6 +309,7 @@ impl Frame {
             hf_meta,
             decoder_state,
             frame_counters,
+            native_integer_frame,
             render_pipeline: None,
             reference_frame_data,
             lf_frame_data,
@@ -339,15 +353,27 @@ impl Frame {
 
             if self.header.has_patches() {
                 info!("decoding patches");
-                let p = PatchesDictionary::read_internal(
-                    br,
-                    self.header.size_padded().0,
-                    self.header.size_padded().1,
-                    self.decoder_state.extra_channel_info().len(),
-                    &self.decoder_state.reference_frames[..],
-                    self.decoder_state.level5_limits,
-                    &mut self.buffer_recycler.modular_scratch.get().lz77_window,
-                )?;
+                let p = if let Some(capture) = &self.decoder_state.native_integer_capture {
+                    PatchesDictionary::read_with_reference_info(
+                        br,
+                        self.header.size_padded().0,
+                        self.header.size_padded().1,
+                        self.decoder_state.extra_channel_info().len(),
+                        &capture.reference_info(),
+                        self.decoder_state.level5_limits,
+                        &mut self.buffer_recycler.modular_scratch.get().lz77_window,
+                    )?
+                } else {
+                    PatchesDictionary::read_internal(
+                        br,
+                        self.header.size_padded().0,
+                        self.header.size_padded().1,
+                        self.decoder_state.extra_channel_info().len(),
+                        &self.decoder_state.reference_frames[..],
+                        self.decoder_state.level5_limits,
+                        &mut self.buffer_recycler.modular_scratch.get().lz77_window,
+                    )?
+                };
                 *self.patches.try_write().unwrap() = p;
             }
 
@@ -830,6 +856,8 @@ impl Frame {
             )?;
         }
         if let Some(pixels) = pixels {
+            #[cfg(feature = "decoder-profile")]
+            let _render = crate::decoder_profile::scope("vardct.post_idct_pipeline");
             for (c, img) in pixels.into_iter().enumerate() {
                 pipeline!(
                     self,

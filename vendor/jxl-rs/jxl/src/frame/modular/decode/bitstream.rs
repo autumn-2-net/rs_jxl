@@ -208,6 +208,8 @@ pub(in crate::frame::modular) fn decode_modular_subbitstream(
     recycler: &BufferRecycler,
     level5_limits: bool,
 ) -> Result<()> {
+    #[cfg(feature = "decoder-profile")]
+    let _profile = crate::decoder_profile::scope("modular.substream");
     // Skip decoding if all grids are zero-sized.
     let is_empty = buffers
         .iter()
@@ -278,6 +280,8 @@ pub(in crate::frame::modular) fn decode_modular_subbitstream(
         .unwrap_or(0);
 
     if can_decode_fast_lossless(tree) {
+        #[cfg(feature = "decoder-profile")]
+        let _profile = crate::decoder_profile::scope("modular.fast_lossless");
         decode_fast_lossless(buffers, tree, br, partial_decoded_buffers, storage)?
     } else {
         let mut reader = SymbolReader::new(

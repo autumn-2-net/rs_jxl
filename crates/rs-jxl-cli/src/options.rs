@@ -6,6 +6,64 @@ use rs_jxl::tools::lz77::Lz77Mode;
 use rs_jxl::{EncodeOptions, ModularOptions};
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
+enum MaBudgetMode {
+    Strict,
+    Bounded,
+}
+
+/// Resource controls shared by manual and source encoding, outside manual_tools.
+#[derive(Debug, Args)]
+#[group(id = "ma_budget", multiple = true)]
+pub struct MaBudgetOptions {
+    /// MA leaf exhaustion: strict errors; bounded stops optional splits, still lossless
+    #[arg(long, value_enum)]
+    ma_budget_mode: Option<MaBudgetMode>,
+    /// Additional learned MA tree leaf cap (1..=2097152), including source/pilot
+    #[arg(long, value_name = "N", value_parser = parse_ma_max_leaves)]
+    ma_max_leaves: Option<usize>,
+}
+
+fn parse_ma_max_leaves(value: &str) -> std::result::Result<usize, String> {
+    value
+        .parse::<usize>()
+        .ok()
+        .filter(|limit| (1..=rs_jxl::modular::ma_train::MAX_TREE_LEAVES).contains(limit))
+        .ok_or_else(|| "MA leaf cap must be an integer in 1..=2097152".into())
+}
+
+impl MaBudgetOptions {
+    pub fn apply(&self, options: &mut ModularOptions) {
+        if let Some(mode) = self.ma_budget_mode {
+            options.ma_budget_mode = Some(match mode {
+                MaBudgetMode::Strict => rs_jxl::modular::ma_train::MaBudgetMode::Strict,
+                MaBudgetMode::Bounded => rs_jxl::modular::ma_train::MaBudgetMode::Bounded,
+            });
+        }
+        if let Some(limit) = self.ma_max_leaves {
+            options.ma_max_leaves = Some(limit);
+        }
+    }
+}
+
+/// Exact MA search proofs, independent of effort and leaf-budget controls.
+#[derive(Debug, Args)]
+#[group(id = "ma_pruning", multiple = true)]
+pub struct MaPruningOptions {
+    /// Experimental exact MA partition reuse and small-node dominance pruning
+    #[arg(long)]
+    ma_prune: bool,
+}
+
+impl MaPruningOptions {
+    pub fn apply(&self, options: &mut ModularOptions) {
+        if self.ma_prune {
+            options.source_property_dedup = true;
+            options.source_ma_dominance = true;
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
 enum Entropy {
     Auto,
     Prefix,

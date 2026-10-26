@@ -12,6 +12,10 @@ use super::{
 };
 use crate::{Error, Result};
 
+#[cfg(test)]
+#[path = "ma_channel_budget_tests.rs"]
+mod budget_tests;
+
 /// Resolved source experiment. Metadata/final-only/probe eligibility belongs
 /// to the caller; ineligible calls must resolve to Disabled before training.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -268,16 +272,7 @@ pub(super) fn graft(
     learned: Vec<Node>,
     max_leaves: usize,
 ) -> Result<()> {
-    if learned.is_empty() {
-        return Err(Error::Encoding("empty MA channel learner tree".into()));
-    }
-    let final_size = nodes
-        .len()
-        .checked_add(learned.len() - 1)
-        .ok_or(Error::Limit("MA channel merged node count overflow"))?;
-    if final_size.div_ceil(2) > max_leaves {
-        return Err(Error::Limit("merged MA channel tree exceeds leaf budget"));
-    }
+    merged_node_count(nodes.len(), learned.len(), max_leaves)?;
     nodes
         .try_reserve(learned.len() - 1)
         .map_err(|_| Error::Limit("MA channel graft allocation"))?;
@@ -301,6 +296,41 @@ pub(super) fn graft(
     Ok(())
 }
 
+fn merged_node_count(current: usize, learned: usize, max_leaves: usize) -> Result<usize> {
+    if current == 0 || learned == 0 {
+        return Err(Error::Encoding("empty MA graft tree".into()));
+    }
+    let final_size = current
+        .checked_add(learned - 1)
+        .ok_or(Error::Limit("MA merged node count overflow"))?;
+    if final_size > super::MAX_TREE_NODES {
+        return Err(Error::Limit("merged MA tree exceeds decoder node limit"));
+    }
+    if final_size.div_ceil(2) > max_leaves {
+        crate::profile::note(
+            "ma.merge_limit",
+            format_args!(
+                "current_nodes={current} learned_nodes={learned} merged_nodes={final_size} max_leaves={max_leaves}"
+            ),
+        );
+        return Err(Error::Limit("merged MA tree exceeds leaf budget"));
+    }
+    Ok(final_size)
+}
+
+/// Every other leaf is already occupied or reserved for an unfinished job.
+/// Give a learner all remaining capacity, never an equal partition quota.
+pub(super) fn graft_leaf_allowance(nodes: usize, max_leaves: usize) -> Result<usize> {
+    let reserved = nodes
+        .div_ceil(2)
+        .checked_sub(1)
+        .ok_or_else(|| Error::Encoding("empty MA graft destination tree".into()))?;
+    max_leaves
+        .checked_sub(reserved)
+        .filter(|&limit| limit != 0)
+        .ok_or(Error::Limit("MA skeleton exceeds leaf budget"))
+}
+
 pub(super) fn train(
     samples: &mut Samples<impl SampleStorage>,
     options: &TrainOptions,
@@ -311,7 +341,13 @@ pub(super) fn train(
         return Ok(None);
     };
     let _scope = crate::profile::scope("ma.channel_trees");
-    let root_limit = if options.parallel && !crate::execution::is_serial() {
+    // Bounded roots consume the shared remainder in plan order. Independent
+    // allowances can oversubscribe the merge, and pruning learned trees would
+    // lose their seed predictors or mandatory partitions.
+    let parallel_roots = options.parallel
+        && options.budget_mode != Some(super::MaBudgetMode::Bounded)
+        && !crate::execution::is_serial();
+    let root_limit = if parallel_roots {
         options.parallel_tools.roots(plan.jobs.len())
     } else {
         1
@@ -327,7 +363,8 @@ pub(super) fn train(
             root_limit,
         ),
     );
-    if options.parallel && !crate::execution::is_serial() {
+    if parallel_roots {
+        let local_limit = graft_leaf_allowance(plan.nodes.len(), options.max_leaves)?;
         // Partitioning is complete. Loan every column's disjoint intervals;
         // quantizers stay shared. Only local index descriptors are rebuilt.
         drop(plan.indices);
@@ -354,6 +391,7 @@ pub(super) fn train(
             options.parallel_tools.quiet,
             |(_, part, mut view)| {
                 let learning = TrainOptions {
+                    max_leaves: local_limit,
                     static_property_range: Some(part.range),
                     ..options.clone()
                 };
@@ -396,6 +434,7 @@ pub(super) fn train(
         // Preserve absolute indices for deterministic race hashes and deferred
         // cache membership. A learner only mutates this prepartitioned range.
         let learning = TrainOptions {
+            max_leaves: graft_leaf_allowance(plan.nodes.len(), options.max_leaves)?,
             static_property_range: Some(part.range),
             ..options.clone()
         };
@@ -414,8 +453,8 @@ pub(super) fn train(
                 multiplier: 1,
             }],
         )?;
-        // No per-partition quota or early full-tree truncation: reject a merge
-        // that cannot fit the existing invocation budget, including its skeleton.
+        // The local allowance reserves other roots; the graft still enforces
+        // the invocation ceiling after all independent work has completed.
         graft(&mut plan.nodes, part.node, learned, options.max_leaves)?;
     }
     Ok(Some(plan.nodes))

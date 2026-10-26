@@ -22,6 +22,93 @@ fn complete(bytes: usize, artifact: usize) -> TrialOutput<usize> {
     })
 }
 
+fn first_boundary_candidate(height: u32, options: &DriverOptions) -> (CandidateParams, usize) {
+    let image = Image::new(
+        512,
+        height,
+        PixelLayout::Gray,
+        PixelData::U8(vec![7; 512 * height as usize]),
+    )
+    .unwrap();
+    let mut first = None;
+    let mut probes = 0;
+    let result = run_pixel_search::<_, _, ()>(
+        &image,
+        &CandidateParams::default().backend(9).unwrap(),
+        options,
+        |params, _, budget| {
+            assert_eq!(budget.beat_bytes, None);
+            first = Some(params.clone());
+            Err(Error::Encoding("boundary test reached first full".into()))
+        },
+        |params, _| {
+            probes += 1;
+            Ok(
+                if params.predictor == Some(Predictor::Zero) && params.learning_fraction == 0.0 {
+                    10
+                } else {
+                    100
+                },
+            )
+        },
+    );
+    assert!(matches!(result, Err(Error::Encoding(message))
+        if message == "boundary test reached first full"));
+    (first.unwrap(), probes)
+}
+
+#[test]
+fn pilot_scan_and_screen_share_effective_adaptive_boundary() {
+    for explicit_adaptive in [false, true] {
+        let mut options = DriverOptions::scout();
+        options.scout_pilot_first = true;
+        options.preflight.enabled = true;
+        options.screen.adaptive_coverage = explicit_adaptive;
+        options.screen.regions.full_width_strips = true;
+        for height in [255, 256, 257] {
+            let (first, probes) = first_boundary_candidate(height, &options);
+            if height < 256 {
+                assert_eq!(first, CandidateParams::default().backend(3).unwrap());
+                assert_eq!(probes, 0);
+            } else {
+                // This candidate exists only when coverage supplies flat-palette
+                // evidence, not merely when the pilot's screen is available.
+                assert_eq!(first.speed_tier, 1);
+                assert_eq!(first.predictor, Some(Predictor::Zero));
+                assert_eq!(first.learning_fraction, 0.0);
+                assert!(probes > 0);
+            }
+        }
+    }
+}
+
+#[test]
+fn pilot_scan_keeps_ordinary_threshold_and_explicit_scan_opt_out() {
+    let mut options = DriverOptions::scout();
+    options.scout_pilot_first = true;
+    options.screen.regions.full_width_strips = true;
+    for height in [1023, 1024] {
+        let (first, probes) = first_boundary_candidate(height, &options);
+        if height < 1024 {
+            assert_eq!(first, CandidateParams::default().backend(3).unwrap());
+            assert_eq!(probes, 0);
+        } else {
+            assert_eq!(first.predictor, Some(Predictor::Zero));
+            assert_eq!(first.learning_fraction, 0.0);
+            assert!(probes > 0);
+        }
+    }
+    options.preflight.enabled = true;
+    options.coverage_scan = false;
+    let (first, probes) = first_boundary_candidate(256, &options);
+    assert_eq!(first, CandidateParams::default().backend(9).unwrap());
+    assert!(probes > 0);
+    options = DriverOptions::scout();
+    let (first, probes) = first_boundary_candidate(256, &options);
+    assert_eq!(first, CandidateParams::default().backend(3).unwrap());
+    assert_eq!(probes, 0);
+}
+
 #[test]
 fn retained_output_is_the_winning_invocation_and_ties_are_stable() {
     let image = image();

@@ -21,6 +21,7 @@
 #![forbid(unsafe_code)]
 
 use super::cost::{self, ChannelView};
+use super::encode::receipt::RepresentationReceipt;
 use super::encode::{self, Group, ModularOptions, Prepared};
 use super::group::{self, Channel, Transform};
 use super::layout::{self, ChannelShape, PartitionPlan, Passes, StreamKind};
@@ -350,6 +351,9 @@ fn prepare_layout(
     passes: &Passes,
     responsive: bool,
 ) -> Result<PreparedLayout> {
+    if let Some(collector) = &options.representation_receipt {
+        collector.begin()?;
+    }
     options.validate()?;
     passes.validate()?;
     if group_size_shift > 3 {
@@ -408,6 +412,7 @@ fn prepare_layout(
             transforms.push(t);
         }
     }
+    let palette_transform_count = transforms.len();
     transforms.extend(apply_global_rct(
         &mut channels,
         &mut state,
@@ -430,6 +435,20 @@ fn prepare_layout(
         state.max_bitdepth += 2;
     }
     let allow_rct = state.max_bitdepth < max_depth;
+    let receipt = options
+        .representation_receipt
+        .as_ref()
+        .map(|_| {
+            RepresentationReceipt::full_image(
+                image.width(),
+                image.height(),
+                image.channel_count(),
+                &transforms[..palette_transform_count],
+                channels.len() - state.meta_channels,
+                state.meta_channels,
+            )
+        })
+        .transpose()?;
     let shapes: Vec<_> = channels.iter().map(ChannelShape::from).collect();
     let partition = layout::partition_channels(
         &shapes,
@@ -494,6 +513,9 @@ fn prepare_layout(
     };
     if global.transforms.len() > 273 {
         return Err(Error::Limit("Modular global transform count"));
+    }
+    if let (Some(collector), Some(receipt)) = (&options.representation_receipt, receipt) {
+        collector.publish(receipt)?;
     }
     Ok(PreparedLayout {
         global,
@@ -696,6 +718,9 @@ fn encode_frame_areas(
     budget: Option<&SectionBudget>,
 ) -> Result<TrialEncode<Vec<Vec<u8>>>> {
     let _scope = crate::profile::scope("modular.frame_areas");
+    if let Some(collector) = &options.representation_receipt {
+        collector.begin()?;
+    }
     let descriptor = ImageDescriptor::from_image(image)?;
     let areas = layout::frame_areas(
         image.width() as usize,
@@ -739,6 +764,13 @@ fn encode_frame_areas(
                 ));
             }
         } else {
+            if let Some(collector) = &options.representation_receipt {
+                collector.publish(RepresentationReceipt::groupwise(
+                    image.width(),
+                    image.height(),
+                    image.channel_count(),
+                ))?;
+            }
             sections.resize_with(partition.num_dc_groups + partition.num_groups + 2, || None);
             script = Some(global.transforms.clone());
             let bytes = complete_or_return!(budget::section(budget, || {
@@ -928,6 +960,10 @@ pub(crate) fn encode_layout_trial(
         global, encoded, &partition, passes, limit,
     )?))
 }
+
+#[cfg(test)]
+#[path = "receipt_tests.rs"]
+mod receipt_tests;
 
 #[cfg(test)]
 mod tests {

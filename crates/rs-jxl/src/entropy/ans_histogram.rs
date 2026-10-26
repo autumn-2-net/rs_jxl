@@ -31,14 +31,21 @@ pub enum AnsHistogramStrategy {
 }
 
 #[derive(Clone, Debug)]
-pub(super) struct NormalizedHistogram {
-    pub(super) counts: Vec<u16>,
+pub(super) struct NormalizedHistogram<Counts = Vec<u16>> {
+    pub(super) counts: Counts,
     pub(super) cost: f32,
     method: u8,
     omit_pos: usize,
     alphabet_size: usize,
     num_symbols: usize,
     symbols: [usize; 2],
+}
+
+#[derive(Clone, Copy, Default)]
+struct Bin {
+    freq: i64,
+    count_index: usize,
+    bin_index: usize,
 }
 
 pub(super) fn population_precision(logcount: u8, shift: u8) -> u8 {
@@ -129,19 +136,74 @@ fn write_varlen_u8(n: usize, emit: &mut impl FnMut(u8, u64) -> Result<()>) -> Re
     }
 }
 
+fn input_shape(counts: &[u64]) -> Result<(u64, usize)> {
+    if counts.len() > MAX_ALPHABET_SIZE {
+        return Err(Error::InvalidInput(
+            "ANS histogram has more than 256 bins".into(),
+        ));
+    }
+    let total = counts.iter().try_fold(0u64, |sum, &count| {
+        sum.checked_add(count)
+            .filter(|&n| n <= i32::MAX as u64)
+            .ok_or(Error::Limit("ANS histogram weight total exceeds i32::MAX"))
+    })?;
+    let alphabet_size = counts.iter().rposition(|&n| n != 0).map_or(0, |n| n + 1);
+    Ok((total, alphabet_size))
+}
+
+/// Exact Fast population cost without retaining a normalized coding table.
+pub(super) fn fast_population_cost(counts: &[u64]) -> Result<f32> {
+    let (total, alphabet_size) = input_shape(counts)?;
+    if alphabet_size == 0 {
+        return Ok(3.0);
+    }
+    let mut storage = [0u16; MAX_ALPHABET_SIZE];
+    let mut normalized = NormalizedHistogram {
+        counts: &mut storage[..alphabet_size],
+        cost: 0.0,
+        method: 0,
+        omit_pos: 0,
+        alphabet_size,
+        num_symbols: 0,
+        symbols: [0; 2],
+    };
+    for (symbol, &count) in counts[..alphabet_size].iter().enumerate() {
+        if count != 0 {
+            if normalized.num_symbols < 2 {
+                normalized.symbols[normalized.num_symbols] = symbol;
+            }
+            normalized.num_symbols += 1;
+        }
+    }
+    if normalized.num_symbols == 1 {
+        normalized.method = 1;
+        normalized.counts[normalized.symbols[0]] = TABLE_SIZE as u16;
+        return Ok(normalized.histogram_bits()? as f32);
+    }
+    // Flat header bits do not read counts; each rebalance overwrites every bin.
+    let flat_sum = u128::from(total) * u128::from(log_table()[alphabet_size]) * 12;
+    let mut cost = normalized.histogram_bits()? as f32 + flat_sum as f32 * (1.0 / 2147483648.0);
+    let mut bins = [Bin::default(); MAX_ALPHABET_SIZE];
+    for shift in [0, 6, 11] {
+        normalized.method = shift + 1;
+        normalized.rebalance_with_scratch(&counts[..alphabet_size], total, &mut bins)?;
+        let sum: i64 = counts[..alphabet_size]
+            .iter()
+            .zip(normalized.counts.iter())
+            .map(|(&weight, &count)| weight as i64 * i64::from(log_table()[usize::from(count)]))
+            .sum();
+        let data_bits = (total as f32 - sum as f32 * (1.0 / 2147483648.0)) * 12.0;
+        let candidate = normalized.histogram_bits()? as f32 + data_bits;
+        if candidate < cost {
+            cost = candidate;
+        }
+    }
+    Ok(cost)
+}
+
 impl NormalizedHistogram {
     pub(super) fn compute(counts: &[u64], strategy: AnsHistogramStrategy) -> Result<Self> {
-        if counts.len() > MAX_ALPHABET_SIZE {
-            return Err(Error::InvalidInput(
-                "ANS histogram has more than 256 bins".into(),
-            ));
-        }
-        let total = counts.iter().try_fold(0u64, |sum, &count| {
-            sum.checked_add(count)
-                .filter(|&n| n <= i32::MAX as u64)
-                .ok_or(Error::Limit("ANS histogram weight total exceeds i32::MAX"))
-        })?;
-        let alphabet_size = counts.iter().rposition(|&n| n != 0).map_or(0, |n| n + 1);
+        let (total, alphabet_size) = input_shape(counts)?;
         let mut result = Self {
             counts: vec![0; alphabet_size.max(1)],
             cost: 0.0,
@@ -216,6 +278,12 @@ impl NormalizedHistogram {
         self.encode(&mut |bits, value| Ok(writer.write(bits, value)?))
     }
 
+    fn rebalance(&mut self, weights: &[u64], total: u64) -> Result<()> {
+        self.rebalance_with_scratch(weights, total, &mut [Bin::default(); MAX_ALPHABET_SIZE])
+    }
+}
+
+impl<Counts: AsRef<[u16]>> NormalizedHistogram<Counts> {
     pub(super) fn histogram_bits(&self) -> Result<usize> {
         let mut size = 0;
         self.encode(&mut |bits, _| {
@@ -226,6 +294,7 @@ impl NormalizedHistogram {
     }
 
     fn encode(&self, emit: &mut impl FnMut(u8, u64) -> Result<()>) -> Result<()> {
+        let counts = self.counts.as_ref();
         if self.method == 0 {
             emit(1, 0)?;
             emit(1, 1)?;
@@ -243,7 +312,7 @@ impl NormalizedHistogram {
                 }
             }
             if self.num_symbols == 2 {
-                emit(LOG_TABLE_SIZE, u64::from(self.counts[self.symbols[0]]))?;
+                emit(LOG_TABLE_SIZE, u64::from(counts[self.symbols[0]]))?;
             }
             return Ok(());
         }
@@ -262,7 +331,7 @@ impl NormalizedHistogram {
             if i == self.alphabet_size
                 || i == self.omit_pos
                 || i == self.omit_pos + 1
-                || self.counts[i] != self.counts[last]
+                || counts[i] != counts[last]
             {
                 same[last] = i - last;
                 last = i;
@@ -270,7 +339,7 @@ impl NormalizedHistogram {
         }
         let mut widths = [0u8; MAX_ALPHABET_SIZE];
         let mut omit_width = 10;
-        for (i, &count) in self.counts[..self.alphabet_size].iter().enumerate() {
+        for (i, &count) in counts[..self.alphabet_size].iter().enumerate() {
             if i != self.omit_pos && count > 0 {
                 widths[i] = floor_log2(u32::from(count)) + 1;
                 omit_width = omit_width.max(widths[i] + u8::from(i < self.omit_pos));
@@ -298,10 +367,10 @@ impl NormalizedHistogram {
                 if widths[i] > 1 && i != self.omit_pos {
                     let bitcount = population_precision(widths[i] - 1, shift);
                     let drop_bits = widths[i] - 1 - bitcount;
-                    debug_assert_eq!(self.counts[i] & ((1 << drop_bits) - 1), 0);
+                    debug_assert_eq!(counts[i] & ((1 << drop_bits) - 1), 0);
                     emit(
                         bitcount,
-                        u64::from((self.counts[i] >> drop_bits) - (1 << bitcount)),
+                        u64::from((counts[i] >> drop_bits) - (1 << bitcount)),
                     )?;
                 }
                 i += if same[i] >= 5 { same[i] } else { 1 };
@@ -309,20 +378,22 @@ impl NormalizedHistogram {
         }
         Ok(())
     }
+}
 
-    fn rebalance(&mut self, weights: &[u64], total: u64) -> Result<()> {
-        #[derive(Clone, Copy)]
-        struct Bin {
-            freq: i64,
-            count_index: usize,
-            bin_index: usize,
-        }
+impl<Counts: AsRef<[u16]> + AsMut<[u16]>> NormalizedHistogram<Counts> {
+    fn rebalance_with_scratch(
+        &mut self,
+        weights: &[u64],
+        total: u64,
+        bins: &mut [Bin; MAX_ALPHABET_SIZE],
+    ) -> Result<()> {
+        let counts = self.counts.as_mut();
         let shift = self.method - 1;
         let allowed = allowed_counts(shift);
         let ac = &allowed.entries;
         let logs = log_table();
         let norm = TABLE_SIZE as f64 / total as f64;
-        let mut bins = Vec::with_capacity(MAX_ALPHABET_SIZE);
+        let mut num_bins = 0;
         let mut remainder_pos = 0;
         let mut max_freq = 0i64;
         let mut rest = TABLE_SIZE as i32;
@@ -337,18 +408,27 @@ impl NormalizedHistogram {
                 .max(u32::from(weight > 0))
                 .min(TABLE_SIZE as u32 - 1);
             count &= !((1 << smallest_increment_log(count, shift)) - 1);
-            self.counts[n] = count as u16;
+            counts[n] = count as u16;
             rest -= count as i32;
             if target > 1.0 {
-                bins.push(Bin {
+                bins[num_bins] = Bin {
                     freq,
                     count_index: usize::from(allowed.indices[count as usize]),
                     bin_index: n,
-                });
+                };
+                num_bins += 1;
             }
         }
-        bins.retain(|bin| bin.bin_index != remainder_pos);
-        rest += i32::from(self.counts[remainder_pos]);
+        // Stable compaction preserves first-equal increment/decrement choices.
+        let mut retained = 0;
+        for i in 0..num_bins {
+            if bins[i].bin_index != remainder_pos {
+                bins[retained] = bins[i];
+                retained += 1;
+            }
+        }
+        let bins = &mut bins[..retained];
+        rest += i32::from(counts[remainder_pos]);
         if !bins.is_empty() {
             let max_log = ac[1].step_log;
             let mut balance_inc = [0i64; 11];
@@ -428,11 +508,11 @@ impl NormalizedHistogram {
                 }
             }
             for bin in bins {
-                self.counts[bin.bin_index] = ac[bin.count_index].count;
+                counts[bin.bin_index] = ac[bin.count_index].count;
             }
             for n in 0..remainder_pos {
-                if self.counts[n] >= 2048 {
-                    self.counts[remainder_pos] = self.counts[n];
+                if counts[n] >= 2048 {
+                    counts[remainder_pos] = counts[n];
                     remainder_pos = n;
                     break;
                 }
@@ -441,10 +521,9 @@ impl NormalizedHistogram {
         if !(1..TABLE_SIZE as i32).contains(&rest) {
             return Err(Error::Encoding("ANS histogram rebalancing failed".into()));
         }
-        self.counts[remainder_pos] = rest as u16;
+        counts[remainder_pos] = rest as u16;
         self.omit_pos = remainder_pos;
-        if self
-            .counts
+        if counts
             .iter()
             .map(|&count| usize::from(count))
             .sum::<usize>()
@@ -603,6 +682,164 @@ mod tests {
         AnsHistogramStrategy::Direct0,
         AnsHistogramStrategy::Direct6,
     ];
+
+    fn assert_fast_population_cost(counts: &[u64]) {
+        let expected = NormalizedHistogram::compute(counts, AnsHistogramStrategy::Fast).unwrap();
+        assert_eq!(
+            fast_population_cost(counts).unwrap().to_bits(),
+            expected.cost.to_bits(),
+            "counts={counts:?} method={}",
+            expected.method
+        );
+    }
+
+    fn population_fixtures() -> Vec<Vec<u64>> {
+        let mut fixtures = vec![
+            vec![2048, 2047, 1],
+            vec![1, 2, 3, 5, 8, 13, 16384],
+            vec![i32::MAX as u64 - 255, 1, 254],
+            vec![1_000_000; 256],
+            (0..256).map(|i| if i == 0 { 1 } else { 257 }).collect(),
+        ];
+        for size in [
+            3, 4, 5, 6, 7, 8, 15, 16, 17, 31, 32, 33, 63, 64, 127, 128, 255, 256,
+        ] {
+            fixtures.push(vec![1; size]);
+            fixtures.push(
+                (0..size)
+                    .map(|i| if i % 7 == 0 { 0 } else { (i * i + 1) as u64 })
+                    .collect(),
+            );
+            for omit in [0, size / 2, size - 1] {
+                let mut counts = vec![1; size];
+                counts[omit] = i32::MAX as u64 - size as u64 + 1;
+                fixtures.push(counts);
+            }
+        }
+        fixtures
+    }
+
+    #[test]
+    fn fast_population_cost_empty_singletons_and_pairs_match_compute_bits() {
+        for size in 0..=256 {
+            assert_fast_population_cost(&vec![0; size]);
+        }
+        for symbol in 0..256 {
+            for weight in [1, 4096, i32::MAX as u64] {
+                let mut counts = vec![0; 256];
+                counts[symbol] = weight;
+                assert_fast_population_cost(&counts);
+            }
+        }
+        for a in [0, 1, 15, 31, 127, 254] {
+            for b in [1, 16, 32, 128, 255] {
+                if a >= b {
+                    continue;
+                }
+                for weight in [1, 2048, i32::MAX as u64 - 1] {
+                    let mut counts = vec![0; 256];
+                    counts[a] = weight;
+                    counts[b] = 1;
+                    assert_fast_population_cost(&counts);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fast_population_cost_dense_sparse_rle_and_large_weights_match_compute_bits() {
+        for counts in population_fixtures() {
+            assert_fast_population_cost(&counts);
+            if counts.len() < 256 {
+                let mut padded = counts;
+                padded.resize(256, 0);
+                assert_fast_population_cost(&padded);
+            }
+        }
+        let mut state = 0x297a_3c41u32;
+        for case in 0..384 {
+            let length = case % 256 + 1;
+            let counts: Vec<_> = (0..length)
+                .map(|_| {
+                    state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+                    if state & 7 == 0 {
+                        0
+                    } else {
+                        u64::from((state >> 8) % (1 << (case % 17)))
+                    }
+                })
+                .collect();
+            assert_fast_population_cost(&counts);
+        }
+    }
+
+    #[test]
+    fn fast_population_cost_preserves_validation_errors_and_order() {
+        for counts in [
+            vec![0; 257],
+            vec![u64::MAX; 257],
+            vec![u64::MAX],
+            vec![u64::MAX, 1],
+            vec![i32::MAX as u64, 1],
+            vec![0, i32::MAX as u64 + 1, 0],
+        ] {
+            let expected =
+                NormalizedHistogram::compute(&counts, AnsHistogramStrategy::Fast).unwrap_err();
+            let actual = fast_population_cost(&counts).unwrap_err();
+            assert_eq!(actual.to_string(), expected.to_string());
+        }
+    }
+
+    #[test]
+    fn stack_scratch_preserves_all_fast_rebalances_counts_omission_and_bits() {
+        let mut bins = [Bin {
+            freq: i64::MIN,
+            count_index: usize::MAX,
+            bin_index: usize::MAX,
+        }; MAX_ALPHABET_SIZE];
+        let mut storage = [u16::MAX; MAX_ALPHABET_SIZE];
+        for counts in population_fixtures().into_iter().rev() {
+            let prototype =
+                NormalizedHistogram::compute(&counts, AnsHistogramStrategy::Direct0).unwrap();
+            let size = prototype.alphabet_size;
+            let weights = &counts[..size];
+            let total = counts.iter().sum();
+            for shift in [0, 6, 11] {
+                let mut expected = prototype.clone();
+                expected.method = shift + 1;
+                expected.rebalance(weights, total).unwrap();
+                storage.fill(u16::MAX);
+                let mut actual = NormalizedHistogram {
+                    counts: &mut storage[..size],
+                    cost: 0.0,
+                    method: shift + 1,
+                    omit_pos: usize::MAX,
+                    alphabet_size: size,
+                    num_symbols: prototype.num_symbols,
+                    symbols: prototype.symbols,
+                };
+                actual
+                    .rebalance_with_scratch(weights, total, &mut bins)
+                    .unwrap();
+                assert_eq!(&*actual.counts, expected.counts.as_slice());
+                assert_eq!(actual.omit_pos, expected.omit_pos);
+                assert_eq!(
+                    actual.histogram_bits().unwrap(),
+                    expected.histogram_bits().unwrap()
+                );
+                let mut writer = BitWriter::new(4096);
+                actual
+                    .encode(&mut |bits, value| Ok(writer.write(bits, value)?))
+                    .unwrap();
+                writer.zero_pad_to_byte().unwrap();
+                let mut oracle = BitWriter::new(4096);
+                expected.write(&mut oracle).unwrap();
+                oracle.zero_pad_to_byte().unwrap();
+                assert_eq!(writer.into_bytes().unwrap(), oracle.into_bytes().unwrap());
+                assert!(storage[size..].iter().all(|&count| count == u16::MAX));
+            }
+        }
+    }
 
     fn roundtrip(histogram: &NormalizedHistogram) {
         let mut writer = BitWriter::new(4096);

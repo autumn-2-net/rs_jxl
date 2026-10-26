@@ -107,6 +107,7 @@ pub struct JxlDecoder {
     box_parser: BoxParser,
     codestream_parser: CodestreamParser,
     jpeg_capture: Option<super::JxlJpegCoefficientCapture>,
+    native_integer_capture: Option<super::JxlNativeIntegerCapture>,
 }
 
 impl JxlDecoder {
@@ -118,6 +119,7 @@ impl JxlDecoder {
             box_parser,
             codestream_parser: CodestreamParser::new(),
             jpeg_capture: None,
+            native_integer_capture: None,
         }
     }
 
@@ -127,6 +129,10 @@ impl JxlDecoder {
     /// Internal buffers and scratch allocations are retained across resets to avoid repeated
     /// allocations when decoding multiple images.
     pub fn reset(&mut self) {
+        if let Some(capture) = self.native_integer_capture.take() {
+            capture.inner.abort();
+        }
+        self.codestream_parser.frame_info.native_integer_capture = None;
         if let Some(capture) = self.jpeg_capture.take() {
             capture.inner.abort();
         }
@@ -140,6 +146,9 @@ impl JxlDecoder {
     /// unsupported forms return errors instead of reencoding pixels.
     /// Pixel restoration filters do not affect the captured integer coefficients.
     pub fn enable_jpeg_coefficient_capture(&mut self) -> Result<super::JxlJpegCoefficientCapture> {
+        if self.native_integer_capture.is_some() {
+            return Err(Error::ApiUsageError("Native integer capture is enabled"));
+        }
         if self.jpeg_capture.is_some() {
             return Err(Error::ApiUsageError("JPEG capture is already enabled"));
         }
@@ -152,6 +161,42 @@ impl JxlDecoder {
             ))?;
         let capture = frame.enable_jpeg_coefficient_capture()?;
         self.jpeg_capture = Some(capture.clone());
+        Ok(capture)
+    }
+
+    /// Enables exact original-color Modular integer output before any input or
+    /// immediately after `BasicInfo`, before the first frame is constructed.
+    /// Normal pixel buffers are not populated in this mode. No CMS, spot-color
+    /// rendering, alpha conversion, or floating-point roundtrip is performed.
+    pub fn enable_native_integer_capture(&mut self) -> Result<super::JxlNativeIntegerCapture> {
+        if self.native_integer_capture.is_some()
+            || self.jpeg_capture.is_some()
+            || self
+                .codestream_parser
+                .frame_info
+                .current_frame_header()
+                .is_some()
+            || !self.scanned_frames().is_empty()
+        {
+            return Err(Error::ApiUsageError(
+                "Enable native integer capture once before the first frame",
+            ));
+        }
+        if self.options.scan_frames_only
+            || self.options.alpha_mode != super::AlphaMode::AsIs
+            || self.options.desired_intensity_target.is_some()
+        {
+            return Err(Error::NativeIntegerUnsupported(
+                "scan-only, alpha conversion or tone mapping",
+            ));
+        }
+        let inner =
+            crate::util::sync::Arc::new(crate::frame::native_integer::NativeIntegerCapture::new());
+        let capture = super::JxlNativeIntegerCapture {
+            inner: inner.clone(),
+        };
+        self.codestream_parser.frame_info.native_integer_capture = Some(inner);
+        self.native_integer_capture = Some(capture.clone());
         Ok(capture)
     }
 
@@ -344,6 +389,11 @@ impl JxlDecoder {
     /// needed to reconstruct any missing ones (or directly to the target frame if none are
     /// missing), skipping intermediate frames that are not stored.
     pub fn start_new_frame(&mut self, seek_target: VisibleFrameSeekTarget) -> Result<u64> {
+        if self.native_integer_capture.is_some() {
+            return Err(Error::NativeIntegerUnsupported(
+                "seeking during native integer capture",
+            ));
+        }
         if self.jpeg_capture.is_some() {
             return Err(Error::ApiUsageError(
                 "Reset the decoder before seeking with JPEG capture",
@@ -415,6 +465,11 @@ impl JxlDecoder {
             buffers,
             parallel_runner.unwrap_or(&mut SequentialRunner),
         );
+        if let Some(capture) = &self.native_integer_capture {
+            if matches!(&result, Err(error) if !matches!(error, Error::OutOfBounds(_))) {
+                capture.inner.abort();
+            }
+        }
         if let Some(capture) = &self.jpeg_capture {
             match &result {
                 Ok(Event::FrameComplete { .. }) => {

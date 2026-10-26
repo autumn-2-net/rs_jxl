@@ -13,12 +13,15 @@ use super::super::ma_train::PropertyQuantization;
 use super::super::ma_train::Sample;
 use super::super::predictor::Predictor;
 use super::super::tree::pack_signed;
+#[cfg(test)]
 use crate::entropy::hybrid_uint::HybridUintConfig;
 use crate::{Error, Result};
 
 const UNUSED: u32 = u32::MAX;
 const A: u64 = 0x1e35_a7bd;
 const B: u64 = 0x1e35_a7bd_1e35_a7bd;
+const MAX_CACHED_HASHES: usize = 1 << 20;
+const MAX_CONCAT_PAYLOAD_BYTES: usize = 64 << 20;
 
 pub(crate) enum GatherColumn {
     Packed(Vec<u8>),
@@ -73,6 +76,78 @@ pub(crate) struct PreparedSamples {
 impl PreparedSamples {
     pub(crate) fn len(&self) -> usize {
         self.counts.len()
+    }
+
+    fn validate_concat(&self) -> Result<usize> {
+        let ids = &self.quantization.properties;
+        if self.predictors.is_empty()
+            || self.predictors.len() > 14
+            || ids.is_empty()
+            || ids.len() >= 64
+            || ids.len() != self.quantization.thresholds.len()
+            || self.properties.len() != ids.len()
+            || self.residuals.len() != self.predictors.len()
+            || ids.iter().enumerate().any(|(p, &id)| {
+                id >= 256
+                    || ids[..p].contains(&id)
+                    || self.quantization.thresholds[p]
+                        .windows(2)
+                        .any(|w| w[0] >= w[1])
+                    || (id >= 2 && self.quantization.thresholds[p].len() >= 256)
+            })
+        {
+            return Err(Error::InvalidInput("invalid MA concat schema".into()));
+        }
+        let rows = self.len();
+        if rows > UNUSED as usize {
+            return Err(Error::Limit("MA gather index exceeds source u32"));
+        }
+        if self.total > i32::MAX as u64 {
+            return Err(Error::Limit("MA sample weight exceeds source i32::MAX"));
+        }
+        let mut total = 0u64;
+        for &count in &self.counts {
+            if count == 0 {
+                return Err(Error::InvalidInput("zero MA concat multiplicity".into()));
+            }
+            total = total
+                .checked_add(u64::from(count))
+                .filter(|&n| n <= i32::MAX as u64)
+                .ok_or(Error::Limit("MA sample weight exceeds source i32::MAX"))?;
+        }
+        if total != self.total {
+            return Err(Error::InvalidInput("MA concat total mismatch".into()));
+        }
+        let mut row_bytes = self
+            .residuals
+            .len()
+            .checked_mul(std::mem::size_of::<[u8; 2]>())
+            .and_then(|bytes| bytes.checked_add(std::mem::size_of::<u16>()))
+            .ok_or(Error::Limit("MA concat payload overflow"))?;
+        for (&id, column) in ids.iter().zip(&self.properties) {
+            let bytes = match column {
+                GatherColumn::Packed(values) if id >= 2 && values.len() == rows => 1,
+                GatherColumn::Static(values) if id < 2 && values.len() == rows => 4,
+                _ => {
+                    return Err(Error::InvalidInput(
+                        "invalid MA concat property column".into(),
+                    ));
+                }
+            };
+            row_bytes = row_bytes
+                .checked_add(bytes)
+                .ok_or(Error::Limit("MA concat payload overflow"))?;
+        }
+        if self.residuals.iter().any(|column| column.len() != rows) {
+            return Err(Error::InvalidInput(
+                "invalid MA concat residual column".into(),
+            ));
+        }
+        #[cfg(test)]
+        if self.static_ids.len() != rows {
+            return Err(Error::InvalidInput("invalid MA concat static IDs".into()));
+        }
+        Ok(row_bytes)
     }
 
     /// Preserve the complete quantized objective for the existing train API.
@@ -165,6 +240,14 @@ fn table_slots(records: usize) -> Result<usize> {
         .ok_or(Error::Limit("MA gather table capacity overflow"))
 }
 
+fn concat_allowed(rows: usize, total: u64, row_bytes: usize, payload_limit: usize) -> bool {
+    // ceil(99 * total / 100), without multiplying a potentially large total.
+    rows as u64 >= total - total / 100
+        && rows
+            .checked_mul(row_bytes)
+            .is_some_and(|bytes| bytes <= payload_limit.min(MAX_CONCAT_PAYLOAD_BYTES))
+}
+
 /// Source double expression converted to size_t only after adding 64.
 pub(super) fn expected_samples(fraction: f64, width: usize, rows: usize) -> Result<usize> {
     let value = fraction * rows as f64 * width as f64 + 64.0;
@@ -196,11 +279,34 @@ fn hashes(
     [first, second]
 }
 
+/// Only the token and bit count of HybridUintConfig(4, 1, 2) are stored.
+#[inline]
+fn residual_token(value: i32) -> [u8; 2] {
+    let packed = pack_signed(value);
+    if packed < 16 {
+        [packed as u8, 0]
+    } else {
+        // nbits = floor(log2(packed)) - 3, in 1..=28. The base token
+        // 16 + (exponent - 4) * 8 is (nbits + 1) * 8; its low three
+        // bits hold the next-highest bit and the two low bits of packed.
+        let nbits = 28 - packed.leading_zeros();
+        let token = ((nbits + 1) << 3) | ((packed >> nbits) & 4) | (packed & 3);
+        [token as u8, nbits as u8]
+    }
+}
+
 pub(super) struct SourceSampleCollector {
     prepared: PreparedSamples,
     table: Vec<u32>,
     property_order: Vec<usize>,
-    config: HybridUintConfig,
+    property_luts: Vec<Vec<u8>>,
+    required_properties: usize,
+    // The schema is fixed; channel/group IDs usually repeat for a whole stripe.
+    static_bins: [Option<(i32, u32)>; 2],
+    // Keys do not change when weights merge; saturated rows still need hashes
+    // during append. Only this prefix is cached, never the learner's columns.
+    cached_hashes: Vec<[u64; 2]>,
+    hash_limit: usize,
     reserved_rows: usize,
 }
 
@@ -208,6 +314,7 @@ impl SourceSampleCollector {
     pub(super) fn new(
         predictors: &[Predictor],
         quantization: &PropertyQuantization,
+        cache_hashes: bool,
     ) -> Result<Self> {
         let ids = &quantization.properties;
         if predictors.is_empty()
@@ -236,6 +343,29 @@ impl SourceSampleCollector {
                     .map(|(p, _)| p),
             )
             .collect();
+        // Dynamic properties have only 1023 possible clamped values. Build
+        // their exact bins once; empty tables retain the wide/static search.
+        let mut property_luts = Vec::new();
+        property_luts
+            .try_reserve_exact(ids.len())
+            .map_err(|_| Error::Limit("MA gather quantization allocation"))?;
+        for (&id, thresholds) in ids.iter().zip(&quantization.thresholds) {
+            let mut lut = Vec::new();
+            if id >= 2 && thresholds.len() <= usize::from(u8::MAX) {
+                lut.try_reserve_exact(1023)
+                    .map_err(|_| Error::Limit("MA gather quantization allocation"))?;
+                let mut bin = 0u8;
+                for value in -511..=511 {
+                    while usize::from(bin) < thresholds.len()
+                        && value > thresholds[usize::from(bin)]
+                    {
+                        bin += 1;
+                    }
+                    lut.push(bin);
+                }
+            }
+            property_luts.push(lut);
+        }
         Ok(Self {
             prepared: PreparedSamples {
                 predictors: predictors.to_vec(),
@@ -258,9 +388,25 @@ impl SourceSampleCollector {
             },
             table: Vec::new(),
             property_order,
-            config: HybridUintConfig::new(4, 1, 2).map_err(|e| Error::Encoding(e.to_string()))?,
+            property_luts,
+            required_properties: ids.iter().copied().max().unwrap_or(1).max(1) + 1,
+            static_bins: [None; 2],
+            cached_hashes: Vec::new(),
+            hash_limit: if cache_hashes { MAX_CACHED_HASHES } else { 0 },
             reserved_rows: 0,
         })
+    }
+
+    fn reserve_hashes(&mut self, records: usize) -> Result<()> {
+        let required = records.min(self.hash_limit);
+        let capacity = self.cached_hashes.capacity();
+        if required > capacity {
+            let target = required.max(capacity + capacity / 2).min(self.hash_limit);
+            self.cached_hashes
+                .try_reserve_exact(target - self.cached_hashes.len())
+                .map_err(|_| Error::Limit("MA gather hash allocation"))?;
+        }
+        Ok(())
     }
 
     fn reserve_columns(&mut self, extra: usize) -> Result<()> {
@@ -271,6 +417,7 @@ impl SourceSampleCollector {
             reserve(column, extra)?;
         }
         reserve(&mut self.prepared.counts, extra)?;
+        self.reserve_hashes(self.prepared.len().saturating_add(extra))?;
         self.reserved_rows = self
             .prepared
             .properties
@@ -280,12 +427,28 @@ impl SourceSampleCollector {
             .chain([self.prepared.counts.capacity()])
             .min()
             .unwrap_or(0);
+        // Only the cached prefix needs hash capacity. At the cap, subsequent
+        // records use the original hashing/comparison path without allocation.
+        if self.cached_hashes.capacity() < self.hash_limit {
+            self.reserved_rows = self.reserved_rows.min(self.cached_hashes.capacity());
+        }
         #[cfg(test)]
         {
             reserve(&mut self.prepared.static_ids, extra)?;
             self.reserved_rows = self.reserved_rows.min(self.prepared.static_ids.capacity());
         }
         Ok(())
+    }
+
+    fn row_hash(&self, row: usize) -> [u64; 2] {
+        self.cached_hashes.get(row).copied().unwrap_or_else(|| {
+            hashes(
+                self.prepared.residuals.iter().map(|column| column[row]),
+                self.property_order
+                    .iter()
+                    .map(|&p| self.prepared.properties[p].value(row)),
+            )
+        })
     }
 
     /// Called once per channel/stripe, or once for a complete appended wave.
@@ -309,12 +472,7 @@ impl SourceSampleCollector {
         self.table = table;
         for row in 0..self.prepared.len() {
             if self.prepared.counts[row] != u16::MAX {
-                let hash = hashes(
-                    self.prepared.residuals.iter().map(|column| column[row]),
-                    self.property_order
-                        .iter()
-                        .map(|&p| self.prepared.properties[p].value(row)),
-                );
+                let hash = self.row_hash(row);
                 self.register(row, self.positions(hash));
             }
         }
@@ -339,14 +497,26 @@ impl SourceSampleCollector {
         properties: &[u32],
         residuals: &[[u8; 2]],
         ids: [i32; 2],
+        weight: u32,
+    ) -> Result<()> {
+        let hash = hashes(
+            residuals.iter().copied(),
+            self.property_order.iter().map(|&p| properties[p]),
+        );
+        self.insert_hashed(properties, residuals, ids, weight, hash)
+    }
+
+    fn insert_hashed(
+        &mut self,
+        properties: &[u32],
+        residuals: &[[u8; 2]],
+        ids: [i32; 2],
         mut weight: u32,
+        hash: [u64; 2],
     ) -> Result<()> {
         #[cfg(not(test))]
         let _ = ids;
-        let positions = self.positions(hashes(
-            residuals.iter().copied(),
-            self.property_order.iter().map(|&p| properties[p]),
-        ));
+        let positions = self.positions(hash);
         while weight != 0 {
             let mut remaining = weight.min(u32::from(u16::MAX)) as u16;
             weight -= u32::from(remaining);
@@ -356,6 +526,13 @@ impl SourceSampleCollector {
                     continue;
                 }
                 let row = previous as usize;
+                if self
+                    .cached_hashes
+                    .get(row)
+                    .is_some_and(|&cached| cached != hash)
+                {
+                    continue;
+                }
                 if !self
                     .prepared
                     .residuals
@@ -400,6 +577,11 @@ impl SourceSampleCollector {
                 column.push(value);
             }
             self.prepared.counts.push(remaining);
+            if row < self.hash_limit {
+                debug_assert_eq!(self.cached_hashes.len(), row);
+                debug_assert!(self.cached_hashes.len() < self.cached_hashes.capacity());
+                self.cached_hashes.push(hash);
+            }
             #[cfg(test)]
             self.prepared.static_ids.push(ids);
             if remaining != u16::MAX {
@@ -415,14 +597,8 @@ impl SourceSampleCollector {
         residuals: &[i32],
         weight: u32,
     ) -> Result<()> {
-        if properties.len() < 2
+        if properties.len() < self.required_properties
             || residuals.len() != self.prepared.predictors.len()
-            || self
-                .prepared
-                .quantization
-                .properties
-                .iter()
-                .any(|&p| p >= properties.len())
         {
             return Err(Error::InvalidInput(
                 "invalid MA gather sample dimensions".into(),
@@ -444,18 +620,31 @@ impl SourceSampleCollector {
             .ok_or(Error::Limit("MA sample weight exceeds source i32::MAX"))?;
         let mut bins = [0; 64];
         for (p, &id) in self.prepared.quantization.properties.iter().enumerate() {
-            let value = if id < 2 {
-                properties[id]
-            } else {
-                properties[id].clamp(-511, 511)
+            if id < 2 {
+                let value = properties[id];
+                bins[p] = match self.static_bins[id] {
+                    Some((previous, bin)) if previous == value => bin,
+                    _ => {
+                        let bin = self.prepared.quantization.thresholds[p]
+                            .partition_point(|&t| value > t)
+                            as u32;
+                        self.static_bins[id] = Some((value, bin));
+                        bin
+                    }
+                };
+                continue;
+            }
+            let value = properties[id].clamp(-511, 511);
+            bins[p] = match self.property_luts[p].get((i64::from(value) + 511) as usize) {
+                Some(&bin) => u32::from(bin),
+                None => {
+                    self.prepared.quantization.thresholds[p].partition_point(|&t| value > t) as u32
+                }
             };
-            bins[p] =
-                self.prepared.quantization.thresholds[p].partition_point(|&t| value > t) as u32;
         }
         let mut tokens = [[0; 2]; 14];
         for (token, &value) in tokens.iter_mut().zip(residuals) {
-            let encoded = self.config.encode(pack_signed(value));
-            *token = [encoded.token as u8, encoded.nbits as u8];
+            *token = residual_token(value);
         }
         self.insert(
             &bins[..self.prepared.properties.len()],
@@ -503,17 +692,104 @@ impl SourceSampleCollector {
                 let ids = batch.prepared.static_ids[row];
                 #[cfg(not(test))]
                 let ids = [0; 2];
-                self.insert(
+                let hash = batch.cached_hashes.get(row).copied().unwrap_or_else(|| {
+                    hashes(
+                        tokens[..batch.prepared.residuals.len()].iter().copied(),
+                        batch.property_order.iter().map(|&p| bins[p]),
+                    )
+                });
+                self.insert_hashed(
                     &bins[..batch.prepared.properties.len()],
                     &tokens[..batch.prepared.residuals.len()],
                     ids,
                     u32::from(batch.prepared.counts[row]),
+                    hash,
                 )?;
             }
             // Drop each consumed batch and its table before the next one.
         }
         self.prepared.total = total;
         Ok(())
+    }
+
+    /// Terminal, opt-in single-wave merge. Local weights are retained exactly;
+    /// extra cross-batch records may change record-count-based search heuristics.
+    pub(super) fn finish_appended(self, batches: Vec<Self>) -> Result<PreparedSamples> {
+        self.finish_appended_with_limit(batches, MAX_CONCAT_PAYLOAD_BYTES)
+    }
+
+    // A smaller private limit lets tests exercise the real fallback cheaply.
+    fn finish_appended_with_limit(
+        mut self,
+        batches: Vec<Self>,
+        payload_limit: usize,
+    ) -> Result<PreparedSamples> {
+        let row_bytes = self.prepared.validate_concat()?;
+        let mut rows = self.prepared.len();
+        let mut total = self.prepared.total;
+        for batch in &batches {
+            if self.prepared.predictors != batch.prepared.predictors
+                || self.prepared.quantization != batch.prepared.quantization
+            {
+                return Err(Error::InvalidInput("incompatible MA gather batches".into()));
+            }
+            batch.prepared.validate_concat()?;
+            rows = rows
+                .checked_add(batch.prepared.len())
+                .filter(|&n| n <= UNUSED as usize)
+                .ok_or(Error::Limit("MA gather index exceeds source u32"))?;
+            total = total
+                .checked_add(batch.prepared.total)
+                .filter(|&n| n <= i32::MAX as u64)
+                .ok_or(Error::Limit("MA sample weight exceeds source i32::MAX"))?;
+        }
+        if !concat_allowed(rows, total, row_bytes, payload_limit) {
+            self.append(batches)?;
+            return Ok(self.finish());
+        }
+
+        // Drop every index/hash cache before allocating destination columns.
+        // Consuming collectors prevents later insertion with a stale index.
+        let mut prepared_batches = Vec::new();
+        prepared_batches
+            .try_reserve_exact(batches.len())
+            .map_err(|_| Error::Limit("MA concat batch allocation"))?;
+        for batch in batches {
+            prepared_batches.push(batch.finish());
+        }
+        let mut output = self.finish();
+        let extra = rows - output.len();
+        for column in &mut output.properties {
+            column.reserve(extra)?;
+        }
+        for column in &mut output.residuals {
+            reserve(column, extra)?;
+        }
+        reserve(&mut output.counts, extra)?;
+        #[cfg(test)]
+        reserve(&mut output.static_ids, extra)?;
+        for mut batch in prepared_batches {
+            for (destination, source) in output.properties.iter_mut().zip(batch.properties) {
+                match (destination, source) {
+                    (GatherColumn::Packed(destination), GatherColumn::Packed(mut source)) => {
+                        destination.append(&mut source);
+                    }
+                    (GatherColumn::Static(destination), GatherColumn::Static(mut source)) => {
+                        destination.append(&mut source);
+                    }
+                    _ => unreachable!("concat property layout validated before allocation"),
+                }
+            }
+            for (destination, mut source) in output.residuals.iter_mut().zip(batch.residuals) {
+                destination.append(&mut source);
+            }
+            output.counts.append(&mut batch.counts);
+            #[cfg(test)]
+            output.static_ids.append(&mut batch.static_ids);
+        }
+        output.total = total;
+        debug_assert_eq!(output.len(), rows);
+        Ok(output)
     }
 
     /// AllSamplesDone: the invocation-local index table is not handed to search.
@@ -523,16 +799,29 @@ impl SourceSampleCollector {
 }
 
 #[cfg(test)]
+#[path = "gather_concat_tests.rs"]
+mod concat_tests;
+
+#[cfg(test)]
+#[path = "gather_push_tests.rs"]
+mod push_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
     fn collector() -> SourceSampleCollector {
+        collector_with_hashes(false)
+    }
+
+    fn collector_with_hashes(cache_hashes: bool) -> SourceSampleCollector {
         SourceSampleCollector::new(
             &[Predictor::Zero],
             &PropertyQuantization {
                 properties: vec![0, 1, 9],
                 thresholds: vec![vec![0], vec![3], vec![-2, 0, 2]],
             },
+            cache_hashes,
         )
         .unwrap()
     }
@@ -542,6 +831,373 @@ mod tests {
         p[1] = 3;
         p[9] = value;
         p
+    }
+
+    #[test]
+    fn source_quantization_lut_matches_every_clamped_value_and_bin_width() {
+        let mut cases: Vec<Vec<i32>> = [0, 1, 2, 17, 127, 254, 255]
+            .into_iter()
+            .map(|count| (0..count).map(|i| -511 + i * 4).collect())
+            .collect();
+        cases.push(vec![i32::MIN, -512, -511, -1, 0, 1, 511, 512, i32::MAX]);
+        cases.push((-1000..-745).collect());
+        cases.push((1000..1255).collect());
+        for thresholds in cases {
+            let c = SourceSampleCollector::new(
+                &[Predictor::Zero],
+                &PropertyQuantization {
+                    properties: vec![9, 1, 0],
+                    thresholds: vec![thresholds.clone(), vec![i32::MIN, i32::MAX], vec![]],
+                },
+                false,
+            )
+            .unwrap();
+            assert_eq!(c.property_luts[0].len(), 1023);
+            assert!(c.property_luts[1].is_empty());
+            assert!(c.property_luts[2].is_empty());
+            for value in -511..=511 {
+                assert_eq!(
+                    usize::from(c.property_luts[0][(value + 511) as usize]),
+                    thresholds.partition_point(|&t| value > t),
+                    "value={value} thresholds={thresholds:?}",
+                );
+            }
+        }
+    }
+
+    fn assert_same_collector(actual: &SourceSampleCollector, expected: &SourceSampleCollector) {
+        assert_eq!(actual.table, expected.table);
+        assert_eq!(actual.prepared.total, expected.prepared.total);
+        assert_eq!(actual.prepared.counts, expected.prepared.counts);
+        assert_eq!(actual.prepared.residuals, expected.prepared.residuals);
+        assert_eq!(actual.prepared.static_ids, expected.prepared.static_ids);
+        assert_eq!(
+            actual.prepared.properties.len(),
+            expected.prepared.properties.len()
+        );
+        for (a, b) in actual
+            .prepared
+            .properties
+            .iter()
+            .zip(&expected.prepared.properties)
+        {
+            match (a, b) {
+                (GatherColumn::Packed(a), GatherColumn::Packed(b)) => assert_eq!(a, b),
+                (GatherColumn::Static(a), GatherColumn::Static(b)) => assert_eq!(a, b),
+                _ => panic!("property storage changed"),
+            }
+        }
+        for collector in [actual, expected] {
+            assert_eq!(
+                collector.cached_hashes.len(),
+                collector.prepared.len().min(collector.hash_limit),
+            );
+            assert!(collector.cached_hashes.capacity() <= collector.hash_limit);
+            for (row, &cached) in collector.cached_hashes.iter().enumerate() {
+                assert_eq!(
+                    cached,
+                    hashes(
+                        collector
+                            .prepared
+                            .residuals
+                            .iter()
+                            .map(|column| column[row]),
+                        collector
+                            .property_order
+                            .iter()
+                            .map(|&p| collector.prepared.properties[p].value(row)),
+                    ),
+                );
+            }
+        }
+    }
+
+    fn hash_collector(limit: usize) -> SourceSampleCollector {
+        assert!(limit <= MAX_CACHED_HASHES);
+        let mut result = collector_with_hashes(limit != 0);
+        result.hash_limit = limit;
+        result
+    }
+
+    #[test]
+    fn source_hash_cache_switch_disables_allocations_without_changing_records() {
+        let mut cached = collector_with_hashes(true);
+        let mut uncached = collector_with_hashes(false);
+        assert_eq!(cached.hash_limit, MAX_CACHED_HASHES);
+        assert_eq!(uncached.hash_limit, 0);
+        for extra in [1, 128, 0] {
+            cached.prepare(extra).unwrap();
+            uncached.prepare(extra).unwrap();
+            for i in 0..32 {
+                cached.push(&properties(i), &[i], 1).unwrap();
+                uncached.push(&properties(i), &[i], 1).unwrap();
+            }
+            assert!(!cached.cached_hashes.is_empty());
+            assert_eq!(uncached.cached_hashes.capacity(), 0);
+            assert_same_collector(&cached, &uncached);
+        }
+    }
+
+    #[test]
+    fn source_hash_cache_matches_uncached_overshoot_rebuilds_and_saturation() {
+        for limit in [0, 1, 2, 7, 64] {
+            let mut actual = hash_collector(limit);
+            let mut expected = hash_collector(0);
+            for extra in [1, 0, 128, 0] {
+                actual.prepare(extra).unwrap();
+                expected.prepare(extra).unwrap();
+                let table_size = actual.table.len();
+                for i in 0..128 {
+                    let value = [i32::MIN, i32::MAX, -511, -1, 0, 511][i % 6];
+                    let mut p = properties(value);
+                    p[0] = (i % 3) as i32;
+                    let residual = value.wrapping_add(i as i32);
+                    for weight in [1, 0, 65_534, 1, 2, 65_536] {
+                        actual.push(&p, &[residual], weight).unwrap();
+                        expected.push(&p, &[residual], weight).unwrap();
+                    }
+                }
+                assert_eq!(
+                    actual.table.len(),
+                    table_size,
+                    "overshoot cannot resize slots"
+                );
+                assert_same_collector(&actual, &expected);
+            }
+            assert!(actual.prepared.len() > limit);
+            assert!(actual.prepared.counts.contains(&u16::MAX));
+            assert!(matches!(
+                actual.push(&properties(0), &[0], u32::MAX),
+                Err(Error::Limit(_))
+            ));
+            assert!(matches!(
+                expected.push(&properties(0), &[0], u32::MAX),
+                Err(Error::Limit(_))
+            ));
+            assert_same_collector(&actual, &expected);
+        }
+    }
+
+    #[test]
+    fn source_hash_cache_mixed_append_keeps_records_and_preflight_errors() {
+        for master_limit in [0, 3, 64] {
+            let mut actual = hash_collector(master_limit);
+            let mut expected = hash_collector(0);
+            actual.prepare(1).unwrap();
+            expected.prepare(1).unwrap();
+            actual.push(&properties(-7), &[i32::MIN], 65_534).unwrap();
+            expected.push(&properties(-7), &[i32::MIN], 65_534).unwrap();
+            for wave in 0..3 {
+                let mut batches = Vec::new();
+                let mut reference_batches = Vec::new();
+                for batch_limit in [64, 0, 2] {
+                    let mut batch = hash_collector(batch_limit);
+                    let mut reference = hash_collector(0);
+                    batch.prepare(1).unwrap();
+                    reference.prepare(1).unwrap();
+                    for i in 0..17 {
+                        let p = properties(-7 + i);
+                        let residual = if i % 3 == 0 { i32::MIN } else { i + wave };
+                        let weight = if i % 4 == 0 { 65_537 } else { 1 };
+                        batch.push(&p, &[residual], weight).unwrap();
+                        reference.push(&p, &[residual], weight).unwrap();
+                    }
+                    assert_same_collector(&batch, &reference);
+                    batches.push(batch);
+                    reference_batches.push(reference);
+                }
+                batches.push(hash_collector(0));
+                reference_batches.push(hash_collector(0));
+                actual.append(batches).unwrap();
+                expected.append(reference_batches).unwrap();
+                assert_same_collector(&actual, &expected);
+                actual.prepare(0).unwrap();
+                expected.prepare(0).unwrap();
+                assert_same_collector(&actual, &expected);
+            }
+            let mut incompatible = hash_collector(2);
+            incompatible.prepared.quantization.thresholds[2][0] -= 1;
+            assert!(matches!(
+                actual.append(vec![incompatible]),
+                Err(Error::InvalidInput(_))
+            ));
+            assert_same_collector(&actual, &expected);
+            let mut overweight = hash_collector(0);
+            overweight.prepared.total = i32::MAX as u64;
+            assert!(matches!(
+                actual.append(vec![overweight]),
+                Err(Error::Limit(_))
+            ));
+            assert_same_collector(&actual, &expected);
+        }
+    }
+
+    #[test]
+    fn source_hash_cache_full_collision_still_checks_keys_and_retains_misses() {
+        let mut c = hash_collector(4);
+        c.prepare(2).unwrap();
+        // Deliberately force equal full hashes for unequal keys. Hash equality
+        // may only select the old exact comparison, never prove a match.
+        let hash = [0, 1 << 16];
+        let first = [0, 0, 0];
+        let second = [1, 0, 0];
+        c.insert_hashed(&first, &[[1, 0]], [0, 3], 1, hash).unwrap();
+        c.insert_hashed(&second, &[[1, 0]], [0, 3], 1, hash)
+            .unwrap();
+        let slots = c.table.clone();
+        assert_eq!(&slots[..2], &[0, 1]);
+        for _ in 0..2 {
+            c.insert_hashed(&first, &[[2, 0]], [0, 3], 1, hash).unwrap();
+        }
+        c.insert_hashed(&first, &[[1, 0]], [0, 3], 1, hash).unwrap();
+        assert_eq!(c.table, slots);
+        assert_eq!(c.prepared.counts, [2, 1, 1, 1]);
+        assert_eq!(c.prepared.residuals[0], [[1, 0], [1, 0], [2, 0], [2, 0]]);
+        assert_eq!(c.cached_hashes, [hash; 4]);
+    }
+
+    #[test]
+    fn source_hash_cache_reservation_caps_at_sixteen_mib() {
+        let mut c = hash_collector(MAX_CACHED_HASHES);
+        c.reserve_hashes(usize::MAX).unwrap();
+        assert_eq!(c.cached_hashes.capacity(), MAX_CACHED_HASHES);
+        assert_eq!(
+            c.cached_hashes.capacity() * std::mem::size_of::<[u64; 2]>(),
+            16 << 20
+        );
+        assert!(c.cached_hashes.is_empty());
+        let pointer = c.cached_hashes.as_ptr();
+        c.reserve_hashes(0).unwrap();
+        c.reserve_hashes(MAX_CACHED_HASHES + 1).unwrap();
+        assert_eq!(c.cached_hashes.as_ptr(), pointer);
+        assert_eq!(c.cached_hashes.capacity(), MAX_CACHED_HASHES);
+        assert!(c.prepare(usize::MAX).is_err());
+        assert!(c.prepared.counts.is_empty());
+    }
+
+    #[test]
+    fn source_quantization_lut_preserves_hash_merge_saturation_and_table_lifetime() {
+        let quantization = PropertyQuantization {
+            properties: vec![9, 1, 0, 2],
+            thresholds: vec![
+                (-511..509).step_by(4).collect(),
+                (-600..600).collect(),
+                vec![i32::MIN, -1, 0, i32::MAX],
+                vec![i32::MIN, -512, -511, 0, 511, 512, i32::MAX],
+            ],
+        };
+        let make = || {
+            SourceSampleCollector::new(
+                &[Predictor::Weighted, Predictor::Gradient],
+                &quantization,
+                false,
+            )
+            .unwrap()
+        };
+        let mut actual = make();
+        let mut reference = make();
+        for lut in &mut reference.property_luts {
+            lut.clear();
+        }
+        let pointers: Vec<_> = actual.property_luts.iter().map(Vec::as_ptr).collect();
+        let values: Vec<_> = [i32::MIN, i32::MAX, -512, -511, 511, 512]
+            .into_iter()
+            .chain(-520..=520)
+            .collect();
+        for extra in [1, 0, 4096, 0] {
+            actual.prepare(extra).unwrap();
+            reference.prepare(extra).unwrap();
+            for (i, &value) in values.iter().enumerate() {
+                let mut p = properties(value);
+                p[0] = [i32::MIN, -1, 0, 1, i32::MAX][i % 5];
+                p[1] = value;
+                p[2] = value;
+                let residuals = [value, value.wrapping_neg()];
+                for weight in [1, 0, u32::from(u16::MAX), 2] {
+                    actual.push(&p, &residuals, weight).unwrap();
+                    reference.push(&p, &residuals, weight).unwrap();
+                }
+            }
+            assert_same_collector(&actual, &reference);
+            assert_eq!(
+                actual
+                    .property_luts
+                    .iter()
+                    .map(Vec::as_ptr)
+                    .collect::<Vec<_>>(),
+                pointers,
+            );
+        }
+        let mut batch = make();
+        let mut reference_batch = make();
+        for lut in &mut reference_batch.property_luts {
+            lut.clear();
+        }
+        batch.prepare(1).unwrap();
+        reference_batch.prepare(1).unwrap();
+        for value in [i32::MIN, 0, i32::MAX] {
+            batch.push(&properties(value), &[0, 0], 65_537).unwrap();
+            reference_batch
+                .push(&properties(value), &[0, 0], 65_537)
+                .unwrap();
+        }
+        actual.append(vec![batch]).unwrap();
+        reference.append(vec![reference_batch]).unwrap();
+        assert_same_collector(&actual, &reference);
+        assert_eq!(
+            actual
+                .property_luts
+                .iter()
+                .map(Vec::as_ptr)
+                .collect::<Vec<_>>(),
+            pointers,
+        );
+    }
+
+    #[test]
+    fn source_quantization_lut_keeps_schema_and_sample_errors() {
+        for thresholds in [(0..256).collect(), vec![1, 1], vec![1, 0]] {
+            assert!(matches!(
+                SourceSampleCollector::new(
+                    &[Predictor::Zero],
+                    &PropertyQuantization {
+                        properties: vec![9],
+                        thresholds: vec![thresholds]
+                    },
+                    false,
+                ),
+                Err(Error::InvalidInput(_)),
+            ));
+        }
+        let mut c = SourceSampleCollector::new(
+            &[Predictor::Zero],
+            &PropertyQuantization {
+                properties: vec![0],
+                thresholds: vec![(0..1024).collect()],
+            },
+            false,
+        )
+        .unwrap();
+        assert!(c.property_luts[0].is_empty());
+        assert!(matches!(
+            c.push(&[i32::MAX, 0], &[0], 1),
+            Err(Error::InvalidInput(_))
+        ));
+        assert!(c.push(&[i32::MAX, 0], &[0], 0).is_ok());
+        c.prepare(1).unwrap();
+        c.push(&[i32::MAX, 0], &[0], 1).unwrap();
+        assert_eq!(c.prepared.properties[0].value(0), 1024);
+        assert!(matches!(c.push(&[0], &[0], 0), Err(Error::InvalidInput(_))));
+        assert!(matches!(
+            c.push(&[0, 0], &[], 1),
+            Err(Error::InvalidInput(_))
+        ));
+        assert!(matches!(
+            c.push(&[0, 0], &[0], u32::MAX),
+            Err(Error::Limit(_))
+        ));
+        assert_eq!(c.prepared.total, 1);
+        assert_eq!(c.prepared.counts, [1]);
     }
 
     #[test]
@@ -649,6 +1305,7 @@ mod tests {
                 properties: vec![9, 1, 0],
                 thresholds: vec![vec![0], vec![3], vec![0]],
             },
+            false,
         )
         .unwrap();
         assert_eq!(reordered.property_order, [2, 1, 0]);

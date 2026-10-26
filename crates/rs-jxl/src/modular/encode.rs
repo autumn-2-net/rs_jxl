@@ -14,6 +14,15 @@ use crate::entropy::stream::{Coding, Model, Token};
 use crate::tools::lz77::{self, Command, Lz77Options};
 use crate::{Error, Image, Result, bit_writer::BitWriter};
 
+#[path = "receipt.rs"]
+pub mod receipt;
+#[path = "receipt_cost.rs"]
+pub mod receipt_cost;
+
+#[cfg(test)]
+#[path = "receipt_cost_tests.rs"]
+mod receipt_cost_tests;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FixedTree {
     Zero,
@@ -29,6 +38,15 @@ pub struct ModularOptions {
     pub weighted_preset: u8,
     pub tree_samples: usize,
     pub max_tree_leaves: usize,
+    /// Separate complete-tree ceiling for source learning. None preserves the
+    /// legacy max_tree_leaves ceiling; Some is bounded by decoder node limits.
+    pub max_merged_tree_leaves: Option<usize>,
+    /// Optional MA exhaustion policy; None keeps source strict / legacy bounded.
+    pub ma_budget_mode: Option<ma_train::MaBudgetMode>,
+    /// Additional learned-tree cap, 1..=MAX_TREE_LEAVES. Unlike legacy preset
+    /// limits, this survives source scheduler projection. Decoder bounds still
+    /// apply; this cannot increase an existing ceiling or limit fixed trees.
+    pub ma_max_leaves: Option<usize>,
     pub split_threshold: f64,
     pub entropy: Coding,
     pub lz77: bool,
@@ -50,6 +68,8 @@ pub struct ModularOptions {
     pub source_predictor_dedup: bool,
     /// Source opt-in verified equal-partition reuse and inherited property mask.
     pub source_property_dedup: bool,
+    /// Exact extra-bit dominance proof for default-scoring MA nodes of weight <=256.
+    pub source_ma_dominance: bool,
     /// Explicit source histogram-layout experiments; default leaves them off.
     pub source_ma_histograms: ma_train::HistogramOptions,
     /// Optional source entropy/description-cost experiments; off by default.
@@ -73,6 +93,8 @@ pub struct ModularOptions {
     pub rct_candidates: Option<usize>,
     /// Score modes 0..n; None uses weighted_preset.
     pub weighted_candidates: Option<usize>,
+    /// Opt-in preset search parallelism on the caller's installed executor.
+    pub parallel_weighted: bool,
     pub fixed_tree: Option<FixedTree>,
     /// Explicit validated MA tree, corresponding to source custom_fixed_tree.
     pub custom_tree: Option<Tree>,
@@ -82,6 +104,13 @@ pub struct ModularOptions {
     pub tree_group_splits: Vec<usize>,
     /// Source global/per-group palette eligibility, ordering and cost rejection.
     pub palette_policy: Option<super::palette::PaletteOptions>,
+    /// Opt-in Image layout diagnostics. Use a fresh collector for each native
+    /// full/probe invocation; cloning options shares this single-use collector.
+    /// None does not copy channels, transform scripts or pixel samples.
+    pub representation_receipt: Option<std::sync::Arc<receipt::ReceiptCollector>>,
+    /// Actual emitted MA tree and entropy-model header bits, not a byte bound.
+    /// Use a fresh collector per invocation and read after encoding completes.
+    pub model_cost_receipt: Option<std::sync::Arc<receipt_cost::ModelCostReceipt>>,
     /// Executable source LZ parser; length/config fields must match entropy wire.
     pub source_lz77: Option<lz77::SourceConfig>,
     /// Encode the MA tree with source entropy/LZ policy, not legacy prefix-only.
@@ -95,6 +124,9 @@ impl Default for ModularOptions {
             weighted_preset: 0,
             tree_samples: 1024,
             max_tree_leaves: 16,
+            max_merged_tree_leaves: None,
+            ma_budget_mode: None,
+            ma_max_leaves: None,
             split_threshold: 48.0,
             entropy: Coding::Auto,
             lz77: true,
@@ -108,6 +140,7 @@ impl Default for ModularOptions {
             source_constant_channels: false,
             source_predictor_dedup: false,
             source_property_dedup: false,
+            source_ma_dominance: false,
             source_ma_histograms: Default::default(),
             source_ma_scoring: Default::default(),
             source_ma_search: Default::default(),
@@ -119,17 +152,25 @@ impl Default for ModularOptions {
             entropy_options: Default::default(),
             rct_candidates: None,
             weighted_candidates: None,
+            parallel_weighted: false,
             fixed_tree: None,
             custom_tree: None,
             tree_groups: None,
             tree_group_splits: Vec::new(),
             palette_policy: None,
+            representation_receipt: None,
+            model_cost_receipt: None,
             source_lz77: None,
             source_tree_entropy: false,
         }
     }
 }
 impl ModularOptions {
+    pub(super) fn tree_leaf_limit(&self) -> usize {
+        let limit = self.max_merged_tree_leaves.unwrap_or(self.max_tree_leaves);
+        self.ma_max_leaves.map_or(limit, |cap| limit.min(cap))
+    }
+
     pub(crate) fn for_pixel_metadata(
         &self,
         metadata: &crate::metadata::ImageMetadata,
@@ -158,6 +199,12 @@ impl ModularOptions {
             || self.tree_samples > 1 << 20
             || self.max_tree_leaves == 0
             || self.max_tree_leaves > ma_train::MAX_LEAVES
+            || self
+                .max_merged_tree_leaves
+                .is_some_and(|limit| !(1..=ma_train::MAX_TREE_LEAVES).contains(&limit))
+            || self
+                .ma_max_leaves
+                .is_some_and(|limit| !(1..=ma_train::MAX_TREE_LEAVES).contains(&limit))
             || !self.split_threshold.is_finite()
             || self.split_threshold < 0.0
         {
@@ -267,7 +314,12 @@ pub(super) fn weighted_header(
                 stride: c.width,
             })
             .collect();
-        super::cost::select_weighted_preset(&views, count, true)?.preset
+        let selected = if options.parallel_weighted {
+            super::cost::select_weighted_preset_parallel(&views, count, true)?
+        } else {
+            super::cost::select_weighted_preset(&views, count, true)?
+        };
+        selected.preset
     } else {
         options.weighted_preset
     };
@@ -440,16 +492,21 @@ pub(super) fn visit_channel(
     };
     let mut properties = Properties::default();
     for y in 0..height {
+        let neighbors = super::predictor::NeighborRow::new(plane, width, width, y)
+            .map_err(|e| Error::Encoding(e.to_string()))?;
         for x in 0..width {
-            let n = Neighbors::from_plane(plane, width, width, x, y)
+            let n = neighbors
+                .at(x)
                 .map_err(|e| Error::Encoding(e.to_string()))?;
+            let pos = y * width + x;
             let (prediction, error) = if let Some(state) = &mut state {
-                state.predict(x, y, n.top, n.left, n.topright, n.topleft, n.toptop)?
+                state.predict_and_update(
+                    plane[pos], x, y, n.top, n.left, n.topright, n.topleft, n.toptop,
+                )?
             } else {
                 (0, 0)
             };
             props[..16].copy_from_slice(&properties.calculate(n, x, y, c, stream_id, error));
-            let pos = y * width + x;
             for (i, r) in references.iter().enumerate() {
                 let v = r.samples[pos];
                 let left = if x > 0 { r.samples[pos - 1] } else { 0 };
@@ -468,9 +525,6 @@ pub(super) fn visit_channel(
                 ]);
             }
             visitor(c, pos, n, prediction, &props, plane[pos])?;
-            if let Some(state) = &mut state {
-                state.update(plane[pos], x, y)?;
-            }
         }
     }
     Ok(())
@@ -553,11 +607,17 @@ pub(super) fn train_options(options: &ModularOptions) -> ma_train::TrainOptions 
         channel_tree: options.source_channel_tree,
         predictor_dedup: options.source_predictor_dedup,
         property_dedup: options.source_property_dedup,
+        split_dominance: options.source_ma_dominance,
         predictors: predictors(options.predictor),
         properties: (0..16 + 4 * options.previous_channels)
             .filter(|&p| p != 1)
             .collect(),
         max_leaves: options.max_tree_leaves,
+        max_merged_leaves: options
+            .max_merged_tree_leaves
+            .or(options.ma_max_leaves)
+            .map(|_| options.tree_leaf_limit()),
+        budget_mode: options.ma_budget_mode,
         split_threshold: options.split_threshold,
         ..Default::default()
     };
@@ -608,7 +668,7 @@ fn learn(
     if let Some(tree) = predefined(planes.iter(), options, bits)? {
         return Ok(tree);
     }
-    super::training::learn(
+    super::training::learn_local(
         &[super::training::TrainingStream {
             channels: planes,
             wp: *wp,
@@ -723,6 +783,26 @@ pub(super) fn write_tree(
     }
 }
 
+/// Only final output writers call this; model costing and trial tree writes do not.
+pub(super) fn write_tree_and_model(
+    tree: &Tree,
+    model: &Model,
+    writer: &mut BitWriter,
+    options: &ModularOptions,
+) -> Result<()> {
+    if let Some(receipt) = &options.model_cost_receipt {
+        let before = writer.bits_written();
+        write_tree(tree, writer, options)?;
+        let after_tree = writer.bits_written();
+        model.write_header(writer)?;
+        receipt.record(after_tree - before, writer.bits_written() - after_tree);
+        Ok(())
+    } else {
+        write_tree(tree, writer, options)?;
+        model.write_header(writer)
+    }
+}
+
 pub(crate) fn encode_group(
     image: &Image,
     g: Group,
@@ -808,8 +888,7 @@ pub(crate) fn write_prepared_stream(
             options.entropy,
             &options.entropy_options,
         )?;
-        write_tree(&tree, writer, options)?;
-        model.write_header(writer)?;
+        write_tree_and_model(&tree, &model, writer, options)?;
         model.write_stream(&streams[0], writer)?;
     }
     Ok(())

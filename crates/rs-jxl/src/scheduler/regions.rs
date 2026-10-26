@@ -23,6 +23,8 @@ pub enum AtlasMode {
 pub struct RegionOptions {
     pub context_side: usize,
     pub full_width_strips: bool,
+    /// Explicit experimental full-width calibration height; default source geometry is unchanged.
+    pub strip_rows: Option<usize>,
     pub compact_context_side: usize,
     pub atlas: AtlasMode,
     /// None is source default (automatic for Routed, 65536 otherwise).
@@ -34,10 +36,58 @@ impl Default for RegionOptions {
         Self {
             context_side: 0,
             full_width_strips: false,
+            strip_rows: None,
             compact_context_side: 256,
             atlas: AtlasMode::Disabled,
             band_pixels: None,
             automatic_band_pixels: false,
+        }
+    }
+}
+
+#[cfg(test)]
+mod strip_tests {
+    use super::*;
+    use crate::PixelLayout;
+
+    #[test]
+    fn explicit_strip_height_is_bounded_and_preserves_source_samples() {
+        let image = Image::new(
+            67,
+            37,
+            PixelLayout::Gray,
+            PixelData::U8((0..67 * 37).map(|p| (p % 251) as u8).collect()),
+        )
+        .unwrap();
+        for height in [1, 17, 128, 1024] {
+            let options = RegionOptions {
+                full_width_strips: true,
+                strip_rows: Some(height),
+                ..Default::default()
+            };
+            for spec in screen_regions(&image, None, &options).unwrap() {
+                assert_eq!(spec.regions.len(), 1);
+                let r = spec.regions[0];
+                assert_eq!(r.width, 67);
+                assert_eq!(r.height, height.min(37));
+                assert!(r.y + r.height <= 37);
+                let sample = copy_sample(&image, &spec, 67 * 37).unwrap();
+                let PixelData::U8(values) = sample.pixels() else {
+                    panic!("sample format changed")
+                };
+                let PixelData::U8(original) = image.pixels() else {
+                    unreachable!()
+                };
+                assert_eq!(values, &original[r.y * 67..(r.y + r.height) * 67]);
+            }
+        }
+        for (wide, height) in [(false, 8), (true, 0), (true, 1025)] {
+            let options = RegionOptions {
+                full_width_strips: wide,
+                strip_rows: Some(height),
+                ..Default::default()
+            };
+            assert!(screen_regions(&image, None, &options).is_err());
         }
     }
 }
@@ -77,6 +127,9 @@ pub fn screen_regions(
     if options.compact_context_side == 0
         || options.compact_context_side > 256
         || options.band_pixels.is_some_and(|p| p == 0 || p > 262144)
+        || options
+            .strip_rows
+            .is_some_and(|rows| rows == 0 || rows > 1024 || !options.full_width_strips)
     {
         return Err(Error::InvalidInput("invalid probe region limits".into()));
     }
@@ -102,7 +155,7 @@ pub fn screen_regions(
     });
     let mut regions: Vec<ScanRegion> = Vec::new();
     if options.full_width_strips {
-        let ch = h.min((65536 / w).clamp(8, 32));
+        let ch = h.min(options.strip_rows.unwrap_or((65536 / w).clamp(8, 32)));
         if let Some(scan) = scan {
             let mut active: Vec<_> = scan
                 .tiles

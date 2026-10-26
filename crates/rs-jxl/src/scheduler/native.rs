@@ -23,6 +23,15 @@ use super::{
     worker_pool::{TaskRunner, WorkerExecution, WorkerPlan, run_plan},
 };
 
+#[path = "native_overlap.rs"]
+mod native_overlap;
+
+#[path = "native_tools.rs"]
+mod native_tools;
+#[cfg(test)]
+#[path = "native_probe_sampling_tests.rs"]
+mod probe_sampling_tests;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum NativeAcceptance {
     #[default]
@@ -37,6 +46,22 @@ pub struct NativeBackendOptions {
     /// Explicit override for full native test runs. Does not pretend the source
     /// automatic patch decision was performed. Strict mode rejects a rewrite.
     pub patches_off: bool,
+    /// Diagnostic only: bypass small-image tuple-palette rejection in Zero
+    /// predictor probes. Requires AllowReportedGaps; full encodes are unchanged.
+    pub probe_palette: bool,
+    /// Opt-in literal-family palette tools for both probes and full trials.
+    /// Explicit caller palettes and automatic/cross-channel families are retained.
+    pub literal_palette_tools: bool,
+    /// Experimental ranking estimate using actual emitted tree/model bits.
+    /// Requires AllowReportedGaps; full encoded bytes are unaffected.
+    pub model_adjusted_probes: bool,
+    /// Experimental quarter-rate MA sampling in probes only; complete trials
+    /// retain their requested policy. Requires AllowReportedGaps.
+    pub probe_sampling_quarter: bool,
+    /// Experimental family-specific backend tools; not the ordinary source preset.
+    pub routed_tools: bool,
+    /// Collect actual accepted representations independently for every trial.
+    pub record_representations: bool,
     pub resources: NativeResourcePolicy,
 }
 
@@ -56,6 +81,9 @@ pub struct NativeAdaptation {
     pub gaps: Vec<CapabilityGap>,
     pub state: AdaptationState,
     pub resources: NativeResourceLimits,
+    pub representation: Option<std::sync::Arc<crate::modular::encode::receipt::ReceiptCollector>>,
+    /// Invocation-local emitted header costs; bounded/failed trials may be partial.
+    pub model_costs: Option<std::sync::Arc<crate::modular::encode::receipt_cost::ModelCostReceipt>>,
 }
 
 #[derive(Clone, Debug)]
@@ -131,15 +159,87 @@ pub(super) fn prepare(
     kind: NativeTrialKind,
 ) -> Result<(NativeArtifact, NativeAdaptation)> {
     let mut effective = params.clone();
+    let reduced_probe_sampling = settings.probe_sampling_quarter
+        && kind == NativeTrialKind::Probe
+        && effective.learning_fraction >= 0.01;
+    if reduced_probe_sampling {
+        effective.learning_fraction *= 0.25;
+    }
     let rewritten = settings.patches_off && effective.patches != Override::Off;
     if settings.patches_off {
         effective.patches = Override::Off;
     }
     let mut projection =
         project_native_with_resources(&effective, image, base, settings.resources)?;
+    if reduced_probe_sampling {
+        projection
+            .gaps
+            .push(CapabilityGap::ReducedProbeTrainingSamples);
+    }
+    if settings.routed_tools
+        && let Some(options) = &mut projection.options
+    {
+        native_tools::apply(options, &effective);
+    }
+    if settings.literal_palette_tools
+        && base.modular.palette_policy.is_none()
+        && effective.predictor == Some(crate::modular::predictor::Predictor::Zero)
+        && (1..=65536).contains(&effective.palette_colors)
+        && let Some(policy) = projection
+            .options
+            .as_mut()
+            .and_then(|options| options.modular.palette_policy.as_mut())
+    {
+        policy.force_palette = true;
+        policy.tools.order = crate::modular::palette::PaletteOrder::FrequencyBandsMorton;
+        policy.tools.mapping = crate::modular::palette::PaletteMapping::Flat;
+        projection.gaps.push(CapabilityGap::LiteralPaletteTools);
+    }
     if rewritten {
         projection.gaps.push(CapabilityGap::ForcedPatchesOff);
     }
+    let model_adjusted = settings.model_adjusted_probes && kind == NativeTrialKind::Probe;
+    if model_adjusted {
+        projection.gaps.push(CapabilityGap::ModelScaledProbeScore);
+    }
+    let collect_model_costs = model_adjusted
+        || base.modular.model_cost_receipt.is_some()
+        || base
+            .source_patch_reference
+            .as_ref()
+            .is_some_and(|reference| reference.modular.model_cost_receipt.is_some());
+    let model_costs = projection.options.as_mut().and_then(|options| {
+        let receipt = collect_model_costs.then(|| {
+            std::sync::Arc::new(crate::modular::encode::receipt_cost::ModelCostReceipt::default())
+        });
+        options.modular.model_cost_receipt = receipt.clone();
+        // Atlas resolution replaces ModularOptions, so bind its emitted costs
+        // explicitly. The single-use representation collector stays separate.
+        if let Some(reference) = &mut options.source_patch_reference {
+            reference.modular.model_cost_receipt = receipt.clone();
+        }
+        receipt
+    });
+    if settings.probe_palette
+        && kind == NativeTrialKind::Probe
+        && effective.predictor == Some(crate::modular::predictor::Predictor::Zero)
+        && (1..=65536).contains(&effective.palette_colors)
+        && let Some(policy) = projection
+            .options
+            .as_mut()
+            .and_then(|options| options.modular.palette_policy.as_mut())
+    {
+        policy.force_palette = true;
+        projection.gaps.push(CapabilityGap::ForcedProbePalette);
+    }
+    let representation = projection.options.as_mut().and_then(|options| {
+        if settings.record_representations {
+            options.modular.representation_receipt = Some(std::sync::Arc::new(
+                crate::modular::encode::receipt::ReceiptCollector::default(),
+            ));
+        }
+        options.modular.representation_receipt.clone()
+    });
     let adaptation = NativeAdaptation {
         kind,
         width: image.width(),
@@ -149,6 +249,8 @@ pub(super) fn prepare(
         gaps: projection.gaps.clone(),
         state: projection.state(),
         resources: projection.resources,
+        representation,
+        model_costs,
     };
     let gaps = projection.gaps.clone();
     let resources = projection.resources;
@@ -304,6 +406,13 @@ pub(super) fn run_native_search_with_pool(
     pool: &rayon::ThreadPool,
     context: Option<FrameContext<'_>>,
 ) -> Result<NativeSearchResult> {
+    if driver_options.scout_pilot_consensus && !settings.model_adjusted_probes {
+        return Err(Error::InvalidInput(
+            "native scout pilot consensus requires model-adjusted probe ranking".into(),
+        ));
+    }
+    let base = scout_execution_options(base, driver_options.adaptive_scout);
+    let base = &base;
     let mut driver_options = driver_options.clone();
     let execution = WorkerExecution {
         limits: driver_options.workers,
@@ -328,11 +437,15 @@ pub(super) fn run_native_search_with_pool(
     let full_batch_records = Rc::clone(&adaptations);
     let probe_batch_records = Rc::clone(&adaptations);
     let prefix_records = Rc::clone(&adaptations);
+    let overlap_records = Rc::clone(&adaptations);
+    let parent_pixels = u64::from(image.width()) * u64::from(image.height());
     let mut output = run_pixel_search_with_batches(
         image,
         params,
         &driver_options,
         |params, image, budget: TrialBudget| {
+            let _scope = crate::profile::scope("scheduler.full_encode");
+            let start = crate::profile::enabled().then(std::time::Instant::now);
             let (mut artifact, record) =
                 prepare(params, image, base, settings, NativeTrialKind::Full)?;
             artifact.options.max_output_bytes = artifact
@@ -340,28 +453,58 @@ pub(super) fn run_native_search_with_pool(
                 .max_output_bytes
                 .min(budget.max_output_bytes);
             full_records.borrow_mut().push(record);
-            Ok(
-                match encode_full_trial(
-                    image,
-                    &artifact.options,
-                    budget.beat_bytes,
-                    Some(pool),
-                    context,
-                )? {
-                    TrialEncode::Complete(bytes) => {
-                        TrialOutput::Complete(EncodedOutput { bytes, artifact })
-                    }
-                    TrialEncode::Bounded { lower_bound } => TrialOutput::Bounded { lower_bound },
-                },
-            )
+            let trial = encode_full_trial(
+                image,
+                &artifact.options,
+                budget.beat_bytes,
+                Some(pool),
+                context,
+            )?;
+            if let Some(start) = start {
+                crate::profile::note(
+                    "scheduler.full_result",
+                    format_args!(
+                        "seconds={:.6} bytes={:?} params={params:?}",
+                        start.elapsed().as_secs_f64(),
+                        match &trial {
+                            TrialEncode::Complete(bytes) => Some(bytes.len()),
+                            TrialEncode::Bounded { .. } => None,
+                        },
+                    ),
+                );
+            }
+            Ok(match trial {
+                TrialEncode::Complete(bytes) => {
+                    TrialOutput::Complete(EncodedOutput { bytes, artifact })
+                }
+                TrialEncode::Bounded { lower_bound } => TrialOutput::Bounded { lower_bound },
+            })
         },
         |params, image| {
             let (artifact, record) =
                 prepare(params, image, base, settings, NativeTrialKind::Probe)?;
             probe_records.borrow_mut().push(record);
-            Ok(crate::encode::encode_with_pool(image, &artifact.options, pool)?.len())
+            let bytes = crate::encode::encode_with_pool(image, &artifact.options, pool)?;
+            native_tools::probe_score(
+                bytes.len(),
+                image,
+                parent_pixels,
+                &artifact.options,
+                settings.model_adjusted_probes,
+            )
         },
         BatchEncoders {
+            pilot_overlap: Some(Box::new(|request| {
+                native_overlap::run(
+                    request,
+                    base,
+                    settings,
+                    pool,
+                    context,
+                    execution,
+                    &mut overlap_records.borrow_mut(),
+                )
+            })),
             full: Some(Box::new(|image, tasks| {
                 let mut artifacts = Vec::with_capacity(tasks.len());
                 for task in tasks {
@@ -385,27 +528,53 @@ pub(super) fn run_native_search_with_pool(
                     .saturating_mul(3 + image.metadata().extra_channels.len() as u64)
                     .saturating_mul(32)
                     .saturating_add(32 << 20);
-                let plan = if cooperative {
+                let plan = if cooperative
+                    && tasks.len() == 1
+                    && execution.limits.tasks >= pool.current_num_threads()
+                {
+                    // One finalist already owns the available pool. Avoid an
+                    // extra arena/queue layer around every inner kernel task.
+                    WorkerPlan::data_parallel(1)
+                } else if cooperative {
                     WorkerPlan::cooperative(tasks.len(), execution.limits, scratch)?
                         .with_quiet(execution.arena_quiet)
                 } else {
                     WorkerPlan::independent(tasks.len(), 64)?
                 };
-                let outcomes = run_plan(Some(pool), &plan, |i, runner| match runner {
-                    TaskRunner::Null => encode_full_trial(
-                        image,
-                        &artifacts[i].options,
-                        tasks[i].budget.beat_bytes,
-                        None,
-                        context,
-                    ),
-                    TaskRunner::Pool(pool) => encode_full_trial(
-                        image,
-                        &artifacts[i].options,
-                        tasks[i].budget.beat_bytes,
-                        Some(pool),
-                        context,
-                    ),
+                let outcomes = run_plan(Some(pool), &plan, |i, runner| {
+                    let _scope = crate::profile::scope("scheduler.full_encode");
+                    let start = crate::profile::enabled().then(std::time::Instant::now);
+                    let outcome = match runner {
+                        TaskRunner::Null => encode_full_trial(
+                            image,
+                            &artifacts[i].options,
+                            tasks[i].budget.beat_bytes,
+                            None,
+                            context,
+                        ),
+                        TaskRunner::Pool(pool) => encode_full_trial(
+                            image,
+                            &artifacts[i].options,
+                            tasks[i].budget.beat_bytes,
+                            Some(pool),
+                            context,
+                        ),
+                    }?;
+                    if let Some(start) = start {
+                        crate::profile::note(
+                            "scheduler.full_result",
+                            format_args!(
+                                "seconds={:.6} bytes={:?} batched=true params={:?}",
+                                start.elapsed().as_secs_f64(),
+                                match &outcome {
+                                    TrialEncode::Complete(bytes) => Some(bytes.len()),
+                                    TrialEncode::Bounded { .. } => None,
+                                },
+                                tasks[i].params,
+                            ),
+                        );
+                    }
+                    Ok(outcome)
                 })?;
                 Ok(outcomes
                     .into_iter()
@@ -446,7 +615,13 @@ pub(super) fn run_native_search_with_pool(
                             pool,
                         )?,
                     };
-                    Ok(bytes.len())
+                    native_tools::probe_score(
+                        bytes.len(),
+                        tasks[i].image,
+                        parent_pixels,
+                        &artifacts[i].options,
+                        settings.model_adjusted_probes,
+                    )
                 })
             })),
             prefix: Some(Box::new(|screen| {
@@ -485,9 +660,14 @@ pub(super) fn run_native_search_with_pool(
                             .expect("prefix tile belongs to screen order");
                         let (artifact, _, attempted) = &prepared[candidate][position];
                         attempted.store(true, Ordering::Relaxed);
-                        Ok(
-                            crate::encode::encode_serial(&screen.samples[tile], &artifact.options)?
-                                .len(),
+                        let bytes =
+                            crate::encode::encode_serial(&screen.samples[tile], &artifact.options)?;
+                        native_tools::probe_score(
+                            bytes.len(),
+                            &screen.samples[tile],
+                            parent_pixels,
+                            &artifact.options,
+                            settings.model_adjusted_probes,
                         )
                     },
                 );
@@ -517,6 +697,37 @@ pub(super) fn run_native_search_with_pool(
         output,
         adaptations,
     })
+}
+
+fn scout_execution_options(base: &EncodeOptions, enabled: bool) -> EncodeOptions {
+    let mut options = base.clone();
+    if enabled {
+        // These tools preserve the selected sample sites and predictor state;
+        // row striping, which approximates learning history, stays disabled.
+        options.modular.parallel_tokens = true;
+        options.modular.source_gather.get_or_insert_with(|| {
+            crate::modular::sample::GatherOptions {
+                workers: base.threads.clamp(1, 64),
+                sparse: true,
+                ..Default::default()
+            }
+        });
+        let lz =
+            options
+                .modular
+                .source_lz77
+                .get_or_insert_with(|| crate::tools::lz77::SourceConfig {
+                    compact_steps: true,
+                    ..Default::default()
+                });
+        lz.parallelism
+            .get_or_insert(crate::tools::lz77::SourceParallelism {
+                max_workers: base.threads.clamp(1, 64),
+                fast_streams: true,
+                ..Default::default()
+            });
+    }
+    options
 }
 
 #[cfg(test)]

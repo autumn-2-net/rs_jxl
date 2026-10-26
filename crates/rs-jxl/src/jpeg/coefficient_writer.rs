@@ -18,8 +18,10 @@ use std::fmt;
 
 use super::coefficients::ScanBand;
 use super::data::{BLOCK_SIZE, NATURAL_ORDER};
-use super::entropy_writer::{EntropyBitWriter, WriteError, magnitude_bits};
+use super::entropy_writer::{EntropyBatch, EntropyBitWriter, WriteError, magnitude_bits};
 use super::huffman::{HuffmanCode, HuffmanTable};
+use super::refinement::{self, Masks};
+use super::sequential;
 
 const MAX_EOB_RUN: u16 = 0x7fff;
 const MAX_BUFFERED_BITS: usize = MAX_EOB_RUN as usize * (BLOCK_SIZE - 1);
@@ -123,22 +125,43 @@ impl DctCodingState {
     }
 
     fn flush_inner(&mut self, writer: &mut EntropyBitWriter) -> Result<(), CoefficientWriteError> {
-        if self.eob_run != 0 {
-            let count = (15 - self.eob_run.leading_zeros()) as u8;
-            let symbol = count << 4;
-            let code = self.eob_codes[usize::from(count)]
-                .ok_or(WriteError::MissingHuffmanSymbol(symbol))?;
-            let suffix = u32::from(self.eob_run) & ((1u32 << count) - 1);
-            writer.write_bits(
-                (u32::from(code.bits) << count) | suffix,
-                code.bit_length + count,
-            )?;
+        if self.eob_run == 0 {
+            // Only buffer_end_of_band appends corrections, after starting a run;
+            // successful flushes clear the run and corrections together.
+            debug_assert_eq!(self.refinement_bits, 0);
+            debug_assert!(self.refinement_words.is_empty());
+            return Ok(());
         }
-        let mut remaining = self.refinement_bits;
-        for &word in &self.refinement_words {
-            let count = remaining.min(16) as u8;
-            writer.write_bits(u32::from(word), count)?;
-            remaining -= usize::from(count);
+        let count = (15 - self.eob_run.leading_zeros()) as u8;
+        let symbol = count << 4;
+        let code =
+            self.eob_codes[usize::from(count)].ok_or(WriteError::MissingHuffmanSymbol(symbol))?;
+        let suffix = u32::from(self.eob_run) & ((1u32 << count) - 1);
+        let value = (u32::from(code.bits) << count) | suffix;
+        let count = code.bit_length + count;
+        // Keep large EOB runs on the streaming path; short runs and correction
+        // sequences can share one reservation and several word-wide emissions.
+        let batched = (2..=64).contains(&self.refinement_words.len())
+            && writer
+                .try_batch(|batch| {
+                    batch.write_bits(value, count)?;
+                    let mut remaining = self.refinement_bits;
+                    for &word in &self.refinement_words {
+                        let count = remaining.min(16) as u8;
+                        batch.write_bits(u32::from(word), count)?;
+                        remaining -= usize::from(count);
+                    }
+                    Some(())
+                })
+                .is_some();
+        if !batched {
+            writer.write_bits(value, count)?;
+            let mut remaining = self.refinement_bits;
+            for &word in &self.refinement_words {
+                let count = remaining.min(16) as u8;
+                writer.write_bits(u32::from(word), count)?;
+                remaining -= usize::from(count);
+            }
         }
         self.eob_run = 0;
         self.eob_codes = [None; 15];
@@ -155,8 +178,15 @@ impl DctCodingState {
         count: u8,
     ) -> Result<(), CoefficientWriteError> {
         debug_assert!(count <= 63);
-        let codes = std::array::from_fn(|i| ac.code((i as u8) << 4));
-        if self.eob_run != 0 && codes != self.eob_codes {
+        // A table can be replaced at the same address between calls. Compare
+        // contents, but only build a snapshot when starting a new run.
+        if self.eob_run != 0
+            && self
+                .eob_codes
+                .iter()
+                .enumerate()
+                .any(|(i, &code)| ac.code((i as u8) << 4) != code)
+        {
             return Err(CoefficientWriteError::Invalid(
                 "AC table changed inside a pending EOB run",
             ));
@@ -185,15 +215,12 @@ impl DctCodingState {
                 .map_err(|_| CoefficientWriteError::AllocationFailed)?;
         }
         if self.eob_run == 0 {
-            self.eob_codes = codes;
+            self.eob_codes = std::array::from_fn(|i| ac.code((i as u8) << 4));
         }
         self.eob_run += 1;
         let mut remaining = usize::from(count);
-        while remaining != 0 {
-            let used = self.refinement_bits & 15;
-            if used == 0 {
-                self.refinement_words.push(0);
-            }
+        let used = self.refinement_bits & 15;
+        if used != 0 && remaining != 0 {
             let take = (16 - used).min(remaining);
             let chunk = ((bits >> (remaining - take)) & ((1u64 << take) - 1)) as u16;
             let last = self
@@ -201,9 +228,17 @@ impl DctCodingState {
                 .last_mut()
                 .expect("packed word exists");
             *last = ((u32::from(*last) << take) as u16) | chunk;
-            self.refinement_bits += take;
             remaining -= take;
         }
+        while remaining >= 16 {
+            remaining -= 16;
+            self.refinement_words.push((bits >> remaining) as u16);
+        }
+        if remaining != 0 {
+            self.refinement_words
+                .push((bits & ((1u64 << remaining) - 1)) as u16);
+        }
+        self.refinement_bits = total;
         if self.eob_run == MAX_EOB_RUN {
             self.flush_inner(writer)?;
         }
@@ -230,16 +265,23 @@ fn validate_ac_band(
     coefficients: &[i16; BLOCK_SIZE],
     band: ScanBand,
 ) -> Result<usize, CoefficientWriteError> {
+    #[cfg(feature = "decoder-profile")]
+    let _profile = jxl_decoder::decoder_profile::sample_scope("sample.jpeg.validate_ac_band", 5);
     let mut trailing_zeros = 0;
     for &natural in &NATURAL_ORDER[usize::from(band.start.max(1))..=usize::from(band.end)] {
-        let value = shifted_ac(coefficients[natural], band.low_bit);
-        let (category, _) = magnitude_bits(value)?;
-        if category != 0 && category + band.low_bit >= 12 {
+        let magnitude = i32::from(coefficients[natural]).abs();
+        // For low_bit <= 10 the original category test is exactly this bound,
+        // including values that disappear under the point transform.
+        if magnitude >= 2048 {
             return Err(CoefficientWriteError::Invalid(
                 "AC coefficient exceeds supported precision",
             ));
         }
-        trailing_zeros = if value == 0 { trailing_zeros + 1 } else { 0 };
+        trailing_zeros = if magnitude >> band.low_bit == 0 {
+            trailing_zeros + 1
+        } else {
+            0
+        };
     }
     Ok(trailing_zeros)
 }
@@ -255,22 +297,122 @@ pub fn encode_sequential_block(
     last_dc: &mut i16,
     coefficients: &[i16; BLOCK_SIZE],
 ) -> Result<(), CoefficientWriteError> {
-    // Ss=0 forbids grouping EOB runs across DC coefficients, so the initial
-    // algorithm emits the same sequential codes and immediately flushes EOB.
-    encode_initial_block(
-        writer,
-        Some(dc),
-        Some(ac),
-        ScanBand {
-            start: 0,
-            end: 63,
-            low_bit: 0,
-        },
-        extra_zero_runs,
-        &mut DctCodingState::new(0),
-        last_dc,
-        coefficients,
-    )
+    let (dc_count, dc_bits) = magnitude_bits(i32::from(coefficients[0]) - i32::from(*last_dc))?;
+    if dc_count >= 12 {
+        return Err(CoefficientWriteError::Invalid(
+            "DC difference exceeds 11 bits",
+        ));
+    }
+    // Validate before any emission or predictor update, retaining nonzero
+    // positions so entropy emission need not scan zero coefficients again.
+    let nonzero = sequential::nonzero_ac(coefficients).ok_or(
+        CoefficientWriteError::Invalid(
+            "AC coefficient exceeds supported precision",
+        ),
+    )?;
+    if extra_zero_runs != 0 {
+        let trailing = nonzero.leading_zeros().min(63) as usize;
+        // Preserve the frozen reader's single final ZRL overshoot.
+        if u64::from(extra_zero_runs) > trailing.div_ceil(16) as u64 {
+            return Err(CoefficientWriteError::Invalid(
+                "extra zero runs exceed trailing spectral band",
+            ));
+        }
+    }
+
+    if writer
+        .try_batch(|batch| {
+            batch.write_symbol_bits(dc, dc_count, u32::from(dc_bits), dc_count)?;
+            let mut remaining = nonzero;
+            let mut next = 1;
+            while remaining != 0 {
+                let k = remaining.trailing_zeros() as usize;
+                let mut zeros = k - next;
+                while zeros > 15 {
+                    batch.write_symbol(ac, 0xf0)?;
+                    zeros -= 16;
+                }
+                let (count, bits) = magnitude_bits(i32::from(coefficients[NATURAL_ORDER[k]])).ok()?;
+                batch.write_symbol_bits(ac, ((zeros as u8) << 4) | count, u32::from(bits), count)?;
+                next = k + 1;
+                remaining &= remaining - 1;
+            }
+            let mut zeros = (BLOCK_SIZE - next) as i32;
+            for _ in 0..extra_zero_runs {
+                batch.write_symbol(ac, 0xf0)?;
+                zeros -= 16;
+            }
+            if zeros > 0 {
+                batch.write_symbol(ac, 0)?;
+            }
+            Some(())
+        })
+        .is_some()
+    {
+        *last_dc = coefficients[0];
+        return Ok(());
+    }
+
+    // Budget or table failures replay the original symbol-at-a-time path,
+    // including its partially advanced writer and DC predictor on error.
+    writer.write_symbol_bits(dc, dc_count, u32::from(dc_bits), dc_count)?;
+    *last_dc = coefficients[0];
+    let mut zeros = 0i32;
+    for &natural in &NATURAL_ORDER[1..BLOCK_SIZE] {
+        let value = i32::from(coefficients[natural]);
+        if value == 0 {
+            zeros += 1;
+            continue;
+        }
+        while zeros > 15 {
+            writer.write_symbol(ac, 0xf0)?;
+            zeros -= 16;
+        }
+        let (count, bits) = magnitude_bits(value)?;
+        writer.write_symbol_bits(ac, ((zeros as u8) << 4) | count, u32::from(bits), count)?;
+        zeros = 0;
+    }
+    for _ in 0..extra_zero_runs {
+        writer.write_symbol(ac, 0xf0)?;
+        zeros -= 16;
+    }
+    if zeros > 0 {
+        writer.write_symbol(ac, 0)?;
+    }
+    Ok(())
+}
+
+#[inline]
+fn batch_initial_ac(
+    batch: &mut EntropyBatch,
+    ac: &HuffmanTable,
+    order: &[usize],
+    low_bit: u8,
+    extra_zero_runs: u32,
+    coefficients: &[i16; BLOCK_SIZE],
+) -> Option<i32> {
+    #[cfg(feature = "decoder-profile")]
+    let _profile = jxl_decoder::decoder_profile::sample_scope("sample.jpeg.batch_initial_ac", 6);
+    let mut zeros = 0i32;
+    for &natural in order {
+        let value = shifted_ac(coefficients[natural], low_bit);
+        if value == 0 {
+            zeros += 1;
+            continue;
+        }
+        while zeros > 15 {
+            batch.write_symbol(ac, 0xf0)?;
+            zeros -= 16;
+        }
+        let (count, bits) = magnitude_bits(value).ok()?;
+        batch.write_symbol_bits(ac, ((zeros as u8) << 4) | count, u32::from(bits), count)?;
+        zeros = 0;
+    }
+    for _ in 0..extra_zero_runs {
+        batch.write_symbol(ac, 0xf0)?;
+        zeros -= 16;
+    }
+    Some(zeros)
 }
 
 /// Emit a first progressive pass, or a sequential band. Negative DC uses an
@@ -339,24 +481,47 @@ pub fn encode_initial_block(
             return Ok(());
         }
         let ac = ac.expect("validated AC table");
-        let mut zeros = 0i32;
-        for &natural in &NATURAL_ORDER[usize::from(band.start.max(1))..=usize::from(band.end)] {
-            let value = shifted_ac(coefficients[natural], band.low_bit);
-            if value == 0 {
-                zeros += 1;
-                continue;
-            }
+        let order = &NATURAL_ORDER[usize::from(band.start.max(1))..=usize::from(band.end)];
+        let has_symbols = trailing != order.len() || extra_zero_runs != 0;
+        if has_symbols {
             state.flush_inner(writer)?;
-            while zeros > 15 {
-                writer.write_symbol(ac, 0xf0)?;
-                zeros -= 16;
-            }
-            let (count, bits) = magnitude_bits(value)?;
-            writer.write_symbol_bits(ac, ((zeros as u8) << 4) | count, u32::from(bits), count)?;
-            zeros = 0;
         }
-        if extra_zero_runs != 0 {
-            state.flush_inner(writer)?;
+        let batched = !has_symbols
+            || writer
+                .try_batch(|batch| {
+                    batch_initial_ac(
+                        batch,
+                        ac,
+                        order,
+                        band.low_bit,
+                        extra_zero_runs,
+                        coefficients,
+                    )?;
+                    Some(())
+                })
+                .is_some();
+        let mut zeros = trailing as i32 - 16 * extra_zero_runs as i32;
+        if !batched {
+            zeros = 0;
+            for &natural in order {
+                let value = shifted_ac(coefficients[natural], band.low_bit);
+                if value == 0 {
+                    zeros += 1;
+                    continue;
+                }
+                while zeros > 15 {
+                    writer.write_symbol(ac, 0xf0)?;
+                    zeros -= 16;
+                }
+                let (count, bits) = magnitude_bits(value)?;
+                writer.write_symbol_bits(
+                    ac,
+                    ((zeros as u8) << 4) | count,
+                    u32::from(bits),
+                    count,
+                )?;
+                zeros = 0;
+            }
             for _ in 0..extra_zero_runs {
                 writer.write_symbol(ac, 0xf0)?;
                 zeros -= 16;
@@ -392,14 +557,16 @@ pub fn encode_refinement_block(
                 "pending AC state before DC refinement",
             ));
         }
-        if band.end != 0 {
+        let (masks, last_new, tail) = if band.end != 0 {
             if ac.is_none() {
                 return Err(CoefficientWriteError::Invalid(
                     "missing refinement AC table",
                 ));
             }
-            validate_ac_band(coefficients, band)?;
-        }
+            prepare_refinement_band(coefficients, band)?
+        } else {
+            (Masks::default(), 0, RefinementTail::default())
+        };
         if band.start == 0 {
             writer.write_bits(((i32::from(coefficients[0]) >> band.low_bit) & 1) as u32, 1)?;
         }
@@ -409,19 +576,30 @@ pub fn encode_refinement_block(
         let ac = ac.expect("validated refinement AC table");
         let start = usize::from(band.start.max(1));
         let end = usize::from(band.end);
-        let mut magnitudes = [0i32; BLOCK_SIZE];
-        let mut last_new = 0;
-        for k in start..=end {
-            magnitudes[k] = i32::from(coefficients[NATURAL_ORDER[k]]).abs() >> band.low_bit;
-            if magnitudes[k] == 1 {
-                last_new = k;
+        let batched = if last_new == 0 {
+            // Validation already collected the whole band's corrections. No
+            // symbols, scratch batch or second coefficient walk are needed.
+            true
+        } else {
+            state.flush_inner(writer)?;
+            writer
+                .try_batch(|batch| batch_refinement_ac(batch, ac, start, last_new, masks))
+                .is_some()
+        };
+        if batched {
+            if tail.zeros != 0 || tail.count != 0 {
+                state.buffer_end_of_band(writer, ac, tail.bits, tail.count)?;
+                if band.start == 0 {
+                    state.flush_inner(writer)?;
+                }
             }
+            return Ok(());
         }
         let mut zeros = 0u8;
         let mut correction_bits = 0u64;
         let mut correction_count = 0u8;
         for k in start..=end {
-            let magnitude = magnitudes[k];
+            let magnitude = i32::from(coefficients[NATURAL_ORDER[k]]).abs() >> band.low_bit;
             if magnitude == 0 {
                 zeros += 1;
                 continue;
@@ -456,6 +634,79 @@ pub fn encode_refinement_block(
         Ok(())
     })();
     state.finish_operation(result)
+}
+
+fn batch_refinement_ac(
+    batch: &mut EntropyBatch,
+    ac: &HuffmanTable,
+    start: usize,
+    last_new: usize,
+    masks: Masks,
+) -> Option<()> {
+    #[cfg(feature = "decoder-profile")]
+    let _profile = jxl_decoder::decoder_profile::sample_scope("sample.jpeg.batch_refinement_ac", 7);
+    let mut zeros = 0u8;
+    let mut bits = 0u64;
+    let mut count = 0u8;
+    let mut remaining = masks.nonzero & (u64::MAX >> (63 - last_new));
+    let mut cursor = start;
+    while remaining != 0 {
+        let k = remaining.trailing_zeros() as usize;
+        remaining &= remaining - 1;
+        zeros += (k - cursor) as u8;
+        cursor = k + 1;
+        while zeros > 15 {
+            batch.write_symbol(ac, 0xf0)?;
+            zeros -= 16;
+            batch_corrections(batch, bits, count)?;
+            bits = 0;
+            count = 0;
+        }
+        if masks.newly_nonzero & (1 << k) == 0 {
+            bits = (bits << 1) | ((masks.correction >> k) & 1);
+            count += 1;
+            continue;
+        }
+        let sign = ((masks.positive >> k) & 1) as u32;
+        batch.write_symbol_bits(ac, (zeros << 4) | 1, sign, 1)?;
+        batch_corrections(batch, bits, count)?;
+        bits = 0;
+        count = 0;
+        zeros = 0;
+    }
+    Some(())
+}
+
+#[inline]
+fn batch_corrections(batch: &mut EntropyBatch, bits: u64, count: u8) -> Option<()> {
+    batch.write_bits64(bits, count)
+}
+
+#[derive(Default)]
+struct RefinementTail {
+    zeros: u8,
+    bits: u64,
+    count: u8,
+}
+
+fn prepare_refinement_band(
+    coefficients: &[i16; BLOCK_SIZE],
+    band: ScanBand,
+) -> Result<(Masks, usize, RefinementTail), CoefficientWriteError> {
+    #[cfg(feature = "decoder-profile")]
+    let _profile = jxl_decoder::decoder_profile::sample_scope("sample.jpeg.prepare_refinement", 4);
+    let masks = refinement::classify(coefficients, band).ok_or(CoefficientWriteError::Invalid(
+        "AC coefficient exceeds supported precision",
+    ))?;
+    let last_new = 63usize.saturating_sub(masks.newly_nonzero.leading_zeros() as usize);
+    // Shift by last_new, then by one, so a new coefficient at index 63
+    // produces an empty suffix without a shift-by-64.
+    let suffix = (u64::MAX << last_new) << 1;
+    let selected = suffix & (u64::MAX << band.start.max(1)) & (u64::MAX >> (63 - band.end));
+    let existing = selected & masks.nonzero;
+    let (bits, count) = refinement::correction_bits(masks.correction, existing);
+    let zeros = (selected & !masks.nonzero).count_ones() as u8;
+    Ok((masks, last_new, RefinementTail { zeros, bits, count }))
 }
 
 fn write_corrections(

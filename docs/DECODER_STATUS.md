@@ -54,6 +54,28 @@ for frame in &image.frames {
 let selected = decode_frame(&jxl_bytes, 2, &options)?;
 ```
 
+For repeated independent inputs, `Decoder` owns reusable worker resources:
+
+```rust
+use rs_jxl::decode::{DecodeOptions, Decoder};
+
+let mut decoder = Decoder::new(DecodeOptions { threads: 4, ..Default::default() })?;
+let first = decoder.decode(&first_jxl)?;
+let selected = decoder.decode_frame(&second_jxl, 2)?;
+let original_jpeg = decoder.reconstruct_jpeg(&jpeg_transcoded_jxl)?;
+```
+
+Only immutable options and the worker pool are retained. Each call creates fresh
+parser, frame and reference state, including after a failed input. Resource limits
+apply separately to each complete input. `options()` returns an immutable view;
+create another context to change configuration. Calls require `&mut self`; this
+is not a shared global decoder cache. At one thread no pool is created. The free
+functions remain available and construct their own resources for each call.
+Streaming already retains its resources for the lifetime of its input and is
+unchanged. CLI `--num-reps` now reuses one context, so repeated-call benchmark
+results must not be interpreted as equivalent single-image kernel speedups.
+See [the measured experiments](CODEC_EXPERIMENTS_20261025.md).
+
 `decode` consumes a complete input slice, validates all frames and collects
 requested trailing metadata. `decode_frame` reconstructs dependencies before
 the selected zero-based *visible* frame and stops there. It does not validate
@@ -78,11 +100,17 @@ It does not change frame indices. `inspect` scans frame headers, profiles and bo
 without decoding compressed pixel sections or allocating output canvases. Such a
 scan validates the container/header structure, not the skipped pixel payloads.
 
-`SampleFormat::Native` preserves source integer ranges through 16 bits. An
-integer declared as 10 bits is returned in U16 storage with values 0..1023.
-Floating input is widened to F32. Integers wider than 16 bits are normalized
-F32, which **cannot preserve every U31 integer**. `U8` and `U16` explicitly
-request conversion to their full storage ranges; `F32` requests float output.
+`SampleFormat::Native` preserves source integer ranges. An integer declared as
+10 bits is returned in U16 storage with values 0..1023. Wide original-color
+Modular integers (17..31 bits) use a separate pre-float capture path and return
+U32 storage, including extra planes. This path supports exact integer-compatible
+composition, not arbitrary fractional rendering. Unsupported transforms,
+resampling and mixed floating/integer capture return an error instead of rounded
+samples; explicitly select F32 for rendered output. See
+[native integer decoding](NATIVE_INTEGER_DECODE.md) for its precise boundaries.
+Floating input is widened to F32. `U8` and `U16` explicitly request conversion
+to their full storage ranges; `F32` requests normalized floating output, which
+cannot preserve every U31 value.
 `U8Bits(1..=8)` and `U16Bits(1..=16)` request an explicit significant-bit range.
 The decoder never labels such format conversion pixel-bit-exact.
 
@@ -115,6 +143,22 @@ the Black plane remains available as an extra channel. An explicit RGB/gray CMS
 destination can convert a CMYK source using its Black plane.
 
 ## Color and Partial Output
+
+`DecodeOptions::dither` selects the floating-point-to-U8 output pattern:
+`DitherMode::JxlRs` (default) preserves upstream jxl-rs;
+`DitherMode::Libjxl` uses libjxl v0.12.0's table for C++ output compatibility.
+CLI: `--dither jxl-rs|libjxl`. Selection is per decoder, including previews and
+extra output planes, not a process-global switch. Upstream jxl-rs deliberately
+changed that table in [PR #940](https://github.com/libjxl/jxl-rs/pull/940) for
+more even dithering; its different U8 samples were not evidence of damaged JPEG
+coefficients. This output selection does not affect native integer lossless
+samples, F32 output, Modular smooth-squeeze, or byte-exact original-JPEG
+reconstruction. It does not
+guarantee universal pixel equality: the upstream VarDCT floating-point pipeline
+can still differ slightly from C++, even with identical quantizers. See the
+bounded measurements in `JPEG_PIXEL_DECODE_20261025.md`.
+Explicit CMS/background postprocessing retains its existing nondithered final
+quantizer; the option selects the backend's already-dithered output.
 
 `DecodeOptions::color` contains `ColorOptions`: an optional `ColorProfile::Icc`
 byte vector or structured `ColorProfile::Encoding`, `display_nits`, and an optional
@@ -241,7 +285,8 @@ wire default, with the same padding-work budget as explicit bits.
 - The 2026-10-24 strict floating-render matrix is 12/17 against each official
   decoder version, not an all-green conformance result. Five VarDCT cases exceed
   the unchanged `1e-5` diagnostic threshold; see the checkpoint below.
-- Exact native U31 integer output remains beyond the rendered-pixel djxl target.
+- Native U31 output has an explicit integer-only path; fractional blends,
+  resampling, VarDCT and floating-channel mixtures are outside that exact path.
 - Mixed-upsampled patch dictionaries are supported when color patches do not
   blend extra channels. Cross-resolution EC/alpha blending rejected by the C++
   reference is still rejected, rather than assigned invented semantics.
@@ -250,6 +295,11 @@ wire default, with the same padding-work budget as explicit bits.
 - Progressive selection currently consumes all frame sections while skipping
   eligible later HF entropy work. It is not a streaming/network-byte optimization.
   Required reference frames and unsupported progressions retain full quality.
+- Incremental pixel input is a separate `StreamDecoder` / `decode_reader` API,
+  described in [streaming input](STREAMING_INPUT.md). It retains parser state and
+  can emit frames before EOF; callers must still validate `finish()`. Backend
+  buffering and references prevent a constant-memory promise. JPEG restoration
+  and metadata-only entry points still take complete byte slices.
 - Output CMS is explicit; opaque ICC transforms reject out-of-range input instead
   of silently clipping it. Structured profiles use an unclamped matrix path.
 - Numerical rendering and general ICC-engine differences with skcms-based djxl
@@ -519,7 +569,78 @@ regressions and arc-length sampling) and six JPEG coefficient-capture tests
 passed there. This is not a claim that
 the complete upstream suite was run.
 
+## Native Samples and Incremental Input Checkpoint (2026-10-24)
+
+The public Native path now retains 17..31-bit original-color Modular integer
+samples without f32 storage. Color and extra planes keep their declared code
+values; unequal-depth interleaved alpha is only a display convenience, and its
+separate plane is authoritative. Integer RCT/palette/squeeze routes, multigroup
+execution, reference crops and exact sample limits are covered by targeted
+tests. This is the documented integer subset, not all fractional render modes.
+See [native integer decoding](NATIVE_INTEGER_DECODE.md).
+
+`StreamDecoder` and the `decode_reader*` APIs keep one decoder and runner alive
+across chunks. They publish frames before EOF but still require EOF validation
+for the complete file. CLI `--stream-input` reads incrementally and retains
+decoded frames until transactional output publication. JPEG reconstruction and
+metadata-only/selected-frame input remain separate one-slice APIs. See
+[streaming input](STREAMING_INPUT.md).
+
+Additional fixes validate patch entropy final state, signed coordinates, extents
+and full-width blend symbols. Version-1 out-of-order chunks decode sequentially
+without exposing unrepresentable seek checkpoints; version 0 still rejects
+out-of-order chunks. This does not change the encoder's ordered version-0 output.
+
+JPEG DC refinement no longer requires an unused DC Huffman table. Source tables
+and selectors are retained, and original JPEG bytes are reconstructed exactly.
+The bounded compatibility probe is diagnostic, not a new arithmetic transcoder.
+Arithmetic JPEG remains an implementation/mapping investigation, not a claimed
+format prohibition; CMYK original-JPEG archival has a distinct coefficient
+mapping limitation. See [JPEG compatibility](JPEG_COMPATIBILITY.md).
+
+Windows x86_64 targeted results at this checkpoint:
+
+- 92 integration tests passed: ordinary decoding, raw layers, hostile input,
+  JPEG reconstruction/capture, lossless edges, 17 streaming tests, seven wide
+  integer tests, three DC-refinement tests and automatic multiframe selection.
+  The hostile child worker is deliberately ignored for ordinary discovery and
+  invoked by four parent tests; it is not counted twice. Two optional
+  external-corpus tests were not run.
+- 295 JPEG-module unit tests passed, including 14 compatibility-probe tests;
+  nine optional reference-codec tests were not run.
+- 82 CLI tests passed; two optional external-codec tests were not run. This
+  includes streaming input, no output publication on failure, and exact NPY
+  integer widening.
+- 11 vendor native-integer helper tests and 28 patch-module tests passed in the
+  existing isolated vendor fixture copy. This is not the full upstream suite.
+- 10 platform-harness tests passed, including failure/timeout accounting and
+  the prohibition on automatic WSL invocation.
+- Full workspace/all-target compilation with the already-installed Windows
+  Rust 1.89.0 minimum toolchain passed. Final Clippy with `-D warnings` and
+  workspace rustfmt checks also passed.
+
+Release test builds used `CARGO_PROFILE_RELEASE_LTO=false` and
+`CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16` to reduce development link time. Runtime
+logs are under ignored `out/decoder-integration/`; no bitstream-hash equality
+was used as codec acceptance. Pixel tests use original samples; JPEG tests use
+the original entire JPEG file. This is bounded regression coverage, not an
+exhaustive fuzzer, a process-memory sandbox, or full format certification.
+
+Linux runtime acceptance was not performed. WSL preparation was stopped at the
+user's instruction; it must not restart implicitly. macOS is outside the user's
+current acceptance scope. Python bindings and CI were not changed.
+
 ## Verification Commands
+
+For single-thread JPEG reconstruction and subsequent pixel-decoder changes,
+see [Single-Thread and Pixel Decoder Follow-Up](DECODER_SINGLE_20261024.md).
+This records measured gains and remaining official-decoder performance gaps,
+not a claim of universal speed parity or full corpus conformance.
+
+For the later JPEG reconstruction performance iteration, including parallel scan
+writing, unchanged original-byte acceptance, and remaining single-thread gaps,
+see [Parallel JPEG Reconstruction](DECODER_PARALLEL_20261024.md). Its normal
+Release measurements are separate from the reduced-LTO feature-test builds above.
 
 During feature implementation use compile checks; execute the runtime matrix
 after integrating the complete path:

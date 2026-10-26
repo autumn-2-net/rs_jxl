@@ -7,6 +7,8 @@
 pub mod api;
 mod bit_reader;
 mod color;
+#[cfg(feature = "decoder-profile")]
+pub mod decoder_profile;
 mod entropy_coding;
 pub mod error;
 mod features;

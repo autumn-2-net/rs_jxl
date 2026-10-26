@@ -28,6 +28,8 @@ use super::{ColorCorrelationParams, DataStatus, Frame};
 const FIXED_ONE: i32 = 1 << 11;
 const ROUND: i32 = FIXED_ONE / 2;
 
+use jxl_simd::jpeg_capture as simd;
+
 pub(crate) fn unsupported(reason: &'static str) -> Error {
     Error::ApiUsageError(reason)
 }
@@ -36,6 +38,7 @@ pub(crate) fn unsupported(reason: &'static str) -> Error {
 struct CaptureState {
     output: Option<JxlJpegCoefficients>,
     quantization: Option<[[u16; 64]; 3]>,
+    cfl_quantization_ratios: [[i32; 64]; 2],
     lf_done: Vec<bool>,
     hf_done: Vec<bool>,
     hf_passes: Vec<usize>,
@@ -237,6 +240,7 @@ impl JpegCapture {
                     components,
                 }),
                 quantization: None,
+                cfl_quantization_ratios: [[0; 64]; 2],
                 lf_done: vec![false; header.num_lf_groups()],
                 hf_done: vec![false; header.num_groups()],
                 hf_passes: vec![0; header.num_groups()],
@@ -315,6 +319,11 @@ impl JpegCapture {
                 tables[c][k] = value as u16;
             }
         }
+        let ratios = std::array::from_fn(|chroma| {
+            std::array::from_fn(|k| {
+                FIXED_ONE * i32::from(tables[1][k]) / i32::from(tables[chroma * 2][k])
+            })
+        });
         let mut state = self.state.lock().unwrap();
         if let Some(output) = &mut state.output {
             for component in &mut output.components {
@@ -322,6 +331,7 @@ impl JpegCapture {
             }
         }
         state.quantization = Some(tables);
+        state.cfl_quantization_ratios = ratios;
         Ok(())
     }
 
@@ -395,9 +405,9 @@ impl JpegCapture {
 
     pub(crate) fn new_group(&self, header: &FrameHeader, group: usize) -> Result<JpegGroupCapture> {
         let state = self.state.lock().unwrap();
-        let quantization = state
-            .quantization
-            .ok_or(unsupported("JPEG capture has no quantization tables"))?;
+        if state.quantization.is_none() {
+            return Err(unsupported("JPEG capture has no quantization tables"));
+        }
         let output = state
             .output
             .as_ref()
@@ -406,17 +416,24 @@ impl JpegCapture {
         for component in &output.components {
             active[component.jxl_channel] = true;
         }
+        let cfl_quantization_ratios = state.cfl_quantization_ratios;
+        drop(state);
         let rect = header.block_group_rect(group);
+        let hshifts = std::array::from_fn(|c| header.hshift(c));
+        let vshifts = std::array::from_fn(|c| header.vshift(c));
+        let widths = std::array::from_fn(|c| rect.size.0 >> hshifts[c]);
         let mut coefficients = [Vec::new(), Vec::new(), Vec::new()];
         for c in 0..3 {
             if active[c] {
-                coefficients[c] = zeroed_coefficients(
-                    (rect.size.0 >> header.hshift(c)) * (rect.size.1 >> header.vshift(c)),
-                )?;
+                coefficients[c] = zeroed_coefficients(widths[c] * (rect.size.1 >> vshifts[c]))?;
             }
         }
         Ok(JpegGroupCapture {
-            quantization,
+            cfl: cfl_quantization_ratios.map(CflScaleCache::new),
+            hshifts,
+            vshifts,
+            widths,
+            is444: header.is444(),
             active,
             coefficients,
         })
@@ -491,6 +508,9 @@ impl JpegCapture {
             } else {
                 1024 / i32::from(component.quantization[0])
             };
+            if offset == 0 {
+                continue;
+            }
             for block in component.coefficients.chunks_exact_mut(64) {
                 block[0] = (i32::from(block[0]) - offset) as i16;
             }
@@ -517,19 +537,66 @@ impl JpegCapture {
 }
 
 pub(crate) struct JpegGroupCapture {
-    quantization: [[u16; 64]; 3],
+    cfl: [CflScaleCache; 2],
+    hshifts: [usize; 3],
+    vshifts: [usize; 3],
+    widths: [usize; 3],
+    is444: bool,
     active: [bool; 3],
     coefficients: [Vec<i16>; 3],
 }
 
-fn restore_ac(residual: i32, luma: i32, q_y: u16, q_c: u16, factor: i8) -> Result<i16> {
-    let ratio = FIXED_ONE * i32::from(q_y) / i32::from(q_c);
-    let scale = i32::from(factor) * FIXED_ONE / DEFAULT_COLOR_FACTOR as i32;
-    let scaled = ratio
-        .checked_mul(scale)
-        .and_then(|x| x.checked_add(ROUND))
-        .ok_or(unsupported("JPEG capture CfL scale overflow"))?
-        >> 11;
+struct CflScaleCache {
+    ratios: [i32; 64],
+    factor: i8,
+    scaled: [Option<i32>; 64],
+    fast_scaled: [i32; 64],
+    fast_valid: bool,
+}
+
+impl CflScaleCache {
+    fn new(ratios: [i32; 64]) -> Self {
+        Self {
+            ratios,
+            factor: 0,
+            scaled: [Some(0); 64],
+            fast_scaled: [0; 64],
+            fast_valid: true,
+        }
+    }
+
+    fn for_factor(&mut self, factor: i8) -> &[Option<i32>; 64] {
+        if self.factor != factor {
+            self.fast_valid = true;
+            let scale = i32::from(factor) * FIXED_ONE / DEFAULT_COLOR_FACTOR as i32;
+            for k in 1..64 {
+                // Keep failures per coefficient, so caching cannot reorder errors
+                // or reject an unused DC scale. Both original roundings remain.
+                self.scaled[k] = self.ratios[k]
+                    .checked_mul(scale)
+                    .and_then(|x| x.checked_add(ROUND))
+                    .map(|x| x >> 11);
+                self.fast_scaled[k] = self.scaled[k].unwrap_or(0);
+                self.fast_valid &= self.scaled[k].is_some_and(|x| (-524288..=524288).contains(&x));
+            }
+            self.factor = factor;
+        }
+        &self.scaled
+    }
+}
+
+#[inline]
+fn checked_ac(value: i32) -> Result<i16> {
+    if !(-4095..=4095).contains(&value) {
+        return Err(unsupported(
+            "JPEG capture AC coefficient is outside the 8-bit JPEG range",
+        ));
+    }
+    Ok(value as i16)
+}
+
+#[inline]
+fn restore_ac_scaled(residual: i32, luma: i32, scaled: i32) -> Result<i16> {
     let prediction = luma
         .checked_mul(scaled)
         .and_then(|x| x.checked_add(ROUND))
@@ -538,12 +605,7 @@ fn restore_ac(residual: i32, luma: i32, q_y: u16, q_c: u16, factor: i8) -> Resul
     let value = residual
         .checked_add(prediction)
         .ok_or(unsupported("JPEG capture AC coefficient overflow"))?;
-    if !(-4095..=4095).contains(&value) {
-        return Err(unsupported(
-            "JPEG capture AC coefficient is outside the 8-bit JPEG range",
-        ));
-    }
-    Ok(value as i16)
+    checked_ac(value)
 }
 
 impl JpegGroupCapture {
@@ -553,30 +615,47 @@ impl JpegGroupCapture {
         group: usize,
         bx: usize,
         by: usize,
-        raw: &[[i32; 64]; 3],
+        raw: [&[i32; 64]; 3],
         factors: [i8; 3],
     ) -> Result<()> {
-        let rect = header.block_group_rect(group);
+        #[cfg(feature = "decoder-profile")]
+        let _profile = crate::decoder_profile::sample_scope("sample.jpeg.capture_block", 3);
+        debug_assert_eq!(self.is444, header.is444());
+        debug_assert_eq!(
+            self.widths[1],
+            header.block_group_rect(group).size.0 >> self.hshifts[1]
+        );
         for c in [1, 0, 2] {
-            let hs = header.hshift(c);
-            let vs = header.vshift(c);
+            let hs = self.hshifts[c];
+            let vs = self.vshifts[c];
             if !self.active[c] || ((bx >> hs) << hs) != bx || ((by >> vs) << vs) != by {
                 continue;
             }
-            let offset = ((by >> vs) * (rect.size.0 >> hs) + (bx >> hs)) * 64;
-            for k in 1..64 {
+            let offset = ((by >> vs) * self.widths[c] + (bx >> hs)) * 64;
+            let output = &mut self.coefficients[c][offset..offset + 64];
+            let factor = if self.is444 && c != 1 { factors[c] } else { 0 };
+            if factor == 0 {
+                if simd::capture(raw[c], None, output) {
+                    continue;
+                }
+                for (k, coefficient) in output.iter_mut().enumerate().skip(1) {
+                    *coefficient = checked_ac(raw[c][(k % 8) * 8 + k / 8])?;
+                }
+                continue;
+            }
+            let cache = &mut self.cfl[c / 2];
+            cache.for_factor(factor);
+            if cache.fast_valid && simd::capture(raw[c], Some((raw[1], &cache.fast_scaled)), output)
+            {
+                continue;
+            }
+            let scaled = &cache.scaled;
+            for (k, coefficient) in output.iter_mut().enumerate().skip(1) {
                 let transposed = (k % 8) * 8 + k / 8;
-                let factor = if header.is444() && c != 1 {
-                    factors[c]
-                } else {
-                    0
-                };
-                self.coefficients[c][offset + k] = restore_ac(
+                *coefficient = restore_ac_scaled(
                     raw[c][transposed],
                     raw[1][transposed],
-                    self.quantization[1][k],
-                    self.quantization[c][k],
-                    factor,
+                    scaled[k].ok_or(unsupported("JPEG capture CfL scale overflow"))?,
                 )?;
             }
         }

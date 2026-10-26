@@ -105,13 +105,19 @@ pub fn transcode_search(
     }
     let retained = transcode::with_threads(&settings, |pool| {
         let prepared = transcode::Prepared::new(&jpeg, &settings)?;
+        let mut ac_cache = transcode::SearchCache::new(&jpeg);
         run(options.effort, pixels, limits, |effort, budget| {
             let candidate = transcode::Options {
                 tier: SpeedTier::try_from(10 - effort as i8)?,
                 max_output_bytes: budget.max_output_bytes,
                 ..settings.clone()
             };
-            prepared.encode(&jpeg, &candidate, pool)
+            // e1/e2 have only one trial: no AC reuse can repay serialization.
+            if options.effort < 3 {
+                prepared.encode(&jpeg, &candidate, pool)
+            } else {
+                prepared.encode_with_cache(&jpeg, &candidate, pool, &mut ac_cache)
+            }
         })
     })?;
     Ok(SearchResult {
@@ -134,6 +140,82 @@ pub fn transcode_search(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn one_trial_search_keeps_backend_three_and_original_jpeg() {
+        let input = crate::jpeg::transcode_reference_tests::fixtures::fixtures()
+            .into_iter()
+            .find(|(name, _)| name == "rgb_seq_33x25")
+            .unwrap()
+            .1;
+        for effort in [1, 2] {
+            let options = TranscodeOptions {
+                effort,
+                ..Default::default()
+            };
+            let result = transcode_search(&input, &options, SearchLimits::default()).unwrap();
+            assert_eq!(result.backend_effort, 3);
+            assert_eq!(result.trials.len(), 1);
+            assert_eq!(result.trials[0].stage, 1);
+            assert_eq!(
+                crate::decode::reconstruct_jpeg(&result.data, &Default::default()).unwrap(),
+                input,
+            );
+        }
+    }
+
+    #[test]
+    fn search_cache_preserves_complete_trial_ledger_and_winner() {
+        let input = crate::jpeg::transcode_reference_tests::fixtures::fixtures()
+            .into_iter()
+            .find(|(name, _)| name == "rgb_seq_33x25")
+            .unwrap()
+            .1;
+        let options = TranscodeOptions {
+            effort: 11,
+            threads: 2,
+            ..Default::default()
+        };
+        let settings = options.resolve().unwrap();
+        let jpeg = archival::read_input(&input, &options.limits.input).unwrap();
+        let pixels = u64::from(jpeg.width) * u64::from(jpeg.height);
+        let expected = transcode::with_threads(&settings, |pool| {
+            let prepared = transcode::Prepared::new(&jpeg, &settings)?;
+            run(
+                options.effort,
+                pixels,
+                SearchLimits::default(),
+                |effort, budget| {
+                    let candidate = transcode::Options {
+                        tier: SpeedTier::try_from(10 - effort as i8)?,
+                        max_output_bytes: budget.max_output_bytes.min(settings.max_output_bytes),
+                        ..settings.clone()
+                    };
+                    prepared.encode(&jpeg, &candidate, pool)
+                },
+            )
+        })
+        .unwrap();
+        let actual = transcode_search(&input, &options, SearchLimits::default()).unwrap();
+        assert_eq!(actual.data, expected.bytes);
+        assert_eq!(actual.backend_effort, expected.artifact);
+        assert_eq!(actual.winner_index, expected.winner_index);
+        assert_eq!(actual.full_pixels, expected.full_pixels);
+        assert_eq!(actual.trials.len(), expected.full_encodes);
+        assert_eq!(actual.trials.len(), expected.trials.len());
+        for (actual, expected) in actual.trials.iter().zip(&expected.trials) {
+            assert_eq!(actual.stage, expected.stage);
+            assert_eq!(
+                actual.backend_effort,
+                (10 - expected.params.speed_tier) as u8
+            );
+            assert_eq!(Some(actual.bytes), expected.bytes);
+        }
+        assert_eq!(
+            crate::decode::reconstruct_jpeg(&actual.data, &Default::default()).unwrap(),
+            input
+        );
+    }
 
     #[test]
     fn every_effort_is_the_source_prefix_and_retains_the_smallest_output() {

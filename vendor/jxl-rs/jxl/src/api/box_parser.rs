@@ -150,6 +150,9 @@ pub(super) struct BoxParser {
     // to box info
     codestream_pos_to_box: BTreeMap<u64, BoxParserCheckpoint>,
     allow_checkpoint: bool,
+    // Once physical and logical chunk order diverge, the current checkpoint
+    // representation cannot reconstruct the buffered chunks after a seek.
+    seek_index_available: bool,
     container_level: Option<ProfileLevel>,
     aux: AuxBoxState,
     input_closed: bool,
@@ -175,6 +178,7 @@ impl BoxParser {
             container_level: None,
             codestream_pos_to_box: BTreeMap::new(),
             allow_checkpoint: true,
+            seek_index_available: true,
             aux: AuxBoxState {
                 boxes_to_extract: box_types.into_iter().collect(),
                 ..Default::default()
@@ -209,6 +213,7 @@ impl BoxParser {
         self.latest_codestream_box = CodestreamBoxType::None;
         self.codestream_pos_to_box.clear();
         self.allow_checkpoint = true;
+        self.seek_index_available = true;
         self.container_level = None;
         self.aux.boxes.clear();
         self.aux.box_buffer = None;
@@ -240,7 +245,7 @@ impl BoxParser {
         &self,
         codestream_pos: u64,
     ) -> Result<Option<BoxParserCheckpoint>> {
-        if !self.allow_checkpoint {
+        if !self.allow_checkpoint || !self.seek_index_available {
             Ok(None)
         } else {
             // last element with key <= codestream_pos.
@@ -250,9 +255,8 @@ impl BoxParser {
                 .last()
                 .unwrap();
             if !b.is_valid_checkpoint {
-                // Disallow files that have frame starts in boxes that are not
-                // valid checkpoints.
-                return Err(Error::InvalidBox);
+                // Sequential decoding does not require a seekable frame start.
+                return Ok(None);
             }
             let overflow = codestream_pos - start;
             if let Some(bytes) = &mut b.codestream_left {
@@ -753,6 +757,11 @@ impl BoxParser {
                     if content_len.is_none() {
                         return Err(Error::InvalidBox);
                     }
+                    // Do not resume publishing seek targets even after this
+                    // buffer drains: skipped frame/reference indexes and the
+                    // physical-offset map are no longer a complete seek index.
+                    // Keep checkpoint accounting for total_bytes_consumed.
+                    self.seek_index_available = false;
                     self.state = ParseState::OOOJxlp(idx, content_len);
                     self.ooo_jxlp_buffer.insert(
                         idx,

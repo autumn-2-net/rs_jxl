@@ -459,6 +459,15 @@ impl CodestreamParser {
                         }?;
                     }
 
+                    if !matches!(process_mode, ProcessMode::Skip(..)) {
+                        self.frame_info
+                            .current_frame_mut()
+                            .unwrap()
+                            .finish_native_integer_frame(
+                                decode_options.coalescing,
+                                process_mode.notify_user(),
+                            )?;
+                    }
                     let header = self.frame_info.current_frame_header().unwrap();
                     let is_last = header.is_last;
                     if process_mode.notify_user() {

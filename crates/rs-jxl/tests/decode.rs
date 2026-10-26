@@ -446,6 +446,56 @@ fn integer_image(width: u32, height: u32, layout: PixelLayout, wide: bool) -> Im
 }
 
 #[test]
+fn modular_row_boundaries_roundtrip_every_predictor_and_entropy_coder() {
+    use rs_jxl::modular::tree::{Node, Tree};
+
+    // Every channel exceeds the tiny-channel fallback, including narrow rows.
+    let dimensions = [
+        (1, 65),
+        (2, 33),
+        (3, 23),
+        (4, 17),
+        (5, 15),
+        (7, 11),
+        (17, 9),
+        (65, 9),
+    ];
+    for id in 0..14 {
+        let predictor = Predictor::try_from(id).unwrap();
+        for wide in [false, true] {
+            for coding in [Coding::Prefix, Coding::Ans] {
+                let mut options = encode_options();
+                options.modular.fixed_tree = None;
+                options.modular.custom_tree = Some(
+                    Tree::new(vec![Node::Leaf {
+                        predictor,
+                        offset: 0,
+                        multiplier: 1,
+                    }])
+                    .unwrap(),
+                );
+                options.modular.entropy = coding;
+                for (width, height) in dimensions {
+                    let mut source = integer_image(width, height, PixelLayout::Gray, wide);
+                    if !wide {
+                        let mut metadata = source.metadata().clone();
+                        metadata.modular_16_bit_buffer_sufficient = true;
+                        source = source.with_metadata(metadata, vec![]).unwrap();
+                    }
+                    let bytes = encode(&source, &options).unwrap();
+                    let result = decode(&bytes, &DecodeOptions::default()).unwrap();
+                    assert_eq!(
+                        only_frame(&result).pixels,
+                        *source.pixels(),
+                        "{predictor:?} {coding:?} wide={wide} {width}x{height}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn native_integer_roundtrips_all_layouts_and_hidden_colors() {
     for wide in [false, true] {
         for layout in LAYOUTS {
@@ -478,6 +528,67 @@ fn native_integer_roundtrips_all_layouts_and_hidden_colors() {
                         &frame.extra_planes[0],
                         &alpha_plane(source.pixels(), layout),
                     );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn modular_channel_readers_keep_entropy_configs_and_lz77_separate() {
+    use rs_jxl::entropy::HybridUintConfig;
+    use rs_jxl::entropy::options::UintConfigStrategy;
+    use rs_jxl::modular::tree::{Node, Tree};
+
+    let mixed = Tree::new(vec![
+        Node::Split {
+            property: 3,
+            threshold: 24,
+            greater: 1,
+            less_equal: 2,
+        },
+        Node::Leaf {
+            predictor: Predictor::Weighted,
+            offset: 0,
+            multiplier: 1,
+        },
+        Node::Leaf {
+            predictor: Predictor::Left,
+            offset: 0,
+            multiplier: 1,
+        },
+    ])
+    .unwrap();
+    for wide in [false, true] {
+        for layout in [PixelLayout::Gray, PixelLayout::Rgba] {
+            let source = integer_image(73, 9, layout, wide);
+            for coding in [Coding::Prefix, Coding::Ans] {
+                for (split, msb, lsb) in [(4, 2, 0), (0, 0, 0), (2, 0, 1)] {
+                    for lz77 in [false, true] {
+                        for fixed in [
+                            Some(FixedTree::Zero),
+                            Some(FixedTree::Weighted),
+                            Some(FixedTree::Gradient),
+                            Some(FixedTree::GradientLeaf),
+                            None,
+                        ] {
+                            let mut options = encode_options();
+                            options.modular.fixed_tree = fixed;
+                            options.modular.custom_tree = fixed.is_none().then(|| mixed.clone());
+                            options.modular.entropy = coding;
+                            options.modular.lz77 = lz77;
+                            options.modular.entropy_options.uint_config = UintConfigStrategy::Fixed(
+                                HybridUintConfig::new(split, msb, lsb).unwrap(),
+                            );
+                            let bytes = encode(&source, &options).unwrap();
+                            let result = decode(&bytes, &DecodeOptions::default()).unwrap();
+                            assert_eq!(
+                                only_frame(&result).pixels,
+                                *source.pixels(),
+                                "wide={wide} {layout:?} {coding:?} uint={split}/{msb}/{lsb} lz={lz77} {fixed:?}"
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -652,12 +763,22 @@ fn float_edges_preserve_payloads_and_hidden_colors_in_every_layout() {
 }
 
 #[test]
-fn native_wide_integers_are_normalized_f32_not_u31_storage() {
+fn native_wide_integers_are_exact_and_float_projection_is_explicit() {
     let values = vec![0, 1, 1 << 24, 1 << 30, (1 << 31) - 2, (1 << 31) - 1];
     let source = Image::new(3, 2, PixelLayout::Gray, PixelData::U32(values.clone())).unwrap();
-    let result = decode(&encoded(&source), &DecodeOptions::default()).unwrap();
+    let bytes = encoded(&source);
+    let native = decode(&bytes, &DecodeOptions::default()).unwrap();
+    assert_eq!(only_frame(&native).pixels, PixelData::U32(values.clone()));
+    let result = decode(
+        &bytes,
+        &DecodeOptions {
+            format: SampleFormat::F32,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     let PixelData::F32(samples) = &only_frame(&result).pixels else {
-        panic!("wide native output must be F32")
+        panic!("explicit float output must be F32")
     };
     assert_eq!(samples.len(), values.len());
     for (&actual, &value) in samples.iter().zip(&values) {

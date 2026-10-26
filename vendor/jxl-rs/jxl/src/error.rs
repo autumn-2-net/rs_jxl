@@ -15,6 +15,10 @@ use crate::image::DataTypeTag;
 #[derive(Error, Debug)]
 #[non_exhaustive]
 pub enum Error {
+    #[error("Exact native integer decoding is unsupported: {0}")]
+    NativeIntegerUnsupported(&'static str),
+    #[error("Invalid exact native integer samples: {0}")]
+    NativeIntegerInvalid(&'static str),
     #[error("Invalid UTF-8 in JPEG XL name")]
     InvalidUtf8String,
     #[error("Invalid raw quantization table")]

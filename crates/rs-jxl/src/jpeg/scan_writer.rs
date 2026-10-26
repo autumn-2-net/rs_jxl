@@ -18,6 +18,9 @@ use super::huffman::HuffmanTable;
 use super::reader::ReadLimits;
 use super::reconstruction_validation::{append_record, reserve, validate};
 
+#[path = "scan_writer_parallel.rs"]
+mod parallel;
+
 #[derive(Clone, Debug)]
 pub struct WriteLimits {
     pub structural: ReadLimits,
@@ -95,18 +98,45 @@ pub fn reconstruct_from_coefficients(
     jpeg: &JpegData,
     limits: &WriteLimits,
 ) -> Result<Vec<u8>, ReconstructionError> {
-    validate(jpeg, limits)?;
+    reconstruct_with_pool(jpeg, limits, None)
+}
+
+pub(crate) fn reconstruct_with_pool(
+    jpeg: &JpegData,
+    limits: &WriteLimits,
+    pool: Option<&rayon::ThreadPool>,
+) -> Result<Vec<u8>, ReconstructionError> {
+    let _total = crate::profile::scope("decode.jpeg.rewrite");
+    {
+        let _validation = crate::profile::scope("decode.jpeg.writer_validation");
+        validate(jpeg, limits)?;
+    }
+    if let Some(pool) = pool
+        && let Some(output) = parallel::progressive(jpeg, limits, pool)?
+    {
+        return Ok(output);
+    }
     let mut output = Vec::new();
     let mut padding = 0;
     for record in &jpeg.records {
         if let JpegRecord::Entropy(entropy) = record {
-            let bytes = encode_scan(
-                jpeg,
-                entropy.scan_index,
-                &mut padding,
-                limits,
-                limits.max_output_bytes - output.len(),
-            )?;
+            let remaining = limits.max_output_bytes - output.len();
+            let parallel = if let Some(pool) = pool {
+                parallel::sequential(
+                    jpeg,
+                    entropy.scan_index,
+                    &mut padding,
+                    limits,
+                    remaining,
+                    pool,
+                )?
+            } else {
+                None
+            };
+            let bytes = match parallel {
+                Some(bytes) => bytes,
+                None => encode_scan(jpeg, entropy.scan_index, &mut padding, limits, remaining)?,
+            };
             reserve(&mut output, bytes.len(), limits.max_output_bytes)?;
             output.extend_from_slice(&bytes);
         } else {
@@ -170,7 +200,23 @@ fn encode_scan(
     limits: &WriteLimits,
     max_bytes: usize,
 ) -> Result<Vec<u8>, ReconstructionError> {
+    let _scan = crate::profile::scope("decode.jpeg.scan_write");
     let scan = &jpeg.scan_info[index];
+    #[cfg(feature = "decoder-profile")]
+    let _scan_kind =
+        crate::profile::scope(if jpeg.coding_process != Some(CodingProcess::Progressive) {
+            "decode.jpeg.scan.sequential"
+        } else if scan.se == 0 {
+            if scan.ah == 0 {
+                "decode.jpeg.scan.dc_initial"
+            } else {
+                "decode.jpeg.scan.dc_refine"
+            }
+        } else if scan.ah == 0 {
+            "decode.jpeg.scan.ac_initial"
+        } else {
+            "decode.jpeg.scan.ac_refine"
+        });
     let entropy = jpeg
         .entropy_data(index)
         .ok_or(ReconstructionError::Invalid("entropy descriptor"))?;

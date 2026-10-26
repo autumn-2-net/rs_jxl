@@ -12,7 +12,7 @@ use modular::{FullModularImage, ModularStorage, Tree};
 use quant_weights::DequantMatrices;
 use quantizer::{LfQuantFactors, QuantizerParams};
 
-use crate::api::{AlphaMode, JxlDecoderOptions, JxlParallelRunner};
+use crate::api::{AlphaMode, DitherMode, JxlDecoderOptions, JxlParallelRunner};
 use crate::entropy_coding::decode::Histograms;
 use crate::error::Result;
 use crate::features::epf::SigmaSource;
@@ -38,6 +38,7 @@ mod group;
 pub(crate) mod jpeg;
 pub mod lf_preview;
 pub mod modular;
+pub(crate) mod native_integer;
 mod quant_weights;
 pub mod quantizer;
 pub mod render;
@@ -130,6 +131,7 @@ pub struct DecoderState {
     pub allow_16bit_modular_buffers: bool,
     pub high_precision: bool,
     pub alpha_mode: AlphaMode,
+    pub dither: DitherMode,
     pub adjust_orientation: bool,
     pub level5_limits: bool,
     pub sample_limit: Option<usize>,
@@ -138,6 +140,7 @@ pub struct DecoderState {
     // (before HF is available) will do nothing.
     pub lf_frame_was_rendered: bool,
     pub(crate) jpeg_capture: Option<Arc<jpeg::JpegCapture>>,
+    pub(crate) native_integer_capture: Option<Arc<native_integer::NativeIntegerCapture>>,
 }
 
 impl DecoderState {
@@ -145,6 +148,9 @@ impl DecoderState {
     pub const NUM_LF_FRAMES: usize = 4;
 
     pub fn keep_slots(&mut self, keep_slots: [bool; 8]) {
+        if let Some(capture) = &self.native_integer_capture {
+            capture.keep_slots(keep_slots);
+        }
         if keep_slots == [true; 8] {
             return;
         }
@@ -174,11 +180,13 @@ impl DecoderState {
             allow_16bit_modular_buffers: !options.test_options.disable_16bit_modular_buffers,
             high_precision: options.high_precision,
             alpha_mode: options.alpha_mode,
+            dither: options.dither,
             adjust_orientation: options.adjust_orientation,
             level5_limits,
             sample_limit: options.sample_limit,
             lf_frame_was_rendered: false,
             jpeg_capture: None,
+            native_integer_capture: None,
         }
     }
 
@@ -346,6 +354,7 @@ pub struct Frame {
     // LF groups that received data or have modified neighbors and need to be previewed.
     lf_preview_dirty_groups: BTreeSet<usize>,
     frame_counters: (usize, usize),
+    native_integer_frame: Option<native_integer::NativeIntegerFrameBuffer>,
 }
 
 impl Frame {

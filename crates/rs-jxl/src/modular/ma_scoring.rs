@@ -52,13 +52,23 @@ pub enum DescriptionCost {
 
 impl DescriptionCost {
     pub(super) fn cost(self, scorer: &DefaultScorer, counts: &[u32], total: u32) -> f32 {
+        if self == Self::Disabled {
+            return 0.0;
+        }
+        self.cost_for_active(
+            scorer,
+            counts.iter().filter(|&&count| count != 0).count(),
+            total,
+        )
+    }
+
+    pub(super) fn cost_for_active(self, scorer: &DefaultScorer, active: usize, total: u32) -> f32 {
         let weight = match self {
             Self::Disabled => return 0.0,
             Self::Quarter => 0.25,
             Self::Half => 0.5,
             Self::Full => 1.0,
         };
-        let active = counts.iter().filter(|&&count| count != 0).count();
         if active > 1 {
             weight * 0.5 * (active - 1) as f32 * scorer.log2(total as f32 + 1.0)
         } else {

@@ -14,9 +14,10 @@ use crate::api::{Endianness, JxlDataFormat, JxlOutputBuffer};
 use crate::image::ImageDataType;
 use crate::render::low_memory_pipeline::row_buffers::RowBuffer;
 use crate::render::save::{SaveChannelType, SaveStage};
-use crate::util::DITHER_TABLE;
+use crate::util::DitherTable;
 
 #[inline(always)]
+#[allow(clippy::too_many_arguments)]
 fn f32_to_u8_simd<D: SimdDescriptor>(
     d: D,
     input: &[f32],
@@ -25,6 +26,7 @@ fn f32_to_u8_simd<D: SimdDescriptor>(
     position: (usize, usize),
     channel: usize,
     xsize: usize,
+    dither_table: &DitherTable,
 ) {
     let (x0, y0) = position;
     let simd_width = D::F32Vec::LEN;
@@ -41,7 +43,7 @@ fn f32_to_u8_simd<D: SimdDescriptor>(
         let x = block * simd_width;
         let val = D::F32Vec::load(d, input_chunk);
         let dither_x = (x0 + x + channel * 23) % 32;
-        let dither = D::F32Vec::load(d, &DITHER_TABLE[dither_y][dither_x..]);
+        let dither = D::F32Vec::load(d, &dither_table[dither_y][dither_x..]);
         let scaled = val * scale;
         let dithered = scaled + dither;
         let clamped = dithered.max(zero).min(scale);
@@ -52,6 +54,7 @@ fn f32_to_u8_simd<D: SimdDescriptor>(
 simd_function!(
     f32_to_u8,
     d: D,
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn f32_to_u8_impl(
         input: &[f32],
         output: &mut [u8],
@@ -59,8 +62,9 @@ simd_function!(
         position: (usize, usize),
         channel: usize,
         xsize: usize,
+        dither_table: &DitherTable,
     ) {
-        f32_to_u8_simd(d, input, output, max, position, channel, xsize);
+        f32_to_u8_simd(d, input, output, max, position, channel, xsize, dither_table);
     }
 );
 
@@ -252,10 +256,11 @@ fn load_f32_as_u8<D: SimdDescriptor>(
     max: f32,
     pos: (usize, usize),
     c: usize,
+    dither_table: &DitherTable,
 ) -> D::U8Vec {
     let len = D::U8Vec::LEN;
     let mut buf = [0u8; 64];
-    f32_to_u8_simd(d, src, &mut buf[..len], max, pos, c, len);
+    f32_to_u8_simd(d, src, &mut buf[..len], max, pos, c, len, dither_table);
     D::U8Vec::load(d, &buf[..len])
 }
 
@@ -388,33 +393,34 @@ simd_function!(
         max: u8,
         alpha: AlphaU8<'_>,
         out: &mut [u8],
+        dither_table: &DitherTable,
     ) {
         let max_f32 = max as f32;
         let max_i32 = max as i32;
         match alpha {
             AlphaU8::None => run_simd_chunks!(out, u8, U8Vec, 3, |n, out_chunk| {
                 let p = (pos.0 + n, pos.1);
-                let vr = load_f32_as_u8(d, &r[n..], max_f32, p, channels[0]);
-                let vg = load_f32_as_u8(d, &g[n..], max_f32, p, channels[1]);
-                let vb = load_f32_as_u8(d, &b[n..], max_f32, p, channels[2]);
+                let vr = load_f32_as_u8(d, &r[n..], max_f32, p, channels[0], dither_table);
+                let vg = load_f32_as_u8(d, &g[n..], max_f32, p, channels[1], dither_table);
+                let vb = load_f32_as_u8(d, &b[n..], max_f32, p, channels[2], dither_table);
                 U8SimdVec::store_interleaved_3(vr, vg, vb, out_chunk);
             }),
             AlphaU8::Opaque => {
                 let va = D::U8Vec::splat(d, max);
                 run_simd_chunks!(out, u8, U8Vec, 4, |n, out_chunk| {
                     let p = (pos.0 + n, pos.1);
-                    let vr = load_f32_as_u8(d, &r[n..], max_f32, p, channels[0]);
-                    let vg = load_f32_as_u8(d, &g[n..], max_f32, p, channels[1]);
-                    let vb = load_f32_as_u8(d, &b[n..], max_f32, p, channels[2]);
+                    let vr = load_f32_as_u8(d, &r[n..], max_f32, p, channels[0], dither_table);
+                    let vg = load_f32_as_u8(d, &g[n..], max_f32, p, channels[1], dither_table);
+                    let vb = load_f32_as_u8(d, &b[n..], max_f32, p, channels[2], dither_table);
                     U8SimdVec::store_interleaved_4(vr, vg, vb, va, out_chunk);
                 });
             }
             AlphaU8::I16(a, a_scale) => {
                 run_simd_chunks!(out, u8, U8Vec, 4, |n, out_chunk| {
                     let p = (pos.0 + n, pos.1);
-                    let vr = load_f32_as_u8(d, &r[n..], max_f32, p, channels[0]);
-                    let vg = load_f32_as_u8(d, &g[n..], max_f32, p, channels[1]);
-                    let vb = load_f32_as_u8(d, &b[n..], max_f32, p, channels[2]);
+                    let vr = load_f32_as_u8(d, &r[n..], max_f32, p, channels[0], dither_table);
+                    let vg = load_f32_as_u8(d, &g[n..], max_f32, p, channels[1], dither_table);
+                    let vb = load_f32_as_u8(d, &b[n..], max_f32, p, channels[2], dither_table);
                     let va = load_i16_as_u8(d, &a[n..], a_scale, max_i32);
                     U8SimdVec::store_interleaved_4(vr, vg, vb, va, out_chunk);
                 });
@@ -553,6 +559,7 @@ pub(super) fn store_fused(
                         max,
                         alpha,
                         output_slice,
+                        stage.dither_table,
                     );
                     true
                 }
@@ -694,6 +701,84 @@ mod test {
     use jxl_simd::{f16, test_all_instruction_sets};
 
     use super::*;
+    use crate::api::DitherMode;
+    use crate::util::dither_table;
+
+    #[test]
+    fn u8_dither_modes_dispatch_interleaving_and_tails() {
+        let channels = [2, 0, 3];
+        let pos = (29, 31);
+        for mode in [DitherMode::JxlRs, DitherMode::Libjxl] {
+            let table = dither_table(mode);
+            for max in [15u8, 255] {
+                for xsize in 1..=65 {
+                    let inputs: [Vec<f32>; 3] = std::array::from_fn(|c| {
+                        (0..xsize + 64)
+                            .map(|i| ((i + c) % 13) as f32 / 16.0 + 0.001)
+                            .collect()
+                    });
+                    let mut planar = vec![0u8; xsize + 64];
+                    f32_to_u8(
+                        &inputs[0],
+                        &mut planar,
+                        max as f32,
+                        pos,
+                        channels[0],
+                        xsize,
+                        table,
+                    );
+                    let integer_alpha = vec![7i16; xsize + 64];
+                    for alpha in [
+                        AlphaU8::None,
+                        AlphaU8::Opaque,
+                        AlphaU8::I16(&integer_alpha, 1),
+                    ] {
+                        let nc = if matches!(alpha, AlphaU8::None) { 3 } else { 4 };
+                        let mut output = vec![0xa5; xsize * nc + 1];
+                        store_f32_to_u8_interleaved(
+                            &inputs[0],
+                            &inputs[1],
+                            &inputs[2],
+                            channels,
+                            pos,
+                            max,
+                            alpha,
+                            &mut output[..xsize * nc],
+                            table,
+                        );
+                        for i in 0..xsize {
+                            assert_eq!(planar[i], output[i * nc]);
+                            for c in 0..3 {
+                                let channel = channels[c];
+                                let noise = table[(pos.1 + channel * 13) % 32]
+                                    [(pos.0 + i + channel * 23) % 32];
+                                let expected = (inputs[c][i] * max as f32 + noise)
+                                    .clamp(0.0, max as f32)
+                                    .round_ties_even()
+                                    as u8;
+                                assert_eq!(
+                                    output[i * nc + c],
+                                    expected,
+                                    "{mode:?}, {xsize}, {i}, {c}"
+                                );
+                            }
+                            if nc == 4 {
+                                assert_eq!(
+                                    output[i * nc + 3],
+                                    if matches!(alpha, AlphaU8::Opaque) {
+                                        max
+                                    } else {
+                                        7
+                                    }
+                                );
+                            }
+                        }
+                        assert_eq!(output[xsize * nc], 0xa5);
+                    }
+                }
+            }
+        }
+    }
 
     fn expand_f16(bits: u16) -> f32 {
         if bits & 0x7c00 == 0x7c00 {

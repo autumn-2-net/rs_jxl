@@ -254,6 +254,8 @@ impl<'a, 'b> PaletteStep<'a, 'b> {
         scratch: &mut [Vec<i32>; 4],
         wp_scratch: &mut WeightedPredictorScratch,
     ) -> Result<()> {
+        #[cfg(feature = "decoder-profile")]
+        let _profile = crate::decoder_profile::scope("transform.palette");
         let PaletteStep {
             buf_in,
             buf_pal,

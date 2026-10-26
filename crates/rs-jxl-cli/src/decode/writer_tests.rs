@@ -3,6 +3,28 @@ use crate::decode::writers::{Output, Raster, serialize_raster, write_portable_de
 use std::io::{Seek, SeekFrom, Write};
 
 #[test]
+fn npy_widens_mixed_integer_planes_without_float_rounding() {
+    let mut f = frame(2, 1, PixelLayout::Gray, PixelData::U8(vec![1, 255]));
+    f.extra_planes = vec![
+        PixelData::U16(vec![32769, 65535]),
+        PixelData::U32(vec![16_777_217, 2_147_483_647]),
+    ];
+    let mut bytes = Vec::new();
+    write_npy(&mut bytes, &[f]).unwrap();
+    let header_len = usize::from(u16::from_le_bytes(bytes[8..10].try_into().unwrap()));
+    assert!(
+        std::str::from_utf8(&bytes[10..10 + header_len])
+            .unwrap()
+            .contains("'<u4'")
+    );
+    let values: Vec<_> = bytes[10 + header_len..]
+        .chunks_exact(4)
+        .map(|v| u32::from_le_bytes(v.try_into().unwrap()))
+        .collect();
+    assert_eq!(values, [1, 32769, 16_777_217, 255, 65535, 2_147_483_647]);
+}
+
+#[test]
 fn pnm_selects_gray_or_rgb_and_pgx_keeps_custom_range() {
     let gray = frame(2, 1, PixelLayout::Gray, PixelData::U16(vec![0x123, 0xfff]));
     for (format, prefix) in [

@@ -87,6 +87,255 @@ fn ac(c: usize, x: usize, y: usize, k: usize) -> i32 {
     (c * 70 + k + x % 13) as i32 - (y % 11) as i32 - 100
 }
 
+fn restore_ac(residual: i32, luma: i32, q_y: u16, q_c: u16, factor: i8) -> Result<i16> {
+    let ratio = FIXED_ONE * i32::from(q_y) / i32::from(q_c);
+    let mut cache = CflScaleCache::new([ratio; 64]);
+    let scaled =
+        cache.for_factor(factor)[1].ok_or(unsupported("JPEG capture CfL scale overflow"))?;
+    restore_ac_scaled(residual, luma, scaled)
+}
+
+fn reference_restore_ac(
+    residual: i32,
+    luma: i32,
+    q_y: u16,
+    q_c: u16,
+    factor: i8,
+) -> std::result::Result<i16, &'static str> {
+    // The original operation order, with independent wide arithmetic and an
+    // explicit i32 check at each intermediate, not just on the final value.
+    let ratio = 2048 * i64::from(q_y) / i64::from(q_c);
+    let scale = 2048 * i64::from(factor) / 84;
+    let product = i32::try_from(ratio * scale).map_err(|_| "JPEG capture CfL scale overflow")?;
+    let scaled = i32::try_from(i64::from(product) + 1024)
+        .map_err(|_| "JPEG capture CfL scale overflow")?
+        >> 11;
+    let product = i32::try_from(i64::from(luma) * i64::from(scaled))
+        .map_err(|_| "JPEG capture CfL prediction overflow")?;
+    let prediction = i32::try_from(i64::from(product) + 1024)
+        .map_err(|_| "JPEG capture CfL prediction overflow")?
+        >> 11;
+    let value = i32::try_from(i64::from(residual) + i64::from(prediction))
+        .map_err(|_| "JPEG capture AC coefficient overflow")?;
+    if value < -4095 || value > 4095 {
+        return Err("JPEG capture AC coefficient is outside the 8-bit JPEG range");
+    }
+    Ok(value as i16)
+}
+
+fn ac_error_reason(error: Error) -> &'static str {
+    match error {
+        Error::ApiUsageError(reason) => reason,
+        other => panic!("Unexpected coefficient error: {other}"),
+    }
+}
+
+#[test]
+fn cached_cfl_matches_checked_reference_for_all_factors_and_boundaries() {
+    let quantization = [
+        (1, 1),
+        (3, 7),
+        (7, 3),
+        (65535, 65535),
+        (65535, 1),
+        (1, 65535),
+        (84, 83),
+        (1023, 2),
+        (1024, 2),
+        (1025, 2),
+        (65535, 84),
+        (65535, 83),
+        (32768, 127),
+        (1, 23),
+    ];
+    let ratios = std::array::from_fn(|k| {
+        let (y, c) = quantization[k % quantization.len()];
+        2048 * i32::from(y) / i32::from(c)
+    });
+    let mut cache = CflScaleCache::new(ratios);
+    for factor in (i8::MIN..=i8::MAX).chain((i8::MIN..=i8::MAX).rev()) {
+        // Repeated factors exercise reuse, not just cache invalidation.
+        for _ in 0..2 {
+            let scales = cache.for_factor(factor);
+            for (k, &scale) in scales.iter().enumerate().skip(1) {
+                let (q_y, q_c) = quantization[k % quantization.len()];
+                for (residual, luma) in [
+                    (0, 0),
+                    (-4095, -4095),
+                    (4095, 4095),
+                    (i32::MIN, 0),
+                    (i32::MAX, 0),
+                    (0, i32::MIN),
+                    (0, i32::MAX),
+                    (0, i32::MAX - 1023),
+                    (0, i32::MIN + 1023),
+                    (-4096, 2047),
+                    (4096, -2047),
+                    (-1, -1),
+                    (0, -1),
+                    (0, 1),
+                    (17, -199),
+                    (-17, 199),
+                    (i32::MAX, 1),
+                    (i32::MIN, -1),
+                ] {
+                    let actual = scale
+                        .ok_or(unsupported("JPEG capture CfL scale overflow"))
+                        .and_then(|s| restore_ac_scaled(residual, luma, s))
+                        .map_err(ac_error_reason);
+                    assert_eq!(
+                        actual,
+                        reference_restore_ac(residual, luma, q_y, q_c, factor),
+                        "factor={factor}, q_y={q_y}, q_c={q_c}, residual={residual}, luma={luma}",
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn zero_factor_capture_preserves_range_checks_and_skips_dc() {
+    let header = header(8, 8, true, [0; 3]);
+    let capture = JpegCapture::new(&header, false).unwrap();
+    capture
+        .set_quantization(&QuantEncoding::Raw {
+            qtable: (0..192)
+                .map(|i| if i / 64 == 1 { 65535 } else { 1 })
+                .collect(),
+            qtable_den: 1.0 / 2040.0,
+        })
+        .unwrap();
+    let mut group = capture.new_group(&header, 0).unwrap();
+    let raw: [[i32; 64]; 3] = std::array::from_fn(|c| {
+        std::array::from_fn(|k| {
+            if k == 0 {
+                i32::MIN
+            } else {
+                [-4095, 4095, 0][(k + c) % 3]
+            }
+        })
+    });
+    group
+        .capture_block(&header, 0, 0, 0, raw.each_ref(), [0, 127, 0])
+        .unwrap();
+    for c in 0..3 {
+        assert_eq!(group.coefficients[c][0], 0);
+        for k in 1..64 {
+            assert_eq!(
+                i32::from(group.coefficients[c][k]),
+                raw[c][(k % 8) * 8 + k / 8]
+            );
+        }
+    }
+    for c in 0..3 {
+        for invalid in [i32::MIN, -4096, 4096, i32::MAX] {
+            let mut invalid_raw = raw;
+            invalid_raw[c][8] = invalid;
+            let error = group
+                .capture_block(&header, 0, 0, 0, invalid_raw.each_ref(), [0; 3])
+                .unwrap_err();
+            assert_eq!(
+                ac_error_reason(error),
+                "JPEG capture AC coefficient is outside the 8-bit JPEG range"
+            );
+        }
+    }
+}
+
+#[test]
+fn group_cfl_cache_tracks_factor_changes_and_quantization_transposition() {
+    let header = header(137, 73, true, [0; 3]);
+    let quantization: [[u16; 64]; 3] =
+        std::array::from_fn(|c| std::array::from_fn(|k| ((k * 3 + c * 7) % 23 + 1) as u16));
+    let capture = JpegCapture::new(&header, false).unwrap();
+    capture
+        .set_quantization(&QuantEncoding::Raw {
+            qtable: (0..192)
+                .map(|i| i32::from(quantization[i / 64][(i % 8) * 8 + (i % 64) / 8]))
+                .collect(),
+            qtable_den: 1.0 / 2040.0,
+        })
+        .unwrap();
+    let mut data = capture.new_group(&header, 0).unwrap();
+    let rect = header.block_group_rect(0);
+    let factors = [-128, 127, 0, -42, 84, 0, 1, -1];
+    for by in 0..rect.size.1 {
+        for bx in 0..rect.size.0 {
+            let index = by * rect.size.0 + bx;
+            let factors = [
+                factors[(index / 3) % factors.len()],
+                127,
+                factors[index % factors.len()],
+            ];
+            let raw = std::array::from_fn(|c| {
+                std::array::from_fn(|k| ((k + c * 3 + index * 7) % 31) as i32 - 15)
+            });
+            data.capture_block(&header, 0, bx, by, raw.each_ref(), factors)
+                .unwrap();
+            for c in 0..3 {
+                for k in 1..64 {
+                    let transposed = (k % 8) * 8 + k / 8;
+                    let expected = reference_restore_ac(
+                        raw[c][transposed],
+                        raw[1][transposed],
+                        quantization[1][k],
+                        quantization[c][k],
+                        if c == 1 { 0 } else { factors[c] },
+                    )
+                    .unwrap();
+                    assert_eq!(data.coefficients[c][index * 64 + k], expected);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn cfl_cache_preserves_error_order_and_valid_prefix_writes() {
+    let header = header(8, 8, true, [0; 3]);
+    let capture = JpegCapture::new(&header, false).unwrap();
+    let mut quantization = [1; 192];
+    quantization[64] = 65535; // DC is unused even when its CfL scale overflows.
+    quantization[64 + 16] = 65535; // Natural AC index 2 has a scale overflow.
+    capture
+        .set_quantization(&QuantEncoding::Raw {
+            qtable: quantization.into(),
+            qtable_den: 1.0 / 2040.0,
+        })
+        .unwrap();
+    let mut data = capture.new_group(&header, 0).unwrap();
+    let mut raw = [[0; 64]; 3];
+    raw[0][8] = 4096;
+    assert_eq!(
+        ac_error_reason(
+            data.capture_block(&header, 0, 0, 0, raw.each_ref(), [127, 0, 0])
+                .unwrap_err()
+        ),
+        "JPEG capture AC coefficient is outside the 8-bit JPEG range",
+    );
+    raw[0][8] = 17;
+    assert_eq!(
+        ac_error_reason(
+            data.capture_block(&header, 0, 0, 0, raw.each_ref(), [127, 0, 0])
+                .unwrap_err()
+        ),
+        "JPEG capture CfL scale overflow",
+    );
+    assert_eq!(data.coefficients[0][1], 17);
+    assert_eq!(data.coefficients[0][2], 0);
+    data.capture_block(&header, 0, 0, 0, raw.each_ref(), [0; 3])
+        .unwrap();
+    // Returning to a nonzero factor must not reuse the bypass's zero result.
+    assert_eq!(
+        ac_error_reason(
+            data.capture_block(&header, 0, 0, 0, raw.each_ref(), [127, 0, 0])
+                .unwrap_err()
+        ),
+        "JPEG capture CfL scale overflow",
+    );
+}
+
 #[test]
 fn captures_dc_ac_tables_and_subsampled_group_coordinates() {
     for (width, height, ycbcr, modes, gray) in [
@@ -152,7 +401,7 @@ fn captures_dc_ac_tables_and_subsampled_group_coordinates() {
                             )
                         })
                     });
-                    data.capture_block(&header, group, bx, by, &raw, [0; 3])
+                    data.capture_block(&header, group, bx, by, raw.each_ref(), [0; 3])
                         .unwrap();
                 }
             }
@@ -251,7 +500,7 @@ fn group_cfl_transposes_once_and_does_not_modify_input() {
         std::array::from_fn(|c| std::array::from_fn(|k| (c * 100 + k) as i32 - 140));
     let original = raw;
     group
-        .capture_block(&header, 0, 0, 0, &raw, [84, 0, -84])
+        .capture_block(&header, 0, 0, 0, raw.each_ref(), [84, 0, -84])
         .unwrap();
     for k in 1..64 {
         let t = (k % 8) * 8 + k / 8;
@@ -486,7 +735,7 @@ fn multipass_capture_rejects_missing_duplicate_and_reordered_passes() {
         accumulated[1][8] += value << shift;
     }
     assert_eq!(accumulated[1][8], 1);
-    data.capture_block(&header, 0, 0, 0, &accumulated, [42, 0, -42])
+    data.capture_block(&header, 0, 0, 0, accumulated.each_ref(), [42, 0, -42])
         .unwrap();
     assert_eq!(data.coefficients[1][1], 1);
     capture.store_group(&header, 0, data).unwrap();

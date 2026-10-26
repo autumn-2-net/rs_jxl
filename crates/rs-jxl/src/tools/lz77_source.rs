@@ -52,7 +52,9 @@
 
 use std::collections::BTreeMap;
 
-use super::dp::{Frontier, visit_intervals};
+use super::dp::Frontier;
+#[cfg(test)]
+use super::dp::visit_intervals;
 use super::{
     Command, DISTANCE_COST, DistanceCodes, FilterPolicy, HybridUintConfig, LENGTH_COST, Literal,
     MIN_MATCH, Match, SourceLz77Method, WINDOW_SIZE, literals, reserved,
@@ -83,8 +85,16 @@ pub use blocks::{SourceBlockMode, SourceSeedBlocks, SourceSeedGuided};
 #[path = "lz77_source_suffix.rs"]
 mod suffix;
 pub use suffix::SourceSuffixMode;
+#[path = "lz77_source_chain_batch.rs"]
+mod chain_batch;
 #[path = "lz77_source_distances.rs"]
 mod distances;
+#[path = "lz77_source_histograms.rs"]
+mod histograms;
+#[path = "lz77_source_prices.rs"]
+mod prices;
+#[path = "lz77_source_profile.rs"]
+mod profile;
 #[path = "lz77_source_sais.rs"]
 mod sais;
 #[path = "lz77_source_search.rs"]
@@ -296,6 +306,15 @@ pub struct SourceConfig {
     pub chain_limit: Option<u32>,
     /// MATCH_CACHE override; buckets, seeds and range modes ignore this option.
     pub chain_match_cache: SourceChainCache,
+    /// Opt-in immutable chain256 SymbolId batches, not the bucket index.
+    /// Keeps coarse-chain visit budgets and the global endpoint DP. Requires
+    /// >=65536 tokens and a seed with more than one wire token per four inputs;
+    /// highly repetitive streams keep the demand-driven mutable chain.
+    pub chain_batch: bool,
+    /// Peak index/build/batch scratch allowance per stream, excluding the
+    /// existing DP/input/output. Clamped by parallelism.scratch_bytes. A small
+    /// budget disables refinement first, then falls back to the mutable chain.
+    pub chain_batch_bytes: usize,
     /// DOMINANCE=1: cost-aware mutable-bucket candidates for modes 2/3.
     /// Does not enable indexed search or change the default candidate route.
     pub bucket_dominance: bool,
@@ -550,6 +569,8 @@ impl Default for SourceConfig {
             compact_steps: false,
             chain_limit: None,
             chain_match_cache: SourceChainCache::Auto,
+            chain_batch: false,
+            chain_batch_bytes: 128 << 20,
             bucket_dominance: false,
             index_interval_dp: SourceIntervalDp::Disabled,
             parallelism: None,
@@ -690,22 +711,33 @@ impl Costs {
         }
     }
     fn raw(inputs: &[&[Literal]], config: &SourceConfig) -> Self {
-        let mut counts = Counts::new();
+        let _profile = crate::profile::scope("lz77.source.raw_histogram");
+        let count_profile = crate::profile::scope("lz77.source.raw_histogram.count");
+        let tokens = inputs
+            .iter()
+            .fold(0usize, |total, input| total.saturating_add(input.len()));
+        let mut counts = histograms::RawCounts::for_inputs(inputs, tokens);
         for input in inputs {
             for literal in *input {
                 let token = config.literal_uint_config.encode(literal.value).token;
-                *counts
-                    .entry(literal.context)
-                    .or_default()
-                    .entry(token)
-                    .or_default() += 1;
+                counts.increment(literal.context, token);
             }
         }
+        drop(count_profile);
+        let merge_profile = crate::profile::scope("lz77.source.raw_histogram.merge");
+        let counts = counts.into_counts();
+        drop(merge_profile);
+        let _cost_profile = crate::profile::scope("lz77.source.raw_histogram.costs");
         Self::from_counts(counts, BTreeMap::new(), config)
     }
     fn fitted(seed: &[Vec<Command>], widths: &[usize], config: &SourceConfig) -> Self {
-        let mut counts = Counts::new();
-        let mut distances = BTreeMap::new();
+        let _profile = crate::profile::scope("lz77.source.fitted_histogram");
+        let count_profile = crate::profile::scope("lz77.source.fitted_histogram.count");
+        let tokens = seed
+            .iter()
+            .fold(0usize, |total, stream| total.saturating_add(stream.len()));
+        let mut counts = histograms::ContextCounts::new(tokens);
+        let mut distances = histograms::SymbolCounts::new();
         for (index, stream) in seed.iter().enumerate() {
             let codes = DistanceCodes::new(widths.get(index).copied().unwrap_or(0), WINDOW_SIZE);
             for &command in stream {
@@ -725,7 +757,7 @@ impl Costs {
                             .literal_uint_config
                             .encode(codes.symbol(distance as usize))
                             .token;
-                        *distances.entry(token).or_default() += 1;
+                        distances.increment(token);
                         (
                             context,
                             config.min_symbol()
@@ -736,13 +768,15 @@ impl Costs {
                         )
                     }
                 };
-                *counts
-                    .entry(context)
-                    .or_default()
-                    .entry(symbol)
-                    .or_default() += 1;
+                counts.increment(context, symbol);
             }
         }
+        drop(count_profile);
+        let merge_profile = crate::profile::scope("lz77.source.fitted_histogram.merge");
+        let counts = counts.into_counts();
+        let distances = distances.into_counts();
+        drop(merge_profile);
+        let _cost_profile = crate::profile::scope("lz77.source.fitted_histogram.costs");
         Self::from_counts(counts, distances, config)
     }
     fn bits(&self, context: u32, symbol: u32) -> f32 {
@@ -768,6 +802,7 @@ impl Costs {
         }
         Ok(sums)
     }
+    #[cfg(test)]
     fn optimal_cumulative(&self, input: &[Literal], config: &SourceConfig) -> Result<Vec<f64>> {
         let mut sums = reserved(input.len() + 1)?;
         sums.push(0.0);
@@ -805,12 +840,17 @@ impl Costs {
 }
 
 fn static_cost(matched: Match, context: u32, costs: &Costs) -> f32 {
+    static_cost_with_penalty(matched, costs.penalty(context))
+}
+
+#[inline]
+fn static_cost_with_penalty(matched: Match, penalty: f32) -> f32 {
     let len = HybridUintConfig::new(1, 0, 0)
         .unwrap()
         .encode((matched.length - MIN_MATCH) as u32);
     let length =
         LENGTH_COST[(len.token as usize).min(LENGTH_COST.len() - 1)] as f32 + len.nbits as f32;
-    length + static_distance(matched.symbol) + costs.penalty(context)
+    length + static_distance(matched.symbol) + penalty
 }
 
 fn static_distance(symbol: u32) -> f32 {
@@ -823,11 +863,14 @@ fn fast_stream<const N: usize>(
     values: &[u32],
     width: usize,
     config: &SourceConfig,
-    costs: &Costs,
+    penalties: &prices::Penalties<'_>,
     sums: &[f32],
     saving: &mut f32,
 ) -> Result<Vec<Command>> {
+    let _profile = crate::profile::scope("lz77.source.fast_seed");
+    let init_profile = crate::profile::scope("lz77.source.seed_matcher_init");
     let mut matcher = Fast::<N>::new(values, width, config)?;
+    drop(init_profile);
     let mut output = reserved(input.len())?;
     let mut position = 0;
     while position < input.len() {
@@ -843,7 +886,7 @@ fn fast_stream<const N: usize>(
             continue;
         }
         let raw = sums[position + matched.length] - sums[position];
-        let cost = static_cost(matched, input[position].context, costs);
+        let cost = static_cost_with_penalty(matched, penalties.get(input[position].context));
         let consumed = if config.method.runtime_cost_comparison() && cost > raw {
             let count = if raw < matched.length as f32 && matched.length > MIN_MATCH {
                 matched.length - MIN_MATCH + 1
@@ -877,7 +920,10 @@ fn careful_stream(
     sums: &[f32],
     saving: &mut f32,
 ) -> Result<Vec<Command>> {
+    let _profile = crate::profile::scope("lz77.source.careful_seed");
+    let init_profile = crate::profile::scope("lz77.source.seed_matcher_init");
     let mut matcher = Chain::new(values, width, 256, config.max_match_length)?;
+    drop(init_profile);
     let mut output = reserved(input.len())?;
     let mut position = 0;
     let mut already_updated = false;
@@ -937,6 +983,8 @@ struct Work {
     #[cfg(test)]
     cached_streams: usize,
     #[cfg(test)]
+    chain_batch_streams: usize,
+    #[cfg(test)]
     careful_seed: bool,
     #[cfg(test)]
     fast_tasks: usize,
@@ -979,6 +1027,7 @@ impl Work {
             self.queries += _other.queries;
             self.intervals += _other.intervals;
             self.cached_streams += _other.cached_streams;
+            self.chain_batch_streams += _other.chain_batch_streams;
             self.indexed_streams += _other.indexed_streams;
             self.compact_index_streams += _other.compact_index_streams;
             self.coordinate_index_streams += _other.coordinate_index_streams;
@@ -989,6 +1038,7 @@ impl Work {
     }
 }
 
+#[cfg(test)]
 fn optimal_stream(
     input: &[Literal],
     values: &[u32],
@@ -1003,7 +1053,7 @@ fn optimal_stream(
         values,
         width,
         config,
-        costs,
+        &prices::Prices::new(costs)?,
         seed_tokens,
         _work,
         None,
@@ -1033,11 +1083,13 @@ fn optimal_stream_replay(
     values: &[u32],
     width: usize,
     config: &SourceConfig,
-    costs: &Costs,
+    prices: &prices::Prices<'_>,
     seed_tokens: usize,
     _work: &mut Work,
     mut replay: Option<replay::Pass<'_>>,
 ) -> Result<Vec<Command>> {
+    let _profile = crate::profile::scope("lz77.source.optimal");
+    let setup_profile = crate::profile::scope("lz77.source.matcher_init");
     let indexed =
         config.index_mode != SourceIndexMode::Disabled && values.len() >= index::minimum(config);
     let index = if indexed {
@@ -1059,16 +1111,19 @@ fn optimal_stream_replay(
         .map(|index| index::Batch::new(index, width, config))
         .transpose()?;
     let full_replay = replay.as_ref().is_some_and(|pass| pass.full_replay());
-    let mut matcher = if indexed || full_replay {
+    let mut chain_batch = chain_batch::Batch::new(values, width, config, seed_tokens)?;
+    let mut matcher = if indexed || full_replay || chain_batch.is_some() {
         None
     } else {
         Some(Optimal::new(values, width, config, seed_tokens)?)
     };
+    drop(setup_profile);
     #[cfg(test)]
     {
         _work.cached_streams +=
             usize::from(matcher.as_ref().is_some_and(|m| m.match_cache_enabled()));
         _work.indexed_streams += usize::from(indexed);
+        _work.chain_batch_streams += usize::from(chain_batch.is_some());
         if let Some(index) = &index {
             let (compact, coordinates) = index.layout();
             _work.compact_index_streams += usize::from(compact);
@@ -1082,10 +1137,12 @@ fn optimal_stream_replay(
     let sums = if range {
         Vec::new()
     } else {
-        costs.optimal_cumulative(input, config)?
+        prices.optimal_cumulative(input, config)?
     };
     let compact = config.uses_compact_steps();
+    let parser_profile = crate::profile::scope("lz77.source.dp_init");
     let mut parser = Parser::new(input.len(), range, compact, width)?;
+    drop(parser_profile);
     #[cfg(test)]
     {
         _work.compact_dp_streams += usize::from(compact);
@@ -1093,17 +1150,36 @@ fn optimal_stream_replay(
     let mut frontier = Frontier::new(256)?;
     let mut classes = Classes::new()?;
     let (mut skip, mut repeats, mut previous_end, mut previous_symbol) = (0, 0, 0, 0);
+    let mut profile = profile::Profile::new(input.len());
+    if crate::profile::enabled() {
+        crate::profile::note(
+            "lz77.source.route",
+            format_args!(
+                "tokens={} method={:?} mode={:?} indexed={} bucket={} chain_limit={:?} seed_tokens={} chain_batch={}",
+                input.len(),
+                config.method,
+                config.match_cost,
+                indexed,
+                config.bucket_route().enabled,
+                config.chain_limit,
+                seed_tokens,
+                chain_batch.is_some(),
+            ),
+        );
+    }
     for position in 0..input.len() {
-        parser.advance(position);
+        let mut sample = profile.sample(position);
         if let Some(matcher) = &mut matcher {
             matcher.update(position);
         }
+        profile.index(&mut sample);
+        parser.advance(position);
         let base = parser.cost(position);
         let literal_cost = if range {
             let encoded = config.literal_uint_config.encode(input[position].value);
             f64::from(
                 base as f32
-                    + (costs.bits(input[position].context, encoded.token) + encoded.nbits as f32),
+                    + (prices.bits(input[position].context, encoded.token) + encoded.nbits as f32),
             )
         } else if config.precise() {
             base + sums[position + 1] - sums[position]
@@ -1112,6 +1188,7 @@ fn optimal_stream_replay(
             f64::from(base as f32 + sums[position + 1] as f32 - sums[position] as f32)
         };
         parser.literal(position, literal_cost);
+        profile.dp(&mut sample);
         let replaying = replay.as_ref().is_some_and(|pass| pass.replaying(position));
         if !replaying && skip > 0 {
             skip -= 1;
@@ -1143,15 +1220,17 @@ fn optimal_stream_replay(
                 let order = if config.match_cost == SourceMatchCost::SymbolId {
                     matched.symbol as f64
                 } else {
-                    f64::from(costs.distance(matched.symbol))
+                    f64::from(prices.distance(matched.symbol))
                 };
                 frontier.add(matched, order);
             };
-            if let Some(index) = &index {
+            if let Some(batch) = &mut chain_batch {
+                batch.find_matches(position, &mut add);
+            } else if let Some(index) = &index {
                 indexed_batch.as_mut().unwrap().find_matches(
                     index,
                     position,
-                    |symbol| costs.distance(symbol),
+                    |symbol| prices.distance(symbol),
                     &mut add,
                 );
                 bounded_index_frontier = indexed_batch
@@ -1166,7 +1245,7 @@ fn optimal_stream_replay(
             {
                 matcher.as_mut().unwrap().find_cost_matches(
                     position,
-                    |symbol| costs.distance(symbol),
+                    |symbol| prices.distance(symbol),
                     &mut add,
                 );
             } else {
@@ -1182,18 +1261,20 @@ fn optimal_stream_replay(
         }
         if range {
             for &matched in &classes.entries {
-                frontier.add(matched, f64::from(costs.distance(matched.symbol)));
+                frontier.add(matched, f64::from(prices.distance(matched.symbol)));
             }
         }
+        profile.matching(&mut sample);
         let boundary_only = bounded_index_frontier
             && config.index_interval_dp == SourceIntervalDp::Boundaries
             && config.length_uint_config == HybridUintConfig::new(0, 0, 0).unwrap();
         let mut begin = MIN_MATCH;
+        let row = prices.row(input[position].context);
         for entry in &frontier.entries {
             let matched = entry.matched;
-            let mut relax = |first, end| {
-                let price = costs.length(input[position].context, first, config)
-                    + costs.distance(matched.symbol);
+            let distance_price = prices.distance(matched.symbol);
+            let mut relax = |first, end, length_price: f32| {
+                let price = length_price + distance_price;
                 let cost = if config.precise() {
                     base + f64::from(price)
                 } else {
@@ -1211,18 +1292,14 @@ fn optimal_stream_replay(
                 // ApplyLZ77_RangeParsed only queues length spans for uint000.
                 // Other configs write explicit endpoints, including tie order.
                 for length in begin..=matched.length {
-                    relax(length, length + 1);
+                    relax(length, length + 1, row.length(length, config));
                 }
             } else {
-                visit_intervals(
-                    begin,
-                    matched.length + 1,
-                    config.length_uint_config,
-                    &mut relax,
-                );
+                row.intervals(begin, matched.length + 1, config, &mut relax);
             }
             begin = matched.length + 1;
         }
+        profile.dp(&mut sample);
         // Replay preserves the first pass's queried origins. It must neither
         // recompute skip decisions nor seed repetition state for a spilled tail.
         if replaying {
@@ -1250,6 +1327,7 @@ fn optimal_stream_replay(
         }
     }
     parser.advance(input.len());
+    let _backtrack_profile = crate::profile::scope("lz77.source.backtrack");
     parser.backtrack(input)
 }
 
@@ -1268,6 +1346,7 @@ fn range_replayed(
     let mut budget = replay::Budget::new(cache_limit);
     for pass in 0..2 {
         let costs = Costs::fitted(&seed, widths, config);
+        let prices = prices::Prices::new(&costs)?;
         let mut parsed = reserved(inputs.len())?;
         #[cfg(test)]
         {
@@ -1285,7 +1364,7 @@ fn range_replayed(
                 &values[index],
                 widths.get(index).copied().unwrap_or(0),
                 config,
-                &costs,
+                &prices,
                 0,
                 work,
                 Some(replay),
@@ -1361,12 +1440,14 @@ fn run(
     {
         _work.careful_seed = careful;
     }
+    let values_profile = crate::profile::scope("lz77.source.values");
     let mut values = reserved(inputs.len())?;
     for input in inputs {
         let mut data = reserved(input.len())?;
         data.extend(input.iter().map(|literal| literal.value));
         values.push(data);
     }
+    drop(values_profile);
     let mut shared = if !careful {
         blocks::shared_index(&values, widths, config)?
     } else {
@@ -1383,6 +1464,12 @@ fn run(
         .collect();
     let seed_total: usize = seed_inputs.iter().map(|s| s.len()).sum();
     let costs = Costs::raw(&seed_inputs, config);
+    let seed_prices = prices::Prices::new(&costs)?;
+    let seed_penalties = if careful {
+        None
+    } else {
+        Some(prices::Penalties::new(&costs)?)
+    };
     let encode_seed = |index: usize, saving: &mut f32| -> Result<(Vec<Command>, f32)> {
         let part = &parts[index];
         let input = seed_inputs[index];
@@ -1395,18 +1482,23 @@ fn run(
             *saving += decrease;
             return Ok((commands, raw));
         }
-        let sums = costs.cumulative(input, config)?;
+        let sums = seed_prices.cumulative(input, config)?;
         let commands = if careful {
             careful_stream(input, data, width, config, &costs, &sums, saving)?
         } else {
+            let penalties = seed_penalties.as_ref().expect("fast-seed penalty table");
             match config.method.fast_capacity() {
-                Some(1) => fast_stream::<1>(input, data, width, config, &costs, &sums, saving)?,
-                Some(3) => fast_stream::<3>(input, data, width, config, &costs, &sums, saving)?,
+                Some(1) => fast_stream::<1>(input, data, width, config, penalties, &sums, saving)?,
+                Some(3) => fast_stream::<3>(input, data, width, config, penalties, &sums, saving)?,
                 Some(7) | None => {
-                    fast_stream::<7>(input, data, width, config, &costs, &sums, saving)?
+                    fast_stream::<7>(input, data, width, config, penalties, &sums, saving)?
                 }
-                Some(15) => fast_stream::<15>(input, data, width, config, &costs, &sums, saving)?,
-                Some(31) => fast_stream::<31>(input, data, width, config, &costs, &sums, saving)?,
+                Some(15) => {
+                    fast_stream::<15>(input, data, width, config, penalties, &sums, saving)?
+                }
+                Some(31) => {
+                    fast_stream::<31>(input, data, width, config, penalties, &sums, saving)?
+                }
                 _ => unreachable!("source fast bucket capacity"),
             }
         };
@@ -1443,6 +1535,8 @@ fn run(
             raw += raw_cost;
         }
     }
+    drop(seed_penalties);
+    drop(seed_prices);
     let output_tokens: usize = seed.iter().map(|commands| wire_token_count(commands)).sum();
     let mut threshold = (if careful { seed_total } else { output_tokens }) as f32 * 0.2 + 16.0;
     if !careful && raw <= seed_total as f32 * 2.5 {
@@ -1494,12 +1588,20 @@ fn run(
     }
     for pass in 0..config.match_cost.passes() {
         let costs = Costs::fitted(&seed, widths, config);
+        let prices = prices::Prices::new(&costs)?;
         let mut parsed = reserved(inputs.len())?;
         #[cfg(test)]
         {
             _work.passes += 1;
         }
-        let schedule = if shared.is_some() {
+        // Chain batches own intra-stream matching jobs. Retain the caller's
+        // executor instead of entering Schedule's serial independent-stream
+        // closures, which would disable their parallel work.
+        let chain_batches = inputs
+            .iter()
+            .zip(&seed)
+            .any(|(input, seed)| chain_batch::enabled(input.len(), wire_token_count(seed), config));
+        let schedule = if shared.is_some() || chain_batches {
             Schedule::jobs(inputs.len(), 1)
         } else {
             Schedule::new(inputs, config, false)
@@ -1587,14 +1689,15 @@ fn run(
                     )?
                 }
             } else {
-                optimal_stream(
+                optimal_stream_replay(
                     inputs[index],
                     &values[index],
                     width,
                     config,
-                    &costs,
+                    &prices,
                     wire_token_count(&seed[index]),
                     &mut work,
+                    None,
                 )?
             };
             Ok((commands, work))

@@ -36,8 +36,9 @@
 //! Extra-bit totals exceeding the source SIMD u32 reduction are explicit errors
 //! in EstimateCost; WP uses checked usize totals. Histograms reset per channel.
 //!
-//! Omitted: source flat-WP shortcut (ordinary State gives the same predictions),
-//! parallel/wave scheduling, environment settings, direct-plan replay/audits,
+//! Weighted State includes the exact flat shortcut. The parallel WP entry uses
+//! only the caller's installed executor, with mode 0 fixing the pruning bound.
+//! Omitted: RCT/wave scheduling, environment settings, direct-plan replay/audits,
 //! and source speed-tier eligibility policy. Pruning is explicit, not implicit.
 //! Gradient cost fuses i32 prediction, context spread, signed packing and token
 //! classification in native SIMD. Histogram updates and context-map lookups
@@ -50,6 +51,7 @@ mod cost_simd;
 #[path = "cost_bench.rs"]
 mod cost_bench;
 
+#[cfg(test)]
 use super::predictor::Neighbors;
 use super::{transforms, weighted};
 use crate::entropy::HybridUintConfig;
@@ -89,6 +91,7 @@ impl<'a> ChannelView<'a> {
         Ok(size)
     }
 
+    #[cfg(test)]
     fn neighbors(self, x: usize, y: usize) -> Neighbors {
         Neighbors::from_plane(self.pixels, self.width, self.stride, x, y)
             .expect("validated cost view and raster coordinates")
@@ -270,6 +273,54 @@ struct ChannelCost {
     extra: usize,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum RctCostKey {
+    R,
+    G,
+    B,
+    RMinusG,
+    RMinusB,
+    GMinusR,
+    GMinusB,
+    BMinusR,
+    BMinusG,
+    RMinusMidGB,
+    GMinusMidRB,
+    BMinusMidRG,
+    YCoCgY,
+    YCoCgCg,
+}
+
+const RCT_COST_KEYS: usize = RctCostKey::YCoCgCg as usize + 1;
+
+// These identify whole output planes, not rounded costs. Midpoint addition
+// wraps before shifting; YCoCg's Cg is NOT GMinusMidRB over the full i32 domain.
+fn rct_cost_keys(rct_type: u32) -> Option<[RctCostKey; 3]> {
+    use RctCostKey::*;
+    Some(match rct_type {
+        0 => [R, G, B],
+        6 => [YCoCgY, RMinusB, YCoCgCg],
+        5 => [R, GMinusMidRB, BMinusR],
+        10 => [G, BMinusG, RMinusG],
+        26 => [R, BMinusMidRG, GMinusR],
+        40 => [B, GMinusMidRB, RMinusB],
+        12 => [G, BMinusMidRG, RMinusG],
+        19 => [B, RMinusMidGB, GMinusB],
+        8 => [G, B, RMinusG],
+        4 => [R, GMinusMidRB, B],
+        9 => [G, BMinusG, R],
+        15 => [B, R, GMinusB],
+        16 => [B, RMinusB, G],
+        17 => [B, RMinusB, GMinusB],
+        32 => [G, RMinusMidGB, B],
+        33 => [G, RMinusMidGB, BMinusG],
+        2 => [R, GMinusR, B],
+        1 => [R, G, BMinusR],
+        3 => [R, GMinusR, BMinusR],
+        _ => return None,
+    })
+}
+
 fn channel_cost(ch: ChannelView<'_>, mode: Backend) -> Result<ChannelCost> {
     let mut histograms: [Histogram; 17] = std::array::from_fn(|_| Histogram::default());
     let mut extra = 0usize;
@@ -345,13 +396,27 @@ pub struct RctSelection {
 
 /// Score a prefix of RCT_CANDIDATES (1..=19), retaining the first strict minimum.
 /// The three color views must have equal dimensions; shifts/eligibility belong
-/// to the caller. All other channel costs are cached without changing the
-/// source's per-histogram global fraction accumulation order. Samples are never
-/// mutated. Zero candidates is invalid: skipping search is the parent's policy.
+/// to the caller. Repeated color expressions and all other channel costs are
+/// cached without changing the source's per-histogram global fraction
+/// accumulation order. Samples are never mutated. Zero candidates is invalid:
+/// skipping search is the parent's policy.
 pub fn select_rct(
     channels: &[ChannelView<'_>],
     first_color: usize,
     candidate_count: usize,
+) -> Result<RctSelection> {
+    let _scope = crate::profile::scope("modular.rct_cost");
+    let mode = backend();
+    select_rct_with_cost(channels, first_color, candidate_count, |ch| {
+        channel_cost(ch, mode)
+    })
+}
+
+fn select_rct_with_cost(
+    channels: &[ChannelView<'_>],
+    first_color: usize,
+    candidate_count: usize,
+    mut score_channel: impl FnMut(ChannelView<'_>) -> Result<ChannelCost>,
 ) -> Result<RctSelection> {
     validate(channels)?;
     let end = first_color
@@ -371,10 +436,9 @@ pub fn select_rct(
             "RCT color channels have different dimensions".into(),
         ));
     }
-    let mode = backend();
     let mut costs = channels
         .iter()
-        .map(|&ch| channel_cost(ch, mode))
+        .map(|&ch| score_channel(ch))
         .collect::<Result<Vec<_>>>()?;
     let baseline = combine_costs(&costs)?;
     let mut result = RctSelection {
@@ -384,6 +448,13 @@ pub fn select_rct(
     };
     if candidate_count == 1 {
         return Ok(result);
+    }
+    let mut cache: [Option<ChannelCost>; RCT_COST_KEYS] = std::array::from_fn(|_| None);
+    for (c, key) in [RctCostKey::R, RctCostKey::G, RctCostKey::B]
+        .into_iter()
+        .enumerate()
+    {
+        cache[key as usize] = Some(costs[first_color + c].clone());
     }
     let mut original = Vec::with_capacity(3);
     for &ch in &channels[first_color..end] {
@@ -399,20 +470,29 @@ pub fn select_rct(
         .map(|_| zeroed(shape.0 * shape.1))
         .collect::<Result<_>>()?;
     for &rct_type in &RCT_CANDIDATES[1..candidate_count] {
-        for c in 0..3 {
-            trial[c].copy_from_slice(&original[c]);
+        let keys = rct_cost_keys(rct_type);
+        if keys.is_none_or(|keys| keys.iter().any(|&key| cache[key as usize].is_none())) {
+            for c in 0..3 {
+                trial[c].copy_from_slice(&original[c]);
+            }
+            transforms::rct_forward(&mut trial, 0, rct_type)?;
         }
-        transforms::rct_forward(&mut trial, 0, rct_type)?;
         for c in 0..3 {
-            costs[first_color + c] = channel_cost(
-                ChannelView {
-                    pixels: &trial[c],
-                    width: shape.0,
-                    height: shape.1,
-                    stride: shape.0,
-                },
-                mode,
-            )?;
+            costs[first_color + c] = match keys.and_then(|keys| cache[keys[c] as usize].clone()) {
+                Some(cost) => cost,
+                None => {
+                    let cost = score_channel(ChannelView {
+                        pixels: &trial[c],
+                        width: shape.0,
+                        height: shape.1,
+                        stride: shape.0,
+                    })?;
+                    if let Some(keys) = keys {
+                        cache[keys[c] as usize] = Some(cost.clone());
+                    }
+                    cost
+                }
+            };
         }
         let cost = combine_costs(&costs)?;
         result.candidates.push((rct_type, cost));
@@ -490,11 +570,32 @@ pub fn estimate_wp_cost(
         let mut state = weighted::State::new(header, ch.width)?;
         let mut unhealthy = false;
         for y in 0..ch.height {
+            let row = ch.row(y);
+            let top_row = (y != 0).then(|| ch.row(y - 1));
+            let upper_row = (y > 1).then(|| ch.row(y - 2));
             for x in 0..ch.width {
-                let n = ch.neighbors(x, y);
+                // Address and validate each row once, not all seven neighbors
+                // for every pixel. WP only consumes these five neighbors.
+                let left = if x != 0 {
+                    row[x - 1]
+                } else {
+                    top_row.map_or(0, |r| r[0])
+                };
+                let top = top_row.map_or(left, |r| r[x]);
+                let topleft = if x != 0 {
+                    top_row.map_or(left, |r| r[x - 1])
+                } else {
+                    left
+                };
+                let topright = if x + 1 < ch.width {
+                    top_row.map_or(top, |r| r[x + 1])
+                } else {
+                    top
+                };
+                let toptop = upper_row.map_or(top, |r| r[x]);
+                let value = row[x];
                 let (guess, property) =
-                    state.predict(x, y, n.top, n.left, n.topright, n.topleft, n.toptop)?;
-                let value = ch.row(y)[x];
+                    state.predict_and_update(value, x, y, top, left, topright, topleft, toptop)?;
                 let (residual, overflow) = value.overflowing_sub(guess);
                 unhealthy |= overflow;
                 add_residual(
@@ -502,7 +603,6 @@ pub fn estimate_wp_cost(
                     residual,
                     &mut extra_bits,
                 )?;
-                state.update(value, x, y)?;
             }
             work.pixels += ch.width;
             if bounded && y & 63 == 63 {
@@ -580,6 +680,63 @@ pub fn select_weighted_preset(
     }
     Ok(result)
 }
+
+const WP_PARALLEL_MIN_PIXELS: usize = 65536;
+
+fn parallel_weighted_presets(total_pixels: usize, mode_count: usize) -> bool {
+    mode_count > 2
+        && total_pixels >= WP_PARALLEL_MIN_PIXELS
+        && !crate::execution::is_serial()
+        && rayon::current_thread_index().is_some()
+        // Query worker_count only after detecting an installed caller pool;
+        // Rayon's worker-count query alone could initialize its global pool.
+        && crate::execution::worker_count() > 1
+}
+
+/// Search the same preset prefix using only the caller's installed executor.
+/// Mode 0 finishes first; modes 1..mode_count share its fixed pruning bound and
+/// are reduced in source order with strict '<'. An unhealthy mode 0 leaves the
+/// bound at f32::MAX, disabling pruning. Small/null/serial/single-worker calls,
+/// and searches with at most one remaining mode, use the unchanged serial API.
+///
+/// The selected preset and cost retain serial semantics. With pruning enabled,
+/// losing candidates and work counters may differ because their bound is not
+/// tightened by other concurrently evaluated modes. Each mode owns its state.
+pub fn select_weighted_preset_parallel(
+    channels: &[ChannelView<'_>],
+    mode_count: usize,
+    bounded: bool,
+) -> Result<WeightedPresetSelection> {
+    let total_pixels = validate(channels)?;
+    if !(1..=5).contains(&mode_count) {
+        return Err(Error::InvalidInput(
+            "WP candidate count must be 1..=5".into(),
+        ));
+    }
+    if !parallel_weighted_presets(total_pixels, mode_count) {
+        return select_weighted_preset(channels, mode_count, bounded);
+    }
+    let mut result = select_weighted_preset(channels, 1, bounded)?;
+    let limit = if bounded { result.cost } else { f32::INFINITY };
+    let presets = &[1u8, 2, 3, 4][..mode_count - 1];
+    let candidates = crate::execution::map(presets, |&preset| {
+        crate::execution::serial(|| estimate_wp_cost(channels, preset, limit, None))
+    });
+    for (&preset, candidate) in presets.iter().zip(candidates) {
+        let candidate = candidate?;
+        result.work.add(candidate.work)?;
+        if candidate.cost < result.cost {
+            result.preset = preset;
+            result.cost = candidate.cost;
+        }
+        result.candidates.push(candidate);
+    }
+    Ok(result)
+}
+
+#[cfg(test)]
+#[path = "cost_parallel_tests.rs"]
+mod parallel_tests;
 
 #[cfg(target_arch = "x86_64")]
 mod x86 {
@@ -675,6 +832,10 @@ mod x86 {
         entropy_kernel!("avx2,fma", 8);
     }
 }
+
+#[cfg(test)]
+#[path = "cost_rct_tests.rs"]
+mod rct_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1029,6 +1190,37 @@ mod tests {
             }
         }
         histo_cost + extra as f32
+    }
+
+    #[test]
+    fn weighted_row_addressing_matches_checked_neighbors_and_strides() {
+        for width in [1, 2, 3, 17] {
+            for height in [1, 2, 3, 7] {
+                let stride = width + 5;
+                let mut pixels = vec![i32::MIN; (height - 1) * stride + width];
+                for y in 0..height {
+                    for x in 0..width {
+                        pixels[y * stride + x] = ((x * 127 + y * 37) % 65536) as i32 - 32768;
+                    }
+                }
+                let channels = [ChannelView {
+                    pixels: &pixels,
+                    width,
+                    height,
+                    stride,
+                }];
+                for preset in 0..5 {
+                    assert_eq!(
+                        estimate_wp_cost(&channels, preset, f32::INFINITY, None)
+                            .unwrap()
+                            .cost
+                            .to_bits(),
+                        wp_reference(&channels, preset).to_bits(),
+                        "width={width} height={height} preset={preset}",
+                    );
+                }
+            }
+        }
     }
 
     #[test]

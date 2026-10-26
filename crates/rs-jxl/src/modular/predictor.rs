@@ -150,6 +150,77 @@ pub struct Neighbors {
     pub toprightright: i32,
 }
 
+/// Validated row slices for raster walks; address overflow and plane bounds
+/// are checked once per row instead of once per pixel.
+pub(crate) struct NeighborRow<'a> {
+    current: &'a [i32],
+    above: Option<&'a [i32]>,
+    above_two: Option<&'a [i32]>,
+}
+
+impl<'a> NeighborRow<'a> {
+    pub fn new(
+        pixels: &'a [i32],
+        width: usize,
+        stride: usize,
+        y: usize,
+    ) -> Result<Self, PredictorError> {
+        if width == 0 || stride < width {
+            return Err(PredictorError::InvalidDimensions);
+        }
+        let begin = y
+            .checked_mul(stride)
+            .ok_or(PredictorError::DimensionOverflow)?;
+        let end = begin
+            .checked_add(width)
+            .ok_or(PredictorError::DimensionOverflow)?;
+        let current = pixels
+            .get(begin..end)
+            .ok_or(PredictorError::BufferTooSmall)?;
+        Ok(Self {
+            current,
+            above: (y > 0).then(|| &pixels[begin - stride..end - stride]),
+            above_two: (y > 1).then(|| &pixels[begin - stride * 2..end - stride * 2]),
+        })
+    }
+
+    #[inline]
+    pub fn at(&self, x: usize) -> Result<Neighbors, PredictorError> {
+        if x >= self.current.len() {
+            return Err(PredictorError::PositionOutOfBounds);
+        }
+        let left = if x != 0 {
+            self.current[x - 1]
+        } else {
+            self.above.map_or(0, |row| row[0])
+        };
+        let top = self.above.map_or(left, |row| row[x]);
+        let topleft = if x != 0 {
+            self.above.map_or(left, |row| row[x - 1])
+        } else {
+            left
+        };
+        let topright = self
+            .above
+            .and_then(|row| row.get(x + 1))
+            .copied()
+            .unwrap_or(top);
+        Ok(Neighbors {
+            left,
+            top,
+            topleft,
+            topright,
+            leftleft: if x > 1 { self.current[x - 2] } else { left },
+            toptop: self.above_two.map_or(top, |row| row[x]),
+            toprightright: self
+                .above
+                .and_then(|row| row.get(x + 2))
+                .copied()
+                .unwrap_or(topright),
+        })
+    }
+}
+
 impl Neighbors {
     /// Safe equivalent of the edge-aware neighbor loads in `detail::Predict`.
     /// `pixels` starts at row zero; width/stride are measured in samples. Rows
@@ -295,6 +366,33 @@ pub fn predict_one(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn row_neighbors_match_pointwise_edges_and_padded_stride() {
+        use super::{NeighborRow, Neighbors, PredictorError};
+        for width in [1, 2, 3, 7, 32, 33, 257] {
+            for padding in [0, 1, 11] {
+                let stride = width + padding;
+                let pixels: Vec<_> = (0..stride * 5)
+                    .map(|n| (n as i32).wrapping_mul(0x5c123fa1))
+                    .collect();
+                for y in 0..5 {
+                    let row = NeighborRow::new(&pixels, width, stride, y).unwrap();
+                    for x in 0..width {
+                        assert_eq!(
+                            row.at(x).unwrap(),
+                            Neighbors::from_plane(&pixels, width, stride, x, y).unwrap()
+                        );
+                    }
+                    assert_eq!(row.at(width), Err(PredictorError::PositionOutOfBounds));
+                }
+            }
+        }
+        assert!(NeighborRow::new(&[], 0, 0, 0).is_err());
+        assert!(NeighborRow::new(&[1; 4], 3, 2, 0).is_err());
+        assert!(NeighborRow::new(&[1; 4], 3, 3, 1).is_err());
+        assert!(NeighborRow::new(&[], 2, usize::MAX, 2).is_err());
+    }
+
     use super::*;
 
     // Independent wide scalar formulas: no production helpers, no shifts,

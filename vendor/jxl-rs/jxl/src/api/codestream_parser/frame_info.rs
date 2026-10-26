@@ -53,6 +53,8 @@ impl SectionState {
 }
 
 pub struct FrameInfo {
+    pub(crate) native_integer_capture:
+        Option<Arc<crate::frame::native_integer::NativeIntegerCapture>>,
     frame_header: Option<FrameHeader>,
     toc_parser: Option<IncrementalTocReader>,
     frame: Option<Box<Frame>>,
@@ -89,6 +91,7 @@ pub struct FrameInfo {
 impl FrameInfo {
     pub fn new() -> Self {
         Self {
+            native_integer_capture: None,
             frame_header: None,
             toc_parser: None,
             frame: None,
@@ -310,6 +313,7 @@ impl FrameInfo {
                     DecoderState::new(header, decode_options, level5_limits)
                 });
             decoder_state.level5_limits = level5_limits;
+            decoder_state.native_integer_capture = self.native_integer_capture.clone();
             decoder_state.keep_slots(std::mem::replace(&mut self.keep_slots, [true; 8]));
             let frame = Frame::from_header_and_toc(
                 self.frame_header.take().unwrap(),
@@ -750,6 +754,9 @@ impl FrameInfo {
         pixel_format: &JxlPixelFormat,
         parallel_runner: &mut dyn JxlParallelRunner,
     ) -> Result<()> {
+        if self.native_integer_capture.is_some() {
+            return Ok(());
+        }
         self.prepare_render_pipeline(pixel_format, output_profile)?;
         let Some(frame) = self.frame.as_mut() else {
             return Ok(());

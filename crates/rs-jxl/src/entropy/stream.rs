@@ -13,9 +13,9 @@ use super::options::{ClusterStrategy, EntropyOptions, PREFIX_LOG_ALPHA_SIZE, Uin
 use super::{hybrid_uint::HybridUintConfig, prefix_code::PrefixCode};
 use crate::{Error, Result, bit_writer::BitWriter};
 
-/// 16,384 raw MA-tree leaf contexts plus the optional LZ77 distance context.
-/// This resource bound is independent of the at-most-256 histogram IDs.
-pub const MAX_RAW_CONTEXTS: usize = 16_385;
+/// The global MA tree's maximum leaf count plus an optional LZ77 distance
+/// context. Raw contexts are not the at-most-256 clustered histogram IDs.
+pub const MAX_RAW_CONTEXTS: usize = (1 << 21) + 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Token {
@@ -172,9 +172,9 @@ fn raw_histograms(
 ) -> Result<(Vec<Vec<u64>>, usize)> {
     options.validate()?;
     if contexts == 0 || contexts > MAX_RAW_CONTEXTS {
-        return Err(Error::InvalidInput(
-            "entropy raw contexts must be 1..=16385".into(),
-        ));
+        return Err(Error::InvalidInput(format!(
+            "entropy raw contexts must be 1..={MAX_RAW_CONTEXTS}",
+        )));
     }
     if lz77 && contexts < 2 {
         return Err(Error::InvalidInput(
@@ -1330,19 +1330,14 @@ mod tests {
 
     #[test]
     fn sparse_bins_and_large_raw_context_maps() {
-        let mut sparse = vec![Vec::new(); MAX_RAW_CONTEXTS];
-        add_count(&mut sparse[MAX_RAW_CONTEXTS - 1], 7).unwrap();
+        const CONTEXTS: usize = 32_769;
+        let mut sparse = vec![Vec::new(); CONTEXTS];
+        add_count(&mut sparse[CONTEXTS - 1], 7).unwrap();
         assert_eq!(sparse.iter().map(Vec::len).sum::<usize>(), 8);
         finish_counts(&mut sparse);
-        assert_eq!(
-            sparse.iter().map(Vec::len).sum::<usize>(),
-            MAX_RAW_CONTEXTS + 7
-        );
+        assert_eq!(sparse.iter().map(Vec::len).sum::<usize>(), CONTEXTS + 7);
 
-        let streams = [vec![
-            Token::literal(0, 1),
-            Token::literal(MAX_RAW_CONTEXTS - 1, 17),
-        ]];
+        let streams = [vec![Token::literal(0, 1), Token::literal(CONTEXTS - 1, 17)]];
         let options = EntropyOptions {
             uint_config: UintConfigStrategy::Fixed(HybridUintConfig::default()),
             clustering: ClusterStrategy::Fast,
@@ -1350,19 +1345,18 @@ mod tests {
             ..EntropyOptions::default()
         };
         let model =
-            Model::build_with_options(&streams, MAX_RAW_CONTEXTS, false, Coding::Ans, &options)
-                .unwrap();
-        assert_eq!(model.map.len(), MAX_RAW_CONTEXTS);
+            Model::build_with_options(&streams, CONTEXTS, false, Coding::Ans, &options).unwrap();
+        assert_eq!(model.map.len(), CONTEXTS);
         assert!(model.configs.len() <= 4);
         assert_eq!(
             model.map_token(streams[0][1]).unwrap().context,
-            usize::from(model.map[MAX_RAW_CONTEXTS - 1])
+            usize::from(model.map[CONTEXTS - 1])
         );
         encoded(&model, &streams);
 
         // Exercise all 256 possible IDs in a long map, independently of the
         // clustering outcome; the nested models must still have one context.
-        let map: Vec<u8> = (0..=255).cycle().take(MAX_RAW_CONTEXTS).collect();
+        let map: Vec<u8> = (0..=255).cycle().take(CONTEXTS).collect();
         let mut writer = BitWriter::new(1 << 20);
         super::super::context_map::write_context_map(&map, 256, &mut writer).unwrap();
         assert!(writer.bits_written() > 3);
@@ -1370,14 +1364,14 @@ mod tests {
 
     #[test]
     fn long_single_histogram_map_uses_three_bits() {
+        const CONTEXTS: usize = 32_769;
         let options = EntropyOptions {
             max_histograms: 1,
             ..EntropyOptions::default()
         };
         let model =
-            Model::build_with_options(&[], MAX_RAW_CONTEXTS, false, Coding::Prefix, &options)
-                .unwrap();
-        assert_eq!(model.map, vec![0; MAX_RAW_CONTEXTS]);
+            Model::build_with_options(&[], CONTEXTS, false, Coding::Prefix, &options).unwrap();
+        assert_eq!(model.map, vec![0; CONTEXTS]);
         let (_, bytes) = encoded(&model, &[]);
         // Independently read LZ77=0, simple context map=1, width=0, prefix=1.
         let first: Vec<u8> = (0..5).map(|bit| (bytes[0] >> bit) & 1).collect();
@@ -1430,9 +1424,12 @@ mod tests {
     }
 
     #[test]
-    fn maximum_ma_leaf_count_leaves_room_for_lz77_distance() {
-        const LEAVES: usize = 16_384;
-        assert_eq!(MAX_RAW_CONTEXTS, LEAVES + 1);
+    fn merged_ma_leaf_count_leaves_room_for_lz77_distance() {
+        const LEAVES: usize = 32_768;
+        assert_eq!(
+            MAX_RAW_CONTEXTS,
+            crate::modular::ma_train::MAX_TREE_LEAVES + 1
+        );
         let streams = [vec![
             Token::literal(LEAVES - 1, 5),
             Token {
@@ -1448,9 +1445,8 @@ mod tests {
             max_histograms: 1,
             ..EntropyOptions::default()
         };
-        let model =
-            Model::build_with_options(&streams, MAX_RAW_CONTEXTS, true, Coding::Prefix, &options)
-                .unwrap();
+        let model = Model::build_with_options(&streams, LEAVES + 1, true, Coding::Prefix, &options)
+            .unwrap();
         assert_eq!(model.map.len(), LEAVES + 1);
         assert_eq!(model.configs.len(), 1);
         encoded(&model, &streams);

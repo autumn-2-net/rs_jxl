@@ -150,6 +150,12 @@ where
     pub fn batches(&self) -> usize {
         self.batches
     }
+    /// Release resident inputs and their cached scores, not cumulative work.
+    /// A later score rebuilds samples and charges fresh encoding attempts.
+    pub(crate) fn release_samples_and_cache(&mut self) {
+        self.samples = Vec::new();
+        self.cache = Vec::new();
+    }
     /// Executes the source default deduplicated batch through a caller-owned
     /// executor. The existing FnMut callback remains the serial fallback.
     pub fn set_batch_encoder(&mut self, mut encode: ProbeBatchEncoder<'a>) {
@@ -409,6 +415,41 @@ where
         ranked.sort_by_key(|c| c.context_bytes);
         Ok(ranked)
     }
+    /// Full-fidelity regional scores in one caller-owned batch. Unlike rank's
+    /// cheap first round this never changes the candidate's effort or training.
+    pub(crate) fn score_plan(
+        &mut self,
+        candidates: Vec<Candidate>,
+    ) -> Result<Vec<(Candidate, Vec<usize>)>> {
+        if !self.available() || candidates.is_empty() {
+            return Err(Error::InvalidInput("unavailable pilot screen".into()));
+        }
+        if candidates.len() > self.options.limits.max_candidates {
+            return Err(Error::Limit("pilot candidate count"));
+        }
+        self.init()?;
+        let mut unique: Vec<Candidate> = Vec::new();
+        for candidate in candidates {
+            if !unique.iter().any(|c| c.params == candidate.params) {
+                unique.push(candidate);
+            }
+        }
+        let indices = unique
+            .iter()
+            .map(|c| self.index(&c.params))
+            .collect::<Result<Vec<_>>>()?;
+        let tiles: Vec<_> = (0..self.samples.len()).collect();
+        self.rounds(&indices, &tiles)?;
+        unique
+            .into_iter()
+            .zip(indices)
+            .map(|(mut candidate, index)| {
+                let scores = self.completed(index, &tiles)?;
+                candidate.context_bytes = Some(total(&scores)?);
+                Ok((candidate, scores))
+            })
+            .collect()
+    }
     pub fn smaller_groups(&mut self, ranked: &[Candidate]) -> Result<Vec<Candidate>> {
         let mut result = Vec::new();
         let Some(best) = ranked
@@ -508,3 +549,7 @@ pub fn promising(candidate: &[usize], incumbent: &[usize]) -> bool {
             .zip(incumbent)
             .any(|(&a, &b)| (a as f64) < b as f64 * 0.98)
 }
+
+#[cfg(test)]
+#[path = "probe_release_tests.rs"]
+mod release_tests;

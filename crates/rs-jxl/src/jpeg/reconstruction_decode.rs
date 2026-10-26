@@ -658,7 +658,8 @@ fn validate_layout(m: &DecodedReconstructionMetadata) -> Result<()> {
                 }
                 for c in &scan.components {
                     if !q[m.quant[m.component_quant[c.component_index]].index as usize]
-                        || ((!progressive || scan.ss == 0) && !dc[c.dc_table_index as usize])
+                        || ((!progressive || (scan.ss == 0 && scan.ah == 0))
+                            && !dc[c.dc_table_index as usize])
                         || ((!progressive || scan.se != 0) && !ac[c.ac_table_index as usize])
                     {
                         return Err(Error::Invalid("table used before definition"));

@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 mod controls;
 mod metadata;
 mod outputs;
+mod streaming;
 mod writers;
 pub(crate) use controls::DecodeArgs;
 use controls::OutputFormat;
@@ -26,6 +27,9 @@ pub(crate) fn run(args: DecodeArgs) -> Result<()> {
     let _total = rs_jxl::profile::scope("cli.total");
     let format = args.output_format()?;
     outputs::preflight(&args)?;
+    if args.stream_input {
+        return streaming::run(&args, format);
+    }
     let bytes = io::read_input(&args.input)?;
     let mut options = args.options(format);
     args.configure_color(&mut options, format)?;
@@ -58,13 +62,14 @@ pub(crate) fn run(args: DecodeArgs) -> Result<()> {
     if format == OutputFormat::Png && matches!(options.format, SampleFormat::Native) {
         options.format = default_integer_format(&decode::read_basic_info(&bytes, &options)?)?;
     }
+    let mut decoder = decode::Decoder::new(options.clone())?;
     let mut decoded = None;
     for _ in 0..args.num_reps {
         drop(decoded.take());
         let _decoding = rs_jxl::profile::scope("cli.decode");
         decoded = Some(match args.frame {
-            Some(index) => decode::decode_frame(&bytes, index, &options)?,
-            None => decode::decode(&bytes, &options)?,
+            Some(index) => decoder.decode_frame(&bytes, index)?,
+            None => decoder.decode(&bytes)?,
         });
     }
     let image = decoded.ok_or("no decoding repetitions")?;
@@ -82,11 +87,6 @@ pub(crate) fn run(args: DecodeArgs) -> Result<()> {
     }
     if !image.complete {
         args.diagnostic("warning: selected/partial/progressive output is incomplete; later frames or trailing metadata may not have been validated.");
-    }
-    if options.format == SampleFormat::Native && std::iter::once(&image.info.bit_depth)
-        .chain(image.info.extra_channels.iter().map(|ec| &ec.bit_depth))
-        .any(|depth| matches!(depth, JxlBitDepth::Int { bits_per_sample } if *bits_per_sample > 16)) {
-        args.diagnostic("warning: native integers above 16 bits become normalized F32, not exact integer samples.");
     }
     report(&args, image.bytes_read, started);
     if args.disable_output {
@@ -126,10 +126,11 @@ fn report(args: &DecodeArgs, bytes_read: usize, started: std::time::Instant) {
 
 fn reconstruct(args: &DecodeArgs, bytes: &[u8], options: &DecodeOptions) -> Result<()> {
     let started = std::time::Instant::now();
+    let mut decoder = decode::Decoder::new(options.clone())?;
     let mut output = Vec::new();
     for _ in 0..args.num_reps {
         drop(std::mem::take(&mut output));
-        output = decode::reconstruct_jpeg(bytes, options)?;
+        output = decoder.reconstruct_jpeg(bytes)?;
         if output.len() > MAX_OUTPUT_BYTES {
             return Err("reconstructed JPEG exceeds 512 MiB".into());
         }

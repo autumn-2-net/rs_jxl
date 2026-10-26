@@ -35,6 +35,7 @@ test-log = { version = "0.2.16", features = ["trace"] }
 jxl_macros = { path = "../jxl_macros", version = "=0.8.0", features = ["test"] }
 
 [features]
+decoder-profile = []
 default = ["all-simd"]
 
 brotli = ["dep:brotli-decompressor"]

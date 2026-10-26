@@ -8,7 +8,7 @@ use std::sync::Arc;
 use super::internal::{RenderPipelineShared, Stage};
 use super::stages::ExtendToImageDimensionsStage;
 use super::{RenderPipeline, RenderPipelineInOutStage, RenderPipelineInPlaceStage};
-use crate::api::{JxlColorType, JxlDataFormat};
+use crate::api::{DitherMode, JxlColorType, JxlDataFormat};
 use crate::error::{Error, Result};
 use crate::headers::Orientation;
 use crate::headers::bit_depth::BitDepth;
@@ -23,6 +23,7 @@ use crate::util::tracing_wrappers::*;
 pub struct RenderPipelineBuilder<Pipeline: RenderPipeline> {
     shared: RenderPipelineShared<Pipeline::Buffer>,
     channel_types: Vec<(DataTypeTag, Option<BitDepth>)>,
+    dither: DitherMode,
 }
 
 impl<Pipeline: RenderPipeline> RenderPipelineBuilder<Pipeline> {
@@ -67,6 +68,7 @@ impl<Pipeline: RenderPipeline> RenderPipelineBuilder<Pipeline> {
                 buffer_recycler,
             },
             channel_types: channel_types.to_vec(),
+            dither: DitherMode::default(),
         }
     }
 
@@ -134,6 +136,11 @@ impl<Pipeline: RenderPipeline> RenderPipelineBuilder<Pipeline> {
         )
     }
 
+    pub fn with_dither(mut self, dither: DitherMode) -> Self {
+        self.dither = dither;
+        self
+    }
+
     pub fn add_save_stage(
         self,
         channels: &[usize],
@@ -150,7 +157,8 @@ impl<Pipeline: RenderPipeline> RenderPipelineBuilder<Pipeline> {
             color_type,
             data_format,
             fill_opaque_alpha,
-        );
+        )
+        .with_dither(self.dither);
         self.add_stage_internal(Stage::Save(stage))
     }
 

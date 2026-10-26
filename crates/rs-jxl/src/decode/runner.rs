@@ -3,6 +3,10 @@ use rayon::prelude::*;
 
 pub(super) struct Runner(Option<rayon::ThreadPool>);
 impl Runner {
+    pub(super) fn pool(&self) -> Option<&rayon::ThreadPool> {
+        self.0.as_ref()
+    }
+
     pub(super) fn new(threads: usize) -> crate::Result<Self> {
         let pool = if threads > 1 {
             Some(

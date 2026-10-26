@@ -77,6 +77,10 @@ pub(super) fn sync_scratch(
 }
 
 pub(super) trait ModularChannelDecoder {
+    #[cfg(feature = "decoder-profile")]
+    fn profile_name(&self) -> &'static str {
+        std::any::type_name::<Self>()
+    }
     #[inline(always)]
     fn needs_toptop(&self) -> bool {
         true
@@ -281,6 +285,8 @@ fn decode_modular_channel_impl(
     storage: ModularStorage,
     scratch: &mut [Vec<i32>; 3],
 ) -> Result<()> {
+    #[cfg(feature = "decoder-profile")]
+    let _profile = crate::decoder_profile::scope(t.profile_name());
     let size = buffers[chan].size(storage);
     let xsize = size.0;
     if storage == ModularStorage::I16 {

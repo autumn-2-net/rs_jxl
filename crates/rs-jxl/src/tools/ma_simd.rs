@@ -17,6 +17,13 @@
 //! validated weighted totals, immutable cached deltas, fused movement/scoring,
 //! and a shared triangular contribution table for each side with total <=256.
 //! Its parent estimate uses FastLog2f directly, never a log(count) cache.
+//! `RS_JXL_MA_AVX512=1` opts into 16-bin dense computation with the same eight
+//! logical accumulation lanes. The flag and CPU/OS support are checked once
+//! when constructing the first DefaultScorer. Small/sparse sweeps keep AVX2.
+//! `RS_JXL_MA_RCP=1` instead opts into an AVX2/FMA reciprocal experiment. Its
+//! rational log uses one Newton correction instead of vector division. Integer
+//! counts, clipping, and lookup tables stay exact; tree scoring may differ by
+//! rounding. It takes precedence over the AVX512 experiment and defaults OFF.
 //!
 //! Construct one `LogTable` per trainer/worker and reuse it for dense predictor
 //! histograms and split sweeps. `move_counts_and_log_bits` moves all weighted
@@ -125,13 +132,43 @@ enum DefaultBackend {
     Avx2,
     #[cfg(target_arch = "x86_64")]
     Avx2Fma,
+    #[cfg(target_arch = "x86_64")]
+    Avx2Rcp,
+    #[cfg(target_arch = "x86_64")]
+    Avx512Fma8,
 }
 
 impl DefaultBackend {
+    fn detect(avx512: bool) -> Self {
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = avx512;
+        let backend = Self::Scalar;
+        #[cfg(target_arch = "x86_64")]
+        let backend = if std::is_x86_feature_detected!("avx2") {
+            if std::is_x86_feature_detected!("fma") {
+                if avx512
+                    && std::is_x86_feature_detected!("avx512f")
+                    && std::is_x86_feature_detected!("avx512dq")
+                {
+                    Self::Avx512Fma8
+                } else {
+                    Self::Avx2Fma
+                }
+            } else {
+                Self::Avx2
+            }
+        } else if std::is_x86_feature_detected!("sse2") {
+            Self::Sse2
+        } else {
+            backend
+        };
+        backend
+    }
+
     fn uses_fma(self) -> bool {
         #[cfg(target_arch = "x86_64")]
         {
-            matches!(self, Self::Avx2Fma)
+            matches!(self, Self::Avx2Fma | Self::Avx2Rcp | Self::Avx512Fma8)
         }
         #[cfg(not(target_arch = "x86_64"))]
         {
@@ -162,10 +199,23 @@ impl DefaultBackend {
 /// the appropriate lane BEFORE reduction, equivalent to zero padding. Scalar
 /// fallback accumulates serially. FMA/other vector widths can round differently;
 /// neither all-target bit parity nor identical tree selection is promised.
+/// AVX2 tails use fault-suppressing masked loads/stores when a side needs
+/// FastLog2f, avoiding up to fourteen scalar log evaluations per split. SSE2
+/// uses bounded stack copies for its partial vectors. When both sides use the
+/// small table, scalar tail lookups avoid gather overhead. No padding is needed.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct DefaultScorer {
     small: &'static [f32],
     backend: DefaultBackend,
+}
+
+/// One complete-search threshold, in the caller's stable bin order. `row`
+/// addresses immutable deltas and may differ from `bin` after property packing.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct HistogramSplit {
+    pub(crate) bin: usize,
+    pub(crate) row: usize,
+    pub(crate) totals: (u32, u32),
 }
 
 impl Default for DefaultScorer {
@@ -181,7 +231,12 @@ impl DefaultScorer {
         assert_eq!(above.len(), delta.len());
         #[cfg(target_arch = "x86_64")]
         match self.backend {
-            DefaultBackend::Avx2 | DefaultBackend::Avx2Fma => {
+            DefaultBackend::Avx512Fma8 => {
+                // SAFETY: detected AVX512F/DQ, AVX2/FMA and matching slices.
+                unsafe { x86::avx512_fma8::move_counts(above, below, delta) };
+                return;
+            }
+            DefaultBackend::Avx2 | DefaultBackend::Avx2Fma | DefaultBackend::Avx2Rcp => {
                 // SAFETY: detected AVX2 and matching bounded slices.
                 unsafe { x86::avx2::move_counts(above, below, delta) };
                 return;
@@ -216,25 +271,25 @@ impl DefaultScorer {
             #[cfg(target_arch = "x86_64")]
             DefaultBackend::Sse2 => 4,
             #[cfg(target_arch = "x86_64")]
-            DefaultBackend::Avx2 | DefaultBackend::Avx2Fma => 8,
+            DefaultBackend::Avx2
+            | DefaultBackend::Avx2Fma
+            | DefaultBackend::Avx2Rcp
+            | DefaultBackend::Avx512Fma8 => 8,
         }
     }
 
     pub(crate) fn new() -> Self {
-        let backend = DefaultBackend::Scalar;
-        #[cfg(target_arch = "x86_64")]
-        let backend = if std::is_x86_feature_detected!("avx2") {
-            if std::is_x86_feature_detected!("fma") {
-                DefaultBackend::Avx2Fma
-            } else {
-                DefaultBackend::Avx2
+        static BACKEND: OnceLock<DefaultBackend> = OnceLock::new();
+        let backend = BACKEND.get_or_init(|| {
+            let detected =
+                DefaultBackend::detect(std::env::var("RS_JXL_MA_AVX512").as_deref() == Ok("1"));
+            #[cfg(target_arch = "x86_64")]
+            if detected.uses_fma() && std::env::var("RS_JXL_MA_RCP").as_deref() == Ok("1") {
+                return DefaultBackend::Avx2Rcp;
             }
-        } else if std::is_x86_feature_detected!("sse2") {
-            DefaultBackend::Sse2
-        } else {
-            backend
-        };
-        Self::with_backend(backend)
+            detected
+        });
+        Self::with_backend(*backend)
     }
 
     // Callers selecting a native backend must detect its CPU features first.
@@ -270,6 +325,16 @@ impl DefaultScorer {
     pub(crate) fn estimate_bits(&self, counts: &[u32], total: u32) -> f32 {
         debug_assert!(total <= MAX_HISTOGRAM_TOTAL);
         match self.backend {
+            #[cfg(target_arch = "x86_64")]
+            DefaultBackend::Avx2Rcp => {
+                // SAFETY: AVX2/FMA detected; the kernel bounds every load.
+                unsafe { x86::avx2_rcp::default_estimate(counts, total) }
+            }
+            #[cfg(target_arch = "x86_64")]
+            DefaultBackend::Avx512Fma8 => {
+                // SAFETY: runtime feature/OS detection and internally bounded loads.
+                unsafe { x86::avx512_fma8::default_estimate(counts, total) }
+            }
             #[cfg(target_arch = "x86_64")]
             DefaultBackend::Avx2Fma => {
                 // SAFETY: both AVX2/OS support and FMA detected; bounded loads.
@@ -310,6 +375,16 @@ impl DefaultScorer {
         assert_eq!(above.len(), delta.len(), "MA delta length mismatch");
         debug_assert!(totals.0 <= MAX_HISTOGRAM_TOTAL && totals.1 <= MAX_HISTOGRAM_TOTAL);
         match self.backend {
+            #[cfg(target_arch = "x86_64")]
+            DefaultBackend::Avx2Rcp => {
+                // SAFETY: detected AVX2/FMA and matching bounded slices.
+                unsafe { x86::avx2_rcp::default_move(self, above, below, delta, totals) }
+            }
+            #[cfg(target_arch = "x86_64")]
+            DefaultBackend::Avx512Fma8 => {
+                // SAFETY: detected features and matching bounded slices.
+                unsafe { x86::avx512_fma8::default_move(self, above, below, delta, totals) }
+            }
             #[cfg(target_arch = "x86_64")]
             DefaultBackend::Avx2Fma => {
                 // SAFETY: AVX2+FMA detected, matching lengths and bounded gathers.
@@ -360,7 +435,12 @@ impl DefaultScorer {
         assert!(blocks.windows(2).all(|b| b[0] < b[1]));
         match self.backend {
             #[cfg(target_arch = "x86_64")]
-            DefaultBackend::Avx2Fma => {
+            DefaultBackend::Avx2Rcp => {
+                // SAFETY: detected AVX2/FMA, checked slices and block addresses.
+                unsafe { x86::avx2_rcp::sparse_move(self, above, below, delta, totals, blocks) }
+            }
+            #[cfg(target_arch = "x86_64")]
+            DefaultBackend::Avx2Fma | DefaultBackend::Avx512Fma8 => {
                 // SAFETY: detected CPU features, matching slices, bounded aligned blocks.
                 unsafe { x86::avx2_fma::sparse_move(self, above, below, delta, totals, blocks) }
             }
@@ -389,6 +469,89 @@ impl DefaultScorer {
         }
     }
 
+    /// Dispatch once per predictor, not once per threshold. Deltas and sparse
+    /// addresses are checked before native access; sparse proofs are immutable
+    /// for the whole sweep. No allocation or change in lane arithmetic/order.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn split_sweep(
+        &self,
+        above: &mut [u32],
+        below: &mut [u32],
+        deltas: &[u32],
+        stride: usize,
+        sparse: Option<&[usize]>,
+        splits: impl Iterator<Item = HistogramSplit>,
+        mut emit: impl FnMut(HistogramSplit, f32, f32),
+    ) {
+        assert_eq!(above.len(), below.len(), "MA histogram length mismatch");
+        assert!(stride != 0 && stride >= above.len(), "MA delta stride");
+        assert_eq!(deltas.len() % stride, 0, "MA delta rows");
+        if let Some(blocks) = sparse {
+            let lanes = self.lanes();
+            assert!(blocks.iter().all(|&b| b < above.len() && b % lanes == 0));
+            assert!(blocks.windows(2).all(|b| b[0] < b[1]));
+        }
+        #[cfg(target_arch = "x86_64")]
+        match self.backend {
+            DefaultBackend::Avx2Rcp => {
+                // SAFETY: detected AVX2/FMA and checked histogram layout.
+                unsafe {
+                    x86::avx2_rcp::default_sweep(
+                        self, above, below, deltas, stride, sparse, splits, emit,
+                    )
+                };
+                return;
+            }
+            DefaultBackend::Avx512Fma8 => {
+                // SAFETY: detected features and checked slice/block layout.
+                unsafe {
+                    x86::avx512_fma8::default_sweep(
+                        self, above, below, deltas, stride, sparse, splits, emit,
+                    )
+                };
+                return;
+            }
+            DefaultBackend::Avx2Fma => {
+                // SAFETY: detected CPU features and checked slice/block layout.
+                // The native sweep bounds each row before calling its kernel.
+                unsafe {
+                    x86::avx2_fma::default_sweep(
+                        self, above, below, deltas, stride, sparse, splits, emit,
+                    )
+                };
+                return;
+            }
+            DefaultBackend::Avx2 => {
+                // SAFETY: same checked layout and detected AVX2.
+                unsafe {
+                    x86::avx2::default_sweep(
+                        self, above, below, deltas, stride, sparse, splits, emit,
+                    )
+                };
+                return;
+            }
+            DefaultBackend::Sse2 => {
+                // SAFETY: same checked layout and detected SSE2.
+                unsafe {
+                    x86::sse2::default_sweep(
+                        self, above, below, deltas, stride, sparse, splits, emit,
+                    )
+                };
+                return;
+            }
+            DefaultBackend::Scalar => {}
+        }
+        for split in splits {
+            let delta = split_delta(deltas, stride, above.len(), split.row);
+            let bits = if let Some(blocks) = sparse {
+                self.move_and_score_sparse(above, below, delta, split.totals, blocks)
+            } else {
+                self.move_and_score(above, below, delta, split.totals)
+            };
+            emit(split, bits.0, bits.1);
+        }
+    }
+
     fn small_row(&self, total: u32) -> &[f32] {
         if total > SMALL_HISTOGRAM_TOTAL {
             return &[];
@@ -397,6 +560,12 @@ impl DefaultScorer {
         let offset = total * (total + 1) / 2;
         &self.small[offset..offset + total + 1]
     }
+}
+
+#[inline]
+fn split_delta(deltas: &[u32], stride: usize, symbols: usize, row: usize) -> &[u32] {
+    assert!(row < deltas.len() / stride, "MA delta row out of bounds");
+    &deltas[row * stride..row * stride + symbols]
 }
 
 #[inline]
@@ -911,8 +1080,8 @@ mod count_x86 {
 #[cfg(target_arch = "x86_64")]
 mod x86 {
     use super::{
-        DefaultScorer, LOG_P, LOG_Q, LogTable, MIN_PROBABILITY, PROBABILITY_BITS,
-        cached_source_entropy, inverse_total, source_entropy,
+        DefaultScorer, HistogramSplit, LOG_P, LOG_Q, LogTable, MIN_PROBABILITY, PROBABILITY_BITS,
+        cached_source_entropy, inverse_total, split_delta,
     };
 
     macro_rules! default_kernel {
@@ -972,19 +1141,19 @@ mod x86 {
                 let end = counts.len() / $lanes * $lanes;
                 let mut sum = zero();
                 let mut lanes = [0.0; $lanes];
-                // SAFETY: every unaligned load spans a complete in-bounds
-                // block. The accumulator store spans exactly LANES floats.
+                // SAFETY: full loads are bounded; partial loads enable/copy
+                // only the remaining elements. No readable padding is needed.
                 unsafe {
                     for i in (0..end).step_by($lanes) {
                         let c = load(counts.as_ptr().add(i).cast());
                         sum = sub(sum, default_entropy::<false>(&[], c, inv, tv));
                     }
+                    if end != counts.len() {
+                        let mask = tail_mask(counts.len() - end);
+                        let c = load_tail(counts.as_ptr().add(end), mask);
+                        sum = sub(sum, default_entropy::<false>(&[], c, inv, tv));
+                    }
                     store_f(lanes.as_mut_ptr(), sum);
-                }
-                // Source pads with zero bins. Apply tail contributions to the
-                // same lanes before reduction, without copying the histogram.
-                for (lane, &count) in lanes.iter_mut().zip(&counts[end..]) {
-                    *lane -= source_entropy::<$fma>(count, total, inverse);
                 }
                 reduce_default(lanes)
             }
@@ -1014,6 +1183,47 @@ mod x86 {
                 unsafe { move_dispatch::<true>(scorer, above, below, delta, totals, blocks) }
             }
 
+            #[allow(clippy::too_many_arguments)]
+            #[target_feature(enable = $feature)]
+            pub(in super::super) unsafe fn default_sweep(
+                scorer: &DefaultScorer,
+                above: &mut [u32],
+                below: &mut [u32],
+                deltas: &[u32],
+                stride: usize,
+                sparse: Option<&[usize]>,
+                splits: impl Iterator<Item = HistogramSplit>,
+                mut emit: impl FnMut(HistogramSplit, f32, f32),
+            ) {
+                // Keep the sparse branch and address validation outside the
+                // threshold loop. Row slicing remains checked for every move.
+                if let Some(blocks) = sparse {
+                    for split in splits {
+                        debug_assert!(split.totals.0 <= i32::MAX as u32);
+                        debug_assert!(split.totals.1 <= i32::MAX as u32);
+                        let delta = split_delta(deltas, stride, above.len(), split.row);
+                        // SAFETY: same target features; wrapper checked lengths
+                        // and block addresses, and delta is a bounded row slice.
+                        let (r, l) = unsafe {
+                            move_dispatch::<true>(scorer, above, below, delta, split.totals, blocks)
+                        };
+                        emit(split, r, l);
+                    }
+                } else {
+                    for split in splits {
+                        debug_assert!(split.totals.0 <= i32::MAX as u32);
+                        debug_assert!(split.totals.1 <= i32::MAX as u32);
+                        let delta = split_delta(deltas, stride, above.len(), split.row);
+                        // SAFETY: same checked layout; dense mode ignores blocks.
+                        let (r, l) = unsafe {
+                            move_dispatch::<false>(scorer, above, below, delta, split.totals, &[])
+                        };
+                        emit(split, r, l);
+                    }
+                }
+            }
+
+            #[inline]
             #[target_feature(enable = $feature)]
             unsafe fn move_dispatch<const SPARSE: bool>(
                 scorer: &DefaultScorer,
@@ -1067,6 +1277,14 @@ mod x86 {
                 let (tr, tl) = (splat_i(totals.0 as i32), splat_i(totals.1 as i32));
                 let (mut br, mut bl) = (zero(), zero());
                 let end = above.len() / $lanes * $lanes;
+                let tail_end = if !SPARSE || blocks.last() == Some(&end) {
+                    above.len()
+                } else {
+                    end
+                };
+                // Small-table tails need only bounded scalar loads. Vectorize
+                // when at least one side would otherwise repeat FastLog2f.
+                let vector_tail = !(CACHE_R && CACHE_L);
                 let mut lanes_r = [0.0; $lanes];
                 let mut lanes_l = [0.0; $lanes];
                 // SAFETY: matching lengths ensure all complete-block accesses
@@ -1092,21 +1310,28 @@ mod x86 {
                         br = sub(br, default_entropy::<CACHE_R>(row_r, r, vr, tr));
                         bl = sub(bl, default_entropy::<CACHE_L>(row_l, l, vl, tl));
                     }
+                    if vector_tail && end != tail_end {
+                        let mask = tail_mask(tail_end - end);
+                        let d = load_tail(delta.as_ptr().add(end), mask);
+                        let r = sub_i(load_tail(above.as_ptr().add(end), mask), d);
+                        let l = add_i(load_tail(below.as_ptr().add(end), mask), d);
+                        store_tail(above.as_mut_ptr().add(end), mask, r);
+                        store_tail(below.as_mut_ptr().add(end), mask, l);
+                        br = sub(br, default_entropy::<CACHE_R>(row_r, r, vr, tr));
+                        bl = sub(bl, default_entropy::<CACHE_L>(row_l, l, vl, tl));
+                    }
                     store_f(lanes_r.as_mut_ptr(), br);
                     store_f(lanes_l.as_mut_ptr(), bl);
                 }
-                let tail_end = if !SPARSE || blocks.last() == Some(&end) {
-                    above.len()
-                } else {
-                    end
-                };
-                for i in end..tail_end {
-                    above[i] = above[i].wrapping_sub(delta[i]);
-                    below[i] = below[i].wrapping_add(delta[i]);
-                    lanes_r[i - end] -=
-                        cached_source_entropy::<$fma>(row_r, above[i], totals.0, ir);
-                    lanes_l[i - end] -=
-                        cached_source_entropy::<$fma>(row_l, below[i], totals.1, il);
+                if !vector_tail {
+                    for i in end..tail_end {
+                        above[i] = above[i].wrapping_sub(delta[i]);
+                        below[i] = below[i].wrapping_add(delta[i]);
+                        lanes_r[i - end] -=
+                            cached_source_entropy::<$fma>(row_r, above[i], totals.0, ir);
+                        lanes_l[i - end] -=
+                            cached_source_entropy::<$fma>(row_l, below[i], totals.1, il);
+                    }
                 }
                 (reduce_default(lanes_r), reduce_default(lanes_l))
             }
@@ -1348,8 +1573,8 @@ mod x86 {
 
     pub(super) mod sse2 {
         use super::{
-            DefaultScorer, LOG_P, LOG_Q, LogTable, MIN_PROBABILITY, PROBABILITY_BITS,
-            cached_source_entropy, inverse_total, source_entropy,
+            DefaultScorer, HistogramSplit, LOG_P, LOG_Q, LogTable, MIN_PROBABILITY,
+            PROBABILITY_BITS, cached_source_entropy, inverse_total, split_delta,
         };
         use std::arch::x86_64::*;
         use std::arch::x86_64::{
@@ -1361,6 +1586,34 @@ mod x86 {
             _mm_slli_epi32 as shl_i, _mm_srai_epi32 as sar_i, _mm_storeu_ps as store_f,
             _mm_storeu_si128 as store_i, _mm_sub_epi32 as sub_i, _mm_sub_ps as sub,
         };
+
+        #[inline]
+        fn tail_mask(len: usize) -> usize {
+            debug_assert!(len < 4);
+            len
+        }
+
+        #[inline]
+        #[target_feature(enable = "sse2")]
+        unsafe fn load_tail(ptr: *const u32, len: usize) -> __m128i {
+            let mut lanes = [0u32; 4];
+            // SAFETY: the caller supplies len readable elements, with len < 4.
+            unsafe {
+                std::ptr::copy_nonoverlapping(ptr, lanes.as_mut_ptr(), len);
+                load(lanes.as_ptr().cast())
+            }
+        }
+
+        #[inline]
+        #[target_feature(enable = "sse2")]
+        unsafe fn store_tail(ptr: *mut u32, len: usize, value: __m128i) {
+            let mut lanes = [0u32; 4];
+            // SAFETY: the caller supplies len writable elements, with len < 4.
+            unsafe {
+                store_i(lanes.as_mut_ptr().cast(), value);
+                std::ptr::copy_nonoverlapping(lanes.as_ptr(), ptr, len);
+            }
+        }
 
         #[inline]
         #[target_feature(enable = "sse2")]
@@ -1409,8 +1662,8 @@ mod x86 {
 
     pub(super) mod avx2 {
         use super::{
-            DefaultScorer, LOG_P, LOG_Q, LogTable, MIN_PROBABILITY, PROBABILITY_BITS,
-            cached_source_entropy, inverse_total, source_entropy,
+            DefaultScorer, HistogramSplit, LOG_P, LOG_Q, LogTable, MIN_PROBABILITY,
+            PROBABILITY_BITS, cached_source_entropy, inverse_total, split_delta,
         };
         use std::arch::x86_64::*;
         use std::arch::x86_64::{
@@ -1423,6 +1676,32 @@ mod x86 {
             _mm256_srai_epi32 as sar_i, _mm256_storeu_ps as store_f,
             _mm256_storeu_si256 as store_i, _mm256_sub_epi32 as sub_i, _mm256_sub_ps as sub,
         };
+
+        #[inline]
+        #[target_feature(enable = "avx2")]
+        pub(super) unsafe fn tail_mask(len: usize) -> __m256i {
+            debug_assert!(len < 8);
+            _mm256_cmpgt_epi32(
+                _mm256_set1_epi32(len as i32),
+                _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7),
+            )
+        }
+
+        #[inline]
+        #[target_feature(enable = "avx2")]
+        pub(super) unsafe fn load_tail(ptr: *const u32, mask: __m256i) -> __m256i {
+            // SAFETY: enabled lanes are within the caller's slice. AVX2 masked
+            // loads suppress memory accesses for disabled lanes and return zero.
+            unsafe { _mm256_maskload_epi32(ptr.cast(), mask) }
+        }
+
+        #[inline]
+        #[target_feature(enable = "avx2")]
+        pub(super) unsafe fn store_tail(ptr: *mut u32, mask: __m256i, value: __m256i) {
+            // SAFETY: the same mask bounds stores; adjacent bins/cache rows are
+            // never written, including when the tail ends at a page boundary.
+            unsafe { _mm256_maskstore_epi32(ptr.cast(), mask, value) };
+        }
 
         #[inline]
         #[target_feature(enable = "avx2")]
@@ -1464,10 +1743,10 @@ mod x86 {
     }
 
     pub(super) mod avx2_fma {
-        use super::avx2::{gather_entropy, reduce_default};
+        use super::avx2::{gather_entropy, load_tail, reduce_default, store_tail, tail_mask};
         use super::{
-            DefaultScorer, LOG_P, LOG_Q, MIN_PROBABILITY, cached_source_entropy, inverse_total,
-            source_entropy,
+            DefaultScorer, HistogramSplit, LOG_P, LOG_Q, MIN_PROBABILITY, cached_source_entropy,
+            inverse_total, split_delta,
         };
         use std::arch::x86_64::*;
         use std::arch::x86_64::{
@@ -1488,7 +1767,253 @@ mod x86 {
 
         default_kernel!("avx2,fma", 8, __m256i, __m256, true);
     }
+
+    pub(super) mod avx2_rcp {
+        use super::avx2::{gather_entropy, load_tail, reduce_default, store_tail, tail_mask};
+        use super::{
+            DefaultScorer, HistogramSplit, LOG_P, LOG_Q, MIN_PROBABILITY, cached_source_entropy,
+            inverse_total, split_delta,
+        };
+        use std::arch::x86_64::*;
+        use std::arch::x86_64::{
+            _mm256_add_epi32 as add_i, _mm256_add_ps as add, _mm256_andnot_ps as andnot_f,
+            _mm256_castps_si256 as cast_i, _mm256_castsi256_ps as cast_f,
+            _mm256_cmpeq_epi32 as eq_i, _mm256_cvtepi32_ps as convert, _mm256_loadu_si256 as load,
+            _mm256_max_ps as max, _mm256_mul_ps as mul, _mm256_set1_epi32 as splat_i,
+            _mm256_set1_ps as splat, _mm256_setzero_ps as zero, _mm256_slli_epi32 as shl_i,
+            _mm256_srai_epi32 as sar_i, _mm256_storeu_ps as store_f,
+            _mm256_storeu_si256 as store_i, _mm256_sub_epi32 as sub_i, _mm256_sub_ps as sub,
+        };
+
+        #[inline]
+        #[target_feature(enable = "avx2,fma")]
+        unsafe fn mul_add(a: __m256, b: __m256, c: __m256) -> __m256 {
+            _mm256_fmadd_ps(a, b, c)
+        }
+
+        #[inline]
+        #[target_feature(enable = "avx2,fma")]
+        fn div(a: __m256, b: __m256) -> __m256 {
+            // FastLog2's reduced rational denominator is positive and bounded
+            // away from zero. This is not a general IEEE division replacement.
+            let r = _mm256_rcp_ps(b);
+            let error = _mm256_fnmadd_ps(b, r, _mm256_set1_ps(1.0));
+            _mm256_mul_ps(a, _mm256_fmadd_ps(r, error, r))
+        }
+
+        default_kernel!("avx2,fma", 8, __m256i, __m256, true);
+    }
+
+    pub(super) mod avx512_fma8 {
+        use super::super::SMALL_HISTOGRAM_TOTAL;
+        use super::{
+            DefaultScorer, HistogramSplit, LOG_P, LOG_Q, MIN_PROBABILITY, avx2, avx2_fma,
+            inverse_total, split_delta,
+        };
+        use std::arch::x86_64::*;
+
+        #[inline]
+        #[target_feature(enable = "avx2,fma,avx512f,avx512dq")]
+        pub(in super::super) unsafe fn fast_log(value: __m512) -> __m512 {
+            let bits = _mm512_castps_si512(value);
+            let exponent =
+                _mm512_srai_epi32::<23>(_mm512_sub_epi32(bits, _mm512_set1_epi32(0x3f2aaaab)));
+            let mantissa =
+                _mm512_castsi512_ps(_mm512_sub_epi32(bits, _mm512_slli_epi32::<23>(exponent)));
+            let x = _mm512_sub_ps(mantissa, _mm512_set1_ps(1.0));
+            let numerator = _mm512_fmadd_ps(
+                _mm512_fmadd_ps(_mm512_set1_ps(LOG_P[2]), x, _mm512_set1_ps(LOG_P[1])),
+                x,
+                _mm512_set1_ps(LOG_P[0]),
+            );
+            let denominator = _mm512_fmadd_ps(
+                _mm512_fmadd_ps(_mm512_set1_ps(LOG_Q[2]), x, _mm512_set1_ps(LOG_Q[1])),
+                x,
+                _mm512_set1_ps(LOG_Q[0]),
+            );
+            _mm512_add_ps(
+                _mm512_div_ps(numerator, denominator),
+                _mm512_cvtepi32_ps(exponent),
+            )
+        }
+
+        #[inline]
+        #[target_feature(enable = "avx2,fma,avx512f,avx512dq")]
+        unsafe fn entropy(counts: __m512i, inverse: __m512, total: __m512i) -> __m512 {
+            let cf = _mm512_cvtepi32_ps(counts);
+            let probability =
+                _mm512_max_ps(_mm512_mul_ps(cf, inverse), _mm512_set1_ps(MIN_PROBABILITY));
+            // SAFETY: the same features are enabled; probabilities are normal.
+            let logs = unsafe { fast_log(probability) };
+            let unequal = !_mm512_cmpeq_epi32_mask(counts, total);
+            _mm512_mul_ps(cf, _mm512_maskz_mov_ps(unequal, logs))
+        }
+
+        #[inline]
+        #[target_feature(enable = "avx2,fma,avx512f,avx512dq")]
+        unsafe fn subtract_terms(sum: __m256, terms: __m512, high: bool) -> __m256 {
+            // Keep one accumulator: (sum - low) - high, never sum - (low + high)
+            // or separate 16-lane partial sums. This also preserves compaction.
+            let sum = _mm256_sub_ps(sum, _mm512_castps512_ps256(terms));
+            if high {
+                _mm256_sub_ps(sum, _mm512_extractf32x8_ps::<1>(terms))
+            } else {
+                sum
+            }
+        }
+
+        #[inline]
+        #[target_feature(enable = "avx2,fma,avx512f,avx512dq")]
+        unsafe fn reduce(sum: __m256) -> f32 {
+            let mut lanes = [0.0; 8];
+            // SAFETY: eight writable f32 values and AVX2 enabled.
+            unsafe { _mm256_storeu_ps(lanes.as_mut_ptr(), sum) };
+            avx2::reduce_default(lanes)
+        }
+
+        #[target_feature(enable = "avx2,fma,avx512f,avx512dq")]
+        pub(in super::super) unsafe fn default_estimate(counts: &[u32], total: u32) -> f32 {
+            if counts.len() < 16 {
+                // SAFETY: AVX2/FMA enabled and the original bounded slice.
+                return unsafe { avx2_fma::default_estimate(counts, total) };
+            }
+            let inverse = _mm512_set1_ps(inverse_total(total));
+            let total = _mm512_set1_epi32(total as i32);
+            let end = counts.len() / 16 * 16;
+            let mut sum = _mm256_setzero_ps();
+            // SAFETY: full vectors fit the slice. Tail masks suppress every
+            // out-of-bounds load, without requiring readable padding.
+            unsafe {
+                for i in (0..end).step_by(16) {
+                    let c = _mm512_loadu_si512(counts.as_ptr().add(i).cast());
+                    sum = subtract_terms(sum, entropy(c, inverse, total), true);
+                }
+                let tail = counts.len() - end;
+                if tail != 0 {
+                    let mask = ((1u32 << tail) - 1) as u16;
+                    let c = _mm512_maskz_loadu_epi32(mask, counts.as_ptr().add(end).cast());
+                    sum = subtract_terms(sum, entropy(c, inverse, total), tail > 8);
+                }
+                reduce(sum)
+            }
+        }
+
+        #[target_feature(enable = "avx2,fma,avx512f,avx512dq")]
+        pub(in super::super) unsafe fn move_counts(
+            above: &mut [u32],
+            below: &mut [u32],
+            delta: &[u32],
+        ) {
+            let end = above.len() / 16 * 16;
+            // SAFETY: wrapper checks equal lengths. Each full load/store fits;
+            // AVX2 handles the remaining bounded slices with wrapping arithmetic.
+            unsafe {
+                for i in (0..end).step_by(16) {
+                    let d = _mm512_loadu_si512(delta.as_ptr().add(i).cast());
+                    let r = _mm512_sub_epi32(_mm512_loadu_si512(above.as_ptr().add(i).cast()), d);
+                    let l = _mm512_add_epi32(_mm512_loadu_si512(below.as_ptr().add(i).cast()), d);
+                    _mm512_storeu_si512(above.as_mut_ptr().add(i).cast(), r);
+                    _mm512_storeu_si512(below.as_mut_ptr().add(i).cast(), l);
+                }
+                avx2::move_counts(&mut above[end..], &mut below[end..], &delta[end..]);
+            }
+        }
+
+        #[target_feature(enable = "avx2,fma,avx512f,avx512dq")]
+        pub(in super::super) unsafe fn default_move(
+            scorer: &DefaultScorer,
+            above: &mut [u32],
+            below: &mut [u32],
+            delta: &[u32],
+            totals: (u32, u32),
+        ) -> (f32, f32) {
+            if above.len() < 16
+                || totals.0 <= SMALL_HISTOGRAM_TOTAL
+                || totals.1 <= SMALL_HISTOGRAM_TOTAL
+            {
+                // SAFETY: AVX2/FMA enabled, equal slices; shared small rows are
+                // exactly the original FMA rows, including mixed lookup/log sides.
+                return unsafe { avx2_fma::default_move(scorer, above, below, delta, totals) };
+            }
+            let vr = _mm512_set1_ps(inverse_total(totals.0));
+            let vl = _mm512_set1_ps(inverse_total(totals.1));
+            let tr = _mm512_set1_epi32(totals.0 as i32);
+            let tl = _mm512_set1_epi32(totals.1 as i32);
+            let (mut br, mut bl) = (_mm256_setzero_ps(), _mm256_setzero_ps());
+            let end = above.len() / 16 * 16;
+            // SAFETY: equal checked lengths bound full accesses. Tail masks
+            // bound all three loads and both stores; delta is never mutated.
+            unsafe {
+                for i in (0..end).step_by(16) {
+                    let d = _mm512_loadu_si512(delta.as_ptr().add(i).cast());
+                    let r = _mm512_sub_epi32(_mm512_loadu_si512(above.as_ptr().add(i).cast()), d);
+                    let l = _mm512_add_epi32(_mm512_loadu_si512(below.as_ptr().add(i).cast()), d);
+                    _mm512_storeu_si512(above.as_mut_ptr().add(i).cast(), r);
+                    _mm512_storeu_si512(below.as_mut_ptr().add(i).cast(), l);
+                    br = subtract_terms(br, entropy(r, vr, tr), true);
+                    bl = subtract_terms(bl, entropy(l, vl, tl), true);
+                }
+                let tail = above.len() - end;
+                if tail != 0 {
+                    let mask = ((1u32 << tail) - 1) as u16;
+                    let d = _mm512_maskz_loadu_epi32(mask, delta.as_ptr().add(end).cast());
+                    let r = _mm512_sub_epi32(
+                        _mm512_maskz_loadu_epi32(mask, above.as_ptr().add(end).cast()),
+                        d,
+                    );
+                    let l = _mm512_add_epi32(
+                        _mm512_maskz_loadu_epi32(mask, below.as_ptr().add(end).cast()),
+                        d,
+                    );
+                    _mm512_mask_storeu_epi32(above.as_mut_ptr().add(end).cast(), mask, r);
+                    _mm512_mask_storeu_epi32(below.as_mut_ptr().add(end).cast(), mask, l);
+                    br = subtract_terms(br, entropy(r, vr, tr), tail > 8);
+                    bl = subtract_terms(bl, entropy(l, vl, tl), tail > 8);
+                }
+                (reduce(br), reduce(bl))
+            }
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        #[target_feature(enable = "avx2,fma,avx512f,avx512dq")]
+        pub(in super::super) unsafe fn default_sweep(
+            scorer: &DefaultScorer,
+            above: &mut [u32],
+            below: &mut [u32],
+            deltas: &[u32],
+            stride: usize,
+            sparse: Option<&[usize]>,
+            splits: impl Iterator<Item = HistogramSplit>,
+            mut emit: impl FnMut(HistogramSplit, f32, f32),
+        ) {
+            if sparse.is_some() || above.len() < 16 {
+                // SAFETY: original validated 8-lane sparse layout and AVX2/FMA.
+                unsafe {
+                    avx2_fma::default_sweep(
+                        scorer, above, below, deltas, stride, sparse, splits, emit,
+                    )
+                };
+                return;
+            }
+            for split in splits {
+                debug_assert!(split.totals.0 <= i32::MAX as u32);
+                debug_assert!(split.totals.1 <= i32::MAX as u32);
+                let delta = split_delta(deltas, stride, above.len(), split.row);
+                // SAFETY: same features and bounded, equal-length row slices.
+                let (r, l) = unsafe { default_move(scorer, above, below, delta, split.totals) };
+                emit(split, r, l);
+            }
+        }
+    }
 }
+
+#[cfg(all(test, target_arch = "x86_64"))]
+#[path = "ma_simd_avx512_tests.rs"]
+mod avx512_tests;
+
+#[cfg(all(test, target_arch = "x86_64"))]
+#[path = "ma_simd_rcp_tests.rs"]
+mod rcp_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1559,6 +2084,9 @@ mod tests {
                 profiles.push((DefaultScorer::with_backend(DefaultBackend::Avx2), 8));
                 if std::is_x86_feature_detected!("fma") {
                     profiles.push((DefaultScorer::with_backend(DefaultBackend::Avx2Fma), 8));
+                    if DefaultBackend::detect(true) == DefaultBackend::Avx512Fma8 {
+                        profiles.push((DefaultScorer::with_backend(DefaultBackend::Avx512Fma8), 8));
+                    }
                 }
             }
         }
@@ -1613,7 +2141,16 @@ mod tests {
         #[cfg(target_arch = "x86_64")]
         let expected = if std::is_x86_feature_detected!("avx2") {
             if std::is_x86_feature_detected!("fma") {
-                DefaultBackend::Avx2Fma
+                if std::env::var("RS_JXL_MA_RCP").as_deref() == Ok("1") {
+                    DefaultBackend::Avx2Rcp
+                } else if std::env::var("RS_JXL_MA_AVX512").as_deref() == Ok("1")
+                    && std::is_x86_feature_detected!("avx512f")
+                    && std::is_x86_feature_detected!("avx512dq")
+                {
+                    DefaultBackend::Avx512Fma8
+                } else {
+                    DefaultBackend::Avx2Fma
+                }
             } else {
                 DefaultBackend::Avx2
             }
@@ -1794,6 +2331,134 @@ mod tests {
     }
 
     #[test]
+    fn default_split_sweep_matches_each_threshold_all_native_profiles() {
+        for (scorer, lanes) in default_profiles() {
+            for len in [0, 1, 3, 4, 7, 8, 9, 15, 17, 31, 33, 65, 255, 256] {
+                for scale in [1u32, 257, 65535, 4_000_000] {
+                    for padded in [false, true] {
+                        let stride = len.max(1) + if padded { lanes } else { 0 };
+                        // Nonadjacent rows and unrelated bin tags exercise packed
+                        // layouts. Neighboring storage must stay immutable.
+                        let mut storage = vec![0; 1 + 9 * stride + 1];
+                        let mut parent = vec![0; len];
+                        let mut splits = Vec::new();
+                        let mut moved = 0;
+                        for row in [0, 2, 5, 8] {
+                            let mut weight = 0;
+                            for symbol in 0..len {
+                                if symbol % 23 == 0 || symbol + 1 == len {
+                                    let count = scale + ((symbol + row) % 3) as u32;
+                                    storage[1 + row * stride + symbol] = count;
+                                    parent[symbol] += count;
+                                    weight += count;
+                                }
+                            }
+                            moved += weight;
+                            splits.push(HistogramSplit {
+                                bin: row * 3 + 7,
+                                row,
+                                totals: (0, moved),
+                            });
+                        }
+                        let total: u32 = parent.iter().sum();
+                        for split in &mut splits {
+                            split.totals.0 = total - split.totals.1;
+                        }
+                        let blocks: Vec<_> = parent
+                            .chunks(lanes)
+                            .enumerate()
+                            .filter_map(|(i, b)| b.iter().any(|&n| n != 0).then_some(i * lanes))
+                            .collect();
+                        let original = storage.clone();
+                        for sparse in [None, Some(blocks.as_slice())] {
+                            let mut above = vec![123; len + 2];
+                            above[1..len + 1].copy_from_slice(&parent);
+                            let mut below = vec![123; len + 2];
+                            below[1..len + 1].fill(0);
+                            let mut expected_above = parent.clone();
+                            let mut expected_below = vec![0; len];
+                            let mut expected = Vec::new();
+                            for &split in &splits {
+                                let start = 1 + split.row * stride;
+                                let bits = scorer.move_and_score(
+                                    &mut expected_above,
+                                    &mut expected_below,
+                                    &storage[start..start + len],
+                                    split.totals,
+                                );
+                                expected.push((split.bin, bits.0.to_bits(), bits.1.to_bits()));
+                            }
+                            let mut actual = Vec::new();
+                            scorer.split_sweep(
+                                &mut above[1..len + 1],
+                                &mut below[1..len + 1],
+                                &storage[1..1 + 9 * stride],
+                                stride,
+                                sparse,
+                                splits.iter().copied(),
+                                |split, r, l| actual.push((split.bin, r.to_bits(), l.to_bits())),
+                            );
+                            assert_eq!(
+                                actual, expected,
+                                "backend={:?}, len={len}, scale={scale}",
+                                scorer.backend
+                            );
+                            assert_eq!(&above[1..len + 1], expected_above);
+                            assert_eq!(&below[1..len + 1], expected_below);
+                            assert_eq!(
+                                (above[0], above[len + 1], below[0], below[len + 1]),
+                                (123, 123, 123, 123)
+                            );
+                            assert_eq!(storage, original);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn default_split_sweep_rejects_invalid_layout_before_mutation() {
+        for (scorer, lanes) in default_profiles() {
+            let len = lanes * 2;
+            for (stride, cells, below_len, row, blocks) in [
+                (0, len, len, 0, None),
+                (len - 1, len - 1, len, 0, None),
+                (len, len + 1, len, 0, None),
+                (len, len, len - 1, 0, None),
+                (len, len, len, usize::MAX, None),
+                (len, len, len, 0, Some(vec![len])),
+                (len, len, len, 0, Some(vec![0, 0])),
+                (len, len, len, 0, Some(vec![lanes, 0])),
+            ] {
+                let mut above = vec![1; len];
+                let mut below = vec![0; below_len];
+                let deltas = vec![0; cells];
+                let mut emitted = false;
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    scorer.split_sweep(
+                        &mut above,
+                        &mut below,
+                        &deltas,
+                        stride,
+                        blocks.as_deref(),
+                        std::iter::once(HistogramSplit {
+                            bin: 0,
+                            row,
+                            totals: (len as u32, 0),
+                        }),
+                        |_, _, _| emitted = true,
+                    );
+                }));
+                assert!(result.is_err());
+                assert_eq!(above, vec![1; len]);
+                assert_eq!(below, vec![0; below_len]);
+                assert!(!emitted);
+            }
+        }
+    }
+
+    #[test]
     fn default_small_table_is_shared_source_expression_not_log_cache() {
         let scorer = DefaultScorer::default();
         assert!(std::ptr::eq(scorer.small, DefaultScorer::new().small));
@@ -1839,6 +2504,146 @@ mod tests {
             check_default_move(&above, &below, &delta);
             check_default_move(&above, &vec![0; len], &above);
             check_default_move(&above, &vec![0; len], &vec![0; len]);
+        }
+    }
+
+    #[test]
+    fn default_masked_tails_cover_each_lane_and_independent_table_routes() {
+        // Put mass in both ends of the partial vector, not just lane zero.
+        // check_default_move also surrounds every unaligned slice with canaries.
+        for len in (1..=16).chain(25..=31) {
+            for (right, left) in [
+                (0, 0),
+                (1, 0),
+                (256, 256),
+                (256, 257),
+                (257, 256),
+                (4097, 65535),
+                ((1 << 24) + 1, 257),
+                (MAX_HISTOGRAM_TOTAL - 257, 257),
+            ] {
+                let tail = len / 8 * 8;
+                let first = if tail == len { len - 1 } else { tail };
+                let mut r = vec![0; len];
+                let mut l = vec![0; len];
+                r[first] = right / 3;
+                r[len - 1] += right - right / 3;
+                l[first] = left / 2;
+                l[len - 1] += left - left / 2;
+                let delta: Vec<_> = l.iter().map(|&n| n / 2).collect();
+                let above: Vec<_> = r.iter().zip(&delta).map(|(&r, &d)| r + d).collect();
+                let below: Vec<_> = l.iter().zip(&delta).map(|(&l, &d)| l - d).collect();
+                check_default_move(&above, &below, &delta);
+            }
+        }
+    }
+
+    #[test]
+    fn default_masked_tails_match_full_rescans_through_weighted_split_sweeps() {
+        // Each row is an immutable cached property bin. Include empty rows and
+        // saturated sample weights, then reuse the same cache for another sweep.
+        for symbols in 1..=33 {
+            let rows: Vec<Vec<u32>> = (0..37)
+                .map(|bin| {
+                    (0..symbols)
+                        .map(|symbol| {
+                            if bin % 7 == 0 || (bin + symbol) % 5 != 0 {
+                                0
+                            } else if bin == 18 {
+                                65535
+                            } else {
+                                1 + (bin * 13 + symbol * 19) as u32 % 31
+                            }
+                        })
+                        .collect()
+                })
+                .collect();
+            let snapshot = rows.clone();
+            let parent: Vec<u32> = (0..symbols)
+                .map(|symbol| rows.iter().map(|row| row[symbol]).sum())
+                .collect();
+            for (scorer, width) in default_profiles() {
+                for _ in 0..2 {
+                    // Exact-sized slices exercise kernels without padding.
+                    let mut above = parent.clone().into_boxed_slice();
+                    let mut below = vec![0; symbols].into_boxed_slice();
+                    for bin in 0..rows.len() {
+                        let expected_l: Vec<u32> = (0..symbols)
+                            .map(|s| rows[..=bin].iter().map(|row| row[s]).sum())
+                            .collect();
+                        let expected_r: Vec<u32> = (0..symbols)
+                            .map(|s| rows[bin + 1..].iter().map(|row| row[s]).sum())
+                            .collect();
+                        let totals = (expected_r.iter().sum(), expected_l.iter().sum());
+                        let actual =
+                            scorer.move_and_score(&mut above, &mut below, &rows[bin], totals);
+                        assert_eq!(&*above, expected_r.as_slice());
+                        assert_eq!(&*below, expected_l.as_slice());
+                        for (bits, counts, total) in [
+                            (actual.0, expected_r.as_slice(), totals.0),
+                            (actual.1, expected_l.as_slice(), totals.1),
+                        ] {
+                            assert_eq!(
+                                bits.to_bits(),
+                                default_oracle(counts, total, width, scorer.backend.uses_fma())
+                                    .to_bits(),
+                                "symbols={symbols}, bin={bin}, backend={:?}",
+                                scorer.backend,
+                            );
+                        }
+                    }
+                }
+            }
+            assert_eq!(rows, snapshot);
+        }
+    }
+
+    #[test]
+    fn default_masked_sparse_tail_is_optional_and_preserves_neighboring_storage() {
+        for (scorer, lanes) in default_profiles() {
+            for tail in 1..lanes {
+                let len = 2 * lanes + tail;
+                for include_tail in [false, true] {
+                    let mut parent = vec![0; len];
+                    parent[0] = 65535;
+                    let mut blocks = vec![0];
+                    if include_tail {
+                        parent[len - 1] = 257;
+                        blocks.push(2 * lanes);
+                    }
+                    let delta: Vec<_> = parent.iter().map(|&n| n / 2).collect();
+                    let mut above = parent.clone();
+                    let mut below = vec![0; len];
+                    // The following elements are outside the borrowed histogram.
+                    above.extend([u32::MAX; 8]);
+                    below.extend([u32::MAX; 8]);
+                    let moved = delta.iter().sum::<u32>();
+                    let totals = (parent.iter().sum::<u32>() - moved, moved);
+                    let actual = scorer.move_and_score_sparse(
+                        &mut above[..len],
+                        &mut below[..len],
+                        &delta,
+                        totals,
+                        &blocks,
+                    );
+                    assert_eq!(&above[len..], &[u32::MAX; 8]);
+                    assert_eq!(&below[len..], &[u32::MAX; 8]);
+                    for i in 0..len {
+                        assert_eq!(above[i], parent[i] - delta[i]);
+                        assert_eq!(below[i], delta[i]);
+                    }
+                    for (bits, counts, total) in [
+                        (actual.0, &above[..len], totals.0),
+                        (actual.1, &below[..len], totals.1),
+                    ] {
+                        assert_eq!(
+                            bits.to_bits(),
+                            default_oracle(counts, total, lanes, scorer.backend.uses_fma())
+                                .to_bits()
+                        );
+                    }
+                }
+            }
         }
     }
 

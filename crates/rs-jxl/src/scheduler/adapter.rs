@@ -55,6 +55,14 @@ pub enum CapabilityGap {
     NativeTreeLeafLimit,
     TreeEntropyPolicy,
     ForcedPatchesOff,
+    /// Diagnostic probe-only palette forcing, not a matched whole-image representation.
+    ForcedProbePalette,
+    /// Experimental full/probe literal palette tools, not source defaults.
+    LiteralPaletteTools,
+    /// Probe ranking amortizes measured tree/model bits; never an encoded-byte bound.
+    ModelScaledProbeScore,
+    /// Probe-only reduced MA learning; complete candidate policy is unchanged.
+    ReducedProbeTrainingSamples,
     PaletteRctTransformOrder,
     LzMethodConfiguration,
     LzEntropyWireAlignment,
@@ -77,15 +85,18 @@ pub enum AdaptationState {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct NativeResourcePolicy {
-    /// Explicit caller ceiling for adaptive learning. None selects MAX_LEAVES,
-    /// never the direct encoder's base preset. An unfinished search is an error.
+    /// Explicit whole-tree ceiling, including Some(MAX_LEAVES). None selects
+    /// the source global decoder bound, never the direct encoder's base preset.
+    /// An unfinished search is an error, not permission to truncate the tree.
     pub max_tree_leaves: Option<usize>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NativeResourceLimits {
-    /// Adaptive-tree resource bound, inactive for predefined source trees.
+    /// Legacy learner preset (or the explicit caller ceiling).
     pub max_tree_leaves: usize,
+    /// Effective whole-tree ceiling after intersecting caller and decoder bounds.
+    pub max_merged_tree_leaves: usize,
     /// Source gathering hard ceiling inherited from base.modular.sample_limit.
     pub sample_limit: usize,
 }
@@ -214,8 +225,17 @@ fn project_native_metadata(
 ) -> Result<NativeProjection> {
     params.validate()?;
     image.metadata().validate()?;
+    let resource_policy = resources;
+    let decoder_leaves = crate::modular::ma_train::global_tree_leaf_limit(
+        image.width() as usize,
+        image.height() as usize,
+        image.channel_count(),
+    );
     let resources = NativeResourceLimits {
         max_tree_leaves: resources.max_tree_leaves.unwrap_or(MAX_LEAVES),
+        max_merged_tree_leaves: resources
+            .max_tree_leaves
+            .map_or(decoder_leaves, |limit| limit.min(decoder_leaves)),
         sample_limit: base.modular.sample_limit,
     };
     if !(1..=MAX_LEAVES).contains(&resources.max_tree_leaves) {
@@ -279,6 +299,7 @@ fn project_native_metadata(
     // training::learn enables require_complete_search whenever sampling is
     // Some. Budget exhaustion with beneficial splits errors, never truncates.
     options.modular.max_tree_leaves = resources.max_tree_leaves;
+    options.modular.max_merged_tree_leaves = Some(resources.max_merged_tree_leaves);
     options.modular.rct_candidates = None;
     if let Some(rct) = params.rct {
         options.modular.rct = if rct == 0 { None } else { Some(rct) };
@@ -334,6 +355,14 @@ fn project_native_metadata(
         .as_ref()
         .map(|p| p.tools)
         .unwrap_or_default();
+    // JXL_LOSSLESS_PALETTE_FORCE is available as an explicit base-policy
+    // override, not a predictor/default change. Keep its source color-cap gate.
+    let force_palette = (1..=65536).contains(&params.palette_colors)
+        && base
+            .modular
+            .palette_policy
+            .as_ref()
+            .is_some_and(|p| p.force_palette);
     options.modular.palette_policy = None;
     options.global_palette = true;
     if params.palette_colors > 70911 {
@@ -373,6 +402,7 @@ fn project_native_metadata(
             responsive: params.responsive,
             groupwise: streaming,
             do_color: true,
+            force_palette,
             mode,
             tools: palette_tools,
             ..Default::default()
@@ -454,9 +484,7 @@ fn project_native_metadata(
                 params,
                 image,
                 base,
-                NativeResourcePolicy {
-                    max_tree_leaves: Some(resources.max_tree_leaves),
-                },
+                resource_policy,
             )?);
         }
     }
@@ -511,6 +539,99 @@ mod tectonic_tests {
                 .unwrap();
                 assert_eq!(atlas.modular.palette_policy.as_ref().unwrap().tools, tools);
             }
+        }
+    }
+
+    #[test]
+    fn explicit_force_palette_survives_candidate_and_reference_projection() {
+        let image = Image::new(8, 8, PixelLayout::Rgb, PixelData::U8(vec![19; 8 * 8 * 3])).unwrap();
+        let mut base = EncodeOptions::default();
+        base.modular.palette_policy = Some(PaletteOptions {
+            force_palette: true,
+            ..Default::default()
+        });
+        let original_policy = base.modular.palette_policy.clone();
+        for palette_colors in [1, 10000, 65536] {
+            for predictor in [None, Some(Predictor::Zero)] {
+                let params = CandidateParams {
+                    speed_tier: 1,
+                    palette_colors,
+                    predictor,
+                    ..Default::default()
+                };
+                let original_params = params.clone();
+                for modular in [
+                    project_native(&params, &image, &base)
+                        .unwrap()
+                        .exact_options()
+                        .unwrap()
+                        .modular,
+                    project_source_patch_reference(
+                        &params,
+                        &image,
+                        &base,
+                        NativeResourcePolicy::default(),
+                    )
+                    .unwrap()
+                    .modular,
+                ] {
+                    let policy = modular.palette_policy.unwrap();
+                    assert!(policy.force_palette);
+                    assert_eq!(policy.palette_colors, palette_colors as i32);
+                    assert!(!policy.zero_tokens);
+                }
+                assert_eq!(params, original_params);
+                assert_eq!(base.modular.palette_policy, original_policy);
+            }
+        }
+    }
+
+    #[test]
+    fn force_palette_defaults_and_outside_caps_do_not_enable_override() {
+        let image = Image::new(8, 8, PixelLayout::Rgb, PixelData::U8(vec![19; 8 * 8 * 3])).unwrap();
+        for (force_palette, palette_colors) in [
+            (None, 10000),
+            (Some(false), 10000),
+            (Some(true), 0),
+            (Some(true), 65537),
+            (Some(true), 70000),
+            (Some(true), 70911),
+        ] {
+            let mut base = EncodeOptions::default();
+            base.modular.palette_policy = force_palette.map(|force_palette| PaletteOptions {
+                force_palette,
+                ..Default::default()
+            });
+            let original_policy = base.modular.palette_policy.clone();
+            let params = CandidateParams {
+                speed_tier: 1,
+                palette_colors,
+                predictor: Some(Predictor::Zero),
+                ..Default::default()
+            };
+            let original_params = params.clone();
+            for modular in [
+                project_native(&params, &image, &base)
+                    .unwrap()
+                    .exact_options()
+                    .unwrap()
+                    .modular,
+                project_source_patch_reference(
+                    &params,
+                    &image,
+                    &base,
+                    NativeResourcePolicy::default(),
+                )
+                .unwrap()
+                .modular,
+            ] {
+                let policy = modular.palette_policy.unwrap();
+                assert!(!policy.force_palette);
+                assert_eq!(policy.palette_colors, palette_colors as i32);
+                assert!(!policy.zero_tokens);
+            }
+            assert_eq!(params, original_params);
+            assert_eq!(base.modular.palette_policy, original_policy);
         }
     }
 

@@ -11,6 +11,14 @@ use super::{
 };
 use crate::{Error, Image, Result};
 
+#[cfg(test)]
+#[path = "source_options_budget_tests.rs"]
+mod budget_tests;
+
+#[cfg(test)]
+#[path = "source_options_budget_mode_tests.rs"]
+mod budget_mode_tests;
+
 /// CompressParams::buffering. Streaming requests still obey the source gates.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(i8)]
@@ -195,6 +203,15 @@ impl SourcePatchReferencePolicy {
         source.is_gray = atlas.color_channels() == 1;
         let sampling = SamplingPolicy::from_source(&source)?;
         let mut modular = self.modular.clone();
+        // The atlas is a separate frame: the parent canvas's decoder bound
+        // must not leak into a smaller patch-reference tree.
+        modular.max_merged_tree_leaves = Some(modular.tree_leaf_limit().min(
+            super::ma_train::global_tree_leaf_limit(
+                atlas.width() as usize,
+                atlas.height() as usize,
+                atlas.channel_count(),
+            ),
+        ));
         modular.entropy_options.streaming_mode = streaming;
         if let Some(palette) = &mut modular.palette_policy {
             palette.groupwise = streaming;

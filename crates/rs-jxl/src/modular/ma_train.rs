@@ -81,14 +81,14 @@
 #[cfg(test)]
 use std::collections::HashMap;
 use std::sync::{
-    Arc, Mutex,
+    Arc, Mutex, OnceLock,
     atomic::{AtomicUsize, Ordering},
 };
 
 use crate::execution;
 
 use crate::entropy::HybridUintConfig;
-use crate::tools::ma_simd::{DefaultScorer, MAX_HISTOGRAM_TOTAL};
+use crate::tools::ma_simd::{DefaultScorer, HistogramSplit, MAX_HISTOGRAM_TOTAL};
 use crate::{Error, Result};
 
 use super::predictor::Predictor;
@@ -98,8 +98,18 @@ use super::tree::{Node, Tree, pack_signed};
 mod ma_histograms;
 pub use ma_histograms::{DenseHistogram, PropertyBins};
 use ma_histograms::{
-    HistogramShards, active_blocks, collect_mapped, histogram_stride, prepare_property_bins,
+    HistogramShards, SparseHistogramPlan, collect_compact_pair, collect_mapped, histogram_stride,
+    prepare_property_bins,
 };
+
+#[path = "ma_events.rs"]
+mod ma_events;
+use ma_events::EventScratch;
+
+#[path = "ma_dominance.rs"]
+mod ma_dominance;
+#[path = "ma_partition_proofs.rs"]
+mod ma_partition_proofs;
 
 #[path = "ma_columns.rs"]
 mod columns;
@@ -148,6 +158,50 @@ const WP_PROPERTY: usize = 15;
 /// Explicit training resource ceiling, NOT a bitstream/context-map limit.
 /// Raw MA contexts may exceed 256; entropy clustering assigns final histogram IDs.
 pub const MAX_LEAVES: usize = 16_384;
+
+/// enc_ma.cc/dec_ma.cc kMaxTreeSize counts nodes, not leaf contexts.
+pub const MAX_TREE_NODES: usize = 1 << 22;
+pub const MAX_TREE_LEAVES: usize = MAX_TREE_NODES / 2;
+
+/// Behavior when an MA learner runs out of leaf capacity. Required multiplier,
+/// channel and constant partitions must fit in either mode.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MaBudgetMode {
+    /// Fail if a beneficial adaptive split remains at the ceiling.
+    Strict,
+    /// Stop adaptive splitting at the ceiling, retaining valid lossless leaves.
+    Bounded,
+}
+
+/// dec_modular.cc's global-tree bound uses the original frame dimensions,
+/// before palette/squeeze transforms. Wide arithmetic also handles large metadata.
+pub fn global_tree_leaf_limit(width: usize, height: usize, channels: usize) -> usize {
+    let samples = (width as u128)
+        .saturating_mul(height as u128)
+        .saturating_mul(channels as u128);
+    let nodes = (1024 + samples / 16).min(MAX_TREE_NODES as u128) as usize;
+    (nodes + 1) / 2
+}
+
+pub(super) fn local_tree_leaf_limit(samples: usize) -> usize {
+    let nodes = samples.saturating_add(1024).min(1 << 20);
+    (nodes + 1) / 2
+}
+
+fn cache_pair14_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("RS_JXL_MA_CACHE_PAIR14").as_deref() == Ok("1"))
+}
+
+// Per-predictor timers can dominate small sweeps. RS_JXL_PROFILE=1 keeps
+// broad/cache timings; these detail scopes additionally require
+// RS_JXL_PROFILE_DETAIL=1, read once before the first detail scope.
+fn histogram_detail_scope(name: &'static str) -> Option<crate::profile::Scope> {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    let enabled =
+        *ENABLED.get_or_init(|| std::env::var("RS_JXL_PROFILE_DETAIL").as_deref() == Ok("1"));
+    (enabled && crate::profile::enabled()).then(|| crate::profile::scope(name))
+}
 
 #[derive(Clone, Debug)]
 pub struct Sample {
@@ -267,7 +321,7 @@ pub fn find_constant_channels(
     Ok(constants)
 }
 
-/// Explicit source histogram experiments; all are disabled by default.
+/// Explicit histogram experiments; all are disabled by default.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct HistogramOptions {
     pub shards: bool,
@@ -276,6 +330,11 @@ pub struct HistogramOptions {
     pub property_bins: PropertyBins,
     pub sparse: bool,
     pub paired: bool,
+    /// Sparse property events with the same clipped entropy objective. Uncached
+    /// full sweeps only, weighted total <=65536; dense work keeps the SIMD path.
+    pub events: bool,
+    /// Earlier bounded cache creation/inheritance for fourteen candidates only.
+    pub early_cache_14: bool,
 }
 
 impl HistogramOptions {
@@ -287,6 +346,8 @@ impl HistogramOptions {
         options.property_bins = self.property_bins;
         options.sparse_entropy = self.sparse;
         options.paired_cache = self.paired;
+        options.histogram_events = self.events;
+        options.early_cache_14 = self.early_cache_14;
     }
 }
 
@@ -296,12 +357,21 @@ pub struct TrainOptions {
     pub predictors: Vec<Predictor>,
     /// Property IDs to search, in stable tie-breaking order. 1 is opt-in.
     pub properties: Vec<usize>,
-    /// 1..=MAX_LEAVES. Raw leaf contexts are clustered separately by entropy.
+    /// Legacy invocation ceiling, 1..=MAX_LEAVES. Within a resolved learner this
+    /// is its local allowance, including its seed leaves.
     pub max_leaves: usize,
+    /// Optional whole-tree resource ceiling, at most MAX_TREE_LEAVES. None
+    /// retains max_leaves as the whole-tree ceiling. Source callers resolve this
+    /// separately from the legacy preset and clamp it to decoder geometry limits.
+    /// Constants and all channel/subtree grafts consume this same budget.
+    pub max_merged_leaves: Option<usize>,
     /// At the resource ceiling, fail if any beneficial split remains instead
     /// of returning a truncated tree. Source integration enables this; explicit
     /// legacy leaf-budget searches retain the default false behavior.
     pub require_complete_search: bool,
+    /// Overrides require_complete_search. None preserves the caller's existing
+    /// policy (bounded for direct training, strict for source integration).
+    pub budget_mode: Option<MaBudgetMode>,
     /// Required improvement in sampled bits; equality does not split.
     /// Scoring rounds this to f32, matching the source's default decision path.
     pub split_threshold: f64,
@@ -321,6 +391,9 @@ pub struct TrainOptions {
     /// Constants and verified redundant properties stay masked in descendants;
     /// cross-property proofs require a serial sweep with at least 64 records.
     pub property_dedup: bool,
+    /// Skip predictor sweeps proved unable to improve either child. Limited to
+    /// default scoring/search and weighted populations at most 256.
+    pub split_dominance: bool,
     /// JXL_MA_HISTOGRAM_SHARDS=4; four independent uncached accumulators.
     pub histogram_shards: bool,
     /// JXL_MA_PADDED_HISTOGRAM=1; SIMD-aligned cache-set-avoiding strides.
@@ -331,6 +404,9 @@ pub struct TrainOptions {
     pub sparse_entropy: bool,
     /// JXL_MA_PAIRED_CACHE=1; adjacent active predictors share deferred loads.
     pub paired_cache: bool,
+    /// Opt-in event-bucket sweep. Takes precedence over clipped/count-log only
+    /// when eligible; Shannon and nondefault search options keep their routes.
+    pub histogram_events: bool,
     /// Explicit source scoring experiments; default scoring remains unchanged.
     pub scoring: ScoringOptions,
     /// Default-off source property race and weighted split proposals.
@@ -343,6 +419,9 @@ pub struct TrainOptions {
     /// Shared cache ceiling per training invocation; zero disables retention.
     /// Source MaHistogramBudget::kLimit is 32 MiB, independent of raw leaf count.
     pub histogram_cache_bytes: usize,
+    /// Opt-in 2048/1024-record cache creation/inheritance with fourteen
+    /// configured predictors. Does not change the byte budget or split search.
+    pub early_cache_14: bool,
     /// Evaluate ready siblings concurrently while preserving DFS commit order.
     /// Also requires parallel=true and the source work/grain thresholds.
     pub parallel_nodes: bool,
@@ -365,7 +444,9 @@ impl Default for TrainOptions {
             predictors: vec![Predictor::Weighted, Predictor::Gradient],
             properties: std::iter::once(0).chain(2..=15).collect(),
             max_leaves: 64,
+            max_merged_leaves: None,
             require_complete_search: false,
+            budget_mode: None,
             split_threshold: 16.0,
             max_property_values: 256,
             fast_decode_multiplier: 1.0,
@@ -373,17 +454,20 @@ impl Default for TrainOptions {
             reuse_parent_histograms: true,
             predictor_dedup: false,
             property_dedup: false,
+            split_dominance: false,
             histogram_shards: false,
             padded_histogram: false,
             dense_histogram: DenseHistogram::Disabled,
             property_bins: PropertyBins::Disabled,
             sparse_entropy: false,
             paired_cache: false,
+            histogram_events: false,
             scoring: ScoringOptions::default(),
             search: SearchOptions::default(),
             channel_tree: ChannelTreeMode::Disabled,
             parallel_tools: ParallelOptions::default(),
             histogram_cache_bytes: 32 * 1024 * 1024,
+            early_cache_14: false,
             parallel_nodes: true,
             static_property_range: None,
             multiplier_info: Vec::new(),
@@ -394,6 +478,17 @@ impl Default for TrainOptions {
 }
 
 impl TrainOptions {
+    pub(super) fn complete_search(&self) -> bool {
+        self.budget_mode
+            .map_or(self.require_complete_search, |mode| {
+                mode == MaBudgetMode::Strict
+            })
+    }
+
+    pub(super) fn tree_leaf_limit(&self) -> usize {
+        self.max_merged_leaves.unwrap_or(self.max_leaves)
+    }
+
     /// SetPredictor(Variable): enum order with Weighted/Zero and Gradient/Left
     /// exchanged, not a fresh ordering after the first two entries.
     pub fn variable() -> Self {
@@ -415,6 +510,14 @@ impl TrainOptions {
                 Predictor::Average4,
             ],
             ..Self::default()
+        }
+    }
+
+    fn histogram_cache_thresholds(&self) -> (usize, usize) {
+        if self.early_cache_14 && self.predictors.len() == 14 {
+            (2048, 1024)
+        } else {
+            (8192, 4096)
         }
     }
 
@@ -443,6 +546,9 @@ impl TrainOptions {
             return Err(Error::InvalidInput("invalid MA training properties".into()));
         }
         if !(1..=MAX_LEAVES).contains(&self.max_leaves)
+            || self
+                .max_merged_leaves
+                .is_some_and(|limit| !(1..=MAX_TREE_LEAVES).contains(&limit))
             || !(2..=256).contains(&self.max_property_values)
             || !self.split_threshold.is_finite()
             || !(self.split_threshold as f32).is_finite()
@@ -507,7 +613,8 @@ impl TrainOptions {
                 "MA constants must form an ascending channel suffix".into(),
             ));
         }
-        if self.constant_channels.len() + usize::from(variable_end > range[0][0]) > self.max_leaves
+        if self.constant_channels.len() + usize::from(variable_end > range[0][0])
+            > self.tree_leaf_limit()
         {
             return Err(Error::Limit("MA constant channels exceed leaf budget"));
         }
@@ -1272,6 +1379,7 @@ struct TrainingStats {
     constant_properties: AtomicUsize,
     duplicate_properties: AtomicUsize,
     inherited_properties: AtomicUsize,
+    dominated_predictors: AtomicUsize,
     #[cfg(test)]
     initial_cache_hook: Option<Box<InitialCacheHook>>,
     #[cfg(test)]
@@ -1334,6 +1442,7 @@ struct BinHistogram {
 }
 
 impl BinHistogram {
+    #[inline]
     fn subtract(&mut self, residual: ResidualToken, bin: usize, weight: u32) -> Result<()> {
         let cell = &mut self.counts[bin * self.symbols + usize::from(residual.token)];
         *cell = cell
@@ -1470,18 +1579,78 @@ impl PropertyHistogram {
         plan: &PredictorPlan,
         stride: Option<usize>,
     ) -> Result<()> {
+        self.collect_predictors_values_with_pair14(
+            samples,
+            indices,
+            parents,
+            values,
+            plan,
+            stride,
+            parents.len() == 14 && cache_pair14_enabled(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn collect_predictors_values_with_pair14<T: PropertyValue>(
+        &mut self,
+        samples: &Samples<impl SampleStorage>,
+        indices: &[usize],
+        parents: &[ParentHistogram],
+        values: &[T],
+        plan: &PredictorPlan,
+        stride: Option<usize>,
+        pair14: bool,
+    ) -> Result<()> {
         if !self.allocate_predictors(parents, stride) {
             return Ok(());
         }
-        // Source fused collection: share property/weight loads.
-        for &i in indices {
-            let bin = values[i].index();
-            let weight = u32::from(samples.counts[i]);
-            for &predictor in plan.active() {
-                let histogram = &mut self.predictors[predictor];
-                let residual = samples.residuals[predictor][i];
-                histogram.counts[bin * histogram.symbols + usize::from(residual.token)] += weight;
-                histogram.extra[bin] += u64::from(weight) * u64::from(residual.nbits);
+        if pair14 && plan.cache_pair14_eligible(self.predictors.len()) {
+            // Touch two histogram columns per pass without extra allocations.
+            for predictor in (0..14).step_by(2) {
+                let (first, rest) = self.predictors.split_at_mut(predictor + 1);
+                let (first, second) = (&mut first[predictor], &mut rest[0]);
+                let (a, b) = (
+                    &samples.residuals[predictor][..],
+                    &samples.residuals[predictor + 1][..],
+                );
+                for &i in indices {
+                    let bin = values[i].index();
+                    let weight = u32::from(samples.counts[i]);
+                    let residual = a[i];
+                    first.counts[bin * first.symbols + usize::from(residual.token)] += weight;
+                    first.extra[bin] += u64::from(weight) * u64::from(residual.nbits);
+                    let residual = b[i];
+                    second.counts[bin * second.symbols + usize::from(residual.token)] += weight;
+                    second.extra[bin] += u64::from(weight) * u64::from(residual.nbits);
+                }
+            }
+        } else if self.predictors.len() == 2 && plan.active() == [0, 1] {
+            // Hoist the two column/histogram lookups out of the record loop.
+            let (first, rest) = self.predictors.split_at_mut(1);
+            let (first, second) = (&mut first[0], &mut rest[0]);
+            let (a, b) = (&samples.residuals[0][..], &samples.residuals[1][..]);
+            for &i in indices {
+                let bin = values[i].index();
+                let weight = u32::from(samples.counts[i]);
+                let residual = a[i];
+                first.counts[bin * first.symbols + usize::from(residual.token)] += weight;
+                first.extra[bin] += u64::from(weight) * u64::from(residual.nbits);
+                let residual = b[i];
+                second.counts[bin * second.symbols + usize::from(residual.token)] += weight;
+                second.extra[bin] += u64::from(weight) * u64::from(residual.nbits);
+            }
+        } else {
+            // Source fused collection: share property/weight loads.
+            for &i in indices {
+                let bin = values[i].index();
+                let weight = u32::from(samples.counts[i]);
+                for &predictor in plan.active() {
+                    let histogram = &mut self.predictors[predictor];
+                    let residual = samples.residuals[predictor][i];
+                    histogram.counts[bin * histogram.symbols + usize::from(residual.token)] +=
+                        weight;
+                    histogram.extra[bin] += u64::from(weight) * u64::from(residual.nbits);
+                }
             }
         }
         self.copy_predictors(plan)?;
@@ -1600,11 +1769,31 @@ impl PropertyHistogram {
         values: &[T],
         plan: &PredictorPlan,
     ) -> Result<()> {
-        for &i in removed {
-            let bin = values[i].index();
-            let weight = u32::from(samples.counts[i]);
-            self.subtract_marginal(bin, weight)?;
-            self.subtract_predictors(samples, i, bin, weight, plan)?;
+        if self.predictors.len() == 2 && plan.active() == [0, 1] {
+            let (first, rest) = self.predictors.split_at_mut(1);
+            let (first, second) = (&mut first[0], &mut rest[0]);
+            let (a, b) = (&samples.residuals[0][..], &samples.residuals[1][..]);
+            for &i in removed {
+                let bin = values[i].index();
+                let weight = u32::from(samples.counts[i]);
+                // Preserve record/weight/first/second failure order without
+                // introducing the separate marginal pass of paired_cache.
+                self.used[bin] = self.used[bin].checked_sub(1).ok_or_else(|| {
+                    Error::Encoding("MA cached record subtraction underflow".into())
+                })?;
+                self.weights[bin] = self.weights[bin].checked_sub(weight).ok_or_else(|| {
+                    Error::Encoding("MA cached weight subtraction underflow".into())
+                })?;
+                first.subtract(a[i], bin, weight)?;
+                second.subtract(b[i], bin, weight)?;
+            }
+        } else {
+            for &i in removed {
+                let bin = values[i].index();
+                let weight = u32::from(samples.counts[i]);
+                self.subtract_marginal(bin, weight)?;
+                self.subtract_predictors(samples, i, bin, weight, plan)?;
+            }
         }
         self.copy_predictors(plan)?;
         Ok(())
@@ -1725,7 +1914,7 @@ struct HistogramCache {
 impl HistogramCache {
     // Reserve the complete conservative lease before any property allocation.
     // Entries stay empty until their scoring tasks fill them. This is separate
-    // from find_best_split's source 8192-record creation gate.
+    // from find_best_split's record-count creation gate (8192 by default).
     #[cfg(test)]
     fn reserve(
         samples: &Samples<impl SampleStorage>,
@@ -1817,12 +2006,14 @@ impl HistogramCache {
 
 #[derive(Default)]
 struct PropertyScratch {
+    dominated_predictors: usize,
+    splits: Vec<HistogramSplit>,
     score_mask: Vec<u8>,
     saved_histograms: Vec<BinHistogram>,
     property_bins: Vec<usize>,
-    active_blocks: Vec<usize>,
     shards: HistogramShards,
     scoring: ScoreScratch,
+    events: EventScratch,
     #[cfg(test)]
     sharded_predictors: Vec<usize>,
     #[cfg(test)]
@@ -2006,6 +2197,12 @@ impl PredictorPlan {
         &self.active[..self.active_count]
     }
 
+    fn cache_pair14_eligible(&self, predictors: usize) -> bool {
+        predictors == 14
+            && self.active().iter().copied().eq(0..14)
+            && self.representative.iter().copied().eq(0..14)
+    }
+
     fn pair_available(&self, predictor: usize, predictors: usize) -> bool {
         let start = predictor & !1;
         start + 1 < predictors
@@ -2051,8 +2248,16 @@ fn duplicate_property<T: PropertyValue>(
     values: &[T],
     used: &[usize],
     seen: &mut Vec<SeenProperty>,
+    remap: &mut Vec<usize>,
 ) -> bool {
-    let signature = property_signature(used);
+    // Search experiments may select thresholds by their original bin index.
+    // Only a complete sweep permits ignoring strictly monotone bin relabeling.
+    let relabel = options.search == SearchOptions::default();
+    let signature = if relabel {
+        ma_partition_proofs::signature(used)
+    } else {
+        property_signature(used)
+    };
     let id = options.properties[property];
     for previous in seen.iter() {
         let previous_id = options.properties[previous.property];
@@ -2063,9 +2268,13 @@ fn duplicate_property<T: PropertyValue>(
             continue;
         }
         let same = with_property_values!(&samples.properties[previous.property], |other| {
-            indices
-                .iter()
-                .all(|&i| values[i].index() == other[i].index())
+            if relabel {
+                ma_partition_proofs::same_partition(indices, values, other, used.len(), remap)
+            } else {
+                indices
+                    .iter()
+                    .all(|&i| values[i].index() == other[i].index())
+            }
         });
         if same {
             return true;
@@ -2095,6 +2304,7 @@ fn evaluate_property_values<T: PropertyValue>(
     options: &TrainOptions,
     parents: &[ParentHistogram],
     plan: &PredictorPlan,
+    sparse_plan: &SparseHistogramPlan,
     total: u32,
     property: usize,
     values: &[T],
@@ -2106,12 +2316,14 @@ fn evaluate_property_values<T: PropertyValue>(
     debug_assert!(cached.is_none() || mapping.is_none());
     debug_assert!(cached.is_none_or(|histogram| histogram.valid));
     scratch.score_mask.clear();
+    scratch.dominated_predictors = 0;
     #[cfg(test)]
     {
         scratch.scored_predictors.clear();
         scratch.sharded_predictors.clear();
         scratch.sparse_predictors.clear();
         scratch.packed_bins = 0;
+        scratch.events.reset_trace();
     }
     let bins = samples.thresholds[property].len() + 1;
     if cached.is_none() && !marginals_ready {
@@ -2132,9 +2344,47 @@ fn evaluate_property_values<T: PropertyValue>(
     });
     let first = used.iter().position(|&n| n != 0).unwrap_or(0);
     let last = used.iter().rposition(|&n| n != 0).unwrap_or(0);
-    let mut result = [None; 4];
     if first == last {
-        return Ok(result);
+        return Ok([None; 4]);
+    }
+    scratch.below.clear();
+    scratch.below.resize(bins, Cost::default());
+    scratch.above.clear();
+    scratch.above.resize(bins, Cost::default());
+    if ma_events::eligible(
+        options,
+        total,
+        indices.len(),
+        used,
+        parents,
+        plan,
+        sparse_plan,
+        cached.is_some(),
+    ) {
+        scratch.events.evaluate(
+            samples,
+            indices,
+            values,
+            used,
+            weights,
+            parents,
+            plan,
+            options,
+            total,
+            mapping,
+            &mut scratch.below,
+            &mut scratch.above,
+        )?;
+        #[cfg(test)]
+        scratch.scored_predictors.extend_from_slice(plan.active());
+        return Ok(property_candidates(
+            options,
+            property,
+            used,
+            (&scratch.below, &scratch.above),
+            first..last,
+            &[],
+        ));
     }
     let rows = prepare_property_bins(
         used,
@@ -2145,14 +2395,34 @@ fn evaluate_property_values<T: PropertyValue>(
         &mut scratch.property_bins,
     );
     let packed = rows != bins;
+    // Property weights and live thresholds do not depend on the predictor.
+    // Small descendants often occupy only a handful of the root's 256 bins.
+    // One/two predictors do not amortize materializing a separate split table.
+    let reuse_splits = plan.active_count >= 4
+        || options.scoring != ScoringOptions::default()
+        || options.search != SearchOptions::default();
+    scratch.splits.clear();
+    if reuse_splits {
+        let mut weight_below = 0;
+        for bin in first..last {
+            if used[bin] != 0 {
+                weight_below += weights[bin];
+                scratch.splits.push(HistogramSplit {
+                    bin,
+                    row: if packed {
+                        scratch.property_bins[bin]
+                    } else {
+                        bin
+                    },
+                    totals: (total - weight_below, weight_below),
+                });
+            }
+        }
+    }
     #[cfg(test)]
     {
         scratch.packed_bins = if packed { rows } else { 0 };
     }
-    scratch.below.clear();
-    scratch.below.resize(bins, Cost::default());
-    scratch.above.clear();
-    scratch.above.resize(bins, Cost::default());
     let below_costs = &mut scratch.below;
     let above_costs = &mut scratch.above;
     let scorer = DefaultScorer::default();
@@ -2191,13 +2461,11 @@ fn evaluate_property_values<T: PropertyValue>(
         });
     for pass in 0..1 + usize::from(refine) {
         if pass != 0 {
-            let costs: Vec<_> = (first..last)
-                .map(|bin| {
-                    (below_costs[bin].bits + below_costs[bin].penalty)
-                        + (above_costs[bin].bits + above_costs[bin].penalty)
-                })
-                .collect();
-            ma_search::refine_mask(&mut scratch.score_mask, &costs);
+            ma_search::refine_mask_by(&mut scratch.score_mask, |offset| {
+                let bin = first + offset;
+                (below_costs[bin].bits + below_costs[bin].penalty)
+                    + (above_costs[bin].bits + above_costs[bin].penalty)
+            });
         }
         for &predictor in plan.active() {
             let parent = &parents[predictor];
@@ -2209,6 +2477,13 @@ fn evaluate_property_values<T: PropertyValue>(
             } else {
                 symbols
             };
+            let collect_scope = histogram_detail_scope(if cached.is_some() {
+                "ma.histogram_cached"
+            } else if pass != 0 {
+                "ma.histogram_saved"
+            } else {
+                "ma.histogram_collect"
+            });
             let (increase, extra, stride) = if let Some(cached) = cached {
                 let histogram = &cached.predictors[predictor];
                 (
@@ -2225,9 +2500,14 @@ fn evaluate_property_values<T: PropertyValue>(
                 )
             } else {
                 let paired = !packed
-                    && mapping.is_none()
-                    && indices.len() >= 256
-                    && plan.pair_available(predictor, parents.len());
+                    && plan.pair_available(predictor, parents.len())
+                    && if mapping.is_some() {
+                        // Every active adjacent pair can share the compact
+                        // property/weight scan, including Variable's 14 tools.
+                        indices.len() <= 256
+                    } else {
+                        indices.len() >= 256
+                    };
                 if paired && predictor % 2 == 1 {
                     // The preceding predictor populated both exact histograms.
                     // Swapping preserves capacity and handles unequal strides.
@@ -2250,16 +2530,30 @@ fn evaluate_property_values<T: PropertyValue>(
                         scratch.paired_increase.resize(bins * other_symbols, 0);
                         scratch.paired_extra.clear();
                         scratch.paired_extra.resize(bins, 0);
-                        for &i in indices {
-                            let bin = values[i].index();
-                            let weight = u32::from(samples.counts[i]);
-                            let a = tokens[i];
-                            let b = other_tokens[i];
-                            scratch.increase[bin * storage_stride + usize::from(a.token)] += weight;
-                            scratch.paired_increase[bin * other_symbols + usize::from(b.token)] +=
-                                weight;
-                            scratch.extra[bin] += u64::from(weight) * u64::from(a.nbits);
-                            scratch.paired_extra[bin] += u64::from(weight) * u64::from(b.nbits);
+                        if let Some(mapping) = mapping {
+                            collect_compact_pair(
+                                samples,
+                                indices,
+                                values,
+                                [tokens, other_tokens],
+                                [storage_stride, other_symbols],
+                                mapping,
+                                [&mut scratch.increase, &mut scratch.paired_increase],
+                                [&mut scratch.extra, &mut scratch.paired_extra],
+                            );
+                        } else {
+                            for &i in indices {
+                                let bin = values[i].index();
+                                let weight = u32::from(samples.counts[i]);
+                                let a = tokens[i];
+                                let b = other_tokens[i];
+                                scratch.increase[bin * storage_stride + usize::from(a.token)] +=
+                                    weight;
+                                scratch.paired_increase
+                                    [bin * other_symbols + usize::from(b.token)] += weight;
+                                scratch.extra[bin] += u64::from(weight) * u64::from(a.nbits);
+                                scratch.paired_extra[bin] += u64::from(weight) * u64::from(b.nbits);
+                            }
                         }
                     } else if options.histogram_shards
                         && !packed
@@ -2350,14 +2644,38 @@ fn evaluate_property_values<T: PropertyValue>(
                     storage_stride,
                 )
             };
-            if options.sparse_entropy && !options.scoring.fast_entropy {
-                active_blocks(&parent.counts, scorer.lanes(), &mut scratch.active_blocks);
+            drop(collect_scope);
+            // Both child populations use the nonnegative <=256 contribution
+            // table. This lower bound keeps the exact f32 extra-bit order;
+            // it is local to this node and must not be inherited by children.
+            if options.split_dominance
+                && total <= 256
+                && options.scoring == ScoringOptions::default()
+                && options.search == SearchOptions::default()
+                && ma_dominance::predictor_cannot_improve(
+                    (first..last).filter(|&bin| used[bin] != 0).map(|bin| {
+                        (
+                            bin,
+                            if packed {
+                                scratch.property_bins[bin]
+                            } else {
+                                bin
+                            },
+                        )
+                    }),
+                    extra,
+                    parent.extra_bits,
+                    plan.penalty[predictor],
+                    below_costs,
+                    above_costs,
+                )
+            {
+                scratch.dominated_predictors += 1;
+                continue;
             }
-            let sparse = options.sparse_entropy
-                && !options.scoring.fast_entropy
-                && scratch.active_blocks.len() < node_stride / scorer.lanes();
+            let sparse = sparse_plan.blocks(predictor);
             #[cfg(test)]
-            if sparse {
+            if sparse.is_some() {
                 scratch.sparse_predictors.push(predictor);
             }
             scratch.counts_above.clone_from(&parent.counts);
@@ -2368,18 +2686,64 @@ fn evaluate_property_values<T: PropertyValue>(
                 .reset(options.scoring, &parent.counts, total, indices.len())?;
             let penalty = plan.penalty[predictor];
             let mut extra_below = 0u64;
-            let mut weight_below = 0u32;
-            for bin in first..last {
-                if used[bin] == 0 {
-                    continue;
-                }
-                let row = if packed {
-                    scratch.property_bins[bin]
+            let _score_scope = histogram_detail_scope("ma.histogram_score");
+            if options.scoring == ScoringOptions::default() && scratch.score_mask.is_empty() {
+                let mut weight_below = 0;
+                let count = if reuse_splits {
+                    scratch.splits.len()
                 } else {
-                    bin
+                    last - first
                 };
+                let splits = (0..count).filter_map(|offset| {
+                    if reuse_splits {
+                        return Some(scratch.splits[offset]);
+                    }
+                    let bin = first + offset;
+                    if used[bin] == 0 {
+                        return None;
+                    }
+                    weight_below += weights[bin];
+                    Some(HistogramSplit {
+                        bin,
+                        row: if packed {
+                            scratch.property_bins[bin]
+                        } else {
+                            bin
+                        },
+                        totals: (total - weight_below, weight_below),
+                    })
+                });
+                scorer.split_sweep(
+                    &mut scratch.counts_above,
+                    &mut scratch.counts_below,
+                    increase,
+                    stride,
+                    sparse,
+                    splits,
+                    |split, rbits, lbits| {
+                        extra_below += extra[split.row];
+                        // Keep the same f32 extra-bit and strict tie order as
+                        // the configurable per-threshold scoring path below.
+                        update_cost(
+                            &mut below_costs[split.bin],
+                            lbits + extra_below as f32,
+                            penalty,
+                            predictor,
+                        );
+                        update_cost(
+                            &mut above_costs[split.bin],
+                            (rbits + parent.extra_bits as f32) - extra_below as f32,
+                            penalty,
+                            predictor,
+                        );
+                    },
+                );
+                continue;
+            }
+            for split in &scratch.splits {
+                let bin = split.bin;
+                let row = split.row;
                 extra_below += extra[row];
-                weight_below += weights[bin];
                 // Validated samples and exact cached subsets bound every move and
                 // signed SIMD conversion. Keep the cache immutable for child reuse.
                 let delta = &increase[row * stride..row * stride + symbols];
@@ -2387,7 +2751,7 @@ fn evaluate_property_values<T: PropertyValue>(
                     scorer.move_counts(&mut scratch.counts_above, &mut scratch.counts_below, delta);
                     continue;
                 }
-                let totals = (total - weight_below, weight_below);
+                let totals = split.totals;
                 let (rbits, lbits) = scratch.scoring.move_and_score(
                     options.scoring,
                     &scorer,
@@ -2395,7 +2759,7 @@ fn evaluate_property_values<T: PropertyValue>(
                     &mut scratch.counts_below,
                     delta,
                     totals,
-                    sparse.then_some(scratch.active_blocks.as_slice()),
+                    sparse,
                 );
                 let mut below_bits = lbits + extra_below as f32;
                 // Preserve source f32 addition/subtraction order, not an integer
@@ -2413,30 +2777,50 @@ fn evaluate_property_values<T: PropertyValue>(
                             .description
                             .cost(&scorer, &scratch.counts_above, totals.0);
                 }
-                if below_bits + penalty < below_costs[bin].bits + below_costs[bin].penalty {
-                    below_costs[bin] = Cost {
-                        bits: below_bits,
-                        penalty,
-                        predictor,
-                    };
-                }
-                if above_bits + penalty < above_costs[bin].bits + above_costs[bin].penalty {
-                    above_costs[bin] = Cost {
-                        bits: above_bits,
-                        penalty,
-                        predictor,
-                    };
-                }
+                update_cost(&mut below_costs[bin], below_bits, penalty, predictor);
+                update_cost(&mut above_costs[bin], above_bits, penalty, predictor);
             }
         }
     }
+    Ok(property_candidates(
+        options,
+        property,
+        used,
+        (below_costs, above_costs),
+        first..last,
+        &scratch.score_mask,
+    ))
+}
+
+#[inline]
+fn update_cost(best: &mut Cost, bits: f32, penalty: f32, predictor: usize) {
+    if bits + penalty < best.bits + best.penalty {
+        *best = Cost {
+            bits,
+            penalty,
+            predictor,
+        };
+    }
+}
+
+fn property_candidates(
+    options: &TrainOptions,
+    property: usize,
+    used: &[usize],
+    costs: (&[Cost], &[Cost]),
+    range: std::ops::Range<usize>,
+    score_mask: &[u8],
+) -> Candidates {
+    let (below_costs, above_costs) = costs;
+    let first = range.start;
+    let mut result = [None; 4];
     let mut below_count = 0;
-    for bin in first..last {
+    for bin in range {
         if used[bin] == 0 {
             continue;
         }
         below_count += used[bin];
-        if !scratch.score_mask.is_empty() && scratch.score_mask[bin - first] == 0 {
+        if !score_mask.is_empty() && score_mask[bin - first] == 0 {
             continue;
         }
         let below = below_costs[bin];
@@ -2468,7 +2852,7 @@ fn evaluate_property_values<T: PropertyValue>(
             },
         );
     }
-    Ok(result)
+    result
 }
 
 #[cfg(test)]
@@ -2486,10 +2870,27 @@ fn evaluate_property_cached(
     scratch: &mut PropertyScratch,
 ) -> Result<Candidates> {
     let plan = PredictorPlan::new(samples, indices, options, parents, parent_predictor);
+    let sparse_plan = SparseHistogramPlan::new(
+        parents,
+        plan.active(),
+        DefaultScorer::new().lanes(),
+        options.sparse_entropy && !options.scoring.fast_entropy,
+    );
     with_property_values!(&samples.properties[property], |values| {
         evaluate_property_values(
-            samples, indices, options, parents, &plan, total, property, values, cached, false,
-            mapping, scratch,
+            samples,
+            indices,
+            options,
+            parents,
+            &plan,
+            &sparse_plan,
+            total,
+            property,
+            values,
+            cached,
+            false,
+            mapping,
+            scratch,
         )
     })
 }
@@ -2672,7 +3073,7 @@ fn find_best_split_with_properties(
     let inherited_cache = working_cache.is_some();
     if working_cache.is_some() {
         stats.cache_reuses.fetch_add(1, Ordering::Relaxed);
-    } else if indices.len() >= 8192 {
+    } else if indices.len() >= options.histogram_cache_thresholds().0 {
         let _scope = crate::profile::scope("ma.histogram_cache");
         let stride = options.padded_histogram.then(|| {
             histogram_stride(
@@ -2731,6 +3132,12 @@ fn find_best_split_with_properties(
     let scoring_parents = compact
         .as_ref()
         .map_or(parents.as_slice(), |c| c.parents.as_slice());
+    let sparse_plan = SparseHistogramPlan::new(
+        scoring_parents,
+        plan.active(),
+        scorer.lanes(),
+        options.sparse_entropy && !options.scoring.fast_entropy,
+    );
     let race = ma_search::race(
         samples,
         indices,
@@ -2764,6 +3171,7 @@ fn find_best_split_with_properties(
             }
         }
     }
+    let mut winners = [None; 4];
     let candidates: Vec<Result<(Candidates, bool)>> = {
         let cache_stride = working_cache.as_ref().and_then(|cache| cache.stride);
         let collection_stride = histogram_stride(
@@ -2792,6 +3200,13 @@ fn find_best_split_with_properties(
                     .as_ref()
                     .map(|jobs| jobs[property].lock().expect("MA property cache poisoned"));
                 let cached_property = histogram.as_ref().is_some_and(|h| h.valid);
+                let cache_scope = histogram.as_ref().map(|_| {
+                    crate::profile::scope(if cached_property {
+                        "ma.cache_subtract"
+                    } else {
+                        "ma.cache_collect"
+                    })
+                });
                 if options.property_dedup {
                     if let Some(histogram) = histogram.as_mut() {
                         if cached_property {
@@ -2821,7 +3236,14 @@ fn find_best_split_with_properties(
                     if indices.len() >= 64
                         && let Some(seen) = seen
                         && duplicate_property(
-                            samples, indices, options, property, values, used, seen,
+                            samples,
+                            indices,
+                            options,
+                            property,
+                            values,
+                            used,
+                            seen,
+                            &mut scratch.property_bins,
                         )
                     {
                         // Source Invalidate retains storage but forbids reuse of
@@ -2910,6 +3332,7 @@ fn find_best_split_with_properties(
                         }
                     }
                 }
+                drop(cache_scope);
                 if cached_property && !removed.is_empty() {
                     stats.cache_subtractions.fetch_add(1, Ordering::Relaxed);
                 }
@@ -2923,6 +3346,7 @@ fn find_best_split_with_properties(
                     options,
                     scoring_parents,
                     &plan,
+                    &sparse_plan,
                     total,
                     property,
                     values,
@@ -2931,6 +3355,11 @@ fn find_best_split_with_properties(
                     compact.as_ref().map(|c| &c.mapping),
                     scratch,
                 )?;
+                if scratch.dominated_predictors != 0 {
+                    stats
+                        .dominated_predictors
+                        .fetch_add(scratch.dominated_predictors, Ordering::Relaxed);
+                }
                 #[cfg(test)]
                 if initialize_cache && let Some(hook) = &stats.initial_cache_hook {
                     hook(property, InitialCacheStage::Scored)?;
@@ -2947,6 +3376,31 @@ fn find_best_split_with_properties(
                 || scratch_pool.acquire(),
                 |lease, property| evaluate(&mut lease.scratch, property, None),
             )
+        } else if !options.property_dedup {
+            // Tiny serial nodes dominate the tree count. Reduce their results
+            // immediately instead of allocating a vector of four-way candidates.
+            let mut lease = scratch_pool.acquire();
+            let mut first_error = None;
+            for property in 0..options.properties.len() {
+                match evaluate(&mut lease.scratch, property, None) {
+                    Ok((candidates, _)) => {
+                        for (best, candidate) in winners.iter_mut().zip(candidates) {
+                            if let Some(candidate) = candidate {
+                                keep_better(best, candidate);
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        first_error.get_or_insert(error);
+                    }
+                }
+            }
+            // Like indexed parallel collection, drain the batch before
+            // returning its first ordered error; never publish partial caches.
+            if let Some(error) = first_error {
+                return Err(error);
+            }
+            Vec::new()
         } else {
             let mut lease = scratch_pool.acquire();
             let mut seen = Vec::new();
@@ -2957,7 +3411,6 @@ fn find_best_split_with_properties(
     };
     // Indexed collection followed by strict ordered reduction preserves ties
     // independently of Rayon completion order. No worker mutates samples.
-    let mut winners = [None; 4];
     for (property, candidates) in candidates.into_iter().enumerate() {
         let (candidates, redundant) = candidates?;
         if options.property_dedup {
@@ -3265,6 +3718,19 @@ fn train_nodes_with_scratch(
     stats: &TrainingStats,
     scratch_pool: &ScratchPool,
 ) -> Result<Vec<Node>> {
+    // Resolve once, at the invocation root. Descendant learners receive local
+    // allowances from this budget; they must not reset to the global ceiling.
+    let resolved;
+    let options = if let Some(limit) = options.max_merged_leaves {
+        resolved = TrainOptions {
+            max_leaves: limit,
+            max_merged_leaves: None,
+            ..options.clone()
+        };
+        &resolved
+    } else {
+        options
+    };
     if let Some(nodes) = ma_channel::train(samples, options, stats, scratch_pool)? {
         return Ok(nodes);
     }
@@ -3341,7 +3807,11 @@ fn train_pending_with_layout<const REORDER: bool>(
     let detach = REORDER && options.parallel_tools.enabled(records, options.parallel);
     let mut subtrees = Vec::new();
     scratch_pool.dispatch_slots.store(0, Ordering::Relaxed);
-    let mut leaves = pending.len();
+    // Include finished/reserved seed leaves, not just the ready work queue.
+    let mut leaves = nodes.len().div_ceil(2);
+    if leaves > options.max_leaves {
+        return Err(Error::Limit("MA skeleton exceeds leaf budget"));
+    }
     pending.reverse();
     while let Some(mut state) = pending.pop() {
         let job = state.job;
@@ -3352,7 +3822,7 @@ fn train_pending_with_layout<const REORDER: bool>(
             multiplier,
             ..
         } = job;
-        if leaves == options.max_leaves && !options.require_complete_search {
+        if leaves == options.max_leaves && !options.complete_search() {
             break;
         }
         if begin == end {
@@ -3430,7 +3900,7 @@ fn train_pending_with_layout<const REORDER: bool>(
             options.properties[split.property],
             samples.thresholds[split.property][split.bin],
         );
-        if leaves == options.max_leaves && !options.require_complete_search {
+        if leaves == options.max_leaves && !options.complete_search() {
             break;
         }
         let low = cut - begin;
@@ -3455,7 +3925,7 @@ fn train_pending_with_layout<const REORDER: bool>(
             stats.parent_reuses.fetch_add(1, Ordering::Relaxed);
         }
         if unbalanced
-            && low.max(high) >= 4096
+            && low.max(high) >= options.histogram_cache_thresholds().1
             && let Some(cache) = state.cache.take()
         {
             larger.cache = Some(cache);
@@ -3521,7 +3991,7 @@ fn train_pending_with_layout<const REORDER: bool>(
     crate::profile::note(
         "ma.search_counts",
         format_args!(
-            "distinct={} nodes={} leaves={} cache_peak_bytes={} cache_builds={} cache_reuses={} cache_subtractions={} parent_reuses={} ready_nodes={} scratch_created={} scratch_reused={} equivalent_predictors={} constant_properties={} duplicate_properties={} inherited_properties={} compact_nodes={} paired_cache_subtractions={} race_nodes={} race_draws={} race_pruned={}",
+            "distinct={} nodes={} leaves={} cache_peak_bytes={} cache_builds={} cache_reuses={} cache_subtractions={} parent_reuses={} ready_nodes={} scratch_created={} scratch_reused={} equivalent_predictors={} constant_properties={} duplicate_properties={} inherited_properties={} compact_nodes={} paired_cache_subtractions={} race_nodes={} race_draws={} race_pruned={} dominated_predictors={}",
             records,
             nodes.len(),
             leaves,
@@ -3542,6 +4012,7 @@ fn train_pending_with_layout<const REORDER: bool>(
             stats.race_nodes.load(Ordering::Relaxed),
             stats.race_draws.load(Ordering::Relaxed),
             stats.race_pruned.load(Ordering::Relaxed),
+            stats.dominated_predictors.load(Ordering::Relaxed),
         ),
     );
     Ok(nodes)
@@ -3628,6 +4099,7 @@ fn train_with_constants(
     options: &TrainOptions,
     train_variable: impl FnOnce(&TrainOptions) -> Result<Vec<Node>>,
 ) -> Result<Tree> {
+    let leaf_limit = options.tree_leaf_limit();
     let mut nodes;
     let mut constants = options.constant_channels.as_slice();
     if let Some(first) = constants.first() {
@@ -3639,8 +4111,13 @@ fn train_with_constants(
             constants = &constants[1..];
         } else {
             range[0][1] = first.channel;
+            let remaining = leaf_limit
+                .checked_sub(constants.len())
+                .filter(|&limit| limit != 0)
+                .ok_or(Error::Limit("MA constant channels exceed leaf budget"))?;
             let learning = TrainOptions {
-                max_leaves: options.max_leaves - constants.len(),
+                max_leaves: options.max_leaves.min(remaining),
+                max_merged_leaves: options.max_merged_leaves.map(|_| remaining),
                 static_property_range: Some(range),
                 constant_channels: Vec::new(),
                 ..options.clone()
@@ -3649,6 +4126,9 @@ fn train_with_constants(
         }
     } else {
         nodes = train_variable(options)?;
+    }
+    if nodes.len().div_ceil(2).saturating_add(constants.len()) > leaf_limit {
+        return Err(Error::Limit("MA constant channels exceed leaf budget"));
     }
     append_constants(&mut nodes, constants);
     Tree::new(nodes)
@@ -3680,7 +4160,7 @@ pub fn train(samples: &[Sample], options: &TrainOptions) -> Result<Tree> {
             options.constant_channels.len(),
             options.multiplier_info.len(),
             options.max_leaves,
-            options.require_complete_search,
+            options.complete_search(),
         ),
     );
     options.validate()?;
@@ -3698,6 +4178,26 @@ pub fn train(samples: &[Sample], options: &TrainOptions) -> Result<Tree> {
     validate_sample_constraints(&tree, samples, options)?;
     Ok(tree)
 }
+
+#[cfg(test)]
+#[path = "ma_budget_mode_tests.rs"]
+mod budget_mode_tests;
+
+#[cfg(test)]
+#[path = "ma_cache_pair_tests.rs"]
+mod cache_pair_tests;
+
+#[cfg(test)]
+#[path = "ma_cache_admission_tests.rs"]
+mod cache_admission_tests;
+
+#[cfg(test)]
+#[path = "ma_cache_pair14_tests.rs"]
+mod cache_pair14_tests;
+
+#[cfg(test)]
+#[path = "ma_pruning_tests.rs"]
+mod pruning_tests;
 
 #[cfg(test)]
 mod tests {
@@ -4990,6 +5490,247 @@ mod tests {
     }
 
     #[test]
+    fn sparse_node_plan_is_shared_across_properties_cache_layouts_and_refinement() {
+        let lanes = DefaultScorer::new().lanes();
+        let (mut samples, mut options) = histogram_fixture(1024, 3);
+        for i in 0..samples.counts.len() {
+            samples.residuals[0][i].token = (i % lanes) as u8;
+            samples.residuals[1][i].token = if i % 2 == 0 { 0 } else { (7 * lanes) as u8 };
+            samples.residuals[2][i].token = (i % (2 * lanes + 1)) as u8;
+        }
+        samples.properties[1] = PropertyColumn::Packed((0..1024).map(|i| (i % 96) as u8).collect());
+        samples.thresholds[1] = (0..95).collect();
+        options.sparse_entropy = true;
+        let indices: Vec<_> = (0..1024).rev().collect();
+        let parents = parent_histograms(&samples, &indices);
+        let total = samples.counts.iter().map(|&n| u32::from(n)).sum();
+        let predictors = PredictorPlan::new(&samples, &indices, &options, &parents, 0);
+        let sparse = SparseHistogramPlan::new(&parents, predictors.active(), lanes, true);
+        assert_eq!(sparse.blocks(0), None);
+        assert_eq!(sparse.blocks(2), None);
+        let blocks = sparse.blocks(1).unwrap();
+        let snapshot = blocks.to_vec();
+        let pointer = blocks.as_ptr();
+        let mut actual_scratch = PropertyScratch::default();
+        let mut reference_scratch = PropertyScratch::default();
+        for padded in [false, true] {
+            options.padded_histogram = padded;
+            let stride = padded.then(|| {
+                histogram_stride(
+                    parents.iter().map(|p| p.counts.len()).max().unwrap(),
+                    lanes,
+                    true,
+                )
+            });
+            for refine in [false, true] {
+                options.search.refine_quantiles = refine;
+                let mut reference = options.clone();
+                reference.sparse_entropy = false;
+                for property in 0..options.properties.len() {
+                    let cached = with_property_values!(&samples.properties[property], |values| {
+                        PropertyHistogram::collect_values_with_stride(
+                            &samples,
+                            &indices,
+                            &parents,
+                            property,
+                            values,
+                            &predictors,
+                            stride,
+                        )
+                        .unwrap()
+                    });
+                    for cache in [false, true] {
+                        let actual =
+                            with_property_values!(&samples.properties[property], |values| {
+                                evaluate_property_values(
+                                    &samples,
+                                    &indices,
+                                    &options,
+                                    &parents,
+                                    &predictors,
+                                    &sparse,
+                                    total,
+                                    property,
+                                    values,
+                                    cache.then_some(&cached),
+                                    false,
+                                    None,
+                                    &mut actual_scratch,
+                                )
+                                .unwrap()
+                            });
+                        let expected = evaluate_property_cached(
+                            &samples,
+                            &indices,
+                            &reference,
+                            &parents,
+                            0,
+                            total,
+                            property,
+                            cache.then_some(&cached),
+                            None,
+                            &mut reference_scratch,
+                        )
+                        .unwrap();
+                        assert_same_candidates(actual, expected);
+                        for (a, b) in actual_scratch
+                            .below
+                            .iter()
+                            .chain(&actual_scratch.above)
+                            .zip(
+                                reference_scratch
+                                    .below
+                                    .iter()
+                                    .chain(&reference_scratch.above),
+                            )
+                        {
+                            assert_eq!(a.bits.to_bits(), b.bits.to_bits());
+                            assert_eq!(a.penalty.to_bits(), b.penalty.to_bits());
+                            assert_eq!(a.predictor, b.predictor);
+                        }
+                        if property != 3 {
+                            let passes = if refine && property == 1 { 2 } else { 1 };
+                            assert_eq!(actual_scratch.sparse_predictors, vec![1; passes]);
+                        } else {
+                            assert!(actual_scratch.sparse_predictors.is_empty());
+                        }
+                        assert_eq!(sparse.blocks(1).unwrap(), snapshot);
+                        assert_eq!(sparse.blocks(1).unwrap().as_ptr(), pointer);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sparse_node_plans_follow_compaction_and_deferred_child_cache_in_parallel() {
+        let workers = rayon::ThreadPoolBuilder::new()
+            .num_threads(3)
+            .build()
+            .unwrap();
+        for (records, dense, cache_bytes) in [
+            (128, DenseHistogram::Disabled, 0),
+            (128, DenseHistogram::Small, 0),
+            (8192, DenseHistogram::Disabled, 0),
+            (8192, DenseHistogram::Disabled, 32 << 20),
+        ] {
+            let (mut samples, mut options) = histogram_fixture(records, 3);
+            if records >= 8192 {
+                for (i, residual) in samples.residuals[0].iter_mut().enumerate() {
+                    residual.token = if i < 513 {
+                        255
+                    } else if i % 2 == 0 {
+                        0
+                    } else {
+                        64
+                    };
+                }
+            }
+            options.dense_histogram = dense;
+            options.histogram_cache_bytes = cache_bytes;
+            let indices: Vec<_> = (0..records).collect();
+            for parallel in [false, true] {
+                options.parallel = parallel;
+                let run = |sparse| {
+                    let mut options = options.clone();
+                    options.sparse_entropy = sparse;
+                    let stats = TrainingStats::default();
+                    let scratch = ScratchPool::new(3);
+                    let budget = HistogramBudget::new(cache_bytes);
+                    let mut parents = None;
+                    let mut cache = None;
+                    let root = find_best_split_with_scratch(
+                        &samples,
+                        &indices,
+                        0,
+                        &options,
+                        &mut parents,
+                        &mut cache,
+                        &budget,
+                        &stats,
+                        &scratch,
+                        &[],
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        stats.compact_nodes.load(Ordering::Relaxed),
+                        usize::from(records == 128)
+                    );
+                    if records >= 8192 && parallel {
+                        assert_eq!(scratch.dispatch_slots.load(Ordering::Relaxed), 3);
+                    }
+                    let child = if cache_bytes != 0 {
+                        assert_eq!(parents.as_ref().unwrap()[0].counts.len(), 256);
+                        assert!(cache.is_some());
+                        parents = None;
+                        let child = find_best_split_with_scratch(
+                            &samples,
+                            &indices[513..],
+                            0,
+                            &options,
+                            &mut parents,
+                            &mut cache,
+                            &budget,
+                            &stats,
+                            &scratch,
+                            &indices[..513],
+                        )
+                        .unwrap();
+                        assert_eq!(parents.as_ref().unwrap()[0].counts.len(), 65);
+                        assert_eq!(stats.cache_reuses.load(Ordering::Relaxed), 1);
+                        assert_cached_population(
+                            cache.as_ref().unwrap(),
+                            &samples,
+                            &indices[513..],
+                        );
+                        child
+                    } else {
+                        assert!(cache.is_none());
+                        None
+                    };
+                    (root, child)
+                };
+                let expected = workers.install(|| run(false));
+                let actual = workers.install(|| run(true));
+                assert_same_candidates(
+                    [actual.0, actual.1, None, None],
+                    [expected.0, expected.1, None, None],
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sparse_node_plan_stays_disabled_for_shannon_scoring() {
+        let (samples, mut options) = histogram_fixture(512, 3);
+        options.sparse_entropy = true;
+        options.scoring.fast_entropy = true;
+        let indices: Vec<_> = (0..512).collect();
+        let parents = parent_histograms(&samples, &indices);
+        let total = samples.counts.iter().map(|&n| u32::from(n)).sum();
+        let mut scratch = PropertyScratch::default();
+        let actual = evaluate_property_cached(
+            &samples,
+            &indices,
+            &options,
+            &parents,
+            0,
+            total,
+            1,
+            None,
+            None,
+            &mut scratch,
+        )
+        .unwrap();
+        assert!(scratch.sparse_predictors.is_empty());
+        options.sparse_entropy = false;
+        let expected =
+            evaluate_property(&samples, &indices, &options, &parents, 0, total, 1).unwrap();
+        assert_same_candidates(actual, expected);
+        assert!(!TrainOptions::default().sparse_entropy);
+    }
+
+    #[test]
     fn optional_histograms_preserve_all_costs_and_source_dispatch_priority() {
         let mut actual_scratch = PropertyScratch::default();
         let mut reference_scratch = PropertyScratch::default();
@@ -5324,6 +6065,7 @@ mod tests {
                     values,
                     &histogram.used,
                     &mut seen,
+                    &mut Vec::new(),
                 )
             });
             assert_eq!(actual, expected, "property {property}");
@@ -5334,7 +6076,7 @@ mod tests {
         );
         // A matching signature (including a collision) never bypasses row verification.
         let mut collision = vec![SeenProperty {
-            signature: property_signature(&[32, 32, 32]),
+            signature: ma_partition_proofs::signature(&[32, 32, 32]),
             property: 6,
         }];
         assert!(!duplicate_property(
@@ -5344,7 +6086,8 @@ mod tests {
             1,
             &values,
             &[32, 32, 32],
-            &mut collision
+            &mut collision,
+            &mut Vec::new(),
         ));
         let live: Vec<_> = indices.into_iter().filter(|&i| i >= 2).collect();
         let mut seen = Vec::new();
@@ -5360,6 +6103,7 @@ mod tests {
                     values,
                     &histogram.used,
                     &mut seen,
+                    &mut Vec::new(),
                 )
             });
             assert_eq!(actual, expected);
@@ -6066,9 +6810,25 @@ mod tests {
         let mut scratch = PropertyScratch::default();
         // Cross the pair/compaction boundaries, odd-predictor tails, shrinking
         // strides and constant properties without replacing worker scratch.
-        for (records, predictors) in [(8192, 5), (255, 3), (256, 3), (1024, 14), (17, 1), (257, 2)]
-        {
-            let (samples, options) = histogram_fixture(records, predictors);
+        for (records, predictors) in [
+            (8192, 5),
+            (255, 3),
+            (255, 2),
+            (256, 2),
+            (17, 2),
+            (256, 3),
+            (31, 14),
+            (256, 14),
+            (1024, 14),
+            (17, 1),
+            (257, 2),
+        ] {
+            let (mut samples, options) = histogram_fixture(records, predictors);
+            if predictors == 2 && records <= 256 {
+                for count in samples.counts.iter_mut().step_by(7) {
+                    *count = u16::MAX;
+                }
+            }
             let indices: Vec<_> = (0..records).rev().collect();
             let parents = parent_histograms(&samples, &indices);
             let total = samples.counts.iter().map(|&n| u32::from(n)).sum();
@@ -6112,6 +6872,16 @@ mod tests {
                     )
                     .unwrap();
                     assert_same_candidates(actual, expected);
+                    if packed && predictors == 2 && records <= 256 && property != 3 {
+                        // Predictor one consumes the prepared pair by swapping;
+                        // the retained companion now holds predictor zero.
+                        let bins = samples.thresholds[property].len() + 1;
+                        assert_eq!(
+                            scratch.paired_increase.len(),
+                            bins * compact.parents[0].counts.len(),
+                        );
+                        assert_eq!(scratch.paired_extra.len(), bins);
+                    }
                     for (a, b) in scratch
                         .below
                         .iter()
@@ -6499,6 +7269,48 @@ mod tests {
             drop(cache);
             assert_eq!(budget.used.load(Ordering::Relaxed), 0);
         }
+    }
+
+    #[test]
+    fn serial_candidate_reduction_drains_multiple_errors_in_property_order() {
+        let (samples, mut options) = histogram_fixture(8192, 3);
+        options.parallel = false;
+        let indices: Vec<_> = (0..samples.counts.len()).collect();
+        let parents = parent_histograms(&samples, &indices);
+        let budget = HistogramBudget::new(expected_cache_bytes(&samples, &parents));
+        let visited = Arc::new(AtomicUsize::new(0));
+        let recorded = Arc::clone(&visited);
+        let stats = TrainingStats {
+            initial_cache_hook: Some(Box::new(move |property, stage| {
+                if stage == InitialCacheStage::Filled {
+                    recorded.fetch_add(1, Ordering::Relaxed);
+                    if property != 0 {
+                        return Err(Error::Encoding(format!("failed property {property}")));
+                    }
+                }
+                Ok(())
+            })),
+            ..TrainingStats::default()
+        };
+        let scratch = ScratchPool::new(1);
+        let mut cache = None;
+        let result = find_best_split_with_scratch(
+            &samples,
+            &indices,
+            0,
+            &options,
+            &mut Some(parents),
+            &mut cache,
+            &budget,
+            &stats,
+            &scratch,
+            &[],
+        );
+        assert!(matches!(result, Err(Error::Encoding(message)) if message == "failed property 1"));
+        assert_eq!(visited.load(Ordering::Relaxed), options.properties.len());
+        assert!(cache.is_none());
+        assert_eq!(budget.used.load(Ordering::Relaxed), 0);
+        assert_eq!(scratch.idle.lock().unwrap().len(), 1);
     }
 
     #[test]

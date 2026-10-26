@@ -160,6 +160,45 @@ pub(super) fn finish(
     if jobs.is_empty() {
         return Ok(());
     }
+    if options.budget_mode == Some(super::MaBudgetMode::Bounded) {
+        // Each destination already reserves one seed leaf. Recompute the
+        // remaining allowance after every graft instead of training all jobs
+        // against the same capacity or truncating their finished trees.
+        let mut indices: Vec<_> = (0..samples.counts.len()).collect();
+        for job in jobs {
+            let learning = TrainOptions {
+                max_leaves: super::ma_channel::graft_leaf_allowance(
+                    nodes.len(),
+                    options.max_leaves,
+                )?,
+                max_merged_leaves: None,
+                parallel: false,
+                static_property_range: Some(job.range),
+                ..options.clone()
+            };
+            let mut root = super::PendingNode::new(super::TrainingNode {
+                node: 0,
+                begin: job.records.start,
+                end: job.records.end,
+                predictor: job.predictor,
+                multiplier: job.multiplier,
+            });
+            root.range = job.range;
+            root.redundant_properties = job.redundant;
+            let learned = super::train_pending_with_layout::<true>(
+                samples,
+                &learning,
+                stats,
+                &super::ScratchPool::new(1),
+                &mut indices,
+                vec![job.seed],
+                vec![root],
+            )?;
+            super::ma_channel::graft(nodes, job.destination, learned, options.max_leaves)?;
+        }
+        return Ok(());
+    }
+    let local_limit = super::ma_channel::graft_leaf_allowance(nodes.len(), options.max_leaves)?;
     let _scope = crate::profile::scope("ma.subtrees");
     let sizes: Vec<_> = jobs.iter().map(|job| job.records.len()).collect();
     let order = longest_first(&sizes);
@@ -200,6 +239,7 @@ pub(super) fn finish(
                 // Source passes nullptr and subtree=true. No recursive dispatch,
                 // cache inherited from a sibling, or re-created multiplier skeleton.
                 let learning = TrainOptions {
+                    max_leaves: local_limit,
                     parallel: false,
                     static_property_range: Some(job.range),
                     ..options.clone()

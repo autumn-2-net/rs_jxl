@@ -101,34 +101,61 @@ pub(super) fn prepare_mask(
     Ok(refine)
 }
 
+#[cfg(test)]
 pub(super) fn refine_mask(coarse: &mut [u8], costs: &[f32]) {
     if coarse.len() != costs.len() {
         return;
     }
-    let points: Vec<_> = (0..coarse.len())
-        .filter(|&i| coarse[i] != 0 && costs[i].is_finite())
-        .collect();
-    let mut order: Vec<_> = (0..points.len()).collect();
-    order.sort_by(|&a, &b| {
-        costs[points[a]]
-            .partial_cmp(&costs[points[b]])
-            .unwrap_or(Ordering::Equal)
-    });
-    let mut expanded = vec![false; coarse.len()];
-    let mut valleys = 0;
-    for index in order {
-        if expanded[points[index]] {
+    refine_mask_by(coarse, |i| costs[i]);
+}
+
+pub(super) fn refine_mask_by(coarse: &mut [u8], cost: impl Fn(usize) -> f32) {
+    // The stable sort only consumes two uncovered minima. Strict minima
+    // scans preserve its tie order without points/order/expanded allocations.
+    // Both neighborhoods must be found before changing the coarse-point set.
+    let Some(first) = refinement_valley(coarse, &cost, 0..0) else {
+        return;
+    };
+    let second = refinement_valley(coarse, &cost, first.clone());
+    coarse[first].fill(1);
+    if let Some(second) = second {
+        coarse[second].fill(1);
+    }
+}
+
+fn refinement_valley(
+    coarse: &[u8],
+    cost: &impl Fn(usize) -> f32,
+    excluded: std::ops::Range<usize>,
+) -> Option<std::ops::Range<usize>> {
+    let mut best: Option<std::ops::Range<usize>> = None;
+    let mut best_cost = f32::INFINITY;
+    let mut previous = 0;
+    let mut needs_end = false;
+    for (i, &point) in coarse.iter().enumerate() {
+        if point == 0 {
             continue;
         }
-        let begin = if index == 0 { 0 } else { points[index - 1] };
-        let end = points.get(index + 1).map_or(coarse.len(), |&p| p + 1);
-        coarse[begin..end].fill(1);
-        expanded[begin..end].fill(true);
-        valleys += 1;
-        if valleys == 2 {
-            break;
+        let bits = cost(i);
+        if !bits.is_finite() {
+            continue;
         }
+        if needs_end {
+            if let Some(range) = &mut best {
+                // This is the next original finite coarse point, not the next
+                // point outside the first valley's excluded neighborhood.
+                range.end = i + 1;
+            }
+            needs_end = false;
+        }
+        if !excluded.contains(&i) && bits < best_cost {
+            best = Some(previous..coarse.len());
+            best_cost = bits;
+            needs_end = true;
+        }
+        previous = i;
     }
+    best
 }
 
 const PANELS: usize = 4;
@@ -443,6 +470,59 @@ pub(super) fn race(
 mod tests {
     use super::super::{Predictor, ResidualToken};
     use super::*;
+
+    #[test]
+    fn refinement_scans_match_stable_sort_oracle() {
+        fn oracle(coarse: &mut [u8], costs: &[f32]) {
+            let points: Vec<_> = (0..coarse.len())
+                .filter(|&i| coarse[i] != 0 && costs[i].is_finite())
+                .collect();
+            let mut order: Vec<_> = (0..points.len()).collect();
+            order.sort_by(|&a, &b| costs[points[a]].partial_cmp(&costs[points[b]]).unwrap());
+            let mut expanded = vec![false; coarse.len()];
+            let mut valleys = 0;
+            for index in order {
+                if expanded[points[index]] {
+                    continue;
+                }
+                let begin = if index == 0 { 0 } else { points[index - 1] };
+                let end = points.get(index + 1).map_or(coarse.len(), |&p| p + 1);
+                coarse[begin..end].fill(1);
+                expanded[begin..end].fill(true);
+                valleys += 1;
+                if valleys == 2 {
+                    break;
+                }
+            }
+        }
+        let mut seed = 0x721b4cd3u32;
+        for len in [0, 1, 2, 3, 7, 32, 65, 256, 1025] {
+            for trial in 0..64 {
+                let mut coarse = Vec::new();
+                let mut costs = Vec::new();
+                for _ in 0..len {
+                    seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                    coarse.push(if trial % 8 == 0 {
+                        1
+                    } else {
+                        ((seed >> 16) % 3) as u8
+                    });
+                    costs.push(match (seed >> 24) % 9 {
+                        0 => f32::NAN,
+                        1 => f32::INFINITY,
+                        2 => f32::NEG_INFINITY,
+                        3 => -0.0,
+                        4 => 0.0,
+                        n => (n as i32 - 6) as f32,
+                    });
+                }
+                let mut expected = coarse.clone();
+                oracle(&mut expected, &costs);
+                refine_mask_by(&mut coarse, |i| costs[i]);
+                assert_eq!(coarse, expected, "length={len}, trial={trial}");
+            }
+        }
+    }
 
     #[test]
     fn search_quantile_mask_source_gates_edges_weights_and_refinement_budget() {

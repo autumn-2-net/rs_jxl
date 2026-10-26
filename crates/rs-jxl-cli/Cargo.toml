@@ -5,6 +5,10 @@ edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
+[features]
+decoder-avx512 = ["rs-jxl/decoder-avx512"]
+decoder-profile = ["rs-jxl/decoder-profile"]
+
 [[bin]]
 name = "rs-jxl"
 path = "src/main.rs"

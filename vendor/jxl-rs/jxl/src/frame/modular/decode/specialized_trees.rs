@@ -99,6 +99,8 @@ impl Reader for Reader420NoLz {
         br: &mut BitReader,
         cluster: usize,
     ) -> i32 {
+        #[cfg(feature = "decoder-profile")]
+        let _profile = crate::decoder_profile::sample_scope("sample.entropy.420", 2);
         reader.read_signed_clustered_config_420(histograms, br, cluster)
     }
 }
@@ -113,6 +115,8 @@ impl Reader for ReaderGeneric {
         br: &mut BitReader,
         cluster: usize,
     ) -> i32 {
+        #[cfg(feature = "decoder-profile")]
+        let _profile = crate::decoder_profile::sample_scope("sample.entropy.generic", 2);
         reader.read_signed_clustered_inline(histograms, br, cluster)
     }
 }

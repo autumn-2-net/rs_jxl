@@ -391,26 +391,100 @@ fn decode_jpeg_channel(
     permutation: &Permutation,
     histo_offset: usize,
     shift: u32,
-    mut nonzeros: usize,
+    nonzeros: usize,
     reader: &mut SymbolReader,
     histograms: &Histograms,
     br: &mut BitReader,
 ) -> Result<()> {
-    let mut prev = usize::from(nonzeros <= 4);
-    for k in 1..64 {
-        if nonzeros == 0 {
-            break;
+    if nonzeros == 0 {
+        return Ok(());
+    }
+    // Hoist entropy-mode dispatch out of the coefficient loop, as the regular
+    // VarDCT path does. Reconstruction still uses checked integer accumulation.
+    if reader.has_lz77() {
+        return decode_jpeg_values(current, permutation, histo_offset, shift, nonzeros, |ctx| {
+            reader.read_signed_inline(histograms, br, ctx)
+        });
+    }
+    match histograms.codes() {
+        Codes::Ans(ans) => {
+            decode_jpeg_values(current, permutation, histo_offset, shift, nonzeros, |ctx| {
+                let cluster = histograms.map_context_to_cluster(ctx);
+                let token = reader.read_token_ans_no_lz77(ans, br, cluster);
+                if token == 0 {
+                    0
+                } else {
+                    unpack_signed(histograms.uint(cluster).read(token, br))
+                }
+            })
         }
-        let ctx = histo_offset + COEFF_NUM_NONZERO_CONTEXT[nonzeros] + COEFF_FREQ_CONTEXT[k] + prev;
-        let value = reader.read_signed_inline(histograms, br, ctx);
+        Codes::Huffman(hc) => {
+            decode_jpeg_values(current, permutation, histo_offset, shift, nonzeros, |ctx| {
+                let cluster = histograms.map_context_to_cluster(ctx);
+                let token = reader.read_token_huffman_no_lz77(hc, br, cluster);
+                if token == 0 {
+                    0
+                } else {
+                    unpack_signed(histograms.uint(cluster).read(token, br))
+                }
+            })
+        }
+    }
+}
+
+#[inline(always)]
+fn decode_jpeg_values(
+    current: &mut [i32],
+    permutation: &Permutation,
+    histo_offset: usize,
+    shift: u32,
+    nonzeros: usize,
+    read: impl FnMut(usize) -> i32,
+) -> Result<()> {
+    if shift == 0 {
+        decode_jpeg_values_impl::<true>(current, permutation, histo_offset, shift, nonzeros, read)
+    } else {
+        decode_jpeg_values_impl::<false>(current, permutation, histo_offset, shift, nonzeros, read)
+    }
+}
+
+#[inline(always)]
+fn decode_jpeg_values_impl<const UNSHIFTED: bool>(
+    current: &mut [i32],
+    permutation: &Permutation,
+    histo_offset: usize,
+    shift: u32,
+    mut nonzeros: usize,
+    mut read: impl FnMut(usize) -> i32,
+) -> Result<()> {
+    if nonzeros == 0 {
+        return Ok(());
+    }
+    let mut prev = usize::from(nonzeros <= 4);
+    let mut nz_ctx = histo_offset + COEFF_NUM_NONZERO_CONTEXT[nonzeros];
+    for k in 1..64 {
+        let ctx = nz_ctx + COEFF_FREQ_CONTEXT[k] + prev;
+        let value = read(ctx);
         if value == 0 {
             prev = 0;
             continue;
         }
         let index = permutation[k] as usize;
-        current[index] = checked_jpeg_add(current[index], value, shift)?;
+        current[index] = if UNSHIFTED {
+            current[index]
+                .checked_add(value)
+                .ok_or(crate::frame::jpeg::unsupported(
+                    "JPEG coefficient accumulation overflow",
+                ))?
+        } else {
+            checked_jpeg_add(current[index], value, shift)?
+        };
         nonzeros -= 1;
+        if nonzeros == 0 {
+            return Ok(());
+        }
         prev = 1;
+        nz_ctx = histo_offset + COEFF_NUM_NONZERO_CONTEXT[nonzeros];
     }
     if nonzeros != 0 {
         return Err(Error::EndOfBlockResidualNonZeros(nonzeros));
@@ -866,6 +940,13 @@ pub fn decode_vardct_group(
     buffers: &mut VarDctBuffers,
     jpeg_capture: Option<&crate::frame::jpeg::JpegCapture>,
 ) -> Result<(), Error> {
+    #[cfg(feature = "decoder-profile")]
+    let _profile = crate::decoder_profile::scope("vardct.group");
+    #[cfg(feature = "decoder-profile")]
+    let mut entropy_profile = crate::decoder_profile::Accumulator::new("vardct.blocks.entropy");
+    #[cfg(feature = "decoder-profile")]
+    let mut transform_profile =
+        crate::decoder_profile::Accumulator::new("vardct.blocks.dequant_idct");
     let jpeg_final = jpeg_capture
         .map(|c| c.validate_passes(frame_header, group, passes.iter().map(|(p, _)| *p)))
         .transpose()?
@@ -1030,6 +1111,8 @@ pub fn decode_vardct_group(
 
             let mut block_nonzeros = if is_multi_pass { [1; 3] } else { [0; 3] };
 
+            #[cfg(feature = "decoder-profile")]
+            let entropy_start = entropy_profile.start();
             for PassInfo {
                 histogram_index,
                 reader,
@@ -1097,35 +1180,35 @@ pub fn decode_vardct_group(
                     )?;
                 }
             }
+            #[cfg(feature = "decoder-profile")]
+            entropy_profile.stop(entropy_start);
             if let Some(capture) = &mut jpeg_group {
-                let mut raw = [[0i32; 64]; 3];
-                for c in 0..3 {
-                    // Zero-only blocks intentionally leave the reused scratch buffer untouched.
+                // Capture uses checked i32 accumulation, never the narrow pixel
+                // scratch. Zero-only blocks leave reused scratch untouched.
+                let CoeffsMut::I32(channels) = &coeffs else {
+                    return Err(crate::frame::jpeg::unsupported(
+                        "JPEG capture requires i32 coefficients",
+                    ));
+                };
+                let raw = std::array::from_fn(|c| {
                     if active[c] && block_nonzeros[c] != 0 {
-                        match &coeffs {
-                            CoeffsMut::I32(channels) => {
-                                raw[c].copy_from_slice(&channels[c][offset..offset + 64])
-                            }
-                            CoeffsMut::I16(channels) => {
-                                for (to, &from) in
-                                    raw[c].iter_mut().zip(&channels[c][offset..offset + 64])
-                                {
-                                    *to = i32::from(from);
-                                }
-                            }
-                        }
+                        <&[i32; 64]>::try_from(&channels[c][offset..offset + 64]).unwrap()
+                    } else {
+                        &[0; 64]
                     }
-                }
+                });
                 capture.capture_block(
                     frame_header,
                     group,
                     bx,
                     by,
-                    &raw,
+                    raw,
                     [row_cmap_x[tx], 0, row_cmap_b[tx]],
                 )?;
             }
             if let Some(pixels) = pixels {
+                #[cfg(feature = "decoder-profile")]
+                let transform_start = transform_profile.start();
                 let dequant_matrices = &hf_global.dequant_matrices;
                 dequant_and_transform_to_pixels_dispatch(
                     quant_biases,
@@ -1154,6 +1237,8 @@ pub fn decode_vardct_group(
                     dequant_matrices,
                     block_nonzeros,
                 )?;
+                #[cfg(feature = "decoder-profile")]
+                transform_profile.stop(transform_start);
             }
             if is_multi_pass {
                 coeffs_offset += num_coeffs;
@@ -1182,6 +1267,89 @@ pub fn decode_vardct_group(
 
 #[cfg(test)]
 mod test {
+    #[test]
+    fn jpeg_specialized_loop_preserves_contexts_coefficients_and_failures() {
+        use super::*;
+        let permutation = Permutation(std::borrow::Cow::Owned(
+            std::iter::once(0).chain((1..64).rev()).collect(),
+        ));
+        for shift in [0, 1, 3, 16, 31, 32, 63, 64] {
+            for wanted in 0..64 {
+                for pattern in 0..4 {
+                    let initial = std::array::from_fn::<_, 64, _>(|k| {
+                        if pattern == 3 {
+                            i32::MAX - k as i32
+                        } else {
+                            k as i32 * -11
+                        }
+                    });
+                    let values = std::array::from_fn::<_, 63, _>(|k| match pattern {
+                        0 => {
+                            if k % 3 == 0 {
+                                0
+                            } else {
+                                (k as i32 - 31) * 13
+                            }
+                        }
+                        1 => 0,
+                        2 => {
+                            if k % 2 == 0 {
+                                i32::MIN
+                            } else {
+                                i32::MAX
+                            }
+                        }
+                        _ => k as i32 + 1,
+                    });
+                    let mut expected = initial;
+                    let mut expected_contexts = Vec::new();
+                    let reference = (|| -> Result<()> {
+                        let mut nonzeros = wanted;
+                        let mut prev = usize::from(nonzeros <= 4);
+                        for k in 1..64 {
+                            if nonzeros == 0 {
+                                break;
+                            }
+                            let ctx = 37
+                                + COEFF_NUM_NONZERO_CONTEXT[nonzeros]
+                                + COEFF_FREQ_CONTEXT[k]
+                                + prev;
+                            expected_contexts.push(ctx);
+                            let value = values[k - 1];
+                            if value == 0 {
+                                prev = 0;
+                                continue;
+                            }
+                            let index = permutation[k] as usize;
+                            expected[index] = checked_jpeg_add(expected[index], value, shift)?;
+                            nonzeros -= 1;
+                            prev = 1;
+                        }
+                        if nonzeros == 0 {
+                            Ok(())
+                        } else {
+                            Err(Error::EndOfBlockResidualNonZeros(nonzeros))
+                        }
+                    })();
+                    let mut actual = initial;
+                    let mut contexts = Vec::new();
+                    let result =
+                        decode_jpeg_values(&mut actual, &permutation, 37, shift, wanted, |ctx| {
+                            contexts.push(ctx);
+                            values[contexts.len() - 1]
+                        });
+                    assert_eq!(
+                        format!("{result:?}"),
+                        format!("{reference:?}"),
+                        "shift={shift}, wanted={wanted}, pattern={pattern}"
+                    );
+                    assert_eq!(actual, expected);
+                    assert_eq!(contexts, expected_contexts);
+                }
+            }
+        }
+    }
+
     #[test]
     fn jpeg_pass_accumulation_is_checked_before_narrowing() {
         assert_eq!(super::checked_jpeg_add(0, 1100, 2).unwrap(), 4400);

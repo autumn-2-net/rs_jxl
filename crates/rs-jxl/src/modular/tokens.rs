@@ -7,7 +7,7 @@ use super::{
     encode,
     group::Channel,
     predictor::Predictor,
-    tree::{Tree, pack_signed},
+    tree::{ChannelTree, Tree, pack_signed},
     weighted,
 };
 use crate::{Error, Result, execution, tools::lz77::Literal};
@@ -55,22 +55,62 @@ fn channel(
     wp: &weighted::Header,
     previous_channels: usize,
     stream_id: usize,
-    stateless: &[Predictor],
     scratch: &mut Scratch,
     mut emit: impl FnMut(Literal),
 ) -> Result<()> {
     let channel = &planes[c];
+    if channel.samples.is_empty() {
+        return Ok(());
+    }
+    let plan = ChannelTree::new(tree, c, stream_id);
+    // A static leaf needs no properties or weighted history. Consume the SIMD
+    // residual row directly, keeping the original tree's entropy context IDs.
+    if let Some(leaf) = plan.leaf()
+        && !leaf.predictor.has_weighted()
+    {
+        let row = &mut scratch.rows[leaf.predictor as usize];
+        row.resize(channel.width, 0);
+        for y in 0..channel.height {
+            super::predict_simd::residual_row(
+                &channel.samples,
+                channel.width,
+                channel.width,
+                y,
+                leaf.predictor,
+                row,
+            )
+            .map_err(|e| Error::Encoding(e.to_string()))?;
+            for &value in row.iter() {
+                let residual = value - i64::from(leaf.offset);
+                let residual = if leaf.multiplier == 1 {
+                    residual
+                } else {
+                    if residual % i64::from(leaf.multiplier) != 0 {
+                        return Err(Error::Encoding(
+                            "MA multiplier does not divide a residual".into(),
+                        ));
+                    }
+                    residual / i64::from(leaf.multiplier)
+                };
+                emit(Literal {
+                    context: leaf.context as u32,
+                    value: pack_signed(residual as i32),
+                });
+            }
+        }
+        return Ok(());
+    }
     encode::visit_channel(
         planes,
         c,
         wp,
-        tree.uses_weighted(),
-        previous_channels,
+        plan.weighted,
+        previous_channels.min(plan.previous_channels),
         stream_id,
         |_, pos, _n, wp_pred, props, value| {
             let x = pos % channel.width;
             if x == 0 {
-                for &predictor in stateless {
+                for &predictor in &plan.predictors {
                     let row = &mut scratch.rows[predictor as usize];
                     row.resize(channel.width, 0);
                     super::predict_simd::residual_row(
@@ -84,22 +124,29 @@ fn channel(
                     .map_err(|e| Error::Encoding(e.to_string()))?;
                 }
             }
-            let (context, predictor, offset, multiplier) = tree.lookup(props)?;
+            let leaf = plan.lookup(props)?;
+            let (context, predictor, offset, multiplier) =
+                (leaf.context, leaf.predictor, leaf.offset, leaf.multiplier);
             let residual = if predictor == Predictor::Weighted {
                 i64::from(value) - i64::from(wp_pred)
             } else {
                 scratch.rows[predictor as usize][x]
             } - i64::from(offset);
-            if residual % i64::from(multiplier) != 0 {
-                return Err(Error::Encoding(
-                    "MA multiplier does not divide a residual".into(),
-                ));
-            }
+            let residual = if multiplier == 1 {
+                residual
+            } else {
+                if residual % i64::from(multiplier) != 0 {
+                    return Err(Error::Encoding(
+                        "MA multiplier does not divide a residual".into(),
+                    ));
+                }
+                residual / i64::from(multiplier)
+            };
             // Narrow after division exactly as the source PackSigned call.
             // Decoder arithmetic reconstructs signed floating words modulo 2^32.
             emit(Literal {
                 context: context as u32,
-                value: pack_signed((residual / i64::from(multiplier)) as i32),
+                value: pack_signed(residual as i32),
             });
             Ok(())
         },
@@ -120,11 +167,6 @@ pub(super) fn tokenize(
     tokens
         .try_reserve_exact(count)
         .map_err(|_| Error::Limit("Modular token allocation"))?;
-    let stateless: Vec<_> = tree
-        .predictors()
-        .into_iter()
-        .filter(|p| !p.has_weighted())
-        .collect();
     let parallel = parallel
         && count >= 65536
         && !execution::is_serial()
@@ -146,7 +188,6 @@ pub(super) fn tokenize(
                 wp,
                 previous_channels,
                 stream_id,
-                &stateless,
                 &mut scratch,
                 |t| tokens.push(t),
             )?;
@@ -181,7 +222,6 @@ pub(super) fn tokenize(
                 wp,
                 previous_channels,
                 stream_id,
-                &stateless,
                 &mut Scratch::default(),
                 |t| {
                     destination[written] = t;
@@ -315,6 +355,49 @@ mod tests {
             .install(|| tokenize(&planes, &tree, &weighted::Header::default(), 0, 0, true))
             .unwrap_err();
         assert!(matches!(error, Error::Encoding(_)));
+    }
+
+    #[test]
+    fn specialized_leaves_preserve_wide_residuals_offsets_multipliers_and_tails() {
+        for width in [1, 2, 7, 8, 17, 65] {
+            let channel = Channel {
+                width,
+                height: 3,
+                hshift: 0,
+                vshift: 0,
+                samples: (0..width * 3)
+                    .map(|i| [i32::MIN, i32::MAX, 0, -6, 12][i % 5])
+                    .collect(),
+            };
+            for p in 0..14 {
+                let tree = Tree::new(vec![Node::Leaf {
+                    predictor: Predictor::try_from(p).unwrap(),
+                    offset: -17,
+                    multiplier: 1,
+                }])
+                .unwrap();
+                let planes = [channel.clone()];
+                let wp = weighted::Header::default();
+                assert_eq!(
+                    tokenize(&planes, &tree, &wp, 3, 19, false).unwrap(),
+                    scalar(&planes, &tree, &wp)
+                );
+            }
+            let mut channel = channel;
+            channel.samples = (0..width * 3).map(|i| (i as i32 - 30) * 6 + 5).collect();
+            let tree = Tree::new(vec![Node::Leaf {
+                predictor: Predictor::Zero,
+                offset: 5,
+                multiplier: 6,
+            }])
+            .unwrap();
+            let planes = [channel];
+            let wp = weighted::Header::default();
+            assert_eq!(
+                tokenize(&planes, &tree, &wp, 3, 19, false).unwrap(),
+                scalar(&planes, &tree, &wp)
+            );
+        }
     }
 
     #[test]

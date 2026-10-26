@@ -19,7 +19,10 @@ use super::{
     SourceBucketMode, SourceChainCache, SourceConfig, SourceFastPrefix, SourceFastRanges,
     SourceLz77Method,
 };
-use crate::Result;
+use crate::{Error, Result};
+
+#[path = "lz77_source_seed_profile.rs"]
+mod seed_profile;
 
 pub(super) fn hash(values: &[u32], position: usize) -> u32 {
     // C++ GetHash returns zero for an incomplete tail, which still participates
@@ -45,13 +48,14 @@ fn prefer_match_caching(tokens: usize, seed_tokens: usize) -> bool {
 
 #[derive(Clone)]
 struct Ring<const N: usize> {
-    positions: [usize; N],
-    next: usize,
-    size: usize,
+    positions: [u32; N],
+    next: u8,
+    size: u8,
 }
 
 impl<const N: usize> Ring<N> {
     fn new() -> Self {
+        assert!(N != 0 && N <= u8::MAX as usize);
         Self {
             positions: [0; N],
             next: 0,
@@ -59,21 +63,87 @@ impl<const N: usize> Ring<N> {
         }
     }
     fn insert(&mut self, position: usize) {
-        self.positions[self.next] = position;
-        self.next = (self.next + 1) % N;
-        self.size = (self.size + 1).min(N);
+        debug_assert!(u32::try_from(position).is_ok());
+        self.positions[self.next as usize] = position as u32;
+        self.next = ((self.next as usize + 1) % N) as u8;
+        self.size = (self.size as usize + 1).min(N) as u8;
     }
     // LZ77InsertRepeatedBucket: preserve physical ring rotation as well as the
     // retained entries because LZ77HashMap searches physical slots in order.
     fn repeated(&mut self, begin: usize, end: usize) {
+        debug_assert!(begin <= end && (begin == end || u32::try_from(end - 1).is_ok()));
         let count = end - begin;
         let retained = count.min(N);
-        let first = (self.next + count - retained) % N;
+        let next = (self.next as usize + count % N) % N;
+        let first = (next + N - retained) % N;
         for i in 0..retained {
-            self.positions[(first + i) % N] = end - retained + i;
+            self.positions[(first + i) % N] = (end - retained + i) as u32;
         }
-        self.next = (self.next + count) % N;
-        self.size = (self.size + count).min(N);
+        self.next = next as u8;
+        self.size = (self.size as usize + retained).min(N) as u8;
+    }
+}
+
+fn validate_ring_input_len(len: usize) -> Result<()> {
+    // Public source streams already have an i32 index limit. Also guard direct
+    // matcher construction before any positions are narrowed into the rings.
+    if u32::try_from(len).is_err() {
+        return Err(Error::Limit("source LZ77 ring index domain"));
+    }
+    Ok(())
+}
+
+#[inline]
+fn consider_fast_match(
+    values: &[u32],
+    position: usize,
+    limit: usize,
+    distance: usize,
+    ranges: SourceFastRanges,
+    best: &mut Match,
+    symbol: impl FnOnce() -> u32,
+) {
+    let previous = position - distance;
+    // The bucket hash and spatial tags can collide. Prove the mandatory prefix
+    // before looking up a distance symbol, and do not compare it again below.
+    if limit < MIN_MATCH
+        || values[position] != values[previous]
+        || values[position + 2] != values[previous + 2]
+        || values[position + 1] != values[previous + 1]
+    {
+        return;
+    }
+    let symbol = symbol();
+    let required = if best.length == 0 {
+        MIN_MATCH
+    } else {
+        best.length + usize::from(symbol >= best.symbol)
+    };
+    if required > limit
+        || (required > MIN_MATCH
+            && values[position + required - 1] != values[previous + required - 1])
+    {
+        return;
+    }
+    let length = if ranges.extension() {
+        MIN_MATCH
+            + super::search::fast_match_length(
+                &values[position + MIN_MATCH..position + limit],
+                &values[previous + MIN_MATCH..previous + limit],
+            )
+    } else {
+        let mut length = MIN_MATCH;
+        while length < limit && values[position + length] == values[previous + length] {
+            length += 1;
+        }
+        length
+    };
+    if length >= required {
+        *best = Match {
+            length,
+            distance,
+            symbol,
+        };
     }
 }
 
@@ -85,13 +155,16 @@ pub(super) struct Fast<'a, const N: usize> {
     spatial: Vec<(usize, u32)>,
     groups: Vec<SpecialPrefixGroup>,
     prefix: PrefixFilter<'a>,
+    candidates: [(usize, u32); 120],
     prefix_simd: bool,
     ranges: bool,
     fast_ranges: SourceFastRanges,
+    diagnostics: seed_profile::Profile,
 }
 
 impl<'a, const N: usize> Fast<'a, N> {
     pub(super) fn new(values: &'a [u32], width: usize, config: &SourceConfig) -> Result<Self> {
+        validate_ring_input_len(values.len())?;
         let codes = super::distances::FastCodes::new(width)?;
         let mut spatial = Vec::new();
         if width != 0 {
@@ -138,23 +211,42 @@ impl<'a, const N: usize> Fast<'a, N> {
             spatial,
             groups,
             prefix: PrefixFilter::new(values, policy),
+            candidates: [(0, 0); 120],
             prefix_simd,
             ranges: config.range_search,
             fast_ranges: config.fast_ranges,
+            diagnostics: seed_profile::Profile::new(values.len(), width, N),
         })
     }
 
     pub(super) fn find(&mut self, position: usize) -> Match {
+        if self.diagnostics.sample_next() {
+            self.find_impl::<true>(position)
+        } else {
+            self.find_impl::<false>(position)
+        }
+    }
+
+    fn find_impl<const SAMPLE: bool>(&mut self, position: usize) -> Match {
+        let mut clock = None;
+        if SAMPLE {
+            clock = Some(std::time::Instant::now());
+        }
         let key = hash(self.values, position) as usize & ((1 << 14) - 1);
         self.prefix
             .begin_query(position)
             .expect("source query in bounds");
+        if SAMPLE {
+            self.diagnostics.prepare(&mut clock);
+        }
         let ring = &self.buckets[key];
         let mut best = Match::default();
-        let mut candidates = [(0usize, 0u32); 120];
+        // Only the overwritten prefix is consumed; the unused tail may retain
+        // candidates from earlier queries.
+        let candidates = &mut self.candidates;
         let mut count = 0;
-        if ring.size == N {
-            let safe = position - ring.positions[ring.next];
+        if ring.size as usize == N {
+            let safe = position - ring.positions[ring.next as usize] as usize;
             if self.ranges {
                 if self
                     .spatial
@@ -207,50 +299,43 @@ impl<'a, const N: usize> Fast<'a, N> {
                 }
             }
         }
-        let limit = self.maximum.min(self.values.len() - position);
-        let mut consider = |distance: usize, symbol: u32| {
-            let previous = position - distance;
-            let required = if best.length == 0 {
-                MIN_MATCH
-            } else {
-                best.length + usize::from(symbol >= best.symbol)
-            };
-            if required > limit
-                || self.values[position] != self.values[previous]
-                || self.values[position + required - 1] != self.values[previous + required - 1]
-            {
-                return;
-            }
-            let length = if self.fast_ranges.extension() {
-                super::search::match_length(
-                    &self.values[position..position + limit],
-                    &self.values[previous..previous + limit],
-                )
-            } else {
-                let mut length = 0;
-                while length < limit
-                    && self.values[position + length] == self.values[previous + length]
-                {
-                    length += 1;
-                }
-                length
-            };
-            if length >= required {
-                best = Match {
-                    length,
-                    distance,
-                    symbol,
-                };
-            }
-        };
-        for &(distance, symbol) in &candidates[..count] {
-            consider(distance, symbol);
+        if SAMPLE {
+            self.diagnostics.spatial_filter(&mut clock);
         }
-        for &previous in &ring.positions[..ring.size] {
-            let distance = position - previous;
+        let limit = self.maximum.min(self.values.len() - position);
+        for &(distance, symbol) in &candidates[..count] {
+            consider_fast_match(
+                self.values,
+                position,
+                limit,
+                distance,
+                self.fast_ranges,
+                &mut best,
+                || symbol,
+            );
+        }
+        if SAMPLE {
+            self.diagnostics.spatial_matches(&mut clock);
+        }
+        for &previous in &ring.positions[..ring.size as usize] {
+            let distance = position - previous as usize;
             if distance <= WINDOW_SIZE {
-                consider(distance, self.codes.symbol(distance));
+                consider_fast_match(
+                    self.values,
+                    position,
+                    limit,
+                    distance,
+                    self.fast_ranges,
+                    &mut best,
+                    || self.codes.symbol(distance),
+                );
             }
+        }
+        if SAMPLE {
+            self.diagnostics.ring_matches(&mut clock);
+            // Counter-only rescans are outside the sampled matching clocks.
+            let sample = seed_profile::Sample::capture(self, key, position, best, count);
+            self.diagnostics.record(sample);
         }
         self.buckets[key].insert(position);
         best
@@ -299,6 +384,8 @@ pub(super) struct Chain<'a> {
     cache: MatchCache,
     #[cfg(test)]
     pub(super) last_visits: usize,
+    #[cfg(test)]
+    extensions: usize,
 }
 
 impl<'a> Chain<'a> {
@@ -309,6 +396,17 @@ impl<'a> Chain<'a> {
         maximum: usize,
     ) -> Result<Self> {
         let window = window(values.len());
+        Self::with_window(values, width, limit, maximum, window)
+    }
+
+    pub(super) fn with_window(
+        values: &'a [u32],
+        width: usize,
+        limit: usize,
+        maximum: usize,
+        window: usize,
+    ) -> Result<Self> {
+        debug_assert!(window.is_power_of_two() && window <= WINDOW_SIZE);
         let mut chain = reserved(window)?;
         chain.extend((0..window).map(|i| i as u32));
         Ok(Self {
@@ -327,6 +425,8 @@ impl<'a> Chain<'a> {
             cache: MatchCache::uncached(),
             #[cfg(test)]
             last_visits: 0,
+            #[cfg(test)]
+            extensions: 0,
         })
     }
 
@@ -371,6 +471,15 @@ impl<'a> Chain<'a> {
         &mut self,
         position: usize,
         keep_short: bool,
+        visit: impl FnMut(Match),
+    ) {
+        self.find_matches_impl::<true>(position, keep_short, visit);
+    }
+
+    fn find_matches_impl<const PRUNE: bool>(
+        &mut self,
+        position: usize,
+        keep_short: bool,
         mut visit: impl FnMut(Match),
     ) {
         let slot = position & (self.window - 1);
@@ -386,16 +495,52 @@ impl<'a> Chain<'a> {
             previous_distance = distance;
             let mut length = 0;
             if distance > 0 {
-                let prefix = if self.numzeros > 3 {
+                let mut prefix = if self.numzeros > 3 {
                     (self.numzeros - 1)
                         .min(self.zeros[previous_slot] as usize)
                         .min(limit.saturating_sub(1))
                 } else {
                     0
                 };
-                length =
-                    self.cache
-                        .length_with_prefix(self.values, position, distance, limit, prefix);
+                let required = if keep_short {
+                    MIN_MATCH
+                } else {
+                    MIN_MATCH.max(best.saturating_sub(2))
+                };
+                // A hash hit need not match its mandatory prefix. For ordinary
+                // chains, a failed required endpoint also proves the extension
+                // cannot be emitted. Keep walking every link: zero-run chain
+                // selection depends on the actual length, so bypass this filter
+                // whenever that selection is possible.
+                let reject = if PRUNE && self.numzeros < 3 {
+                    let previous = position - distance;
+                    if required > limit
+                        || self.values[position + required - 1]
+                            != self.values[previous + required - 1]
+                        || self.values[position..position + MIN_MATCH]
+                            != self.values[previous..previous + MIN_MATCH]
+                    {
+                        true
+                    } else {
+                        prefix = MIN_MATCH;
+                        false
+                    }
+                } else {
+                    false
+                };
+                if !reject {
+                    #[cfg(test)]
+                    {
+                        self.extensions += 1;
+                    }
+                    length = self.cache.length_with_prefix(
+                        self.values,
+                        position,
+                        distance,
+                        limit,
+                        prefix,
+                    );
+                }
                 if length >= MIN_MATCH && (keep_short || length >= best.saturating_sub(2)) {
                     visit(Match {
                         length,
@@ -536,11 +681,13 @@ impl ShortBuckets {
             }
             Self::Large(buckets) => {
                 let bucket = &buckets[slot];
-                for i in 0..bucket.size {
-                    visit(bucket.positions[bucket.next.wrapping_sub(i + 1) & 127]);
+                for i in 0..bucket.size as usize {
+                    visit(
+                        bucket.positions[(bucket.next as usize).wrapping_sub(i + 1) & 127] as usize,
+                    );
                 }
                 if bucket.size == 128 {
-                    bucket.positions[bucket.next]
+                    bucket.positions[bucket.next as usize] as usize
                 } else {
                     0
                 }
@@ -569,6 +716,7 @@ pub(super) struct Buckets<'a, const LONG: usize = 8> {
 
 impl<'a, const LONG: usize> Buckets<'a, LONG> {
     pub(super) fn new(values: &'a [u32], width: usize, config: &SourceConfig) -> Result<Self> {
+        validate_ring_input_len(values.len())?;
         let window = window(values.len());
         let mode = config.bucket_route().mode;
         let short = ShortBuckets::new(mode == SourceBucketMode::Short128)?;
@@ -863,8 +1011,62 @@ impl<'a> Optimal<'a> {
 }
 
 #[cfg(test)]
+#[path = "lz77_source_fast_tests.rs"]
+mod fast_tests;
+
+#[cfg(test)]
+#[path = "lz77_source_short_tests.rs"]
+mod short_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chain_extension_filter_preserves_candidates_visits_and_zero_chain_routes() {
+        let mut values = Vec::new();
+        for block in 0..32u32 {
+            let begin = values.len();
+            values.extend([7, 8, 9]);
+            values.extend((3..32).map(|i| 1000 + block * 37 + i));
+            values.extend_from_within(begin..begin + 32);
+            values.extend(std::iter::repeat_n(0, block as usize % 17));
+            values.extend([u32::MAX, 1, 0, 0, 1]);
+        }
+        let mut saved = 0;
+        for cap in [1, 3, 8, 256] {
+            for maximum in [3, 8, 97] {
+                for keep_short in [false, true] {
+                    for cached in [false, true] {
+                        let mut plain = Chain::new(&values, 37, cap, maximum).unwrap();
+                        let mut filtered = Chain::new(&values, 37, cap, maximum).unwrap();
+                        if cached {
+                            plain.cache = MatchCache::new(plain.window).unwrap();
+                            filtered.cache = MatchCache::new(filtered.window).unwrap();
+                        }
+                        for position in 0..values.len() {
+                            plain.update(position);
+                            filtered.update(position);
+                            let mut expected = Vec::new();
+                            let mut actual = Vec::new();
+                            plain.find_matches_impl::<false>(position, keep_short, |m| {
+                                expected.push(tuple(m))
+                            });
+                            filtered.find_matches(position, keep_short, |m| actual.push(tuple(m)));
+                            assert_eq!(
+                                actual, expected,
+                                "p={position} cap={cap} max={maximum} short={keep_short} cached={cached}"
+                            );
+                            assert_eq!(filtered.last_visits, plain.last_visits);
+                        }
+                        assert!(filtered.extensions <= plain.extensions);
+                        saved += plain.extensions - filtered.extensions;
+                    }
+                }
+            }
+        }
+        assert!(saved > 0, "fixture must exercise rejected extensions");
+    }
 
     #[test]
     fn optimal_chain_limit_and_cache_overrides_keep_source_method_and_route_gates() {
@@ -1318,7 +1520,7 @@ mod tests {
         }
         let codes = DistanceCodes::new(width, WINDOW_SIZE);
         let mut history = vec![Vec::<usize>::new(); 1 << 14];
-        for position in 0..values.len().saturating_sub(2) {
+        for position in 0..values.len() {
             let key = hash(values, position) as usize & 16383;
             let bucket = &mut history[key];
             let mut previous = bucket.clone();
@@ -1356,6 +1558,9 @@ mod tests {
                     };
                 }
             }
+            // A query must overwrite every scratch entry it consumes, even
+            // after a query with more spatial candidates or at a short tail.
+            matcher.candidates.fill((usize::MAX, u32::MAX));
             assert_eq!(
                 tuple(matcher.find(position)),
                 tuple(expected),
