@@ -6,6 +6,10 @@
 use super::scan::{IMPLICIT_PALETTE_SIZE, LosslessScan, ScanRegion, centered_region};
 use crate::{Error, Image, PixelData, Result};
 
+#[cfg(test)]
+#[path = "context_probe_tests.rs"]
+mod context_probe_tests;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum AtlasMode {
     #[default]
@@ -209,13 +213,28 @@ pub fn screen_regions(
     } else if options.context_side != 0 {
         let cw = w.min(options.context_side);
         let ch = h.min(options.context_side);
-        for i in 0..3 {
-            regions.push(ScanRegion {
-                x: i * (w - cw) / 2,
-                y: i * (h - ch) / 2,
-                width: cw,
-                height: ch,
-            });
+        if let Some(scan) = scan {
+            // Keep the coverage scan's separated activity strata, but provide
+            // vertical context instead of replacing them with diagonal crops.
+            for anchor in scan.regions() {
+                regions.push(centered_region(
+                    w,
+                    h,
+                    anchor.x + anchor.width / 2,
+                    anchor.y + anchor.height / 2,
+                    cw,
+                    ch,
+                ));
+            }
+        } else {
+            for i in 0..3 {
+                regions.push(ScanRegion {
+                    x: i * (w - cw) / 2,
+                    y: i * (h - ch) / 2,
+                    width: cw,
+                    height: ch,
+                });
+            }
         }
     } else if let Some(scan) = scan {
         let limit = if large {

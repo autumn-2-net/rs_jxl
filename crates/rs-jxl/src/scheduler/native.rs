@@ -26,6 +26,9 @@ use super::{
 #[path = "native_overlap.rs"]
 mod native_overlap;
 
+#[path = "native_front.rs"]
+pub(super) mod front;
+
 #[path = "native_tools.rs"]
 mod native_tools;
 #[cfg(test)]
@@ -42,6 +45,9 @@ pub enum NativeAcceptance {
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NativeBackendOptions {
+    /// Opt-in immutable preparation reuse across full candidates in this search.
+    /// Zero disables it; the cap covers retained buffers, not total process RSS.
+    pub preparation_cache_bytes: usize,
     pub acceptance: NativeAcceptance,
     /// Explicit override for full native test runs. Does not pretend the source
     /// automatic patch decision was performed. Strict mode rejects a rewrite.
@@ -109,6 +115,9 @@ pub struct NativeSearchResult {
     pub output: SearchResult<NativeArtifact>,
     /// One entry per callback, including all independent probe encodes.
     pub adaptations: Vec<NativeAdaptation>,
+    pub preparation_reuse: Option<crate::modular::candidate_cache::ReuseStats>,
+    /// Actual original-image group work, separate from independent crop probes.
+    pub progressive: Option<super::progressive::ProgressiveReport>,
 }
 
 #[derive(Clone, Copy)]
@@ -260,6 +269,9 @@ pub(super) fn prepare(
             .options
             .ok_or_else(|| Error::Encoding(format!("unavailable native candidate: {gaps:?}")))?,
     };
+    if kind == NativeTrialKind::Probe {
+        options.modular.candidate_cache = None;
+    }
     if kind == NativeTrialKind::Probe && options.modular.source_channel_tree_final_only {
         options.modular.source_channel_tree = crate::modular::ma_train::ChannelTreeMode::Disabled;
         if let Some(reference) = &mut options.source_patch_reference {
@@ -411,7 +423,16 @@ pub(super) fn run_native_search_with_pool(
             "native scout pilot consensus requires model-adjusted probe ranking".into(),
         ));
     }
-    let base = scout_execution_options(base, driver_options.adaptive_scout);
+    let mut base = scout_execution_options(base, driver_options.adaptive_scout);
+    let reuse_scope = (settings.preparation_cache_bytes != 0 && context.is_none()).then(|| {
+        crate::modular::candidate_cache::CandidateCache::scope(
+            image,
+            settings.preparation_cache_bytes,
+        )
+    });
+    base.modular.candidate_cache = reuse_scope
+        .as_ref()
+        .map(|scope| std::sync::Arc::clone(&scope.cache));
     let base = &base;
     let mut driver_options = driver_options.clone();
     let execution = WorkerExecution {
@@ -696,10 +717,12 @@ pub(super) fn run_native_search_with_pool(
     Ok(NativeSearchResult {
         output,
         adaptations,
+        preparation_reuse: reuse_scope.as_ref().map(|scope| scope.cache.stats()),
+        progressive: None,
     })
 }
 
-fn scout_execution_options(base: &EncodeOptions, enabled: bool) -> EncodeOptions {
+pub(super) fn scout_execution_options(base: &EncodeOptions, enabled: bool) -> EncodeOptions {
     let mut options = base.clone();
     if enabled {
         // These tools preserve the selected sample sites and predictor state;

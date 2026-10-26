@@ -63,6 +63,14 @@ enum Matcher {
     Routed,
 }
 
+fn parse_context_side(value: &str) -> std::result::Result<u16, String> {
+    match value {
+        "256" => Ok(256),
+        "512" => Ok(512),
+        _ => Err("pilot-context-side must be 256 or 512".into()),
+    }
+}
+
 fn parse_quantile_splits(value: &str) -> std::result::Result<u8, String> {
     match value {
         "32" => Ok(32),
@@ -82,6 +90,9 @@ struct Args {
     output: Option<PathBuf>,
     #[arg(long, value_enum, default_value = "automatic")]
     family: Family,
+    /// Override the RCT for a fixed-plan measurement, without the outer search.
+    #[arg(long, conflicts_with = "search", value_parser = clap::value_parser!(u8).range(0..=41))]
+    rct: Option<u8>,
     /// Override the source MA sample fraction for a direct candidate experiment.
     #[arg(long)]
     learning_fraction: Option<f32>,
@@ -128,6 +139,22 @@ struct Args {
     /// Experimental rejection of consistently weak near-tie pilot alternatives.
     #[arg(long, requires = "content_pilot")]
     pilot_near_tie_consensus: bool,
+    /// Experimental square fine probes for large images.
+    #[arg(long, requires = "content_pilot", value_parser = parse_context_side)]
+    pilot_context_side: Option<u16>,
+    /// Race and resume actual original-image groups, with ordinary fallback.
+    #[arg(
+        long,
+        requires = "content_pilot",
+        conflicts_with = "pilot_context_side"
+    )]
+    pilot_progressive_groups: bool,
+    /// Disable the cheap content router for controlled group-race experiments.
+    #[arg(long, requires = "pilot_progressive_groups")]
+    pilot_progressive_all_content: bool,
+    /// Print source scan evidence without running any encoder candidate.
+    #[arg(long, conflicts_with_all = ["output", "search"])]
+    scan_only: bool,
     #[arg(long, requires = "pilot_first", conflicts_with = "wide_probes", value_parser = clap::value_parser!(u16).range(1..=1024))]
     context_side: Option<u16>,
     #[arg(long)]
@@ -145,6 +172,12 @@ struct Args {
     /// Experimental coarse-only MA split thresholds.
     #[arg(long, value_parser = parse_quantile_splits, conflicts_with = "refine_quantiles")]
     quantile_splits: Option<u8>,
+    /// Build node-local weighted histograms with fewer bins (experimental).
+    #[arg(long, value_parser = clap::value_parser!(u16).range(2..=256), conflicts_with_all = ["refine_quantiles", "quantile_splits"])]
+    ma_histogram_bins: Option<u16>,
+    /// Share immutable preparation across full candidates, bounded in MiB.
+    #[arg(long, requires = "search", conflicts_with = "representations", value_parser = clap::value_parser!(u16).range(1..=1024))]
+    reuse_preparation_mib: Option<u16>,
     #[arg(long)]
     chain_batch: bool,
     #[arg(long, requires = "wide_probes", value_parser = clap::value_parser!(u16).range(1..=1024))]
@@ -206,6 +239,16 @@ impl Args {
 
     fn pilot_options(&self) -> PilotOptions {
         PilotOptions {
+            group_race: self.pilot_progressive_groups.then(|| {
+                rs_jxl::scheduler::progressive::GroupRaceOptions {
+                    content_route: !self.pilot_progressive_all_content,
+                    ..Default::default()
+                }
+            }),
+            context_probe_side: self.pilot_context_side.unwrap_or(0),
+            preparation_cache_bytes: self
+                .reuse_preparation_mib
+                .map_or(0, |mib| usize::from(mib) << 20),
             record_representations: self.representations,
             single_stage: self.pilot_single_stage,
             independent_probes: self.pilot_independent_probes,
@@ -229,6 +272,19 @@ fn run(args: Args) -> Result<()> {
         .read_to_end(&mut bytes)?;
     let decoded = input::decode(&bytes, true)?;
     let image = decoded.image;
+    if args.scan_only {
+        let scan = rs_jxl::scheduler::scan::scan_lossless_input(&image, Default::default());
+        println!(
+            "{}",
+            serde_json::json!({
+                "width": image.width(), "height": image.height(),
+                "colors": scan.sampled_colors, "flat": scan.sampled_flat,
+                "samples": scan.sampled_pixels, "literal": scan.literal_candidate,
+                "continuous_tone": scan.likely_continuous_tone(),
+            })
+        );
+        return Ok(());
+    }
     let mut params = CandidateParams::default().backend(args.effort)?;
     match args.family {
         Family::Automatic => {}
@@ -260,6 +316,9 @@ fn run(args: Args) -> Result<()> {
         }
     }
     params.probe_lz77 = args.lz;
+    if let Some(rct) = args.rct {
+        params.rct = Some(u32::from(rct));
+    }
     if let Some(fraction) = args.learning_fraction {
         params.learning_fraction = fraction;
     }
@@ -380,6 +439,7 @@ fn run(args: Args) -> Result<()> {
     }
     base.modular.source_ma_scoring.fast_entropy = args.shannon;
     base.modular.source_ma_search.refine_quantiles = args.refine_quantiles;
+    base.modular.source_ma_search.histogram_bins = args.ma_histogram_bins.unwrap_or(0);
     base.modular.source_ma_search.quantile_splits = match args.quantile_splits {
         None => rs_jxl::modular::ma_train::QuantileSplits::Disabled,
         Some(32) => rs_jxl::modular::ma_train::QuantileSplits::ThirtyTwo,
@@ -387,6 +447,7 @@ fn run(args: Args) -> Result<()> {
         Some(_) => return Err("quantile-splits must be 32 or 64".into()),
     };
     let seconds;
+    let mut search_report = serde_json::Value::Null;
     let start = Instant::now();
     let encoded = if args.search {
         let mut driver = DriverOptions::scout();
@@ -405,6 +466,9 @@ fn run(args: Args) -> Result<()> {
                 &driver,
                 &base,
                 NativeBackendOptions {
+                    preparation_cache_bytes: args
+                        .reuse_preparation_mib
+                        .map_or(0, |mib| usize::from(mib) << 20),
                     probe_palette: args.probe_palette,
                     model_adjusted_probes: args.model_adjusted,
                     routed_tools: matches!(matcher, Matcher::Routed),
@@ -419,6 +483,9 @@ fn run(args: Args) -> Result<()> {
             )?
         };
         seconds = start.elapsed().as_secs_f64();
+        if let Some(stats) = result.preparation_reuse {
+            eprintln!("preparation_reuse: {stats:?}");
+        }
         if args.representations {
             for record in &result.adaptations {
                 eprintln!(
@@ -434,6 +501,35 @@ fn run(args: Args) -> Result<()> {
             }
         }
         let output = result.output;
+        search_report = serde_json::json!({
+            "routes": output.report.events.iter().filter_map(|event| match event {
+                rs_jxl::scheduler::driver::SearchEvent::Route { name, candidates } =>
+                    Some(serde_json::json!({ "name": name, "candidates": candidates })),
+                _ => None,
+            }).collect::<Vec<_>>(),
+            "progressive": result.progressive.as_ref().map(|p| serde_json::json!({
+                "group_pixels": p.group_pixels,
+                "peak_retained_bytes": p.peak_retained_bytes,
+                "regions": p.regions.iter().map(|r| [r.x, r.y, r.width, r.height]).collect::<Vec<_>>(),
+                "candidates": p.candidates.iter().map(|c| serde_json::json!({
+                    "name": c.name, "params": format!("{:?}", c.params),
+                    "state": format!("{:?}", c.state),
+                    "total_groups": c.total_groups, "encoded_groups": c.encoded_groups,
+                    "reused_groups": c.reused_groups, "encoded_pixels": c.encoded_pixels,
+                    "sampled_region_bytes": c.sampled_region_bytes,
+                    "estimated_bytes": c.estimated_bytes, "seconds": c.seconds,
+                    "final_bytes": c.final_bytes,
+                })).collect::<Vec<_>>(),
+            })),
+            "full_encodes": output.report.full_encodes,
+            "probe_encodes": output.report.probe_encodes,
+            "probe_pixels": output.report.probe_pixels,
+            "winner_index": output.report.winner_index,
+            "trials": output.report.trials.iter().map(|trial| serde_json::json!({
+                "params": format!("{:?}", trial.params),
+                "bytes": trial.bytes, "lower_bound": trial.lower_bound,
+            })).collect::<Vec<_>>(),
+        });
         eprintln!(
             "full={} probes={} winner={:?}",
             output.report.full_encodes, output.report.probe_encodes, output.params
@@ -450,6 +546,7 @@ fn run(args: Args) -> Result<()> {
             },
         )?;
         seconds = start.elapsed().as_secs_f64();
+        eprintln!("candidate={params:?}");
         result.bytes
     };
     let pixels = f64::from(image.width()) * f64::from(image.height());
@@ -461,6 +558,7 @@ fn run(args: Args) -> Result<()> {
             "jpeg_pixel_input": decoded.jpeg, "family": format!("{:?}", args.family), "lz": args.lz,
             "matcher": format!("{matcher:?}"), "search_policy": args.search_policy(),
             "search": args.search, "timing": "encoder call only; input decode and output IO excluded",
+            "search_report": search_report,
         })
     );
     if let Some(path) = args.output {
@@ -489,6 +587,65 @@ fn main() -> std::process::ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn group_race_is_explicit_and_not_combined_with_crop_probe_experiments() {
+        let base = ["encoder_lab", "input.png", "--search", "--content-pilot"];
+        assert!(
+            Args::try_parse_from(base)
+                .unwrap()
+                .pilot_options()
+                .group_race
+                .is_none()
+        );
+        let mut argv = base.to_vec();
+        argv.push("--pilot-progressive-groups");
+        assert!(
+            Args::try_parse_from(&argv)
+                .unwrap()
+                .pilot_options()
+                .group_race
+                .is_some()
+        );
+        argv.extend(["--pilot-context-side", "256"]);
+        assert!(Args::try_parse_from(argv).is_err());
+        assert!(
+            Args::try_parse_from(["encoder_lab", "input.png", "--pilot-progressive-groups"])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn square_probe_parser_is_explicit_and_bounded() {
+        let base = ["encoder_lab", "input.png", "--search", "--content-pilot"];
+        assert_eq!(
+            Args::try_parse_from(base)
+                .unwrap()
+                .pilot_options()
+                .context_probe_side,
+            0
+        );
+        for value in ["256", "512"] {
+            let mut argv = base.to_vec();
+            argv.extend(["--pilot-context-side", value]);
+            assert_eq!(
+                Args::try_parse_from(argv)
+                    .unwrap()
+                    .pilot_options()
+                    .context_probe_side,
+                value.parse::<u16>().unwrap()
+            );
+        }
+        for value in ["0", "255", "300", "513", "x"] {
+            let mut argv = base.to_vec();
+            argv.extend(["--pilot-context-side", value]);
+            assert!(Args::try_parse_from(argv).is_err());
+        }
+        assert!(
+            Args::try_parse_from(["encoder_lab", "input.png", "--pilot-context-side", "256"])
+                .is_err()
+        );
+    }
     use clap::{CommandFactory, error::ErrorKind};
 
     #[test]
@@ -496,6 +653,29 @@ mod tests {
         let args = Args::try_parse_from(["encoder_lab", "input.png"]).unwrap();
         assert!(!args.shannon && !args.refine_quantiles);
         assert_eq!(args.quantile_splits, None);
+        assert_eq!(args.ma_histogram_bins, None);
+        for value in ["2", "16", "32", "64", "256"] {
+            let args =
+                Args::try_parse_from(["encoder_lab", "input.png", "--ma-histogram-bins", value])
+                    .unwrap();
+            assert_eq!(args.ma_histogram_bins, Some(value.parse().unwrap()));
+        }
+        for value in ["0", "1", "257", "-1", "x"] {
+            assert!(
+                Args::try_parse_from(["encoder_lab", "input.png", "--ma-histogram-bins", value])
+                    .is_err()
+            );
+        }
+        assert!(
+            Args::try_parse_from([
+                "encoder_lab",
+                "input.png",
+                "--ma-histogram-bins",
+                "32",
+                "--refine-quantiles"
+            ])
+            .is_err()
+        );
         for value in ["32", "64"] {
             let args =
                 Args::try_parse_from(["encoder_lab", "input.png", "--quantile-splits", value])

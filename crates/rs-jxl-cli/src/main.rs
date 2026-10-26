@@ -122,6 +122,9 @@ struct EncodeArgs {
     /// Experimental content-aware pilot-first search at source effort 9/10
     #[arg(long, requires = "source_search", conflicts_with = "source_scout")]
     source_pilot: bool,
+    /// Experimental original-group racing and continuation within source pilot
+    #[arg(long, requires = "source_pilot")]
+    source_progressive_groups: bool,
     /// Hard MA training sample limit, not a source sampling target
     #[arg(long, value_name = "N", default_value_t = DEFAULT_SOURCE_SAMPLE_LIMIT, requires = "source_effort", value_parser = parse_sample_limit)]
     source_sample_limit: usize,
@@ -215,7 +218,15 @@ fn encode_image(image: &rs_jxl::Image, args: &EncodeArgs) -> Result<Vec<u8>> {
             DriverOptions::default()
         };
         let result = if args.source_pilot {
-            rs_jxl::scheduler::pilot::encode(image, &params, &options)?
+            rs_jxl::scheduler::pilot::encode_with_options(
+                image,
+                &params,
+                &options,
+                rs_jxl::scheduler::pilot::PilotOptions {
+                    group_race: args.source_progressive_groups.then(Default::default),
+                    ..Default::default()
+                },
+            )?
         } else {
             run_native_pixel_search(image, &params, &driver, &options, settings)?
         };
@@ -467,6 +478,23 @@ mod tests {
         ])
         .unwrap();
         assert!(expect_encode(cli.command).source_pilot);
+        let cli = Cli::try_parse_from([
+            "rs-jxl",
+            "encode",
+            "a",
+            "b",
+            "--source-effort",
+            "9",
+            "--source-search",
+            "--source-pilot",
+            "--source-progressive-groups",
+        ])
+        .unwrap();
+        assert!(expect_encode(cli.command).source_progressive_groups);
+        assert!(
+            Cli::try_parse_from(["rs-jxl", "encode", "a", "b", "--source-progressive-groups",])
+                .is_err()
+        );
     }
 
     #[test]

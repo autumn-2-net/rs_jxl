@@ -19,8 +19,8 @@ fn population(planes: &[Channel]) -> Result<usize> {
     })
 }
 
-pub(super) fn shared_channel_parallel(
-    prepared: &[encode::Prepared],
+pub(super) fn shared_channel_parallel<'a>(
+    prepared: impl IntoIterator<Item = &'a encode::Prepared>,
     enabled: bool,
 ) -> Result<bool> {
     if !enabled

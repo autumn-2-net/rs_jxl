@@ -38,7 +38,19 @@ pub(super) fn encode_prepared_shared(
 
 pub(super) fn encode_prepared_shared_trial(
     global: Option<Prepared>,
-    mut groups: Vec<Prepared>,
+    groups: Vec<Prepared>,
+    options: &ModularOptions,
+    limit: usize,
+    patches: Option<&crate::tools::patches::PatchDictionary>,
+    bits: u8,
+    budget: Option<&SectionBudget>,
+) -> Result<TrialEncode<EncodedShared>> {
+    encode_prepared_shared_borrowed_trial(global.as_ref(), &groups, options, limit, patches, bits, budget)
+}
+
+pub(super) fn encode_prepared_shared_borrowed_trial(
+    global: Option<&Prepared>,
+    groups: &[Prepared],
     options: &ModularOptions,
     limit: usize,
     patches: Option<&crate::tools::patches::PatchDictionary>,
@@ -49,15 +61,14 @@ pub(super) fn encode_prepared_shared_trial(
     let single = groups.len() == 1 && global.is_none();
     let budget = budget.filter(|_| !single);
     let mut prepared = Vec::with_capacity(groups.len() + 1);
+    let empty = Prepared {
+        planes: Vec::new(), transforms: Vec::new(),
+        wp: weighted::Header::default(), stream_id: 0,
+    };
     if !single {
-        prepared.push(global.unwrap_or(Prepared {
-            planes: Vec::new(),
-            transforms: Vec::new(),
-            wp: weighted::Header::default(),
-            stream_id: 0,
-        }));
+        prepared.push(global.unwrap_or(&empty));
     }
-    prepared.append(&mut groups);
+    prepared.extend(groups.iter());
     let views: Vec<_> = prepared
         .iter()
         .filter(|g| g.planes.iter().any(|c| !c.samples.is_empty()))
@@ -75,7 +86,7 @@ pub(super) fn encode_prepared_shared_trial(
         training::learn(&views, options)?
     };
     let parallel_channels =
-        super::tokens::shared_channel_parallel(&prepared, options.parallel_tokens)?;
+        super::tokens::shared_channel_parallel(prepared.iter().copied(), options.parallel_tokens)?;
     let streams = if options.lz77
         && let Some(source_lz77) = &options.source_lz77
     {
@@ -90,7 +101,7 @@ pub(super) fn encode_prepared_shared_trial(
             )
         };
         let raw = if parallel_channels {
-            prepared.iter().map(tokenize).collect::<Result<Vec<_>>>()?
+            prepared.iter().map(|g| tokenize(g)).collect::<Result<Vec<_>>>()?
         } else {
             execution::try_map(&prepared, |_, g| tokenize(g))?
         };
@@ -124,7 +135,7 @@ pub(super) fn encode_prepared_shared_trial(
             )
         };
         if parallel_channels {
-            prepared.iter().map(encode).collect::<Result<Vec<_>>>()?
+            prepared.iter().map(|g| encode(g)).collect::<Result<Vec<_>>>()?
         } else {
             execution::try_map(&prepared, |_, g| encode(g))?
         }

@@ -31,11 +31,28 @@ use crate::encode::budget::{self, SectionBudget, TrialEncode, complete_or_return
 use crate::execution;
 use crate::region_input::ImageDescriptor;
 use crate::{Error, Image, Result, tools::patches::PatchDictionary};
+use super::candidate_cache::{PreparationKey, prepared_bytes};
+use std::sync::Arc;
 
-struct PreparedLayout {
-    global: Prepared,
-    streams: Vec<Prepared>,
-    partition: PartitionPlan,
+pub(super) struct PreparedLayout {
+    pub(super) global: Prepared,
+    pub(super) streams: Vec<Prepared>,
+    pub(super) partition: PartitionPlan,
+}
+
+fn reuse_preparation(
+    image: &Image,
+    options: &ModularOptions,
+    key: impl FnOnce() -> PreparationKey,
+    build: impl FnOnce() -> Result<PreparedLayout>,
+) -> Result<Arc<PreparedLayout>> {
+    if let Some(cache) = &options.candidate_cache
+        && options.representation_receipt.is_none()
+        && cache.matches(image)
+    {
+        return cache.get_or_build(key(), build, prepared_bytes);
+    }
+    build().map(Arc::new)
 }
 
 fn source_policy(options: &ModularOptions, responsive: bool) -> Result<PaletteOptions> {
@@ -524,6 +541,9 @@ fn prepare_layout(
     })
 }
 
+#[path = "group_session.rs"]
+pub(crate) mod session;
+
 fn read_image_area(
     image: &Image,
     options: &ModularOptions,
@@ -746,17 +766,20 @@ fn encode_frame_areas(
                 .areas_started
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
+        let prepared = reuse_preparation(
+            image,
+            &local,
+            || PreparationKey::area(&local, group_size_shift, area),
+            || prepare_frame_area_channels(
+                &descriptor, &local, group_size_shift, area,
+                read_image_area(image, &local, area)?,
+            ),
+        )?;
         let PreparedLayout {
             global,
             streams,
             partition,
-        } = prepare_frame_area_channels(
-            &descriptor,
-            &local,
-            group_size_shift,
-            area,
-            read_image_area(image, &local, area)?,
-        )?;
+        } = prepared.as_ref();
         if let Some(script) = &script {
             if script != &global.transforms {
                 return Err(Error::Encoding(
@@ -785,7 +808,7 @@ fn encode_frame_areas(
                 limit,
             )?;
         }
-        let encoded = complete_or_return!(budget::sections(budget, &streams, |_, stream| {
+        let encoded = complete_or_return!(budget::sections(budget, streams, |_, stream| {
             frame::encode_prepared_independent(stream, &local, limit, false, None, image.bits())
         }));
         for (bytes, stream) in encoded.into_iter().zip(&partition.streams) {
@@ -797,8 +820,8 @@ fn encode_frame_areas(
                 limit,
             )?;
         }
-        // Only output bytes survive into the next DC area, not raw channels,
-        // prepared samples, MA trees, predictor state or local entropy models.
+        // The optional scoped cache can retain immutable preparation within its
+        // byte cap. MA samples, trees and entropy models remain candidate-local.
     }
     let sections = sections
         .into_iter()
@@ -927,18 +950,22 @@ pub(crate) fn encode_layout_trial(
     };
     let prepared = {
         let _scope = crate::profile::scope("modular.prepare_layout");
-        prepare_layout(image, options, group_size_shift, passes, responsive)?
+        reuse_preparation(
+            image, options,
+            || PreparationKey::full(options, group_size_shift, passes, responsive),
+            || prepare_layout(image, options, group_size_shift, passes, responsive),
+        )?
     };
     let PreparedLayout {
         global,
         streams,
         partition,
-    } = prepared;
+    } = prepared.as_ref();
     // Source EncodeGroups excludes non-streaming one-group/one-pass frames:
     // their sections share a collapsed writer, so keep their outcome exact.
     let budget = budget.filter(|_| partition.num_groups != 1 || passes.num_passes != 1);
     let (global, encoded) = if shared {
-        complete_or_return!(frame::encode_prepared_shared_trial(
+        complete_or_return!(frame::encode_prepared_shared_borrowed_trial(
             Some(global),
             streams,
             options,
@@ -951,7 +978,7 @@ pub(crate) fn encode_layout_trial(
         let global = complete_or_return!(budget::section(budget, || {
             frame::encode_prepared_independent(&global, options, limit, true, patches, image.bits())
         }));
-        let encoded = complete_or_return!(budget::sections(budget, &streams, |_, g| {
+        let encoded = complete_or_return!(budget::sections(budget, streams, |_, g| {
             frame::encode_prepared_independent(g, options, limit, false, None, image.bits())
         }));
         (global, encoded)

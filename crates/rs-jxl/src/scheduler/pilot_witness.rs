@@ -5,7 +5,7 @@ use crate::modular::{
     source_options::{SourceBuffering, one_pass_geometry},
 };
 
-fn candidates(
+pub(crate) fn candidates(
     image: &Image,
     input: &CandidateParams,
     leader: &CandidateParams,

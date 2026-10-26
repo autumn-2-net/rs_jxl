@@ -10,6 +10,14 @@ use crate::{EncodeOptions, Error, Image, Result};
 /// Resource ceilings and per-invocation diagnostics for the opt-in pilot preset.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PilotOptions {
+    /// Resume real original-image AC groups instead of encoding cropped probes.
+    /// Unsupported dependent layouts retain the existing pilot policy.
+    pub group_race: Option<super::progressive::GroupRaceOptions>,
+    /// Experimental content-stratified square fine probes for large input.
+    /// Zero retains full-width strips; supported sides are 256 and 512.
+    pub context_probe_side: u16,
+    /// Retained immutable preparation across full candidates; zero disables.
+    pub preparation_cache_bytes: usize,
     /// Source MA whole-tree ceiling; None uses the decoder-derived bound,
     /// not base's direct encoder preset. Some(n) remains a hard caller cap.
     pub resources: NativeResourcePolicy,
@@ -37,6 +45,9 @@ pub struct PilotOptions {
 impl Default for PilotOptions {
     fn default() -> Self {
         Self {
+            group_race: None,
+            context_probe_side: 0,
+            preparation_cache_bytes: 0,
             resources: NativeResourcePolicy::default(),
             record_representations: false,
             single_stage: false,
@@ -77,6 +88,12 @@ fn policy(
     driver.scout_staged_probes = !literal && !options.single_stage;
     driver.scout_coarse_consensus = !literal && !options.single_stage;
     driver.screen.regions.full_width_strips = true;
+    if matches!(options.context_probe_side, 256 | 512)
+        && u64::from(image.width()) * u64::from(image.height()) >= 2 << 20
+    {
+        driver.screen.regions.full_width_strips = false;
+        driver.screen.regions.context_side = usize::from(options.context_probe_side);
+    }
     driver.probe_workers = Some(if options.independent_probes {
         driver.workers.concurrency(
             threads.clamp(1, 64),
@@ -86,6 +103,7 @@ fn policy(
         threads.clamp(1, 64)
     });
     let native = NativeBackendOptions {
+        preparation_cache_bytes: options.preparation_cache_bytes,
         acceptance: NativeAcceptance::AllowReportedGaps,
         probe_palette: literal,
         literal_palette_tools: literal,
@@ -164,6 +182,11 @@ pub fn encode_with_options(
     base: &EncodeOptions,
     options: PilotOptions,
 ) -> Result<NativeSearchResult> {
+    if !matches!(options.context_probe_side, 0 | 256 | 512) {
+        return Err(Error::InvalidInput(
+            "pilot context probe side must be 0, 256 or 512".into(),
+        ));
+    }
     if u64::from(image.width()) * u64::from(image.height()) > base.max_pixels {
         return Err(Error::Limit("pixel count"));
     }
@@ -176,6 +199,13 @@ pub fn encode_with_options(
     let literal = super::scan::literal_evidence(image);
     let (driver, native) = policy(image, literal, base.threads, options);
     let base = execution_options(base, literal);
+    if let Some(group_options) = options.group_race {
+        if let Some(result) =
+            super::progressive::try_encode(image, params, &driver, &base, native, group_options)?
+        {
+            return Ok(result);
+        }
+    }
     run_native_pixel_search(image, params, &driver, &base, native)
 }
 
@@ -185,6 +215,50 @@ mod tests {
     use crate::scheduler::native::{NativeTrialKind, prepare};
     use crate::{PixelData, PixelLayout};
     use std::sync::Arc;
+
+    #[test]
+    fn square_context_is_explicit_and_keeps_small_routes() {
+        for (width, height) in [(128, 64), (2048, 1024)] {
+            let input = Image::new(
+                width,
+                height,
+                PixelLayout::Gray,
+                PixelData::U8(vec![0; width as usize * height as usize]),
+            )
+            .unwrap();
+            for side in [0, 256, 512] {
+                for literal in [false, true] {
+                    let options = PilotOptions {
+                        context_probe_side: side,
+                        ..Default::default()
+                    };
+                    let (driver, native) = policy(&input, literal, 16, options);
+                    let active = side != 0 && width == 2048;
+                    assert_eq!(driver.screen.regions.full_width_strips, !active);
+                    assert_eq!(
+                        driver.screen.regions.context_side,
+                        if active { usize::from(side) } else { 0 }
+                    );
+                    assert_eq!(native.model_adjusted_probes, !literal);
+                    assert!(!native.probe_sampling_quarter);
+                }
+            }
+        }
+        assert!(
+            encode_with_options(
+                &image(),
+                &CandidateParams::default().backend(9).unwrap(),
+                &EncodeOptions::default(),
+                PilotOptions {
+                    context_probe_side: 300,
+                    ..Default::default()
+                }
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("context probe side")
+        );
+    }
 
     #[test]
     fn palette_tool_defaults_are_content_gated_and_explicit_policy_is_retained() {
@@ -524,6 +598,9 @@ mod tests {
             for leaves in [None, Some(7)] {
                 for record_representations in [false, true] {
                     let options = PilotOptions {
+                        context_probe_side: 0,
+                        group_race: None,
+                        preparation_cache_bytes: 0,
                         resources: NativeResourcePolicy {
                             max_tree_leaves: leaves,
                         },

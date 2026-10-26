@@ -2,7 +2,7 @@
 use super::*;
 use crate::modular::predictor::Predictor;
 
-fn competitive(candidate: &[usize], leader: &[usize]) -> bool {
+pub(crate) fn competitive(candidate: &[usize], leader: &[usize]) -> bool {
     if candidate.len() != leader.len() || candidate.is_empty() {
         return true;
     }
@@ -106,7 +106,7 @@ fn coarse_dominated(candidate: &[usize], leader: &[usize]) -> bool {
             .all(|(&a, &b)| b != 0 && a as u128 * 100 >= b as u128 * 101)
 }
 
-fn pilot_eligible(
+pub(crate) fn pilot_eligible(
     level: u8,
     consensus: bool,
     near_tie_consensus: bool,

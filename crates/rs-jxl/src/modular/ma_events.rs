@@ -3,8 +3,10 @@
 //! Opt-in sparse split sweeps. The clipped objective is enc_ma_entropy.h's
 //! MaClippedEntropy (b866b3de); record bucketing avoids its dense delta scans.
 
+#[cfg(test)]
+use super::SearchOptions;
 use super::{
-    Cost, ParentHistogram, PredictorPlan, PropertyValue, SampleStorage, Samples, SearchOptions,
+    Cost, ParentHistogram, PredictorPlan, PropertyValue, SampleStorage, Samples,
     SparseHistogramPlan, TrainOptions,
 };
 use crate::tools::ma_simd::{CountEntropyTable, DefaultScorer};
@@ -30,7 +32,7 @@ pub(super) fn eligible(
         || !(2..=MAX_TOTAL).contains(&total)
         || records < 2
         || options.scoring.fast_entropy
-        || options.search != SearchOptions::default()
+        || !options.search.default_sweep()
     {
         return false;
     }

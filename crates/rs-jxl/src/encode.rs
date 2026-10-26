@@ -9,6 +9,7 @@ use crate::{
 use std::io::Write;
 
 pub(crate) mod budget;
+pub(crate) mod session;
 use budget::{SectionBudget, TrialEncode, complete_or_return};
 
 #[derive(Clone, Debug)]

@@ -32,7 +32,7 @@ mod frontiers;
 #[path = "pilot_overlap.rs"]
 mod pilot_overlap;
 #[path = "pilot_witness.rs"]
-mod pilot_witness;
+pub(crate) mod pilot_witness;
 #[path = "preflight_stages.rs"]
 mod preflight_stages;
 #[path = "refinement.rs"]

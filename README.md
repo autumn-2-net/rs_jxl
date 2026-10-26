@@ -180,6 +180,13 @@ not the direct encoder's `base.modular.max_tree_leaves`. For example:
 .\target\release\rs-jxl.exe encode input.png output.jxl --source-effort 9 --source-search --source-pilot --threads 16 --source-sample-limit 33554432
 ```
 
+`--source-progressive-groups` optionally replaces eligible effort-9 pilot
+searches with cheap-front admission and resumable original-group racing.
+Decisive fronts encode directly; ambiguous fronts reuse completed group data.
+Unsupported dependent layouts and wide integers keep the ordinary pilot. See the
+[progressive scheduler](docs/PROGRESSIVE_GROUP_SCHEDULER.md) for scope,
+diagnostics, resource limits, and measured rollout status.
+
 `--ma-budget-mode strict|bounded` explicitly selects whether learned MA leaf
 exhaustion errors or stops optional splitting while retaining lossless pixels.
 `--ma-max-leaves N` adds a cap that survives source/pilot projection. Omission
@@ -253,6 +260,7 @@ not verified. Later changes must repeat the checks; see the checkpoint document.
 - [Rust pixel API](docs/PIXEL_API.md)
 - [MA tree budget modes and CLI controls](docs/MA_TREE_BUDGET.md)
 - [Exact MA partition reuse and dominance pruning](docs/MA_SEARCH_PRUNING.md)
+- [Progressive original-group scheduling](docs/PROGRESSIVE_GROUP_SCHEDULER.md)
 - [Incremental output and frame indexes](docs/STREAMING_OUTPUT.md)
 - [Fast lossless source port](docs/FJXL_PORT_STATUS.md)
 - [Byte-reversible JPEG API](docs/JPEG_API.md)

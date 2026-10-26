@@ -29,9 +29,18 @@ pub struct SearchOptions {
     pub statistical_race: bool,
     pub quantile_splits: QuantileSplits,
     pub refine_quantiles: bool,
+    /// Node-local weighted histogram bins, 2..=256; zero keeps the source sweep.
+    /// Unlike quantile_splits, coarsens collection itself, not just scoring.
+    pub histogram_bins: u16,
 }
 
 impl SearchOptions {
+    pub(super) fn default_sweep(self) -> bool {
+        !self.statistical_race
+            && self.quantile_splits == QuantileSplits::Disabled
+            && !self.refine_quantiles
+    }
+
     pub fn apply(&self, options: &mut TrainOptions) {
         options.search = *self;
     }

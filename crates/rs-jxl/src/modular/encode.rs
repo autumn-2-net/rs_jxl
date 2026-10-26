@@ -33,6 +33,9 @@ pub enum FixedTree {
 
 #[derive(Debug, Clone)]
 pub struct ModularOptions {
+    /// Invocation-scoped preparation sharing, installed by the native search.
+    /// Handles retained in returned artifacts are disabled when search ends.
+    pub candidate_cache: Option<std::sync::Arc<super::candidate_cache::CandidateCache>>,
     pub predictor: Predictor,
     pub rct: Option<u32>,
     pub weighted_preset: u8,
@@ -119,6 +122,7 @@ pub struct ModularOptions {
 impl Default for ModularOptions {
     fn default() -> Self {
         Self {
+            candidate_cache: None,
             predictor: Predictor::Best,
             rct: Some(6),
             weighted_preset: 0,

@@ -129,6 +129,11 @@ mod prepared_storage;
 mod ma_scoring;
 use ma_scoring::ScoreScratch;
 
+#[path = "ma_binning.rs"]
+mod ma_binning;
+#[cfg(test)]
+#[path = "ma_binning_tests.rs"]
+mod ma_binning_tests;
 #[path = "ma_search.rs"]
 mod ma_search;
 pub use ma_scoring::{ClippedEntropyMode, DescriptionCost, ScoringOptions};
@@ -523,6 +528,17 @@ impl TrainOptions {
 
     fn validate(&self) -> Result<()> {
         self.parallel_tools.workers.validate()?;
+        if self.search.histogram_bins != 0
+            && (!(2..=256).contains(&self.search.histogram_bins)
+                || self.search.refine_quantiles
+                || self.search.quantile_splits != QuantileSplits::Disabled
+                || self.search.statistical_race)
+        {
+            return Err(Error::InvalidInput(
+                "MA histogram bins must be 2..=256 and cannot combine with other split proposals"
+                    .into(),
+            ));
+        }
         if self.predictors.is_empty()
             || self.predictors.len() > 14
             || self.predictors.iter().any(|&p| p as u32 >= 14)
@@ -2351,16 +2367,34 @@ fn evaluate_property_values<T: PropertyValue>(
     scratch.below.resize(bins, Cost::default());
     scratch.above.clear();
     scratch.above.resize(bins, Cost::default());
-    if ma_events::eligible(
-        options,
-        total,
-        indices.len(),
-        used,
-        parents,
-        plan,
-        sparse_plan,
-        cached.is_some(),
-    ) {
+    let coarse_rows = if cached.is_none() {
+        ma_binning::prepare(
+            options.search.histogram_bins,
+            options.properties[property],
+            used,
+            weights,
+            total,
+            &mut scratch.property_bins,
+            &mut scratch.splits,
+            &mut scratch.score_mask,
+        )?
+    } else {
+        None
+    };
+    let coarsened = coarse_rows.is_some();
+    let _binning_scope = coarsened.then(|| crate::profile::scope("ma.adaptive_histogram"));
+    if !coarsened
+        && ma_events::eligible(
+            options,
+            total,
+            indices.len(),
+            used,
+            parents,
+            plan,
+            sparse_plan,
+            cached.is_some(),
+        )
+    {
         scratch.events.evaluate(
             samples,
             indices,
@@ -2386,23 +2420,28 @@ fn evaluate_property_values<T: PropertyValue>(
             &[],
         ));
     }
-    let rows = prepare_property_bins(
-        used,
-        options.property_bins,
-        indices.len(),
-        mapping.is_some(),
-        cached.is_some(),
-        &mut scratch.property_bins,
-    );
+    let rows = coarse_rows.unwrap_or_else(|| {
+        prepare_property_bins(
+            used,
+            options.property_bins,
+            indices.len(),
+            mapping.is_some(),
+            cached.is_some(),
+            &mut scratch.property_bins,
+        )
+    });
     let packed = rows != bins;
     // Property weights and live thresholds do not depend on the predictor.
     // Small descendants often occupy only a handful of the root's 256 bins.
     // One/two predictors do not amortize materializing a separate split table.
-    let reuse_splits = plan.active_count >= 4
+    let reuse_splits = coarsened
+        || plan.active_count >= 4
         || options.scoring != ScoringOptions::default()
-        || options.search != SearchOptions::default();
-    scratch.splits.clear();
-    if reuse_splits {
+        || !options.search.default_sweep();
+    if !coarsened {
+        scratch.splits.clear();
+    }
+    if reuse_splits && !coarsened {
         let mut weight_below = 0;
         for bin in first..last {
             if used[bin] != 0 {
@@ -2431,21 +2470,22 @@ fn evaluate_property_values<T: PropertyValue>(
         scorer.lanes(),
         options.padded_histogram && mapping.is_none(),
     );
-    let refine = ma_search::prepare_mask(
-        options.search,
-        options.scoring,
-        indices.len(),
-        options.properties[property],
-        used,
-        weights,
-        total,
-        first,
-        last,
-        rows.checked_mul(node_stride)
-            .ok_or(Error::Limit("MA refinement histogram size"))?,
-        parents.len(),
-        &mut scratch.score_mask,
-    )?;
+    let refine = !coarsened
+        && ma_search::prepare_mask(
+            options.search,
+            options.scoring,
+            indices.len(),
+            options.properties[property],
+            used,
+            weights,
+            total,
+            first,
+            last,
+            rows.checked_mul(node_stride)
+                .ok_or(Error::Limit("MA refinement histogram size"))?,
+            parents.len(),
+            &mut scratch.score_mask,
+        )?;
     let saved_count = if refine && cached.is_none() {
         parents.len()
     } else {
@@ -2687,7 +2727,9 @@ fn evaluate_property_values<T: PropertyValue>(
             let penalty = plan.penalty[predictor];
             let mut extra_below = 0u64;
             let _score_scope = histogram_detail_scope("ma.histogram_score");
-            if options.scoring == ScoringOptions::default() && scratch.score_mask.is_empty() {
+            if options.scoring == ScoringOptions::default()
+                && (scratch.score_mask.is_empty() || coarsened)
+            {
                 let mut weight_below = 0;
                 let count = if reuse_splits {
                     scratch.splits.len()
@@ -3073,7 +3115,9 @@ fn find_best_split_with_properties(
     let inherited_cache = working_cache.is_some();
     if working_cache.is_some() {
         stats.cache_reuses.fetch_add(1, Ordering::Relaxed);
-    } else if indices.len() >= options.histogram_cache_thresholds().0 {
+    } else if options.search.histogram_bins == 0
+        && indices.len() >= options.histogram_cache_thresholds().0
+    {
         let _scope = crate::profile::scope("ma.histogram_cache");
         let stride = options.padded_histogram.then(|| {
             histogram_stride(

@@ -5,6 +5,7 @@
 //! Crate-root registration and central test execution belong to the parent.
 
 pub(crate) mod auxiliary;
+pub mod candidate_cache;
 pub mod cost;
 pub mod encode;
 pub mod fixed;
