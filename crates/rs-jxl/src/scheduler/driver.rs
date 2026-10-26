@@ -84,6 +84,9 @@ pub struct DriverOptions {
     /// Opt-in probe-free tournament when a full frame fits within three legacy
     /// screening crops. Requires pilot-first; candidates retain backend effort.
     pub scout_small_full: bool,
+    /// Experimental family-level confirmation and probe-free small-frame plan.
+    /// Keeps e9 tools; avoids the fallback's learning-slope admission gates.
+    pub scout_family_tournament: bool,
     /// Native-only RCT0/6 aliases for Variable candidates with <3 total channels.
     /// Generic callbacks must leave this off unless they guarantee equivalence.
     pub scout_native_rct_aliases: bool,
@@ -381,6 +384,7 @@ where
     }
     if (options.scout_pilot_consensus
         || options.scout_small_full
+        || options.scout_family_tournament
         || options.scout_near_tie_consensus
         || options.scout_representation_witness
         || options.scout_staged_probes

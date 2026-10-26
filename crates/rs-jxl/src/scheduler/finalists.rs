@@ -26,7 +26,10 @@ where
     }
 
     fn compact_finalists(&self) -> Result<bool> {
-        Ok(self.options.scout_small_full && super::compact_pilot::compact_geometry(self.image)?)
+        Ok(self.options.scout_small_full
+            && (super::compact_pilot::compact_geometry(self.image)?
+                || (self.options.scout_family_tournament
+                    && super::compact_pilot::family_geometry(self.image))))
     }
 
     /// One means keep the original serial baseline path. The estimate matches

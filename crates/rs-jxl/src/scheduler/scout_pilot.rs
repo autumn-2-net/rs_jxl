@@ -230,6 +230,12 @@ where
         None => screen.score_plan(plan)?,
     };
     ranked.sort_by_key(|(c, _)| c.context_bytes);
+    // Keep the best original cross-channel transform as an anchor. Additional
+    // RCTs compete within that representation, not for more full-image slots.
+    let original_cross = ranked
+        .iter()
+        .find(|(c, _)| c.params.predictor == Some(Predictor::Variable))
+        .map(|(c, _)| c.params.clone());
     if !extended.is_empty()
         && ranked.first().is_some_and(|(_, leader_scores)| {
             ranked.iter().any(|(candidate, scores)| {
@@ -244,6 +250,24 @@ where
             name: "adaptive-scout-extended-cross",
             candidates: ranked.len(),
         });
+    }
+    if options.scout_family_tournament {
+        let cross_winner = ranked
+            .iter()
+            .find(|(c, _)| c.params.predictor == Some(Predictor::Variable))
+            .map(|(c, _)| c.params.clone());
+        let before = ranked.len();
+        ranked.retain(|(c, _)| {
+            c.params.predictor != Some(Predictor::Variable)
+                || Some(&c.params) == cross_winner.as_ref()
+                || Some(&c.params) == original_cross.as_ref()
+        });
+        if ranked.len() != before {
+            events.push(SearchEvent::Route {
+                name: "adaptive-scout-family-rct-confirmation",
+                candidates: ranked.len(),
+            });
+        }
     }
     events.push(SearchEvent::Frontier {
         candidates: ranked.iter().map(|(c, _)| c.clone()).collect(),
@@ -334,17 +358,18 @@ where
             }
         }
         let (leader, mut leader_scores) = ranked.remove(0);
-        // Crops cannot certify full-frame palette/patch behavior. Retain a real
-        // output for those distinct representations before pruning by scores.
+        // Preserve representation witnesses, but establish the ranked incumbent
+        // before running them so they can use a real encoded-byte cutoff.
         let witness = ranked.iter().find(|(candidate, scores)| {
             candidate.params.predictor == Some(Predictor::Zero)
                 && competitive(scores, &leader_scores)
         });
-        self.pilot_representation_witness(if leader.params.predictor == Some(Predictor::Zero) {
+        let witness_params = if leader.params.predictor == Some(Predictor::Zero) {
             &leader.params
         } else {
             witness.map_or(&leader.params, |(candidate, _)| &candidate.params)
-        })?;
+        }
+        .clone();
         // The first real candidate must complete. Subsequent candidates may
         // stop only at a proven encoded-byte bound, never a probe estimate.
         let mut leader_params = leader.params.clone();
@@ -392,6 +417,25 @@ where
             } else {
                 let baseline = self.search.trials().is_empty();
                 self.full(9, leader_params.clone(), baseline, false)?;
+            }
+        }
+        let wide_natural = self.options.scout_family_tournament
+            && self.image.bits() > 8
+            && witness_params.predictor.is_none();
+        if !wide_natural {
+            self.pilot_representation_witness(&witness_params)?;
+        }
+        // Mixed flat/foreground content can lose its literal representation in
+        // active-only crops. Confirm one real literal output, not every RCT.
+        if self.options.scout_family_tournament
+            && self.image.bits() <= 8
+            && self
+                .scan
+                .is_some_and(|s| s.sampled_pixels != 0 && s.sampled_flat * 2 >= s.sampled_pixels)
+        {
+            let literal = literal(self.input, 9, 0.01)?;
+            if self.search.find(&literal).is_none() {
+                self.full(9, literal, false, false)?;
             }
         }
         let batch_size = if overlap_finalists {
@@ -1150,3 +1194,7 @@ mod near_tie_tests;
 #[cfg(test)]
 #[path = "scout_overlap_finalists_tests.rs"]
 mod overlap_finalists_tests;
+
+#[cfg(test)]
+#[path = "family_pilot_tests.rs"]
+mod family_pilot_tests;

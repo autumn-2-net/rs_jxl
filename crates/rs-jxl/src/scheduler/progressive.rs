@@ -17,6 +17,8 @@ use crate::{
     modular::predictor::Predictor,
 };
 
+#[path = "group_admission.rs"]
+mod group_admission;
 #[path = "group_regions.rs"]
 mod regions;
 
@@ -32,6 +34,9 @@ pub struct GroupRaceOptions {
     /// old policy. A decisive cheap front skips real-group probing entirely.
     /// Disable only for experiments.
     pub content_route: bool,
+    /// Preserve cheap-front admission for ambiguous fronts. Natural and Zero
+    /// representations remain protected. Disable only for paired experiments.
+    pub shortlist: bool,
     /// At least three activity strata are required before heuristic rejection.
     pub probe_regions: usize,
     /// Maximum regions for refining close challengers against a finished
@@ -49,6 +54,7 @@ impl Default for GroupRaceOptions {
     fn default() -> Self {
         Self {
             content_route: true,
+            shortlist: true,
             probe_regions: 3,
             max_probe_regions: 9,
             discard_margin_basis_points: 100,
@@ -75,6 +81,8 @@ impl GroupRaceOptions {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CandidateState {
     Sampled,
+    /// Cheap-front heuristic rejection, before encoding any original groups.
+    FrontScreened,
     Screened,
     Complete,
     ByteBounded,
@@ -89,6 +97,8 @@ pub struct GroupCandidateReport {
     pub encoded_groups: usize,
     pub reused_groups: usize,
     pub encoded_pixels: u64,
+    /// Cheap crop scores, not comparable to original-group byte lengths.
+    pub pilot_scores: Vec<usize>,
     pub sampled_region_bytes: Vec<usize>,
     pub estimated_bytes: f64,
     pub seconds: f64,
@@ -509,6 +519,7 @@ pub(crate) fn try_encode(
             encoded_groups: 0,
             reused_groups: 0,
             encoded_pixels: 0,
+            pilot_scores: Vec::new(),
             sampled_region_bytes: Vec::new(),
             estimated_bytes: 0.0,
             seconds: start.elapsed().as_secs_f64(),
@@ -568,6 +579,14 @@ pub(crate) fn try_encode(
         usage = front.usage;
         events = front.events;
         let ranked = front.ranked?;
+        for contender in &mut contenders {
+            if let Some((_, scores)) = ranked
+                .iter()
+                .find(|(c, _)| c.params == contender.candidate.params)
+            {
+                contender.report.pilot_scores = scores.clone();
+            }
+        }
         if let Some(params) = decisive_front(&ranked, driver, &scan) {
             let witnesses = if driver.scout_representation_witness {
                 super::driver::pilot_witness::candidates(image, input, &params, Some(&scan))?
@@ -634,13 +653,26 @@ pub(crate) fn try_encode(
                 return finish(search, adaptations, events, usage, None).map(Some);
             }
         }
+        if options.shortlist {
+            let admitted = group_admission::admission(&plan, &ranked, driver, &scan);
+            for (contender, keep) in contenders.iter_mut().zip(admitted) {
+                if !keep {
+                    contender.session = None;
+                    contender.report.state = CandidateState::FrontScreened;
+                }
+            }
+        }
     }
     // Only ambiguous fronts need this reservation. A decisive front above
     // legitimately fits a one-full-encode caller budget. No real groups have
     // run yet; two extra full trials cover representation witnesses.
-    reserve_full_work(pixels, contenders.len() + 2, driver)?;
+    let active = contenders.iter().filter(|c| c.session.is_some()).count();
+    reserve_full_work(pixels, active + 2, driver)?;
     let mut peak = 0;
     for i in 0..contenders.len() {
+        if contenders[i].session.is_none() {
+            continue;
+        }
         sample(&mut contenders[i], sampled, image, &pool)?;
         peak = peak.max(retained(&contenders, 0, options)?);
     }
@@ -648,7 +680,9 @@ pub(crate) fn try_encode(
         contender.report.estimated_bytes =
             estimate(&contender.report.sampled_region_bytes, sampled);
     }
-    let mut order: Vec<_> = (0..contenders.len()).collect();
+    let mut order: Vec<_> = (0..contenders.len())
+        .filter(|&i| contenders[i].session.is_some())
+        .collect();
     order.sort_by(|&a, &b| {
         contenders[a]
             .report
@@ -685,7 +719,7 @@ pub(crate) fn try_encode(
         let before = search.best_before(10, false);
         if let Some(index) = contenders
             .iter()
-            .position(|c| c.candidate.params == witness)
+            .position(|c| c.session.is_some() && c.candidate.params == witness)
         {
             let baseline = search.trials().is_empty();
             let other = retained(

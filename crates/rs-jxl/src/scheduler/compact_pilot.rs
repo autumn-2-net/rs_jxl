@@ -18,6 +18,10 @@ pub(super) fn compact_geometry(image: &Image) -> Result<bool> {
     Ok(u64::from(image.width()) * u64::from(image.height()) <= screening_pixels)
 }
 
+pub(super) fn family_geometry(image: &Image) -> bool {
+    refinable(image) && u64::from(image.width()) * u64::from(image.height()) < 1 << 17
+}
+
 fn compact_plan(
     image: &Image,
     input: &CandidateParams,
@@ -34,6 +38,13 @@ fn compact_plan(
     };
     plan.push(neighborhood);
     plan.push(literal(input, 9, 0.0)?);
+    if options.scout_family_tournament {
+        // A weak 1% -> 10% training gain does not bound the benefit of 100%.
+        // Small inputs can compare these final plans without crop experiments.
+        for fraction in [0.03, 0.1, 1.0] {
+            plan.push(literal(input, 9, fraction)?);
+        }
+    }
     // Explicit extended transforms all get full-frame trials here; the larger
     // pilot's probe-rank gate does not apply to this compact tournament.
     for candidate in lossless_probe_plan(input, options.plan)
@@ -63,7 +74,8 @@ where
     pub(super) fn run_compact_pilot(&mut self) -> Result<bool> {
         if !self.options.scout_small_full
             || !self.options.scout_pilot_first
-            || !compact_geometry(self.image)?
+            || !(compact_geometry(self.image)?
+                || (self.options.scout_family_tournament && family_geometry(self.image)))
         {
             return Ok(false);
         }

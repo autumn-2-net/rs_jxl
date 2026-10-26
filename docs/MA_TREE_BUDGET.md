@@ -91,3 +91,38 @@ reconstruction through official djxl. A separate one-leaf strict invocation
 returned exit 1 with `MA leaf budget exhausted with beneficial splits remaining`,
 as intended. Unit tests additionally check that failing operations do not turn
 into partially successful outputs.
+
+## Known Source-Effort 10 Sample Limit
+
+The leaf-budget repair above does not fix `grouped MA selected-sample budget
+exceeded`. That error is a separate hard ceiling on gathered training samples,
+before adaptive tree learning. `--ma-budget-mode bounded` only limits splitting;
+it does not cap or reduce sampling and cannot resolve this sample-limit error.
+
+The CLI and `ModularOptions` currently default to 1048576 selected samples.
+Both source effort 9 and 10 use a raw learning fraction of 0.5 scaled by 1.3
+(approximately 65%). A selected sample is a transformed channel value, not one
+whole RGB pixel. Palette transforms and constant channels affect the population.
+
+With automatic buffering, nonresponsive effort 10 selects a shared full-frame
+tree, whereas effort 9 can stream frame areas when there are more than eight
+groups and forced patches do not prohibit streaming. Therefore an image can
+fit effort 9's per-learning-domain limit but exceed the same ceiling in effort
+10's full-frame learning. The error text also serves the gather's local atomic
+budget; it does not by itself imply erroneous double charging across workers.
+
+On 2026-10-26 the current release CLI reproduced this on DIV2K `0716.png`
+(2040x2040, 8-bit), using 16 threads, `--strip-metadata`, no source search, and
+no budget override:
+
+- `--source-effort 9`: success, 4187169 bytes; official libjxl `djxl` reproduced
+  every original pixel sample.
+- `--source-effort 10`: exit 1, `grouped MA selected-sample budget exceeded`;
+  no output file was created.
+
+This is an unresolved default-resource-policy/acceptance gap, not a bitstream
+restriction and not evidence that all effort-9 inputs are safe. Explicitly
+raising `--source-sample-limit` is possible, but an appropriate cap and memory
+cost have not been validated for the reported corpus. Do not confuse an omitted
+default ceiling with an explicit caller limit when designing a future fix;
+neither silently reducing samples nor removing the memory guard is implemented.

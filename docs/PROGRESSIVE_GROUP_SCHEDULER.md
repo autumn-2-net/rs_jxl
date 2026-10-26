@@ -236,9 +236,45 @@ No decoder, JPEG byte-transcode, lossy, or CI change was made for this work.
 - `modular/group_session.rs`: independently resumable native group work.
 - `encode/session.rs`: single-image metadata and complete JXL framing.
 - `scheduler/group_regions.rs`: matched, stratified spatial sampling.
+- `scheduler/group_admission.rs`: preserve cheap-front per-candidate admission.
 - `scheduler/progressive.rs`: candidate racing, continuation and diagnostics.
 - `scheduler/native_front.rs`: existing cheap pilot with native worker dispatch.
 - `scheduler/pilot.rs`: opt-in integration and ordinary-policy fallback.
 
 Experimental preparation caches, MA histogram binning and square cropped
 probes are independent previous experiments, not enabled by this scheduler.
+
+## Ambiguous Front Admission
+
+The checkpoint at `8220444` used the cheap front only to detect a decisive
+one-candidate route. An ambiguous result restarted real-group testing for every
+planned candidate, including extended RCTs already rejected or deferred by the
+cheap front. The follow-up shortlist preserves those individual decisions.
+
+`GroupRaceOptions::shortlist` defaults to true within the opt-in group scheduler.
+The development CLI's `--pilot-progressive-all-candidates` disables only this
+shortlist, leaving all other routing, probes and backend tools unchanged. It
+requires `--pilot-progressive-groups`. `--pilot-progressive-all-content` bypasses
+the cheap front entirely and therefore also bypasses its shortlist.
+
+The shortlist always retains the cheap leader, automatic/neighborhood
+representations and all Zero-predictor representations. Other scored candidates
+use the existing `pilot_eligible` tests, including aggregate competitiveness,
+material regional improvements and the caller's consensus switches. Absent
+Variable-predictor candidates are not resurrected. Invalid, empty or inconsistent
+front scores conservatively admit every candidate. No filename, image ID or
+compressed-output digest is used in routing.
+
+Reports distinguish `FrontScreened` (heuristic cheap-front rejection, zero real
+groups), `Screened` (heuristic real-group rejection) and `ByteBounded` (actual
+retained encoded bytes cannot beat the incumbent). `pilot_scores` are cheap crop
+scores, NOT estimates of the complete file and NOT comparable with
+`sampled_region_bytes`. An empty score vector means that the cheap front did not
+return scores for that candidate. A front-screened candidate has no meaningful
+`estimated_bytes`; its zero value is not a size prediction.
+
+This is not a proof that crop ranking agrees with full images. Natural and
+palette witnesses limit known ranking-inversion risks; independent original-pixel
+checks prove losslessness, not optimal size. Keep the group scheduler opt-in and
+measure new image classes before broadening its scope. See
+[the checkpoint and sample report](GROUP_RACE_SAMPLE_20261026.md).

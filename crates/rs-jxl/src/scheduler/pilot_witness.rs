@@ -104,11 +104,13 @@ mod tests {
         options.coverage_scan = true;
         options.preflight.enabled = true;
         options.screen.adaptive_coverage = true;
+        let mut calls = Vec::new();
         let output = run_pixel_search(
             &image,
             &input,
             &options,
             |params, _, budget| {
+                calls.push((params.predictor, budget.beat_bytes));
                 let size = if params.predictor == Some(Predictor::Zero) && params.palette_colors > 0
                 {
                     40
@@ -137,6 +139,8 @@ mod tests {
         assert_eq!(output.artifact, 40);
         assert_eq!(output.params.predictor, Some(Predictor::Zero));
         assert_eq!(output.params.speed_tier, 1);
+        assert_eq!(calls[0], (Some(Predictor::Variable), None));
+        assert_eq!(calls[1], (Some(Predictor::Zero), Some(100)));
         assert!(output.report.trials.iter().any(|t| t.lower_bound.is_some()));
         assert!(output.report.trials[output.report.winner_index].bytes == Some(40));
     }

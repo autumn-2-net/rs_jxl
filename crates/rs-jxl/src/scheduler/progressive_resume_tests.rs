@@ -105,6 +105,7 @@ fn resume_checks_final_payload_cutoff_before_framing() {
                 encoded_groups: completed,
                 reused_groups: 0,
                 encoded_pixels,
+                pilot_scores: Vec::new(),
                 sampled_region_bytes: Vec::new(),
                 estimated_bytes: 0.0,
                 seconds: 0.0,

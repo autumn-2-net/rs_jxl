@@ -47,6 +47,44 @@ fn complete(bytes: usize, artifact: usize) -> TrialOutput<usize> {
 }
 
 #[test]
+fn family_tournament_confirms_deep_learning_without_a_slope_gate() {
+    let image = image(256, 256, PixelLayout::Rgb);
+    assert!(!compact_geometry(&image).unwrap());
+    assert!(family_geometry(&image));
+    let mut options = options();
+    options.scout_family_tournament = true;
+    let mut fractions = Vec::new();
+    let result = run_pixel_search(
+        &image,
+        &CandidateParams::default().backend(9).unwrap(),
+        &options,
+        |params, _, _| {
+            assert_eq!(params.speed_tier, 1);
+            let size = if params.predictor == Some(Predictor::Zero) {
+                fractions.push(params.learning_fraction);
+                if params.learning_fraction == 1.0 {
+                    50
+                } else {
+                    100
+                }
+            } else {
+                90
+            };
+            Ok(complete(size, size))
+        },
+        |_, _| panic!("small family tournament encoded a crop"),
+    )
+    .unwrap();
+    assert_eq!(result.bytes.len(), 50);
+    assert_eq!(result.params.learning_fraction, 1.0);
+    assert_eq!(result.report.probe_encodes, 0);
+    for fraction in [0.0, 0.01, 0.03, 0.1, 1.0] {
+        assert!(fractions.contains(&fraction));
+    }
+    assert!(!family_geometry(&self::image(512, 256, PixelLayout::Rgb)));
+}
+
+#[test]
 fn small_full_is_default_off_and_requires_pilot_first() {
     assert!(!DriverOptions::default().scout_small_full);
     assert!(!DriverOptions::scout().scout_small_full);

@@ -124,6 +124,12 @@ struct Args {
     pilot_first: bool,
     #[arg(long, requires = "search", conflicts_with_all = ["pilot_first", "model_adjusted", "consensus", "staged_probes", "probe_palette", "wide_probes", "context_side", "matcher"])]
     content_pilot: bool,
+    /// Use source palette defaults instead of forced Morton literal tools.
+    #[arg(long, requires = "content_pilot")]
+    pilot_source_palette: bool,
+    /// Enable the experimental pilot family tournament and confirmation.
+    #[arg(long, requires = "content_pilot")]
+    pilot_family_tournament: bool,
     #[arg(long, requires = "content_pilot")]
     pilot_single_stage: bool,
     #[arg(long, requires = "content_pilot")]
@@ -152,6 +158,9 @@ struct Args {
     /// Disable the cheap content router for controlled group-race experiments.
     #[arg(long, requires = "pilot_progressive_groups")]
     pilot_progressive_all_content: bool,
+    /// Re-test every real-group candidate, ignoring cheap-front admission.
+    #[arg(long, requires = "pilot_progressive_groups")]
+    pilot_progressive_all_candidates: bool,
     /// Print source scan evidence without running any encoder candidate.
     #[arg(long, conflicts_with_all = ["output", "search"])]
     scan_only: bool,
@@ -242,6 +251,7 @@ impl Args {
             group_race: self.pilot_progressive_groups.then(|| {
                 rs_jxl::scheduler::progressive::GroupRaceOptions {
                     content_route: !self.pilot_progressive_all_content,
+                    shortlist: !self.pilot_progressive_all_candidates,
                     ..Default::default()
                 }
             }),
@@ -250,6 +260,8 @@ impl Args {
                 .reuse_preparation_mib
                 .map_or(0, |mib| usize::from(mib) << 20),
             record_representations: self.representations,
+            source_palette: self.pilot_source_palette,
+            family_tournament: self.pilot_family_tournament,
             single_stage: self.pilot_single_stage,
             independent_probes: self.pilot_independent_probes,
             parallel_initial: self.pilot_parallel_initial,
@@ -516,6 +528,7 @@ fn run(args: Args) -> Result<()> {
                     "state": format!("{:?}", c.state),
                     "total_groups": c.total_groups, "encoded_groups": c.encoded_groups,
                     "reused_groups": c.reused_groups, "encoded_pixels": c.encoded_pixels,
+                    "pilot_scores": c.pilot_scores,
                     "sampled_region_bytes": c.sampled_region_bytes,
                     "estimated_bytes": c.estimated_bytes, "seconds": c.seconds,
                     "final_bytes": c.final_bytes,
@@ -589,6 +602,47 @@ mod tests {
     use super::*;
 
     #[test]
+    fn pilot_palette_and_family_flags_are_independent_opt_ins() {
+        let base = ["encoder_lab", "input.png", "--search", "--content-pilot"];
+        for source_palette in [false, true] {
+            for family_tournament in [false, true] {
+                let mut argv = base.to_vec();
+                if source_palette {
+                    argv.push("--pilot-source-palette");
+                }
+                if family_tournament {
+                    argv.push("--pilot-family-tournament");
+                }
+                let args = Args::try_parse_from(argv).unwrap();
+                assert_eq!(args.pilot_source_palette, source_palette);
+                assert_eq!(args.pilot_family_tournament, family_tournament);
+                let options = args.pilot_options();
+                assert_eq!(options.source_palette, source_palette);
+                assert_eq!(options.family_tournament, family_tournament);
+            }
+        }
+    }
+
+    #[test]
+    fn pilot_palette_and_family_flags_require_content_pilot() {
+        for flag in ["--pilot-source-palette", "--pilot-family-tournament"] {
+            for search in [false, true] {
+                let mut argv = vec!["encoder_lab", "input.png", flag];
+                if search {
+                    argv.push("--search");
+                }
+                assert_eq!(
+                    Args::try_parse_from(argv)
+                        .err()
+                        .expect("expected argument rejection")
+                        .kind(),
+                    ErrorKind::MissingRequiredArgument
+                );
+            }
+        }
+    }
+
+    #[test]
     fn group_race_is_explicit_and_not_combined_with_crop_probe_experiments() {
         let base = ["encoder_lab", "input.png", "--search", "--content-pilot"];
         assert!(
@@ -612,6 +666,35 @@ mod tests {
         assert!(
             Args::try_parse_from(["encoder_lab", "input.png", "--pilot-progressive-groups"])
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn group_front_shortlist_can_be_disabled_for_paired_measurement() {
+        let base = [
+            "encoder_lab",
+            "input.png",
+            "--search",
+            "--content-pilot",
+            "--pilot-progressive-groups",
+        ];
+        let options = Args::try_parse_from(base).unwrap().pilot_options();
+        assert!(options.group_race.unwrap().shortlist);
+        let mut argv = base.to_vec();
+        argv.push("--pilot-progressive-all-candidates");
+        let options = Args::try_parse_from(argv).unwrap().pilot_options();
+        let race = options.group_race.unwrap();
+        assert!(!race.shortlist);
+        assert!(race.content_route);
+        assert!(
+            Args::try_parse_from([
+                "encoder_lab",
+                "input.png",
+                "--search",
+                "--content-pilot",
+                "--pilot-progressive-all-candidates",
+            ])
+            .is_err()
         );
     }
 

@@ -148,6 +148,33 @@ def cached_records(folders):
     return cache, origins
 
 
+def select_sample(inputs, sample):
+    """Replay an archived sample in its original order; never replace missing cases."""
+    spec = json.loads(sample.read_text(encoding='utf-8-sig'))
+    selected = spec.get('inputs')
+    if not isinstance(selected, list) or not selected:
+        raise ValueError('Sample manifest must contain a nonempty inputs list')
+    by_path = {Path(row['path']).resolve(): row for row in inputs}
+    seen, rows = set(), []
+    for source in selected:
+        if not isinstance(source, dict) or not isinstance(source.get('path'), str):
+            raise ValueError('Invalid sample input path')
+        path = Path(source['path'])
+        if not path.is_absolute():
+            raise ValueError('Sample input paths must be absolute')
+        path = path.resolve()
+        if path in seen:
+            raise ValueError(f'Duplicate sample input: {path}')
+        seen.add(path)
+        if path not in by_path:
+            raise ValueError(f'Sample input missing from current catalog: {path}')
+        current = by_path[path]
+        if source.get('relative') != current['relative']:
+            raise ValueError(f'Sample dataset identity changed: {path}')
+        rows.append(dict(current, index=len(rows)))
+    return rows
+
+
 def match_cache(records, result):
     matched = {}
     for name, old in records.items():
@@ -206,7 +233,8 @@ def report(out, manifest, results, status, active=None):
     write_derived(out / 'summary.json', data, as_json=True)
     failures = [r for r in results if r['status'] != 'passed']
     write_derived(out / 'failures.json', failures, as_json=True)
-    lines = ['# Rust Content-Pilot Full Corpus', '', f'Status: **{status}**.',
+    title = 'Archived Sample' if 'sample_manifest' in manifest else 'Full Corpus'
+    lines = [f'# Rust Content-Pilot {title}', '', f'Status: **{status}**.',
              f'Processed {len(results)}/{data["total"]}; verified {data["totals"]["passed"]}; '
              f'failures/unsupported {len(failures)}; other-format exclusions {data["excluded"]}.', '',
              'One pass, e9, serial files, 16 threads by default. No old encoder is executed.',
@@ -250,7 +278,7 @@ def measure(row, args, env, phase):
             if info['kind'] == 'png':
                 command = [str(args.encoder), str(source), '--output', str(output),
                            '--threads', str(args.threads), '--ma-workers', str(min(args.threads, 64)),
-                           '--effort', '9', *PILOT_ARGS]
+                           '--effort', '9', *args.pilot_args]
             else:
                 command = [str(args.jpeg_encoder), 'transcode-jpeg', str(source), str(output),
                            '--effort', '9', '--source-search', '--threads', str(args.threads)]
@@ -331,7 +359,16 @@ def main():
     parser.add_argument('--resume-reporting-update', metavar='ORIGINAL_SHA256',
                         help='Explicitly accept a reviewed reporting-only runner repair; '
                              'all other provenance must match the immutable manifest')
-    parser.add_argument('--limit', type=int, help='Explicit smoke subset, never used for the full run')
+    subset = parser.add_mutually_exclusive_group()
+    subset.add_argument('--limit', type=int, help='Explicit smoke subset, never used for the full run')
+    subset.add_argument('--sample-manifest', type=Path,
+                        help='Replay exactly the archived inputs and order, without resampling')
+    parser.add_argument('--pilot-progressive-groups', action='store_true',
+                        help='Use the opt-in progressive group scheduler for pixel inputs only')
+    parser.add_argument('--pilot-source-palette', action='store_true',
+                        help='Use source palette defaults instead of forced Morton literal tools')
+    parser.add_argument('--pilot-family-tournament', action='store_true',
+                        help='Enable the experimental pixel pilot family tournament')
     args = parser.parse_args()
     if args.resume_reporting_update and not args.resume:
         parser.error('--resume-reporting-update requires --resume')
@@ -343,8 +380,17 @@ def main():
     args.cached_run = [p.resolve(strict=True) for p in args.cached_run]
     args.out = args.out.resolve()
     inputs, excluded = inventory(args.catalog)
+    if args.sample_manifest is not None:
+        args.sample_manifest = args.sample_manifest.resolve(strict=True)
+        inputs = select_sample(inputs, args.sample_manifest)
+        excluded = []
     if args.limit is not None:
         inputs = inputs[:args.limit]
+    args.pilot_args = PILOT_ARGS + (['--pilot-progressive-groups'] if args.pilot_progressive_groups else [])
+    if args.pilot_source_palette:
+        args.pilot_args.append('--pilot-source-palette')
+    if args.pilot_family_tournament:
+        args.pilot_args.append('--pilot-family-tournament')
     cache, origins = cached_records(args.cached_run)
     env, environment = port.clean_environment(os.environ)
     binary = lambda p: dict(path=str(p), sha256=port.file_sha256(p), bytes=p.stat().st_size)
@@ -356,8 +402,10 @@ def main():
                              ('benchmark_encoder_corpus.py', 'corpus_inputs.py', 'compare_cpp_port.py')],
                     config=dict(threads=args.threads, effort=9, timeout=args.timeout,
                                 decoder_timeout=args.decoder_timeout, concurrent_files=1,
-                                repeats=1, limit=args.limit, pilot_args=PILOT_ARGS),
+                                repeats=1, limit=args.limit, pilot_args=args.pilot_args),
                     environment=environment, cached_origins=origins)
+    if args.sample_manifest is not None:
+        manifest['sample_manifest'] = binary(args.sample_manifest)
     reporting_update = False
     if args.resume:
         original = json.loads((args.out / 'manifest.json').read_text(encoding='utf-8'))

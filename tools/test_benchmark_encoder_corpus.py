@@ -10,6 +10,31 @@ import benchmark_encoder_corpus as corpus
 
 
 class CorpusTests(unittest.TestCase):
+    def test_sample_preserves_exact_order_and_current_inventory_without_mutation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            inputs = [dict(path=str(root / f'{i}.png'), relative=f'data/{i}.png',
+                           index=i, input_bytes=10 + i) for i in range(3)]
+            sample = root / 'manifest.json'
+            sample.write_text(json.dumps(dict(inputs=[inputs[2], inputs[0]])), encoding='utf-8')
+            result = corpus.select_sample(inputs, sample)
+            self.assertEqual([r['relative'] for r in result], ['data/2.png', 'data/0.png'])
+            self.assertEqual([r['index'] for r in result], [0, 1])
+            self.assertEqual([r['input_bytes'] for r in result], [12, 10])
+            self.assertEqual(inputs[2]['index'], 2)
+
+    def test_sample_refuses_missing_duplicate_foreign_or_empty_inputs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            row = dict(path=str(root / 'a.png'), relative='data/a.png', index=0)
+            sample = root / 'manifest.json'
+            for selected in ([], [row, row], [dict(row, path=str(root / 'missing.png'))],
+                             [dict(row, relative='different/a.png')], [dict(row, path='a.png')],
+                             [{}], [None]):
+                sample.write_text(json.dumps(dict(inputs=selected)), encoding='utf-8')
+                with self.subTest(selected=selected), self.assertRaises(ValueError):
+                    corpus.select_sample([row], sample)
+
     def setUp(self):
         corpus._report_warnings.clear()
 
@@ -133,6 +158,61 @@ class CorpusTests(unittest.TestCase):
             self.assertEqual((out / 'manifest.json').read_bytes(), manifest_bytes)
             session = json.loads((out / 'sessions.jsonl').read_text(encoding='utf-8'))
             self.assertEqual(session['completed_at_start'], 1)
+
+    def test_cli_sample_and_progressive_options_are_frozen_and_resume_compatible(self):
+        with tempfile.TemporaryDirectory() as directory:
+            args, _, inputs, _, _ = self.prepared_run(directory)
+            root = Path(directory)
+            sample = root / 'sample.json'
+            sample.write_text(json.dumps(dict(inputs=[inputs[1]])), encoding='utf-8')
+            out = root / 'sample-results'
+            args[args.index('--out') + 1] = str(out)
+            args += ['--sample-manifest', str(sample), '--pilot-progressive-groups', '--prepare-only']
+            with mock.patch('sys.argv', args), mock.patch('sys.stdout', new_callable=io.StringIO):
+                corpus.main()
+            original = (out / 'manifest.json').read_bytes()
+            manifest = json.loads(original)
+            self.assertEqual(len(manifest['inputs']), 1)
+            self.assertEqual(manifest['inputs'][0]['relative'], inputs[1]['relative'])
+            self.assertEqual(manifest['inputs'][0]['index'], 0)
+            self.assertEqual(manifest['excluded'], [])
+            self.assertEqual(manifest['sample_manifest']['sha256'], corpus.port.file_sha256(sample))
+            self.assertEqual(manifest['config']['pilot_args'],
+                             corpus.PILOT_ARGS + ['--pilot-progressive-groups'])
+            with mock.patch('sys.argv', args + ['--resume']), \
+                    mock.patch('sys.stdout', new_callable=io.StringIO):
+                corpus.main()
+            self.assertEqual((out / 'manifest.json').read_bytes(), original)
+            with mock.patch('sys.argv', args + ['--limit', '1']), \
+                    mock.patch('sys.stderr', new_callable=io.StringIO), self.assertRaises(SystemExit):
+                corpus.main()
+
+    def test_cli_palette_and_family_flags_are_independent_and_frozen_in_pilot_args(self):
+        defaults = list(corpus.PILOT_ARGS)
+        for source_palette in (False, True):
+            for family_tournament in (False, True):
+                with self.subTest(source_palette=source_palette, family_tournament=family_tournament), \
+                        tempfile.TemporaryDirectory() as directory:
+                    args, _, _, _, original = self.prepared_run(directory)
+                    self.assertEqual(json.loads(original)['config']['pilot_args'], defaults)
+                    out = Path(directory) / 'palette-family-results'
+                    args[args.index('--out') + 1] = str(out)
+                    flags = ['--pilot-progressive-groups']
+                    if source_palette:
+                        flags.append('--pilot-source-palette')
+                    if family_tournament:
+                        flags.append('--pilot-family-tournament')
+                    args += flags + ['--prepare-only']
+                    with mock.patch('sys.argv', args), \
+                            mock.patch('sys.stdout', new_callable=io.StringIO):
+                        corpus.main()
+                    original = (out / 'manifest.json').read_bytes()
+                    self.assertEqual(json.loads(original)['config']['pilot_args'], defaults + flags)
+                    self.assertEqual(corpus.PILOT_ARGS, defaults)
+                    with mock.patch('sys.argv', args + ['--resume']), \
+                            mock.patch('sys.stdout', new_callable=io.StringIO):
+                        corpus.main()
+                    self.assertEqual((out / 'manifest.json').read_bytes(), original)
 
     def test_journal_io_error_stops_run_and_releases_lock(self):
         with tempfile.TemporaryDirectory() as directory:

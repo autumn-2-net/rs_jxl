@@ -23,6 +23,11 @@ pub struct PilotOptions {
     pub resources: NativeResourcePolicy,
     /// Allocate an independent representation receipt for each native trial.
     pub record_representations: bool,
+    /// Use source palette defaults instead of forced Morton literal tools.
+    /// Probe-only palette forcing and explicit base palette policies are retained.
+    pub source_palette: bool,
+    /// Experimental family tournament and confirmation; default is false.
+    pub family_tournament: bool,
     /// Experimental: score every family on fine regions without a coarse pass.
     /// Retains fine screening and full winner validation; default is false.
     pub single_stage: bool,
@@ -50,6 +55,8 @@ impl Default for PilotOptions {
             preparation_cache_bytes: 0,
             resources: NativeResourcePolicy::default(),
             record_representations: false,
+            source_palette: false,
+            family_tournament: false,
             single_stage: false,
             independent_probes: false,
             parallel_initial: true,
@@ -70,6 +77,7 @@ fn policy(
     let mut driver = DriverOptions::scout();
     driver.scout_pilot_first = true;
     driver.scout_small_full = true;
+    driver.scout_family_tournament = options.family_tournament;
     driver.scout_native_rct_aliases = image.channel_count() < 3;
     driver.scout_parallel_finalists = true;
     driver.scout_initial_wave = options.parallel_initial;
@@ -106,7 +114,7 @@ fn policy(
         preparation_cache_bytes: options.preparation_cache_bytes,
         acceptance: NativeAcceptance::AllowReportedGaps,
         probe_palette: literal,
-        literal_palette_tools: literal,
+        literal_palette_tools: literal && !options.source_palette,
         model_adjusted_probes: !literal,
         probe_sampling_quarter: options.probe_sampling_quarter,
         routed_tools: true,
@@ -258,6 +266,32 @@ mod tests {
             .to_string()
             .contains("context probe side")
         );
+    }
+
+    #[test]
+    fn source_palette_and_family_tournament_are_independent_opt_ins() {
+        let defaults = PilotOptions::default();
+        assert!(!defaults.source_palette && !defaults.family_tournament);
+        for literal in [false, true] {
+            for source_palette in [false, true] {
+                for family_tournament in [false, true] {
+                    let (driver, native) = policy(
+                        &image(),
+                        literal,
+                        16,
+                        PilotOptions {
+                            source_palette,
+                            family_tournament,
+                            ..Default::default()
+                        },
+                    );
+                    assert_eq!(driver.scout_family_tournament, family_tournament);
+                    assert_eq!(native.literal_palette_tools, literal && !source_palette);
+                    assert_eq!(native.probe_palette, literal);
+                    assert_eq!(native.model_adjusted_probes, !literal);
+                }
+            }
+        }
     }
 
     #[test]
@@ -605,6 +639,8 @@ mod tests {
                             max_tree_leaves: leaves,
                         },
                         record_representations,
+                        source_palette: false,
+                        family_tournament: false,
                         single_stage: false,
                         independent_probes: false,
                         parallel_initial: false,
