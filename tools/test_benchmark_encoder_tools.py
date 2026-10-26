@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -72,7 +73,7 @@ class RepeatTests(unittest.TestCase):
             result += ["--variant", name + "=" + json.dumps(["--marker", name])]
         return result
 
-    def run_harness(self, *, variants=("a", "b"), repeats=None, warmups=None,
+    def run_harness(self, *, variants=("a", "b"), repeats=None, warmups=None, effort=None,
                     samples=None, cases=None, bad_decode=None, matrix=False):
         argv = self.argv(() if matrix else variants, cases)
         if matrix:
@@ -83,6 +84,8 @@ class RepeatTests(unittest.TestCase):
             argv += ["--repeats", str(repeats)]
         if warmups is not None:
             argv += ["--warmups", str(warmups)]
+        if effort is not None:
+            argv += ["--effort", str(effort)]
         calls, visits = [], {}
         decode_count = 0
 
@@ -115,6 +118,10 @@ class RepeatTests(unittest.TestCase):
         result, report, output, calls = self.run_harness()
         self.assertEqual(result, 0)
         self.assertEqual((report["repeats"], report["warmups"]), (1, 0))
+        self.assertEqual(report["effort"], 9)
+        for command in calls[::2]:
+            self.assertEqual(command.count("--effort"), 1)
+            self.assertEqual(command[command.index("--effort") + 1], "9")
         self.assertEqual(report["primary_metric"], "call_mpix_per_second")
         self.assertEqual(len(calls), 4)
         self.assertEqual([row["variant"] for row in report["rows"]], ["a", "b"])
@@ -131,6 +138,59 @@ class RepeatTests(unittest.TestCase):
             self.assertIn("100.000 ms", line)
             self.assertIn("200.000 ms", line)
         self.assertEqual([item["trials"] for item in report["summaries"]], [1, 1])
+
+    def test_explicit_effort_reaches_every_encoder_call_and_report(self):
+        case = dict(index=0, label=self.source.name, kind="png", pixels=2)
+        expected = SimpleNamespace(depth=16)
+        for effort in (None, 1, 10):
+            with self.subTest(effort=effort), \
+                    patch.object(bench, "load_case", return_value=(case, fixture(), None, expected)), \
+                    patch.object(bench.port, "png_samples", return_value=expected), \
+                    patch.object(bench.port, "compare_pixels"):
+                self.out = self.root / f"run-{effort}"
+                result, report, _, calls = self.run_harness(
+                    effort=effort, repeats=2, warmups=1, matrix=True)
+                self.assertEqual(result, 0)
+                selected = 9 if effort is None else effort
+                self.assertEqual(report["effort"], selected)
+                self.assertEqual(len(calls), 12)
+                for row, command in zip(report["rows"], calls[::2]):
+                    self.assertEqual(command.count("--effort"), 1)
+                    self.assertEqual(command[command.index("--effort") + 1], str(selected))
+                    self.assertEqual(row["encode"]["command"], command)
+                for command in calls[1::2]:
+                    self.assertNotIn("--effort", command)
+
+    def test_invalid_effort_fails_before_io(self):
+        for effort in ("0", "-1", "11", "12", "10.5", "bad"):
+            with self.subTest(effort=effort), \
+                    patch("sys.argv", self.argv() + ["--effort", effort]), \
+                    patch.object(bench, "load_case") as load, \
+                    patch.object(bench.port, "run_process") as run, redirect_stderr(StringIO()):
+                with self.assertRaises(SystemExit) as error:
+                    bench.main()
+                self.assertEqual(error.exception.code, 2)
+                self.assertFalse(self.out.exists())
+                load.assert_not_called()
+                run.assert_not_called()
+
+    def test_variants_cannot_override_harness_effort(self):
+        for tokens in (["--effort", "9"], ["--effort=10"]):
+            for matrix in (False, True):
+                argv = self.argv(variants=()) + ["--effort", "10"]
+                if matrix:
+                    path = self.root / "matrix.json"
+                    path.write_text(json.dumps({"a": tokens}), encoding="utf-8")
+                    argv += ["--matrix", str(path)]
+                else:
+                    argv += ["--variant", "a=" + json.dumps(tokens)]
+                with self.subTest(tokens=tokens, matrix=matrix), patch("sys.argv", argv), \
+                        patch.object(bench.port, "run_process") as run, redirect_stderr(StringIO()):
+                    with self.assertRaises(SystemExit) as error:
+                        bench.main()
+                    self.assertEqual(error.exception.code, 2)
+                    self.assertFalse(self.out.exists())
+                    run.assert_not_called()
 
     def test_matrix_variants_use_the_same_repeat_order(self):
         result, report, _, calls = self.run_harness(matrix=True, repeats=2)

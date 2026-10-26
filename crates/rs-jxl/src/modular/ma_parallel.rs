@@ -18,6 +18,10 @@ pub struct ParallelOptions {
     pub balanced: bool,
     /// JXL_MA_SMALL_SUBTREES=1: lower the invocation gate to 8192 records.
     pub small_subtrees: bool,
+    /// Experimental live fork/join of already-decided branches.
+    pub dynamic_subtrees: bool,
+    /// Transfer exact node statistics into disjoint subtree jobs.
+    pub inherit_histograms: bool,
     /// Source lossless worker/task scratch limits, also used by channel roots.
     pub workers: WorkerLimits,
     /// Source ARENA_QUIET, forwarded to the caller's cooperative arena.
@@ -147,6 +151,7 @@ pub(super) struct Detached {
     pub(super) seed: Node,
     pub(super) predictor: usize,
     pub(super) multiplier: u32,
+    pub(super) history: Option<super::ma_frontier::History>,
 }
 
 pub(super) fn finish(
@@ -156,6 +161,7 @@ pub(super) fn finish(
     nodes: &mut Vec<Node>,
     jobs: Vec<Detached>,
     slots: usize,
+    budget: &std::sync::Arc<super::HistogramBudget>,
 ) -> Result<()> {
     if jobs.is_empty() {
         return Ok(());
@@ -185,7 +191,10 @@ pub(super) fn finish(
             });
             root.range = job.range;
             root.redundant_properties = job.redundant;
-            let learned = super::train_pending_with_layout::<true>(
+            if let Some(history) = job.history {
+                history.restore(&mut root);
+            }
+            let learned = super::train_pending_in_frontier::<true>(
                 samples,
                 &learning,
                 stats,
@@ -193,6 +202,8 @@ pub(super) fn finish(
                 &mut indices,
                 vec![job.seed],
                 vec![root],
+                budget,
+                None,
             )?;
             super::ma_channel::graft(nodes, job.destination, learned, options.max_leaves)?;
         }
@@ -207,12 +218,17 @@ pub(super) fn finish(
     crate::profile::note(
         "ma.subtrees",
         format_args!(
-            "jobs={} worker_tasks={} max_samples={} balanced={} cache_budget_bytes={}",
+            "jobs={} worker_tasks={} max_samples={} balanced={} cache_budget_bytes={} shared_cache={}",
             jobs.len(),
             tasks,
             sizes[order[0]],
             options.parallel_tools.balanced,
-            tasks as u64 * ROOT_SCRATCH_BYTES,
+            if options.parallel_tools.inherit_histograms {
+                budget.limit as u64
+            } else {
+                (tasks as u64).saturating_mul(options.histogram_cache_bytes as u64)
+            },
+            options.parallel_tools.inherit_histograms,
         ),
     );
     let mut spatial_order: Vec<_> = jobs.into_iter().enumerate().collect();
@@ -236,8 +252,8 @@ pub(super) fn finish(
         options.parallel_tools.quiet,
         |(_, job, mut view)| {
             execution::serial(|| {
-                // Source passes nullptr and subtree=true. No recursive dispatch,
-                // cache inherited from a sibling, or re-created multiplier skeleton.
+                // Source passes nullptr and subtree=true. No recursive dispatch
+                // or re-created multiplier skeleton; cache handoff is opt-in.
                 let learning = TrainOptions {
                     max_leaves: local_limit,
                     parallel: false,
@@ -258,7 +274,15 @@ pub(super) fn finish(
                 });
                 root.range = job.range;
                 root.redundant_properties = job.redundant;
-                super::train_pending_with_layout::<true>(
+                if let Some(history) = job.history {
+                    history.restore(&mut root);
+                }
+                let child_budget = if options.parallel_tools.inherit_histograms {
+                    std::sync::Arc::clone(budget)
+                } else {
+                    super::HistogramBudget::new(options.histogram_cache_bytes)
+                };
+                super::train_pending_in_frontier::<true>(
                     &mut view,
                     &learning,
                     stats,
@@ -266,6 +290,8 @@ pub(super) fn finish(
                     &mut indices,
                     vec![job.seed],
                     vec![root],
+                    &child_budget,
+                    None,
                 )
             })
         },
@@ -573,8 +599,10 @@ mod tests {
                     seed: seed.clone(),
                     predictor: 1,
                     multiplier: 7,
+                    history: None,
                 }],
                 3,
+                &super::super::HistogramBudget::new(options.histogram_cache_bytes),
             )
         })
         .unwrap();

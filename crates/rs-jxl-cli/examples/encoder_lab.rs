@@ -201,6 +201,12 @@ struct Args {
     representations: bool,
     #[arg(long)]
     subtrees: bool,
+    /// Experimental dynamic MA subtree scheduling.
+    #[arg(long, requires = "subtrees")]
+    dynamic_subtrees: bool,
+    /// Experimental MA subtree histogram inheritance.
+    #[arg(long, requires = "subtrees")]
+    subtree_histograms: bool,
     #[arg(long, requires = "subtrees", value_parser = clap::value_parser!(u16).range(1..=64))]
     ma_workers: Option<u16>,
     #[arg(long)]
@@ -374,6 +380,8 @@ fn run(args: Args) -> Result<()> {
             subtrees: true,
             balanced: true,
             small_subtrees: true,
+            dynamic_subtrees: args.dynamic_subtrees,
+            inherit_histograms: args.subtree_histograms,
             ..Default::default()
         };
         if let Some(workers) = args.ma_workers {
@@ -597,6 +605,46 @@ fn main() -> std::process::ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn subtree_experiments_are_independent_opt_ins() {
+        let plain = Args::try_parse_from(["encoder_lab", "input.png"]).unwrap();
+        assert!(!plain.subtrees);
+        assert!(!plain.dynamic_subtrees);
+        assert!(!plain.subtree_histograms);
+        for dynamic in [false, true] {
+            for histograms in [false, true] {
+                let mut argv = vec!["encoder_lab", "input.png", "--subtrees"];
+                if dynamic {
+                    argv.push("--dynamic-subtrees");
+                }
+                if histograms {
+                    argv.push("--subtree-histograms");
+                }
+                let args = Args::try_parse_from(argv).unwrap();
+                assert!(args.subtrees);
+                assert_eq!(args.dynamic_subtrees, dynamic);
+                assert_eq!(args.subtree_histograms, histograms);
+            }
+        }
+    }
+
+    #[test]
+    fn subtree_experiments_require_subtrees() {
+        for flags in [
+            &["--dynamic-subtrees"][..],
+            &["--subtree-histograms"][..],
+            &["--dynamic-subtrees", "--subtree-histograms"][..],
+        ] {
+            let mut argv = vec!["encoder_lab", "input.png"];
+            argv.extend_from_slice(flags);
+            let error = Args::try_parse_from(argv)
+                .err()
+                .expect("subtree experiments must require --subtrees");
+            assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument);
+            assert!(error.to_string().contains("--subtrees"));
+        }
+    }
 
     #[test]
     fn pilot_palette_and_family_flags_are_independent_opt_ins() {

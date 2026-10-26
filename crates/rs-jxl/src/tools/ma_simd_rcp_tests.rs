@@ -76,6 +76,7 @@ fn corrected_reciprocal_preserves_counts_tails_and_split_sweep_results() {
                 &mut below,
                 &deltas,
                 len,
+                total,
                 None,
                 splits.iter().copied(),
                 |_, r, l| observed.push((r, l)),

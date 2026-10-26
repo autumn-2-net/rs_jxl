@@ -77,6 +77,8 @@
 //! default. Channel roots and optional whole subtrees use disjoint column loans
 //! on the caller's bounded cooperative pool. The default is
 //! the full property/predictor histogram sweep, not a fixed-tree heuristic.
+//! Opt-in live subtree forks and histogram handoff share one cache accounting
+//! domain, without sharing mutable sample columns or limiting tree learning.
 
 #[cfg(test)]
 use std::collections::HashMap;
@@ -146,6 +148,17 @@ pub use ma_channel::ChannelTreeMode;
 #[path = "ma_parallel.rs"]
 mod ma_parallel;
 pub use ma_parallel::ParallelOptions;
+
+#[path = "ma_frontier.rs"]
+mod ma_frontier;
+
+#[cfg(test)]
+#[path = "ma_frontier_tests.rs"]
+mod frontier_tests;
+
+#[cfg(test)]
+#[path = "ma_handoff_tests.rs"]
+mod handoff_tests;
 
 // Monomorphize the entire property task, not a per-record enum accessor.
 macro_rules! with_property_values {
@@ -1380,6 +1393,8 @@ fn subtract_parent_histograms(
 #[derive(Default)]
 struct TrainingStats {
     detached_subtrees: AtomicUsize,
+    dynamic_forks: AtomicUsize,
+    histogram_handoffs: AtomicUsize,
     channel_roots: AtomicUsize,
     race_nodes: AtomicUsize,
     race_draws: AtomicUsize,
@@ -2015,6 +2030,40 @@ impl HistogramCache {
     fn subtract(&mut self, samples: &Samples<impl SampleStorage>, removed: &[usize]) -> Result<()> {
         for (property, histogram) in self.properties.iter_mut().enumerate() {
             histogram.subtract(samples, property, removed)?;
+        }
+        Ok(())
+    }
+
+    fn normalize_for_handoff(
+        &mut self,
+        samples: &Samples<impl SampleStorage>,
+        removed: &[usize],
+        options: &TrainOptions,
+        redundant: &[u8],
+    ) -> Result<()> {
+        let plan = PredictorPlan::identity(samples.residuals.len());
+        let subtract = |property: usize, histogram: &mut PropertyHistogram| {
+            // Redundant entries may contain only updated marginals, or token
+            // tables from an ancestor. They must never be subtracted/reused.
+            if options.property_dedup && redundant.get(property).is_some_and(|&v| v != 0) {
+                histogram.valid = false;
+            }
+            if histogram.valid {
+                with_property_values!(&samples.properties[property], |values| {
+                    histogram.subtract_values(samples, removed, values, &plan)
+                })
+            } else {
+                Ok(())
+            }
+        };
+        if options.parallel && removed.len() >= 1024 {
+            for result in execution::map_mut(&mut self.properties, subtract) {
+                result?;
+            }
+        } else {
+            for (property, histogram) in self.properties.iter_mut().enumerate() {
+                subtract(property, histogram)?;
+            }
         }
         Ok(())
     }
@@ -2760,6 +2809,7 @@ fn evaluate_property_values<T: PropertyValue>(
                     &mut scratch.counts_below,
                     increase,
                     stride,
+                    total,
                     sparse,
                     splits,
                     |split, rbits, lbits| {
@@ -3839,18 +3889,48 @@ fn train_pending_with_layout<const REORDER: bool>(
     stats: &TrainingStats,
     scratch_pool: &ScratchPool,
     indices: &mut [usize],
+    nodes: Vec<Node>,
+    pending: Vec<PendingNode>,
+) -> Result<Vec<Node>> {
+    let frontier = REORDER
+        .then(|| ma_frontier::Frontier::new(options, samples.counts.len()))
+        .flatten();
+    train_pending_in_frontier::<REORDER>(
+        samples,
+        options,
+        stats,
+        scratch_pool,
+        indices,
+        nodes,
+        pending,
+        &HistogramBudget::new(options.histogram_cache_bytes),
+        frontier.as_ref(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn train_pending_in_frontier<const REORDER: bool>(
+    samples: &mut Samples<impl SampleStorage>,
+    options: &TrainOptions,
+    stats: &TrainingStats,
+    scratch_pool: &ScratchPool,
+    indices: &mut [usize],
     mut nodes: Vec<Node>,
     mut pending: Vec<PendingNode>,
+    budget: &Arc<HistogramBudget>,
+    frontier: Option<&ma_frontier::Frontier>,
 ) -> Result<Vec<Node>> {
     let _scope = crate::profile::scope("ma.train_nodes");
-    let budget = HistogramBudget::new(options.histogram_cache_bytes);
     let records: usize = pending
         .iter()
         .map(|root| root.job.end - root.job.begin)
         .sum();
-    let detach = REORDER && options.parallel_tools.enabled(records, options.parallel);
+    let detach =
+        REORDER && frontier.is_none() && options.parallel_tools.enabled(records, options.parallel);
     let mut subtrees = Vec::new();
-    scratch_pool.dispatch_slots.store(0, Ordering::Relaxed);
+    if frontier.is_none() {
+        scratch_pool.dispatch_slots.store(0, Ordering::Relaxed);
+    }
     // Include finished/reserved seed leaves, not just the ready work queue.
     let mut leaves = nodes.len().div_ceil(2);
     if leaves > options.max_leaves {
@@ -3874,6 +3954,11 @@ fn train_pending_with_layout<const REORDER: bool>(
         }
         let slots = scratch_pool.dispatch_slots.load(Ordering::Relaxed);
         if detach && slots > 1 && end - begin <= options.parallel_tools.grain(records, slots) {
+            let history = options
+                .parallel_tools
+                .inherit_histograms
+                .then(|| ma_frontier::History::take(&mut state, samples, indices, options, stats))
+                .transpose()?;
             subtrees
                 .try_reserve(1)
                 .map_err(|_| Error::Limit("MA subtree job allocation"))?;
@@ -3885,6 +3970,7 @@ fn train_pending_with_layout<const REORDER: bool>(
                 seed: nodes[node].clone(),
                 predictor: job.predictor,
                 multiplier,
+                history,
             });
             stats.detached_subtrees.fetch_add(1, Ordering::Relaxed);
             // Parent/cache state can refer outside this range. Drop it before
@@ -3958,7 +4044,11 @@ fn train_pending_with_layout<const REORDER: bool>(
         } else {
             (&mut above, &mut below, &indices[cut..end])
         };
-        if options.reuse_parent_histograms && unbalanced && low.max(high) >= 512 && !detach_children
+        let inherit = options.parallel_tools.inherit_histograms;
+        if options.reuse_parent_histograms
+            && (unbalanced || inherit)
+            && low.max(high) >= 512
+            && (!detach_children || inherit)
         {
             let smaller_parents = parent_histograms(samples, removed);
             larger.parents = Some(subtract_parent_histograms(
@@ -3968,7 +4058,7 @@ fn train_pending_with_layout<const REORDER: bool>(
             smaller.parents = Some(smaller_parents);
             stats.parent_reuses.fetch_add(1, Ordering::Relaxed);
         }
-        if unbalanced
+        if (unbalanced || inherit)
             && low.max(high) >= options.histogram_cache_thresholds().1
             && let Some(cache) = state.cache.take()
         {
@@ -3979,6 +4069,25 @@ fn train_pending_with_layout<const REORDER: bool>(
         }
         // Release a non-inherited cache before reserving any ready-child work.
         drop(state);
+        if let Some(frontier) = frontier
+            && let Some(permit) = frontier.acquire(low, high)
+        {
+            ma_frontier::fork(
+                samples,
+                indices,
+                options,
+                stats,
+                scratch_pool,
+                budget,
+                frontier,
+                permit,
+                &mut nodes,
+                above,
+                below,
+            )?;
+            leaves = nodes.len().div_ceil(2);
+            continue;
+        }
         let work = (end - begin)
             .saturating_mul(options.predictors.len())
             .saturating_mul(options.properties.len());
@@ -4030,8 +4139,19 @@ fn train_pending_with_layout<const REORDER: bool>(
         &mut nodes,
         subtrees,
         scratch_pool.dispatch_slots.load(Ordering::Relaxed),
+        budget,
     )?;
     leaves = nodes.len().div_ceil(2);
+    if options.parallel_tools.dynamic_subtrees || options.parallel_tools.inherit_histograms {
+        crate::profile::note(
+            "ma.frontier",
+            format_args!(
+                "dynamic_forks={} histogram_handoffs={}",
+                stats.dynamic_forks.load(Ordering::Relaxed),
+                stats.histogram_handoffs.load(Ordering::Relaxed),
+            ),
+        );
+    }
     crate::profile::note(
         "ma.search_counts",
         format_args!(

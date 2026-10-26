@@ -17,6 +17,8 @@
 //! validated weighted totals, immutable cached deltas, fused movement/scoring,
 //! and a shared triangular contribution table for each side with total <=256.
 //! Its parent estimate uses FastLog2f directly, never a log(count) cache.
+//! Native sweeps with combined mass <=256 specialize to that table throughout,
+//! hoisting block/tail layout without changing any split or accumulation order.
 //! `RS_JXL_MA_AVX512=1` opts into 16-bin dense computation with the same eight
 //! logical accumulation lanes. The flag and CPU/OS support are checked once
 //! when constructing the first DefaultScorer. Small/sparse sweeps keep AVX2.
@@ -472,6 +474,8 @@ impl DefaultScorer {
     /// Dispatch once per predictor, not once per threshold. Deltas and sparse
     /// addresses are checked before native access; sparse proofs are immutable
     /// for the whole sweep. No allocation or change in lane arithmetic/order.
+    /// `population` is the caller's already-known combined weighted total. It
+    /// selects a kernel, not a resource limit; per-split totals bound lookups.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn split_sweep(
         &self,
@@ -479,6 +483,7 @@ impl DefaultScorer {
         below: &mut [u32],
         deltas: &[u32],
         stride: usize,
+        population: u32,
         sparse: Option<&[usize]>,
         splits: impl Iterator<Item = HistogramSplit>,
         mut emit: impl FnMut(HistogramSplit, f32, f32),
@@ -497,7 +502,7 @@ impl DefaultScorer {
                 // SAFETY: detected AVX2/FMA and checked histogram layout.
                 unsafe {
                     x86::avx2_rcp::default_sweep(
-                        self, above, below, deltas, stride, sparse, splits, emit,
+                        self, above, below, deltas, stride, population, sparse, splits, emit,
                     )
                 };
                 return;
@@ -506,7 +511,7 @@ impl DefaultScorer {
                 // SAFETY: detected features and checked slice/block layout.
                 unsafe {
                     x86::avx512_fma8::default_sweep(
-                        self, above, below, deltas, stride, sparse, splits, emit,
+                        self, above, below, deltas, stride, population, sparse, splits, emit,
                     )
                 };
                 return;
@@ -516,7 +521,7 @@ impl DefaultScorer {
                 // The native sweep bounds each row before calling its kernel.
                 unsafe {
                     x86::avx2_fma::default_sweep(
-                        self, above, below, deltas, stride, sparse, splits, emit,
+                        self, above, below, deltas, stride, population, sparse, splits, emit,
                     )
                 };
                 return;
@@ -525,7 +530,7 @@ impl DefaultScorer {
                 // SAFETY: same checked layout and detected AVX2.
                 unsafe {
                     x86::avx2::default_sweep(
-                        self, above, below, deltas, stride, sparse, splits, emit,
+                        self, above, below, deltas, stride, population, sparse, splits, emit,
                     )
                 };
                 return;
@@ -534,7 +539,7 @@ impl DefaultScorer {
                 // SAFETY: same checked layout and detected SSE2.
                 unsafe {
                     x86::sse2::default_sweep(
-                        self, above, below, deltas, stride, sparse, splits, emit,
+                        self, above, below, deltas, stride, population, sparse, splits, emit,
                     )
                 };
                 return;
@@ -1191,10 +1196,36 @@ mod x86 {
                 below: &mut [u32],
                 deltas: &[u32],
                 stride: usize,
+                population: u32,
                 sparse: Option<&[usize]>,
                 splits: impl Iterator<Item = HistogramSplit>,
                 mut emit: impl FnMut(HistogramSplit, f32, f32),
             ) {
+                // Transfers preserve combined weighted mass. If it fits the
+                // existing table, both sides fit for every subsequent split.
+                if population <= super::super::SMALL_HISTOGRAM_TOTAL {
+                    // SAFETY: the wrapper checked lengths and sparse addresses;
+                    // the specialized sweep still bounds every row and gather.
+                    unsafe {
+                        if let Some(blocks) = sparse {
+                            small_sweep::<true>(
+                                scorer, above, below, deltas, stride, blocks, splits, emit,
+                            );
+                        } else {
+                            small_sweep::<false>(
+                                scorer,
+                                above,
+                                below,
+                                deltas,
+                                stride,
+                                &[],
+                                splits,
+                                emit,
+                            );
+                        }
+                    }
+                    return;
+                }
                 // Keep the sparse branch and address validation outside the
                 // threshold loop. Row slicing remains checked for every move.
                 if let Some(blocks) = sparse {
@@ -1220,6 +1251,95 @@ mod x86 {
                         };
                         emit(split, r, l);
                     }
+                }
+            }
+
+            #[allow(clippy::too_many_arguments)]
+            #[target_feature(enable = $feature)]
+            unsafe fn small_sweep<const SPARSE: bool>(
+                scorer: &DefaultScorer,
+                above: &mut [u32],
+                below: &mut [u32],
+                deltas: &[u32],
+                stride: usize,
+                blocks: &[usize],
+                splits: impl Iterator<Item = HistogramSplit>,
+                mut emit: impl FnMut(HistogramSplit, f32, f32),
+            ) {
+                let end = above.len() / $lanes * $lanes;
+                let tail_end = if !SPARSE || blocks.last() == Some(&end) {
+                    above.len()
+                } else {
+                    end
+                };
+                let block_count = if SPARSE {
+                    blocks.partition_point(|&b| b < end)
+                } else {
+                    end / $lanes
+                };
+                let row = |total: u32| {
+                    // On x86_64 these offsets fit usize for every u32 total.
+                    // Checked slicing independently bounds the nonempty rows
+                    // supplied to gathers, even for malformed numerical inputs.
+                    let total = total as usize;
+                    let offset = total * (total + 1) / 2;
+                    &scorer.small[offset..offset + total + 1]
+                };
+                for split in splits {
+                    debug_assert!(split.totals.0 <= i32::MAX as u32);
+                    debug_assert!(split.totals.1 <= i32::MAX as u32);
+                    let delta = split_delta(deltas, stride, above.len(), split.row);
+                    // A valid sweep conserves mass. Keep the primitive's old
+                    // behavior if later supplied totals break that invariant.
+                    if u64::from(split.totals.0) + u64::from(split.totals.1)
+                        > u64::from(super::super::SMALL_HISTOGRAM_TOTAL)
+                    {
+                        // SAFETY: same features and checked row/block layout.
+                        let (r, l) = unsafe {
+                            move_dispatch::<SPARSE>(
+                                scorer,
+                                above,
+                                below,
+                                delta,
+                                split.totals,
+                                blocks,
+                            )
+                        };
+                        emit(split, r, l);
+                        continue;
+                    }
+                    let row_r = row(split.totals.0);
+                    let row_l = row(split.totals.1);
+                    let (mut br, mut bl) = (zero(), zero());
+                    let mut lanes_r = [0.0; $lanes];
+                    let mut lanes_l = [0.0; $lanes];
+                    // SAFETY: checked sparse addresses and matching slices bound
+                    // full blocks. Both nonempty rows use bounded gathers.
+                    unsafe {
+                        for block in 0..block_count {
+                            let i = if SPARSE {
+                                blocks[block]
+                            } else {
+                                block * $lanes
+                            };
+                            let d = load(delta.as_ptr().add(i).cast());
+                            let r = sub_i(load(above.as_ptr().add(i).cast()), d);
+                            let l = add_i(load(below.as_ptr().add(i).cast()), d);
+                            store_i(above.as_mut_ptr().add(i).cast(), r);
+                            store_i(below.as_mut_ptr().add(i).cast(), l);
+                            br = sub(br, gather_entropy(row_r, r));
+                            bl = sub(bl, gather_entropy(row_l, l));
+                        }
+                        store_f(lanes_r.as_mut_ptr(), br);
+                        store_f(lanes_l.as_mut_ptr(), bl);
+                    }
+                    for i in end..tail_end {
+                        above[i] = above[i].wrapping_sub(delta[i]);
+                        below[i] = below[i].wrapping_add(delta[i]);
+                        lanes_r[i - end] -= row_r[above[i] as usize];
+                        lanes_l[i - end] -= row_l[below[i] as usize];
+                    }
+                    emit(split, reduce_default(lanes_r), reduce_default(lanes_l));
                 }
             }
 
@@ -1982,6 +2102,7 @@ mod x86 {
             below: &mut [u32],
             deltas: &[u32],
             stride: usize,
+            population: u32,
             sparse: Option<&[usize]>,
             splits: impl Iterator<Item = HistogramSplit>,
             mut emit: impl FnMut(HistogramSplit, f32, f32),
@@ -1990,7 +2111,7 @@ mod x86 {
                 // SAFETY: original validated 8-lane sparse layout and AVX2/FMA.
                 unsafe {
                     avx2_fma::default_sweep(
-                        scorer, above, below, deltas, stride, sparse, splits, emit,
+                        scorer, above, below, deltas, stride, population, sparse, splits, emit,
                     )
                 };
                 return;
@@ -2394,6 +2515,7 @@ mod tests {
                                 &mut below[1..len + 1],
                                 &storage[1..1 + 9 * stride],
                                 stride,
+                                total,
                                 sparse,
                                 splits.iter().copied(),
                                 |split, r, l| actual.push((split.bin, r.to_bits(), l.to_bits())),
@@ -2414,6 +2536,246 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn default_small_sweep_matches_weighted_moves_and_table_boundaries() {
+        for (scorer, lanes) in default_profiles() {
+            for len in [1, 3, 4, 7, 8, 9, 15, 16, 17, 33] {
+                for total in (0u32..=257).chain([511, 512, 513, 65535, i32::MAX as u32]) {
+                    let mut parent = vec![0; len];
+                    let last = if total % 2 == 0 && len > lanes {
+                        len / lanes * lanes - 1
+                    } else {
+                        len - 1
+                    };
+                    parent[0] += total / 7;
+                    parent[len / 2] += total / 3;
+                    parent[last] += total - total / 7 - total / 3;
+                    let initial_below: Vec<_> = parent.iter().map(|&n| n / 3).collect();
+                    let initial_above: Vec<_> = parent
+                        .iter()
+                        .zip(&initial_below)
+                        .map(|(&n, &l)| n - l)
+                        .collect();
+                    let stride = len + if total % 2 == 0 { lanes } else { 0 };
+                    let mut storage = vec![u32::MAX; 1 + 9 * stride + 1];
+                    let mut remaining = initial_above.clone();
+                    let mut splits = Vec::new();
+                    // Packed rows need not follow the stable threshold order.
+                    for (step, row) in [5, 0, 7, 2, 8].into_iter().enumerate() {
+                        let start = 1 + row * stride;
+                        for (i, r) in remaining.iter_mut().enumerate() {
+                            let d = *r / (5 - step) as u32;
+                            storage[start + i] = d;
+                            *r -= d;
+                        }
+                        let right = remaining.iter().sum::<u32>();
+                        splits.push(HistogramSplit {
+                            bin: step * 17 + 3,
+                            row,
+                            totals: (right, total - right),
+                        });
+                    }
+                    let blocks: Vec<_> = parent
+                        .chunks(lanes)
+                        .enumerate()
+                        .filter_map(|(i, b)| b.iter().any(|&n| n != 0).then_some(i * lanes))
+                        .collect();
+                    let snapshot = storage.clone();
+                    let mut expected_above = initial_above.clone();
+                    let mut expected_below = initial_below.clone();
+                    let mut expected = Vec::new();
+                    for &split in &splits {
+                        let start = 1 + split.row * stride;
+                        let bits = scorer.move_and_score(
+                            &mut expected_above,
+                            &mut expected_below,
+                            &storage[start..start + len],
+                            split.totals,
+                        );
+                        expected.push((split.bin, split.row, bits.0.to_bits(), bits.1.to_bits()));
+                    }
+                    for sparse in [None, Some(blocks.as_slice())] {
+                        let offset = 1 + len % lanes;
+                        let end = offset + len;
+                        let mut above = vec![u32::MAX; end + 1];
+                        let mut below = vec![u32::MAX; end + 1];
+                        above[offset..end].copy_from_slice(&initial_above);
+                        below[offset..end].copy_from_slice(&initial_below);
+                        let mut actual = Vec::new();
+                        scorer.split_sweep(
+                            &mut above[offset..end],
+                            &mut below[offset..end],
+                            &storage[1..1 + 9 * stride],
+                            stride,
+                            total,
+                            sparse,
+                            splits.iter().copied(),
+                            |split, r, l| {
+                                actual.push((split.bin, split.row, r.to_bits(), l.to_bits()));
+                            },
+                        );
+                        assert_eq!(
+                            actual, expected,
+                            "backend={:?}, len={len}, total={total}, sparse={sparse:?}",
+                            scorer.backend
+                        );
+                        assert_eq!(&above[offset..end], expected_above);
+                        assert_eq!(&below[offset..end], expected_below);
+                        assert_eq!(below[offset..end].iter().sum::<u32>(), total);
+                        for counts in [&above, &below] {
+                            assert!(counts[..offset].iter().all(|&n| n == u32::MAX));
+                            assert_eq!(counts[end], u32::MAX);
+                        }
+                        assert_eq!(storage, snapshot);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn default_small_sweep_requires_combined_mass_to_fit_table() {
+        for (scorer, _) in default_profiles() {
+            let mut above = [128; 4];
+            let mut below = [0; 4];
+            let mut expected_above = above;
+            let mut expected_below = below;
+            let splits = [
+                HistogramSplit {
+                    bin: 3,
+                    row: 0,
+                    totals: (256, 256),
+                },
+                HistogramSplit {
+                    bin: 7,
+                    row: 1,
+                    totals: (0, 512),
+                },
+            ];
+            let mut emitted = 0;
+            scorer.split_sweep(
+                &mut above,
+                &mut below,
+                &[64; 8],
+                4,
+                512,
+                None,
+                splits.into_iter(),
+                |split, r, l| {
+                    let expected = scorer.move_and_score(
+                        &mut expected_above,
+                        &mut expected_below,
+                        &[64; 4],
+                        split.totals,
+                    );
+                    assert_eq!(r.to_bits(), expected.0.to_bits());
+                    assert_eq!(l.to_bits(), expected.1.to_bits());
+                    emitted += 1;
+                },
+            );
+            assert_eq!(emitted, 2);
+            assert_eq!(above, expected_above);
+            assert_eq!(below, expected_below);
+        }
+    }
+
+    #[test]
+    fn default_small_sweep_empty_and_unwind_preserve_completed_moves() {
+        for (scorer, _) in default_profiles() {
+            for callback_panics in [false, true] {
+                let mut above = [9; 9];
+                let mut below = [0; 9];
+                scorer.split_sweep(
+                    &mut above,
+                    &mut below,
+                    &[1; 18],
+                    9,
+                    81,
+                    None,
+                    std::iter::empty(),
+                    |_, _, _| panic!("empty sweep emitted a split"),
+                );
+                assert_eq!(above, [9; 9]);
+                assert_eq!(below, [0; 9]);
+                let splits = [
+                    HistogramSplit {
+                        bin: 3,
+                        row: 0,
+                        totals: (72, 9),
+                    },
+                    HistogramSplit {
+                        bin: 7,
+                        row: usize::MAX,
+                        totals: (63, 18),
+                    },
+                ];
+                let mut emitted = 0;
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    scorer.split_sweep(
+                        &mut above,
+                        &mut below,
+                        &[1; 18],
+                        9,
+                        81,
+                        None,
+                        splits.into_iter(),
+                        |_, _, _| {
+                            emitted += 1;
+                            assert!(!callback_panics, "injected callback panic");
+                        },
+                    );
+                }));
+                assert!(result.is_err());
+                assert_eq!(emitted, 1);
+                assert_eq!(above, [8; 9]);
+                assert_eq!(below, [1; 9]);
+            }
+        }
+    }
+
+    #[test]
+    fn default_small_sweep_changed_totals_keep_general_fallback() {
+        for (scorer, lanes) in default_profiles() {
+            let mut above = [9; 9];
+            let mut below = [0; 9];
+            let mut expected_above = above;
+            let mut expected_below = below;
+            let blocks: Vec<_> = (0..above.len()).step_by(lanes).collect();
+            let totals = [(72, 9), (257, 18), (54, 257), (256, 256), (36, 45)];
+            let mut emitted = 0;
+            scorer.split_sweep(
+                &mut above,
+                &mut below,
+                &[1; 45],
+                9,
+                81,
+                Some(&blocks),
+                totals
+                    .into_iter()
+                    .enumerate()
+                    .map(|(row, totals)| HistogramSplit {
+                        bin: row * 3,
+                        row,
+                        totals,
+                    }),
+                |split, r, l| {
+                    let expected = scorer.move_and_score(
+                        &mut expected_above,
+                        &mut expected_below,
+                        &[1; 9],
+                        split.totals,
+                    );
+                    assert_eq!(r.to_bits(), expected.0.to_bits());
+                    assert_eq!(l.to_bits(), expected.1.to_bits());
+                    emitted += 1;
+                },
+            );
+            assert_eq!(emitted, totals.len());
+            assert_eq!(above, expected_above);
+            assert_eq!(below, expected_below);
         }
     }
 
@@ -2441,6 +2803,7 @@ mod tests {
                         &mut below,
                         &deltas,
                         stride,
+                        len as u32,
                         blocks.as_deref(),
                         std::iter::once(HistogramSplit {
                             bin: 0,

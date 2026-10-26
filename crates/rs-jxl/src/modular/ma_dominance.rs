@@ -324,6 +324,7 @@ mod tests {
             &mut below,
             deltas,
             symbols,
+            total,
             None,
             thresholds,
             |split, rbits, lbits| {

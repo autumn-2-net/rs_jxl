@@ -287,6 +287,7 @@ fn avx512_sweeps_keep_packed_row_order_sparse_blocks_and_cache_transitions() {
                     &mut l,
                     &changes,
                     stride,
+                    total,
                     sparse.then_some(blocks.as_slice()),
                     splits.iter().copied(),
                     |split, rb, lb| {

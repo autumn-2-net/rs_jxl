@@ -245,6 +245,7 @@ fn ma_budget_mode_full_merge_preserves_detached_seed_predictor_offset_and_multip
             seed: seed.clone(),
             predictor: 1,
             multiplier: 7,
+            history: None,
         })
         .collect();
     ma_parallel::finish(
@@ -254,6 +255,7 @@ fn ma_budget_mode_full_merge_preserves_detached_seed_predictor_offset_and_multip
         &mut nodes,
         jobs,
         4,
+        &HistogramBudget::new(options.histogram_cache_bytes),
     )
     .unwrap();
     let tree = Tree::new(nodes).unwrap();

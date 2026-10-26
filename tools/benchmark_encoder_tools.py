@@ -65,6 +65,7 @@ def main():
     cli.add_argument("--djxl", required=True, type=Path)
     cli.add_argument("--case", required=True, action="append", type=Path)
     cli.add_argument("--threads", type=int, default=8)
+    cli.add_argument("--effort", type=int, default=9, help="Encoder-lab effort for all variants (1..10)")
     cli.add_argument("--repeats", type=int, default=1, help="Measured rounds per case (positive)")
     cli.add_argument("--warmups", type=int, default=0, help="Verified, unmeasured rounds per case")
     cli.add_argument("--encoder-env", action="append", default=[], metavar="RS_JXL_NAME=value",
@@ -76,6 +77,8 @@ def main():
     args = cli.parse_args()
     if not 1 <= args.threads <= 64:
         cli.error("threads must be between 1 and 64")
+    if not 1 <= args.effort <= 10:
+        cli.error("effort must be between 1 and 10")
     if args.repeats < 1 or args.warmups < 0:
         cli.error("repeats must be positive and warmups nonnegative")
     try:
@@ -96,7 +99,7 @@ def main():
     decoder_env, decoder_environment = port.clean_environment(os.environ)
     args.out.mkdir(exist_ok=False)
     report = dict(status="failed", encoder=str(encoder), encoder_sha256=port.file_sha256(encoder),
-                  djxl=str(decoder), djxl_sha256=port.file_sha256(decoder), threads=args.threads, effort=9,
+                  djxl=str(decoder), djxl_sha256=port.file_sha256(decoder), threads=args.threads, effort=args.effort,
                   repeats=args.repeats, warmups=args.warmups, primary_metric="call_mpix_per_second",
                   timing="Call includes the entire requested scout/pilot, excludes CLI startup and input/output IO. "
                          "Wall includes the encoder process only, not independent decoding. "
@@ -124,7 +127,7 @@ def main():
                         with tempfile.TemporaryDirectory(dir=root) as temp:
                             output, restored = Path(temp) / "encoded.jxl", Path(temp) / "restored.png"
                             row["encode"] = port.run_process([str(encoder), str(source), "--output", str(output),
-                                                              "--threads", str(args.threads), "--effort", "9", *tokens], env, 300)
+                                                              "--threads", str(args.threads), "--effort", str(args.effort), *tokens], env, 300)
                             port.check_process(row["encode"])
                             metrics = json.loads(row["encode"]["stdout"])
                             if (not math.isfinite(metrics["seconds"]) or metrics["seconds"] <= 0
