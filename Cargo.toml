@@ -1,5 +1,10 @@
 [workspace]
-members = ["crates/rs-jxl", "crates/rs-jxl-cli"]
+members = [
+    "crates/rs-jxl",
+    "crates/rs-jxl-cli",
+    "crates/rs-jxl-image",
+    "crates/rs-jxl-ffi",
+]
 exclude = ["vendor/jxl-rs"]
 resolver = "2"
 

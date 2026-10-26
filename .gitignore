@@ -2,6 +2,9 @@
 /vendor/jxl-rs/target/
 /vendor/jxl-rs/Cargo.lock
 /out/
+/build/
+/dist/
+/python/*.egg-info/
 *.jxl
 *.profraw
 __pycache__/

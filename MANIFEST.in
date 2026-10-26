@@ -1,0 +1,21 @@
+include pyproject.toml setup.py MANIFEST.in README.md AGENTS.md Cargo.toml Cargo.lock
+recursive-include docs *.md
+recursive-include python/rs_jxl *.py *.pyi py.typed *.h
+recursive-include python/tests *.py
+recursive-include crates *.rs *.toml *.md *.h *.hex LICENSE* NOTICE* COPYING*
+recursive-include vendor/jxl-rs *.rs *.toml *.md *.py LICENSE* NOTICE* COPYING* AUTHORS PATENTS
+recursive-include vendor/libsais-rs *.rs *.toml *.md LICENSE* NOTICE* COPYING*
+# Runtime include_bytes! asset and the core test's include_str! profile.
+# Other current vendor include_bytes! references are test-only upstream corpora,
+# not release dependencies; those unvendored corpora remain excluded below.
+include vendor/jxl-rs/jxl/src/util/dither_32x32.bin
+include crates/rs-jxl/tests/srgb_profile.hex
+
+# Globstars also exclude build/cache/private trees nested inside vendored crates.
+global-exclude **/target/** **/out/** **/build/** **/dist/**
+global-exclude **/data/** **/private/** **/resources/** **/testdata/**
+global-exclude **/.git/** **/.hg/** **/.svn/** **/.github/**
+global-exclude **/__pycache__/** **/.pytest_cache/** **/.mypy_cache/** **/.ruff_cache/** **/.cache/**
+global-exclude **/node_modules/** **/.venv/** **/venv/**
+global-exclude *.py[cod] *.so *.dll *.dylib *.exe *.lib *.a *.o *.obj *.pdb
+global-exclude .env .env.* *.pem *.key *.log *.profraw .DS_Store Thumbs.db

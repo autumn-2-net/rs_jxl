@@ -1,13 +1,15 @@
 # Python Interface Boundary
 
-This is an architectural reservation, not a working ABI or Python package.
-Do not reintroduce the deleted bootstrap's CFFI wrapper as an implementation.
+The `rs_jxl` Python package calls the versioned Rust C ABI in-process.
+See [Python API and packaging](PYTHON_API.md) for usage, supported controls,
+ownership, validation and remaining differences from the C++ `jxlpy` package.
 
 The encoder core owns Rust image/coefficient/frame data and does not depend on
-Python. A later `rs-jxl-ffi` crate will expose a C ABI implemented in Rust for
-CFFI callers; a C ABI is not permission to call or link a C++ codec.
+Python. `rs-jxl-ffi` exposes a C ABI implemented in Rust for CFFI callers;
+it does not call or link a C++ codec. `rs-jxl-image` shares PNG/JPEG input
+implementations with the CLI, avoiding separate Python input semantics.
 
-Required contract before publishing:
+Maintenance contracts:
 
 - An explicit ABI version and structure sizes, validated before accessing fields.
 - Typed 8/16-bit samples, layout/stride/byte-order validation and resource limits.
@@ -21,5 +23,7 @@ Required contract before publishing:
 - Path and bytes interfaces at the Python layer, ndarray/tensor layout checks,
   and CPU transfer policy for tensors. No implicit lossy conversion.
 
-Choose the detailed ABI only after the underlying Rust operations work. General
-Rust packages may be used for threading, image I/O and packaging support.
+The ABI header and serialized request contract live under `crates/rs-jxl-ffi`.
+Breaking native layout/protocol changes must bump the ABI version and update
+the Python declaration and tests together. Python metadata, arrays, encoding,
+decoding and multiframe adapters are separate modules, not one API monolith.

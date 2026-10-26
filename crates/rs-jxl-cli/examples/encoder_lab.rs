@@ -1,8 +1,14 @@
 //! Development-only candidate/scout experiments; not part of the installed CLI.
-#[path = "../src/input/mod.rs"]
-mod input;
+use rs_jxl_image as input;
 
 #[path = "../src/options.rs"]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "This example shares MA budget/pruning parsers, not the manual Tools::apply adapter."
+    )
+)]
 mod options;
 
 #[cfg(test)]

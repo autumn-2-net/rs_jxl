@@ -8,7 +8,8 @@ use rs_jxl::jpeg::{
     search::SearchLimits, transcode, transcode_search,
 };
 
-use crate::{Result, io, parse_sample_limit, parse_threads};
+use crate::validators::{parse_sample_limit, parse_threads};
+use crate::{Result, io};
 
 #[derive(Clone, Copy, Debug, Default, ValueEnum)]
 enum Order {

@@ -1,4 +1,5 @@
 use super::*;
+use rs_jxl::EncodeOptions;
 use rs_jxl::modular::ma_train::MaBudgetMode;
 
 #[test]

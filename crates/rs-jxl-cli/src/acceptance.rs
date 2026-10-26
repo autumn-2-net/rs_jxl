@@ -14,7 +14,8 @@ use rs_jxl::scheduler::{
     run_native_pixel_search,
 };
 
-use crate::{Cli, Result, encode_image, expect_encode, input, io};
+use crate::encode::encode_image;
+use crate::{Cli, Result, expect_encode, input, io};
 
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
@@ -91,7 +92,7 @@ fn source_cli_small_png_matches_native_candidate_and_search() -> Result<()> {
                 argv.push("--source-search".into());
             }
             let args = expect_encode(Cli::try_parse_from(argv)?.command);
-            crate::run(args)?;
+            crate::encode::run(args)?;
             let mut base = EncodeOptions::default();
             base.modular.sample_limit = Some(4096);
             let params = CandidateParams::default().backend(3)?;

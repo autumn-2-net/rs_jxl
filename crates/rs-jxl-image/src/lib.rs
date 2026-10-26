@@ -1,16 +1,18 @@
+//! PNG and JPEG pixel input shared by the CLI and bindings.
+
 mod jpeg;
 mod png;
 
 use rs_jxl::Image;
 
-use crate::Result;
+pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
-pub(crate) struct Decoded {
+pub struct Decoded {
     pub image: Image,
     pub jpeg: bool,
 }
 
-pub(crate) fn decode(bytes: &[u8], strip_metadata: bool) -> Result<Decoded> {
+pub fn decode(bytes: &[u8], strip_metadata: bool) -> Result<Decoded> {
     if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
         Ok(Decoded {
             image: png::decode(bytes, strip_metadata)?,

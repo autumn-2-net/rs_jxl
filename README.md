@@ -81,7 +81,7 @@ diagnostics, not a requirement to reproduce C++ arithmetic bit for bit.
 Source coverage, active versus pending integration, and remaining optimization
 work are tracked in [PIXEL_LOSSLESS_PORT_STATUS.md](docs/PIXEL_LOSSLESS_PORT_STATUS.md).
 The parallel-execution, x86-fast-kernel, scheduler-detail and push-streaming
-follow-up is implemented and independently verified; the latest checkpoint has
+follow-up is implemented and independently verified; its earlier checkpoint recorded
 1,527 ordinary tests passing in both debug and optimized validation. See
 [verification](docs/PORT_VERIFICATION.md) for the separate official decoder
 matrices and actual runtime/portability scope.
@@ -108,14 +108,46 @@ original-byte checks including file/stdin/stdout and output protection. Original
 entropy bytes are removed before coefficient encoding. Historical real-file
 checks and the latest reruns are recorded in the verification document.
 See [JPEG API](docs/JPEG_API.md) for controls, budgets and remaining restrictions.
-A future versioned C ABI will
-support Python CFFI. Lossy encoding and neural scheduling are out of scope.
+A versioned Rust C ABI supports Python CFFI through the separate `rs_jxl`
+package; see [Python bindings](docs/PYTHON_INTERFACE.md). Lossy encoding and
+neural scheduling are out of scope.
 
 **The `encode` command's JPEG input decodes to pixels. Original JPEG bytes cannot
 be reconstructed from that output.** Use `transcode-jpeg` or the separate archival API instead of this
-route. Python packaging is not implemented. Decoder integration is tracked
+route. Python wheels bundle the Rust shared library, not a C++ codec or a CLI
+subprocess. Decoder integration is tracked
 separately; official `djxl` remains an independent test oracle, not an
 implementation dependency.
+
+## Python
+
+```powershell
+cargo build --locked --offline --release -p rs-jxl-ffi
+python -m pip wheel . --no-build-isolation --no-deps --wheel-dir dist
+python -m pip install dist/rs_jxl-0.1.0-py3-none-win_amd64.whl
+```
+
+The filename above is for Windows x64; wheel tags follow the native build
+platform. Source builds need a Rust toolchain and cached locked dependencies;
+`cargo fetch --locked` prepares those dependencies on an online machine.
+Set `RS_JXL_NATIVE_LIB` to an already built matching library to skip compilation
+during packaging. Installing a wheel does not need Rust. No CI workflow changed.
+
+```python
+import rs_jxl
+
+jxl = rs_jxl.encode("input.png", effort=9, threads=8)
+pixels = rs_jxl.decode(jxl)  # owned NumPy HWC array
+archived = rs_jxl.transcode_jpeg("input.jpg", effort=9, threads=8)
+original_jpeg = rs_jxl.reconstruct_jpeg(archived)
+```
+
+The package also accepts arrays/tensors, encoded bytes and binary streams,
+supports extra channels and automatic multiframe strategies, and keeps raw
+zero-duration layers separate from display frames. It does not alias `jxlpy`
+or silently accept unsupported lossy/libjxl options. See the
+[API and build guide](docs/PYTHON_INTERFACE.md),
+[code architecture](docs/ARCHITECTURE.md) and [documentation index](docs/README.md).
 
 ## Build and Run
 
@@ -276,7 +308,7 @@ not verified. Later changes must repeat the checks; see the checkpoint document.
 - [Integer, floating-point and SIMD contracts](docs/INTEGER_AND_FLOAT_PATHS.md)
 - [Historical bitstream bring-up](docs/PIXEL_LOSSLESS_MILESTONE.md)
 - [Kernel provenance and upstream BSD notice](docs/PORTING_KERNELS.md)
-- [Python interface boundary](docs/PYTHON_INTERFACE.md)
+- [Python CFFI bindings](docs/PYTHON_INTERFACE.md)
 - [Contributor rules](AGENTS.md)
 
 Translated libjxl code retains upstream attribution and BSD-3-Clause conditions.

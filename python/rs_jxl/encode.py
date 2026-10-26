@@ -1,0 +1,52 @@
+"""Lossless still-image and byte-reversible JPEG entry points."""
+
+from ._arrays import Payload
+from ._ffi import execute
+from ._io import is_source, read_bytes, write_or_return
+from . import _options
+
+
+def transcode_jpeg(src, output=None, *, effort=9, threads=1, source_search=False,
+                   brotli_quality=None, no_cfl=False, order="source", limits=None):
+    """Preserve original JPEG bytes; unsupported JPEG forms fail without pixel fallback."""
+    options = _options.encoder(effort, threads, source_search, None, {})
+    options.update(no_cfl=no_cfl, order=order, limits=_options.limits(limits))
+    if brotli_quality is not None:
+        options["brotli_quality"] = brotli_quality
+    data, _ = execute({"operation": "transcode_jpeg", "options": options}, read_bytes(src))
+    return write_or_return(data, output)
+
+
+def encode(src, output=None, *, layout="auto", effort=7, threads=1,
+           lossless=True, distance=0, lossless_jpeg=True, source_search=False,
+           strip_metadata=False, extra_channels=None, bits_per_sample=0,
+           color_encoding=None, icc_profile=None, orientation=1,
+           allow_device_copy=False, encoder_options=None, **tool_options):
+    """Encode arrays/tensors/PNG bytes; JPEG bytes default to reversible transcoding.
+
+    NumPy auto layout is HWC, Torch auto layout is CHW; output is always lossless.
+    GPU inputs require allow_device_copy=True. Unknown codec options are errors.
+    """
+    _options.lossless_only(lossless, distance)
+    options = _options.encoder(effort, threads, source_search, encoder_options, tool_options)
+    if is_source(src):
+        src = read_bytes(src)
+        if src.startswith(b"\xff\xd8") and lossless_jpeg:
+            if (extra_channels is not None or bits_per_sample or color_encoding is not None
+                    or icc_profile is not None or orientation != 1 or strip_metadata):
+                raise ValueError("JPEG byte transcoding cannot apply pixel/metadata overrides")
+            data, _ = execute({"operation": "transcode_jpeg", "options": options}, src)
+            return write_or_return(data, output)
+    payload = Payload()
+    image = payload.image(src, layout=layout, extra_channels=extra_channels,
+                          bits_per_sample=bits_per_sample, color_encoding=color_encoding,
+                          icc_profile=icc_profile, orientation=orientation,
+                          allow_device_copy=allow_device_copy)
+    options["strip_metadata"] = strip_metadata
+    data, _ = execute({"operation": "encode", "options": options, "images": [image]}, payload.data)
+    return write_or_return(data, output)
+
+
+def convert(src, output=None, **options):
+    """Alias for encode; this does not silently re-encode existing JXL files."""
+    return encode(src, output, **options)

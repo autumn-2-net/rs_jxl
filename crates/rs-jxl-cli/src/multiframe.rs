@@ -8,7 +8,7 @@ use rs_jxl::metadata::Animation;
 use rs_jxl::multiframe::{AutoEncodeResult, AutoOptions, Reference, encode_auto};
 use rs_jxl::{EncodeOptions, Image};
 
-use crate::{Result, input, io, options::Tools, parse_threads};
+use crate::{Result, input, io, options::Tools, validators::parse_threads};
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum ReferenceArg {
