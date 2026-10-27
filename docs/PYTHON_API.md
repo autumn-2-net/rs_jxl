@@ -789,6 +789,13 @@ tests on those systems, not just a matching wheel platform tag.
 
 ### Current Verification
 
+After the 2026-10-27 module cleanup, the rebuilt Release DLL again passed all
+260 Python/harness tests and the freshly built, isolated wheel passed all 174
+API tests, with CUDA and official decoder checks enabled. No Python API or
+protocol changes were made. See the
+[maintenance checkpoint](ARCHITECTURE.md#multiframe-maintenance-checkpoint)
+for the complete Rust regression and the scope of this verification.
+
 The final multiframe stability check on 2026-10-27 passed 260 tests across
 `python/tests` and the multiframe benchmark harness, with official djxl 0.12/0.13
 and CUDA checks enabled. The built Windows wheel was installed into an isolated

@@ -5,15 +5,15 @@ use crate::{
 use rs_jxl::{
     EncodeOptions, Image,
     codec::{EncodeJob, EncodeReport, EncodeRoute, Encoder, SourceRequest, SourceSearch},
-    metadata::Animation,
     modular::predictor::Predictor,
-    multiframe::{self, Reference},
     scheduler::{
         CandidateParams, NativeBackendOptions, NativeImplementation, adapter::project_native,
         params::Override,
     },
 };
 use serde_json::{Value, json};
+
+mod multiframe;
 
 fn candidate(options: &Options) -> Result<(CandidateParams, EncodeOptions)> {
     let mut params = CandidateParams::default()
@@ -113,91 +113,6 @@ fn report(value: &EncodeReport) -> Value {
     })
 }
 
-fn reference(request: &Request) -> Reference {
-    match request.reference.as_deref().unwrap_or("previous") {
-        "full" => Reference::Full,
-        "first" => Reference::First,
-        "smallest_crop" => Reference::SmallestCrop,
-        _ => Reference::Previous,
-    }
-}
-
-fn rect(rect: Option<multiframe::Rect>) -> Value {
-    rect.map_or(Value::Null, |r| {
-        json!({
-            "x": r.x,
-            "y": r.y,
-            "width": r.width,
-            "height": r.height,
-        })
-    })
-}
-
-fn auto_frame_report(index: usize, frame: &multiframe::AutoFrameReport) -> Value {
-    let candidates: Vec<_> = frame
-        .candidates
-        .iter()
-        .map(|candidate| {
-            json!({
-                "strategy": format!("{:?}", candidate.strategy),
-                "tile_size": candidate.tile_size,
-                "reference_index": candidate.reference_index,
-                "source": candidate.source,
-                "save_as_reference": candidate.save_as_reference,
-                "encoded_bytes": candidate.encoded_bytes,
-                "encoded_frames": candidate.encoded_frames,
-                "trial_pixels": candidate.trial_pixels,
-                "elapsed_seconds": candidate.elapsed.as_secs_f64(),
-            })
-        })
-        .collect();
-    let pruned: Vec<_> = frame
-        .pruned
-        .iter()
-        .map(|candidate| {
-            json!({
-                "strategy": format!("{:?}", candidate.strategy),
-                "tile_size": candidate.tile_size,
-                "reference_index": candidate.reference_index,
-                "source": candidate.source,
-                "save_as_reference": candidate.save_as_reference,
-                "lower_bound": candidate.lower_bound,
-                "encoded_frames": candidate.encoded_frames,
-                "planned_frames": candidate.planned_frames,
-                "trial_pixels": candidate.trial_pixels,
-                "elapsed_seconds": candidate.elapsed.as_secs_f64(),
-            })
-        })
-        .collect();
-    let differences: Vec<_> = frame
-        .differences
-        .iter()
-        .map(|difference| {
-            json!({
-                "reference": difference.reference,
-                "source": difference.source,
-                "changed_pixels": difference.changed_pixels,
-                "bounds": rect(difference.bounds),
-            })
-        })
-        .collect();
-    json!({
-        "index": index,
-        "winner_index": frame.winner_index,
-        "retained_reference": frame.retained_reference,
-        "reference_lookahead": frame.reference_lookahead,
-        "lookahead_comparisons": frame.lookahead_comparisons,
-        "reused_payloads": frame.reused_payloads,
-        "reused_payload_pixels": frame.reused_payload_pixels,
-        "references_before": frame.references_before,
-        "references_after": frame.references_after,
-        "candidates": candidates,
-        "pruned": pruned,
-        "analysis_seconds": frame.analysis_elapsed.as_secs_f64(),
-        "differences": differences,
-    })
-}
-
 pub fn execute(request: &Request, data: &[u8]) -> Result<(Value, Vec<u8>)> {
     execute_with_context(request, data, None)
 }
@@ -227,69 +142,7 @@ pub fn execute_with_context(
             result.bytes,
         ));
     }
-    let timebase = request.timebase.unwrap_or([1000, 1]);
-    let animation = Animation {
-        ticks_per_second_numerator: timebase[0],
-        ticks_per_second_denominator: timebase[1],
-        loops: request.loops.unwrap_or(0),
-        timecodes: false,
-    };
-    animation.validate().map_err(message)?;
-    let images = images
-        .into_iter()
-        .map(|image| {
-            let mut metadata = image.metadata().clone();
-            metadata.animation = Some(animation);
-            // with_metadata consumes the image but requires owned extra planes.
-            let extra_planes = image.extra_planes().to_vec();
-            image.with_metadata(metadata, extra_planes).map_err(message)
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let durations = request
-        .durations
-        .clone()
-        .unwrap_or_else(|| vec![1; images.len()]);
-    let options = pixel_options(&images[0], &request.options)?;
-    let mut report = json!({
-        "operation": "encode_multiframe",
-        "jpeg_input": jpeg_input,
-    });
-    let mut owned;
-    let encoder = match context {
-        Some(encoder) => encoder,
-        None => {
-            owned = Encoder::new(options.threads).map_err(message)?;
-            &mut owned
-        }
-    };
-    let bytes = if request.auto.unwrap_or(false) {
-        let auto = request.auto_options.as_ref().map_or_else(
-            || multiframe::AutoOptions {
-                reference: reference(request),
-                ..Default::default()
-            },
-            |auto| auto.native(reference(request)),
-        );
-        let result = encoder
-            .encode_auto(&images, &durations, &options, &auto)
-            .map_err(message)?;
-        let frames: Vec<_> = result
-            .frames
-            .iter()
-            .enumerate()
-            .map(|(index, frame)| auto_frame_report(index, frame))
-            .collect();
-        report["frames"] = json!(frames);
-        result.bytes
-    } else {
-        let plan = multiframe::plan(&images, &durations, reference(request)).map_err(message)?;
-        let frames: Vec<_> = plan.iter().map(|p| p.as_frame()).collect();
-        encoder
-            .encode_frames(&images[0], &frames, &options)
-            .map_err(message)?
-    };
-    report["bytes"] = json!(bytes.len());
-    Ok((report, bytes))
+    multiframe::execute(request, images, jpeg_input, context)
 }
 
 pub fn transcode(request: &Request, data: &[u8]) -> Result<(Value, Vec<u8>)> {
@@ -373,100 +226,5 @@ pub fn transcode_with_context(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use multiframe::{
-        AutoCandidateReport, AutoDiffReport, AutoFrameReport, AutoPrunedReport, Strategy,
-    };
-    use std::time::Duration;
-
-    #[test]
-    fn auto_report_keeps_native_statistics_and_separates_pruned_bounds() {
-        let frame = AutoFrameReport {
-            winner_index: 0,
-            retained_reference: true,
-            reference_lookahead: true,
-            lookahead_comparisons: 3,
-            reused_payloads: 2,
-            reused_payload_pixels: 25,
-            references_before: [None, Some(0), Some(1), None],
-            references_after: [None, Some(2), Some(1), None],
-            candidates: vec![AutoCandidateReport {
-                strategy: Strategy::Full,
-                tile_size: None,
-                reference_index: None,
-                source: 0,
-                save_as_reference: 1,
-                encoded_bytes: 80,
-                encoded_frames: 1,
-                trial_pixels: 100,
-                elapsed: Duration::from_millis(125),
-            }],
-            pruned: vec![AutoPrunedReport {
-                strategy: Strategy::MergedRetained,
-                tile_size: Some(16),
-                reference_index: Some(1),
-                source: 2,
-                save_as_reference: 1,
-                lower_bound: 90,
-                encoded_frames: 1,
-                planned_frames: 3,
-                trial_pixels: 30,
-                elapsed: Duration::from_millis(250),
-            }],
-            analysis_elapsed: Duration::from_millis(500),
-            differences: vec![
-                AutoDiffReport {
-                    reference: 0,
-                    source: 1,
-                    changed_pixels: 0,
-                    bounds: None,
-                },
-                AutoDiffReport {
-                    reference: 1,
-                    source: 2,
-                    changed_pixels: 2,
-                    bounds: Some(multiframe::Rect {
-                        x: 3,
-                        y: 4,
-                        width: 5,
-                        height: 6,
-                    }),
-                },
-            ],
-        };
-        assert_eq!(
-            auto_frame_report(2, &frame),
-            json!({
-                "index": 2,
-                "winner_index": 0,
-                "retained_reference": true,
-                "reference_lookahead": true,
-                "lookahead_comparisons": 3,
-                "reused_payloads": 2,
-                "reused_payload_pixels": 25,
-                "references_before": [null, 0, 1, null],
-                "references_after": [null, 2, 1, null],
-                "candidates": [{
-                    "strategy": "Full", "encoded_bytes": 80, "encoded_frames": 1,
-                    "tile_size": null,
-                    "reference_index": null, "source": 0, "save_as_reference": 1,
-                    "trial_pixels": 100, "elapsed_seconds": 0.125,
-                }],
-                "pruned": [{
-                    "strategy": "MergedRetained", "lower_bound": 90,
-                    "tile_size": 16,
-                    "reference_index": 1, "source": 2, "save_as_reference": 1,
-                    "encoded_frames": 1, "planned_frames": 3,
-                    "trial_pixels": 30, "elapsed_seconds": 0.25,
-                }],
-                "analysis_seconds": 0.5,
-                "differences": [
-                    {"reference": 0, "source": 1, "changed_pixels": 0, "bounds": null},
-                    {"reference": 1, "source": 2, "changed_pixels": 2,
-                     "bounds": {"x": 3, "y": 4, "width": 5, "height": 6}},
-                ],
-            })
-        );
-    }
-}
+#[path = "encode/tests.rs"]
+mod tests;

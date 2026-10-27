@@ -1,168 +1,29 @@
 //! Per-logical-frame search using real encoded layers, with retained winners.
+mod trial;
+
 use super::{
-    Rect, Reference, compatible, crop, diff::DiffMap, lookahead::Lookahead, partition,
-    payload::Payloads, references::ReferenceSlots, regions,
+    AutoEncodeResult, AutoFrameReport, AutoOptions, Reference, candidates::candidates, compatible,
+    lookahead::Lookahead, payload::Payloads, references::ReferenceSlots,
 };
-use crate::{
-    EncodeOptions, Error, Image, Result,
-    encode::budget::{SectionBudget, TrialEncode},
-    frame::{BlendInfo, BlendMode, Frame, FrameOptions},
-};
-use std::{
-    borrow::Cow,
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use crate::{EncodeOptions, Error, Image, Result};
+use std::time::Instant;
+use trial::{Outcome, Trial};
 
-#[derive(Clone, Debug)]
-pub struct AutoOptions {
-    /// SmallestCrop tests both first/previous references using actual bytes.
-    pub reference: Reference,
-    pub allow_mask: bool,
-    pub allow_multi_rect: bool,
-    pub tile_size: u32,
-    /// Additional rectangle grids, tried after the original candidates. Empty
-    /// by default. Equivalent rectangle plans are tried only once per source.
-    pub extra_tile_sizes: Vec<u32>,
-    pub max_rectangles: usize,
-    /// Stop only when finalized output proves a trial cannot beat the winner.
-    pub prune: bool,
-    /// Add a cost-estimated rectangle proposal; retain all legacy candidates.
-    pub adaptive_rectangles: bool,
-    /// Retain a winning delta's background and rotate the other saved canvas.
-    /// Opt-in, requires SmallestCrop. May evict frame zero; not a global optimum.
-    pub retained_reference: bool,
-    /// Use exact next-input geometry to preserve a useful old canvas. Opt-in;
-    /// requires retained_reference and does not guarantee a global minimum.
-    pub reference_lookahead: bool,
-    /// Logical input frames, independent of inserted zero-duration layers.
-    pub max_frames: usize,
-    pub max_total_trials: usize,
-    /// Sum of submitted rectangle areas, including payload-cache hits.
-    pub max_trial_pixels: u64,
+struct Winner {
+    rank: usize,
+    bytes: Vec<u8>,
+    references: [Option<bool>; 4],
+    slots: ReferenceSlots,
 }
-impl Default for AutoOptions {
-    fn default() -> Self {
-        Self {
-            reference: Reference::SmallestCrop,
-            allow_mask: true,
-            allow_multi_rect: true,
-            tile_size: 32,
-            extra_tile_sizes: Vec::new(),
-            max_rectangles: 32,
-            prune: true,
-            adaptive_rectangles: true,
-            retained_reference: false,
-            reference_lookahead: false,
-            max_frames: usize::MAX,
-            max_total_trials: usize::MAX,
-            max_trial_pixels: u64::MAX,
+
+impl Winner {
+    fn cutoff(&self, rank: usize) -> Option<usize> {
+        // Earlier canonical candidates may still win an equal-byte tie.
+        if rank < self.rank {
+            self.bytes.len().checked_add(1)
+        } else {
+            Some(self.bytes.len())
         }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Strategy {
-    Full,
-    CropPrevious,
-    CropFirst,
-    MaskPrevious,
-    MaskFirst,
-    TilesPrevious,
-    TilesFirst,
-    MergedPrevious,
-    MergedFirst,
-    CropRetained,
-    MaskRetained,
-    TilesRetained,
-    MergedRetained,
-}
-
-#[derive(Debug)]
-pub struct AutoCandidateReport {
-    pub strategy: Strategy,
-    /// Grid that proposed a rectangle partition; None for full/crop/mask.
-    pub tile_size: Option<u32>,
-    pub reference_index: Option<usize>,
-    pub source: u8,
-    /// Final layer's save slot (0 on the final stream frame).
-    pub save_as_reference: u8,
-    /// Actual layer bytes, including frame headers and any private patch atlas.
-    pub encoded_bytes: usize,
-    /// Regular layers, excluding private reference-only patch frames.
-    pub encoded_frames: usize,
-    /// Submitted rectangle area including payload-cache hits, not analysis scans.
-    pub trial_pixels: u64,
-    pub elapsed: Duration,
-}
-#[derive(Debug)]
-pub struct AutoPrunedReport {
-    pub strategy: Strategy,
-    pub tile_size: Option<u32>,
-    pub reference_index: Option<usize>,
-    pub source: u8,
-    /// Intended final layer's save slot; pruned trials never change live slots.
-    pub save_as_reference: u8,
-    /// Proven size lower bound, not an estimated or complete encoded byte count.
-    pub lower_bound: usize,
-    pub encoded_frames: usize,
-    pub planned_frames: usize,
-    pub trial_pixels: u64,
-    pub elapsed: Duration,
-}
-#[derive(Debug)]
-pub struct AutoDiffReport {
-    pub reference: usize,
-    pub source: u8,
-    pub changed_pixels: u64,
-    pub bounds: Option<Rect>,
-}
-#[derive(Debug)]
-pub struct AutoFrameReport {
-    pub retained_reference: bool,
-    pub reference_lookahead: bool,
-    pub lookahead_comparisons: usize,
-    pub reused_payloads: usize,
-    pub reused_payload_pixels: u64,
-    /// Complete input states in each slot; None also covers partial scratch state.
-    pub references_before: [Option<usize>; 4],
-    pub references_after: [Option<usize>; 4],
-    pub winner_index: usize,
-    pub candidates: Vec<AutoCandidateReport>,
-    pub pruned: Vec<AutoPrunedReport>,
-    pub differences: Vec<AutoDiffReport>,
-    pub analysis_elapsed: Duration,
-}
-#[derive(Debug)]
-pub struct AutoEncodeResult {
-    pub bytes: Vec<u8>,
-    /// One report per input, also when its duration is zero.
-    pub frames: Vec<AutoFrameReport>,
-}
-
-pub(super) struct Candidate {
-    pub(super) strategy: Strategy,
-    pub(super) tile_size: Option<u32>,
-    pub(super) reference_index: Option<usize>,
-    pub(super) diff: Option<Arc<DiffMap>>,
-    pub(super) source: u8,
-    pub(super) rects: Vec<Rect>,
-    pub(super) mask: bool,
-}
-
-impl Candidate {
-    // Ranking only. No candidate is discarded using this estimate.
-    fn estimated_work(&self) -> u64 {
-        let area = self.rects.iter().fold(0u64, |sum, rect| {
-            sum.saturating_add(u64::from(rect.width) * u64::from(rect.height))
-        });
-        // Sparse mask contents are cheaper, but materialization/transforms still
-        // visit the entire bbox. Keep a scan-cost floor instead of treating that
-        // work as almost free. This weight ranks trials, never bounds their bytes.
-        let pixels = self.diff.as_ref().map_or(area, |diff| {
-            diff.changed_pixels().saturating_add(area.div_ceil(8))
-        });
-        pixels.saturating_add((self.rects.len() as u64).saturating_mul(64))
     }
 }
 
@@ -250,210 +111,6 @@ fn validate(
     Ok(())
 }
 
-fn candidates(
-    images: &[Image],
-    index: usize,
-    auto: &AutoOptions,
-    bytes_per_pixel: f64,
-    differences: &mut Vec<AutoDiffReport>,
-    slots: &ReferenceSlots,
-    lookahead: &Lookahead,
-) -> Result<Vec<Candidate>> {
-    let mut maps = Vec::new();
-    if index != 0
-        && auto.reference != Reference::Full
-        && !images[index]
-            .metadata()
-            .extra_channels
-            .iter()
-            .any(|e| e.dim_shift != 0)
-    {
-        let sources = if auto.retained_reference {
-            slots.sources(index)
-        } else {
-            reference_indices(index, auto.reference)
-                .into_iter()
-                .map(|reference| (reference, if reference == 0 { 1 } else { 2 }))
-                .collect()
-        };
-        for (reference, source) in sources {
-            let diff = match lookahead.map(reference, index) {
-                Some(diff) => diff,
-                None => Arc::new(DiffMap::between(&images[reference], &images[index])?),
-            };
-            differences.push(AutoDiffReport {
-                reference,
-                source,
-                changed_pixels: diff.changed_pixels(),
-                bounds: diff.bounds(),
-            });
-            maps.push((reference, source, diff));
-        }
-    }
-    candidates_from_references(&images[index], index, auto, bytes_per_pixel, &maps)
-}
-
-pub(super) fn reference_indices(index: usize, reference: Reference) -> Vec<usize> {
-    if index == 0 || reference == Reference::Full {
-        return Vec::new();
-    }
-    match reference {
-        Reference::Previous => vec![index - 1],
-        Reference::First => vec![0],
-        _ if index == 1 => vec![0],
-        _ => vec![index - 1, 0],
-    }
-}
-
-/// Shared geometry proposal stage. Maps are computed once per reference pair;
-/// analysis never materializes cropped images or starts an encode trial.
-pub(super) fn candidates_from_maps(
-    current: &Image,
-    index: usize,
-    auto: &AutoOptions,
-    bytes_per_pixel: f64,
-    maps: &[(usize, Arc<DiffMap>)],
-) -> Result<Vec<Candidate>> {
-    let maps: Vec<_> = maps
-        .iter()
-        .map(|(index, diff)| (*index, if *index == 0 { 1 } else { 2 }, Arc::clone(diff)))
-        .collect();
-    candidates_from_references(current, index, auto, bytes_per_pixel, &maps)
-}
-
-fn candidates_from_references(
-    current: &Image,
-    index: usize,
-    auto: &AutoOptions,
-    bytes_per_pixel: f64,
-    maps: &[(usize, u8, Arc<DiffMap>)],
-) -> Result<Vec<Candidate>> {
-    let full = Rect {
-        x: 0,
-        y: 0,
-        width: current.width(),
-        height: current.height(),
-    };
-    let mut result = vec![Candidate {
-        strategy: Strategy::Full,
-        tile_size: None,
-        reference_index: None,
-        diff: None,
-        source: 0,
-        rects: vec![full],
-        mask: false,
-    }];
-    if index == 0
-        || auto.reference == Reference::Full
-        || current
-            .metadata()
-            .extra_channels
-            .iter()
-            .any(|e| e.dim_shift != 0)
-    {
-        return Ok(result);
-    }
-    let mut merged = Vec::new();
-    for &(reference, source, ref diff) in maps {
-        let first = reference == 0 && (index != 1 || auto.reference == Reference::First);
-        let previous = reference + 1 == index;
-        let bounds = diff.bounds();
-        let rect = bounds.unwrap_or(Rect {
-            x: 0,
-            y: 0,
-            width: 1,
-            height: 1,
-        });
-        // A full-size REPLACE crop is the full candidate already tested.
-        if rect != full {
-            result.push(Candidate {
-                tile_size: None,
-                strategy: if first {
-                    Strategy::CropFirst
-                } else if previous {
-                    Strategy::CropPrevious
-                } else {
-                    Strategy::CropRetained
-                },
-                reference_index: Some(reference),
-                diff: None,
-                source,
-                rects: vec![rect],
-                mask: false,
-            });
-        }
-        if bounds.is_none() {
-            continue;
-        }
-        if auto.allow_mask && diff.mask_eligible() {
-            result.push(Candidate {
-                tile_size: None,
-                strategy: if first {
-                    Strategy::MaskFirst
-                } else if previous {
-                    Strategy::MaskPrevious
-                } else {
-                    Strategy::MaskRetained
-                },
-                reference_index: Some(reference),
-                diff: Some(Arc::clone(diff)),
-                source,
-                rects: vec![rect],
-                mask: true,
-            });
-        }
-        if auto.allow_multi_rect
-            && let Some(rects) = regions::tiles_from_map(diff, auto.tile_size, auto.max_rectangles)?
-            && rects.len() > 1
-        {
-            result.push(Candidate {
-                tile_size: Some(auto.tile_size),
-                strategy: if first {
-                    Strategy::TilesFirst
-                } else if previous {
-                    Strategy::TilesPrevious
-                } else {
-                    Strategy::TilesRetained
-                },
-                reference_index: Some(reference),
-                diff: None,
-                source,
-                rects,
-                mask: false,
-            });
-        }
-        if auto.allow_multi_rect
-            && auto.adaptive_rectangles
-            && let Some(rects) =
-                partition::propose(diff, auto.tile_size, auto.max_rectangles, bytes_per_pixel)?
-            && rects.len() > 1
-            && !result.iter().any(|candidate| {
-                !candidate.mask && candidate.source == source && candidate.rects == rects
-            })
-        {
-            merged.push(Candidate {
-                tile_size: Some(auto.tile_size),
-                strategy: if first {
-                    Strategy::MergedFirst
-                } else if previous {
-                    Strategy::MergedPrevious
-                } else {
-                    Strategy::MergedRetained
-                },
-                reference_index: Some(reference),
-                diff: None,
-                source,
-                rects,
-                mask: false,
-            });
-        }
-    }
-    // Keep every legacy candidate ahead of new proposals for equal-size ties.
-    result.extend(merged);
-    super::scales::extend(index, auto, bytes_per_pixel, maps, &mut result)?;
-    Ok(result)
-}
-
 fn encode_inner(
     images: &[Image],
     durations: &[u32],
@@ -499,16 +156,12 @@ fn encode_inner(
         let analysis_elapsed = analysis_started.elapsed();
         let mut completed = Vec::new();
         let mut pruned = Vec::new();
-        let mut winner: Option<(usize, Vec<u8>)> = None;
-        let mut winner_references = available;
-        let mut winner_slots = slots;
+        let mut winner: Option<Winner> = None;
         for (rank, candidate) in candidates {
             trials = trials
                 .checked_add(1)
                 .filter(|&n| n <= auto.max_total_trials)
                 .ok_or(Error::Limit("automatic trial count"))?;
-            let mut trial_refs = available;
-            let mut trial_slots = slots;
             let destination = lookahead
                 .keep
                 .map(|keep| if keep == 1 { 2 } else { 1 })
@@ -519,170 +172,57 @@ fn encode_inner(
                         auto.retained_reference,
                     )
                 });
-            let final_save = if index + 1 == images.len() {
-                0
-            } else {
-                destination
-            };
-            let started = Instant::now();
-            let initial_pixels = pixels;
-            let mut bytes = Vec::new();
-            let mut encoded_frames = 0;
-            let mut submitted_parts = 0;
-            let mut lower_bound = None;
-            // Earlier canonical candidates may win equal-byte ties even if
-            // cheap-first execution measured a later candidate first.
             let cutoff = if auto.prune {
-                winner.as_ref().and_then(|(best_rank, best)| {
-                    if rank < *best_rank {
-                        best.len().checked_add(1)
-                    } else {
-                        Some(best.len())
-                    }
-                })
+                winner.as_ref().and_then(|best| best.cutoff(rank))
             } else {
                 None
             };
-            for (part, &rect) in candidate.rects.iter().enumerate() {
-                if cutoff.is_some_and(|maximum| bytes.len() >= maximum) {
-                    lower_bound = Some(bytes.len());
-                    break;
-                }
-                pixels = pixels
-                    .checked_add(u64::from(rect.width) * u64::from(rect.height))
-                    .filter(|&n| n <= auto.max_trial_pixels)
-                    .ok_or(Error::Limit("automatic trial pixel work"))?;
-                submitted_parts += 1;
-                let final_part = part + 1 == candidate.rects.len();
-                let last = index + 1 == images.len() && final_part;
-                let frame_image = if candidate.mask {
-                    Cow::Owned(regions::mask_from_map(
-                        image,
-                        rect,
-                        candidate.diff.as_ref().expect("mask difference map"),
-                    )?)
-                } else if rect.x == 0
-                    && rect.y == 0
-                    && rect.width == image.width()
-                    && rect.height == image.height()
-                {
-                    Cow::Borrowed(image)
-                } else {
-                    Cow::Owned(crop(image, rect)?)
-                };
-                let frame = Frame {
-                    image: &frame_image,
-                    options: FrameOptions {
-                        origin: (rect.x as i32, rect.y as i32),
-                        duration: if final_part { durations[index] } else { 0 },
-                        save_as_reference: if last { 0 } else { destination },
-                        blend: BlendInfo {
-                            source: if part == 0 {
-                                candidate.source
-                            } else {
-                                destination
-                            },
-                            mode: if candidate.mask {
-                                BlendMode::Blend
-                            } else {
-                                BlendMode::Replace
-                            },
-                            ..Default::default()
-                        },
-                        ..Default::default()
-                    },
-                };
-                trial_refs = crate::encode::validate_frame_references(
-                    canvas.into(),
-                    frame.image.into(),
-                    &frame.options,
-                    options,
-                    last,
-                    trial_refs,
-                )?;
-                let budget = SectionBudget::new(
-                    cutoff.map(|maximum| maximum - bytes.len()),
-                    options.max_output_bytes,
-                );
-                let encoded = if candidate.mask {
-                    crate::encode::encode_logical_frame_trial(
-                        canvas,
-                        &frame,
-                        options,
-                        last,
-                        budget.as_ref(),
-                    )
-                } else {
-                    payloads.encode(rect, canvas, &frame, options, last, budget.as_ref())
-                }?;
-                match encoded {
-                    TrialEncode::Complete(encoded) => {
-                        append(&mut bytes, encoded, options.max_output_bytes)?;
-                        encoded_frames += 1;
-                        trial_slots.saved_layer(
-                            index,
-                            frame.options.save_as_reference,
-                            frame.options.duration,
-                            final_part,
-                            last,
-                        );
-                    }
-                    TrialEncode::Bounded { lower_bound: bound } => {
-                        lower_bound = Some(
-                            bytes
-                                .len()
-                                .checked_add(bound)
-                                .ok_or(Error::Limit("automatic candidate size lower bound"))?,
-                        );
-                        break;
+            let trial = Trial {
+                canvas,
+                image,
+                options,
+                index,
+                duration: durations[index],
+                last_input: index + 1 == images.len(),
+                destination,
+                max_trial_pixels: auto.max_trial_pixels,
+            };
+            match trial.run(
+                &candidate,
+                available,
+                slots,
+                &mut pixels,
+                &mut payloads,
+                cutoff,
+            )? {
+                Outcome::Pruned(report) => pruned.push((rank, report)),
+                Outcome::Complete {
+                    bytes,
+                    report,
+                    references,
+                    slots,
+                } => {
+                    completed.push((rank, report));
+                    if winner
+                        .as_ref()
+                        .is_none_or(|best| (bytes.len(), rank) < (best.bytes.len(), best.rank))
+                    {
+                        winner = Some(Winner {
+                            rank,
+                            bytes,
+                            references,
+                            slots,
+                        });
                     }
                 }
-            }
-            if let Some(lower_bound) = lower_bound {
-                if !candidate.mask {
-                    payloads.skip(&candidate.rects[submitted_parts..]);
-                }
-                pruned.push((
-                    rank,
-                    AutoPrunedReport {
-                        strategy: candidate.strategy,
-                        tile_size: candidate.tile_size,
-                        reference_index: candidate.reference_index,
-                        source: candidate.source,
-                        save_as_reference: final_save,
-                        lower_bound,
-                        encoded_frames,
-                        planned_frames: candidate.rects.len(),
-                        trial_pixels: pixels - initial_pixels,
-                        elapsed: started.elapsed(),
-                    },
-                ));
-                continue;
-            }
-            completed.push((
-                rank,
-                AutoCandidateReport {
-                    strategy: candidate.strategy,
-                    tile_size: candidate.tile_size,
-                    reference_index: candidate.reference_index,
-                    source: candidate.source,
-                    save_as_reference: final_save,
-                    encoded_bytes: bytes.len(),
-                    encoded_frames,
-                    trial_pixels: pixels - initial_pixels,
-                    elapsed: started.elapsed(),
-                },
-            ));
-            if winner
-                .as_ref()
-                .is_none_or(|(best_rank, best)| (bytes.len(), rank) < (best.len(), *best_rank))
-            {
-                winner_references = trial_refs;
-                winner_slots = trial_slots;
-                winner = Some((rank, bytes));
             }
         }
-        let (winner_rank, winner_bytes) = winner.expect("at least one complete candidate");
+        let Winner {
+            rank: winner_rank,
+            bytes: winner_bytes,
+            references: winner_references,
+            slots: winner_slots,
+        } = winner.expect("at least one complete candidate");
         if index == 0 {
             anchor_bytes_per_pixel = winner_bytes.len() as f64
                 / (u64::from(canvas.width()) * u64::from(canvas.height())) as f64;
@@ -732,122 +272,4 @@ fn append(target: &mut Vec<u8>, bytes: Vec<u8>, maximum: usize) -> Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{PixelData, PixelLayout, metadata::Animation};
-
-    #[test]
-    fn sparse_mask_ranking_accounts_for_bbox_work_without_losing_its_discount() {
-        let width = 256;
-        let height = 256;
-        let mut pixels = vec![255; width * height * 4];
-        let previous = Image::new(
-            width as u32,
-            height as u32,
-            PixelLayout::Rgba,
-            PixelData::U8(pixels.clone()),
-        )
-        .unwrap();
-        pixels[(32 * width + 32) * 4] = 0;
-        pixels[(224 * width + 224) * 4] = 0;
-        let current = Image::new(
-            width as u32,
-            height as u32,
-            PixelLayout::Rgba,
-            PixelData::U8(pixels),
-        )
-        .unwrap();
-        let diff = Arc::new(DiffMap::between(&previous, &current).unwrap());
-        assert_eq!(diff.changed_pixels(), 2);
-        let candidates =
-            candidates_from_maps(&current, 1, &AutoOptions::default(), 1.0, &[(0, diff)]).unwrap();
-        let mask = candidates.iter().find(|c| c.mask).unwrap();
-        let crop = candidates
-            .iter()
-            .find(|c| c.strategy == Strategy::CropPrevious)
-            .unwrap();
-        let tiles = candidates
-            .iter()
-            .find(|c| c.strategy == Strategy::TilesPrevious)
-            .unwrap();
-        assert!(mask.estimated_work() < crop.estimated_work());
-        assert!(tiles.estimated_work() < mask.estimated_work());
-        assert_eq!(mask.estimated_work(), 2 + (193u64 * 193).div_ceil(8) + 64);
-
-        // A coarser partition may include unchanged pixels yet still be much
-        // cheaper to execute than scanning a large sparse-mask bbox.
-        let coarser = Candidate {
-            strategy: Strategy::MergedPrevious,
-            tile_size: Some(32),
-            reference_index: Some(0),
-            diff: None,
-            source: 1,
-            rects: vec![
-                Rect {
-                    x: 32,
-                    y: 32,
-                    width: 32,
-                    height: 16,
-                },
-                Rect {
-                    x: 193,
-                    y: 209,
-                    width: 32,
-                    height: 16,
-                },
-            ],
-            mask: false,
-        };
-        assert!(coarser.estimated_work() < mask.estimated_work());
-    }
-
-    #[test]
-    fn reusable_auto_pool_does_not_retain_frame_references_or_trial_budgets() {
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(2)
-            .build()
-            .unwrap();
-        let options = EncodeOptions {
-            threads: 2,
-            ..Default::default()
-        };
-        for supplied in [None, Some(&pool)] {
-            for value in [3, 91, 3] {
-                let images: Vec<_> = [value, value + 1]
-                    .into_iter()
-                    .map(|value| {
-                        let image =
-                            Image::new(4, 4, PixelLayout::Gray, PixelData::U8(vec![value; 16]))
-                                .unwrap();
-                        let mut metadata = image.metadata().clone();
-                        metadata.animation = Some(Animation::default());
-                        image.with_metadata(metadata, vec![]).unwrap()
-                    })
-                    .collect();
-                let limited = AutoOptions {
-                    max_total_trials: 1,
-                    ..Default::default()
-                };
-                assert!(matches!(
-                    encode_auto_in_pool(&images, &[1, 2], &options, &limited, supplied),
-                    Err(Error::Limit(_))
-                ));
-                let result = encode_auto_in_pool(
-                    &images,
-                    &[1, 2],
-                    &options,
-                    &AutoOptions::default(),
-                    supplied,
-                )
-                .unwrap();
-                let decoded = crate::decode::decode(&result.bytes, &Default::default()).unwrap();
-                assert_eq!(decoded.frames.len(), images.len());
-                for (frame, image) in decoded.frames.iter().zip(&images) {
-                    assert_eq!(&frame.pixels, image.pixels());
-                }
-                assert_eq!(result.frames.len(), images.len());
-                assert!(!crate::execution::is_serial());
-            }
-        }
-    }
-}
+mod tests;

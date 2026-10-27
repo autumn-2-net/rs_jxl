@@ -7,7 +7,7 @@ pub use geometry::{GeometryDiagnostics, GeometrySummary, RectangleWorkload};
 pub use history::HistoryAnalysis;
 
 use super::{
-    AutoOptions, Rect, Reference, Strategy, auto, compatible, diff::DiffMap, select_reference,
+    AutoOptions, Rect, Reference, Strategy, candidates, compatible, diff::DiffMap, select_reference,
 };
 use crate::{Error, Image, Result};
 use std::{
@@ -384,7 +384,7 @@ fn analyze_inner(images: &[Image], options: &AnalysisOptions) -> Result<Analysis
                     .ok_or(Error::Limit("analysis crop frame count"))?;
             }
         }
-        let maps: Vec<_> = auto::reference_indices(index, options.reference)
+        let maps: Vec<_> = candidates::reference_indices(index, options.reference)
             .into_iter()
             .map(|reference| {
                 let map = if reference == 0 {
@@ -398,7 +398,7 @@ fn analyze_inner(images: &[Image], options: &AnalysisOptions) -> Result<Analysis
                 )
             })
             .collect();
-        let candidates = auto::candidates_from_maps(
+        let candidates = candidates::candidates_from_maps(
             image,
             index,
             &auto,

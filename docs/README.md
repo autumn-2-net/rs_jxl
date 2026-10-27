@@ -39,6 +39,7 @@ platform certifications.
 | Incremental decoding | [Rust/CLI streaming input](STREAMING_INPUT.md); full Python incremental streaming is not implemented |
 | Byte-reversible JPEG | [JPEG API](JPEG_API.md), [compatibility and supported-domain distinctions](JPEG_COMPATIBILITY.md) |
 | Frame planning, layers and animation | [Automatic frames](MULTIFRAME_AUTO.md), [multiframe CLI](MULTIFRAME_AUTO_CLI.md), [frame-aware search](MULTIFRAME_SEARCH.md) |
+| Multiframe maintenance and module ownership | [Planning/execution boundaries](ARCHITECTURE.md#multiframe-planning-and-execution), including the CLI/FFI report contracts and reference-state commit rules |
 | Geometric and historical multiframe analysis | [Practical analysis guide (Chinese)](MULTIFRAME_ANALYSIS_GUIDE.md), [Native analysis API](MULTIFRAME_ANALYSIS.md), [multiscale e9 experiment](MULTIFRAME_MULTISCALE_BENCHMARK.md) |
 | Different-size images and future temporal reuse | [Heterogeneous layers](HETEROGENEOUS_LAYERS.md), [standard-bitstream reuse roadmap](MULTIFRAME_REUSE_ROADMAP.md) |
 | Incremental encoding and indexes | [Streaming output](STREAMING_OUTPUT.md), [frame index lifecycle](FRAME_INDEX.md) |
@@ -48,7 +49,12 @@ platform certifications.
 
 ## Acceptance and Validation
 
-The latest [multiframe stability checkpoint](MULTIFRAME_STABILITY_20261027.md)
+The latest [multiframe maintenance checkpoint](ARCHITECTURE.md#multiframe-maintenance-checkpoint)
+records the behavior-preserving module cleanup: 2,503 Rust tests, 260 Python and
+harness tests, 174 overlapping installed-wheel API tests and 11 official-decoder
+checks passed. It records ignored cases, packaging checks and validation limits.
+
+The preceding [multiframe stability checkpoint](MULTIFRAME_STABILITY_20261027.md)
 records the full-suite checks, isolated installed-wheel verification, independent
 official decoder checks and the corrected slot-zero reference assertion. It
 also documents the explicit cache-hit tests and what was not revalidated.

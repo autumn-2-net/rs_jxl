@@ -1,5 +1,5 @@
 //! Share repeated unmasked crops only within one logical input's candidate set.
-use super::{Rect, auto::Candidate};
+use super::{Rect, candidates::Candidate};
 use crate::{
     EncodeOptions, Image, Result,
     encode::{

@@ -1,6 +1,8 @@
 //! Optional extra rectangle grids. Reuse exact difference maps and retain the
 //! original candidates; geometry ranks proposals but never predicts a winner.
-use super::{AutoOptions, Reference, Strategy, auto::Candidate, diff::DiffMap, partition, regions};
+use super::{
+    AutoOptions, Reference, Strategy, candidates::Candidate, diff::DiffMap, partition, regions,
+};
 use crate::Result;
 use std::sync::Arc;
 

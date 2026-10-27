@@ -49,6 +49,61 @@ Paths in this table are under `crates/rs-jxl/src`.
 | Runtime JXL decoding | [decode/mod.rs](../crates/rs-jxl/src/decode/mod.rs), `engine.rs`, `native.rs`, `stream.rs`, `jpeg.rs`, `color*.rs` | Backend adaptation, limits, native samples, streaming state, JPEG coefficient capture/reconstruction and explicit rendered conversions. Backend implementation is in `vendor/jxl-rs`. |
 | Experimental transcripts | [final_plan.rs](../crates/rs-jxl/src/final_plan.rs), `final_plan/` | Transcript schemas and wire helpers. Their presence is not evidence that ordinary codec capture/replay is connected. |
 
+### Multiframe Planning and Execution
+
+Automatic multiframe encoding and geometry-only analysis share planning, not
+execution. The 2026-10-27 maintenance refactor separates these responsibilities
+without changing the public `multiframe::*` reexports or option defaults:
+
+| Module under `crates/rs-jxl/src/multiframe` | Ownership |
+| --- | --- |
+| [types.rs](../crates/rs-jxl/src/multiframe/types.rs) | Public automatic options, strategy identities and typed reports. No trial execution. |
+| [candidates.rs](../crates/rs-jxl/src/multiframe/candidates.rs) | Shared reference selection, geometry proposals, canonical candidate order and estimated-work ranking. Both analysis and automatic encoding use this module. |
+| [auto.rs](../crates/rs-jxl/src/multiframe/auto.rs) | Input validation, worker selection, logical-frame orchestration, winner selection and committed reference state. |
+| [auto/trial.rs](../crates/rs-jxl/src/multiframe/auto/trial.rs) | Execute one candidate's layers, check work/output budgets, account for cache use and return a complete or pruned outcome. |
+| [references.rs](../crates/rs-jxl/src/multiframe/references.rs), [lookahead.rs](../crates/rs-jxl/src/multiframe/lookahead.rs) | Retained complete-canvas slots and optional next-input comparisons. These are not additional decoder slots or global search. |
+| [payload.rs](../crates/rs-jxl/src/multiframe/payload.rs) | Per-logical-input repeated-crop lifetime and reuse accounting over `encode/reusable.rs`. |
+| [analysis.rs](../crates/rs-jxl/src/multiframe/analysis.rs), `analysis/` | Exact difference statistics, historical comparisons and hypothetical candidate work without trial encodes. |
+| `diff.rs`, `regions.rs`, `partition.rs`, `scales.rs` | Exact difference maps, crop/mask geometry, rectangle partitioning and optional extra grids. |
+
+A completed trial returns encoded bytes together with its reference-validation
+state and complete-canvas slots. `auto.rs::Winner` retains these as one value;
+the sequence commits them together only after that candidate wins. A pruned
+outcome has a report but no committable output/state. The trial may consume
+shared work budget and populate/release invocation-local payload caches, but
+cannot update the committed sequence references through a mutable borrow.
+
+Canonical candidate rank is separate from cheap-first execution order. Work
+estimates rank trials, never prove their encoded sizes. `Winner::cutoff` retains
+the extra byte needed for an earlier canonical candidate to win an equal-size
+tie. Only finalized byte bounds permit pruning. Preserve these rules when
+changing the planner or trial executor; do not replace them with a predicted
+size or a time cutoff during a code-organization change.
+
+The adapters have their own narrow boundaries:
+
+- CLI [multiframe.rs](../crates/rs-jxl-cli/src/multiframe.rs) orchestrates
+  validation, loading, encoding and transactional publication. `multiframe/args.rs`
+  owns flags and preflight, `input.rs` owns loading/compatibility, and `report.rs`
+  owns text and JSON output. Tests remain `multiframe::tests` in `tests.rs`.
+- FFI [request/multiframe.rs](../crates/rs-jxl-ffi/src/request/multiframe.rs)
+  owns automatic/analysis option decoding, validation and reference-name parsing.
+  The outer request retains operation validation and its error precedence.
+  [encode/multiframe.rs](../crates/rs-jxl-ffi/src/encode/multiframe.rs) handles
+  sequence preparation and report conversion; still-image and byte-reversible
+  JPEG dispatch remain in `encode.rs`. Analysis keeps its separate serializer.
+- CLI encoding JSON uses `analysis_elapsed_seconds`; FFI encoding JSON uses
+  `analysis_seconds`. Encoding strategy labels use their existing Debug spelling,
+  while analysis has its own wire labels. These are existing adapter contracts,
+  not a reason to add serde or presentation policy to the core or silently
+  rename fields. Complete report assertions guard the emitted structures.
+
+Core `auto::tests` and FFI `request::tests`, `encode::tests`, `analysis::tests`
+retain their qualified names after extraction. A new geometry proposal belongs
+in the shared planner and its tests, not a second implementation in an adapter.
+Add metadata/reference behavior to the trial and reference tests only when that
+contract actually changes. Python remains a transport adapter.
+
 ### Unified Jobs and Reusable Resources
 
 `codec::EncodeJob` combines `EncodeOptions` with an optional `SourceRequest`.
@@ -274,6 +329,38 @@ x86_64 Windows evidence does not certify Linux, macOS, ARM or the declared MSRV.
 levels and restrictions. For performance work, retain corpus, options, worker
 counts, repetitions and correctness results; a kernel measurement does not
 establish an end-to-end improvement.
+
+### Multiframe Maintenance Checkpoint
+
+The 2026-10-27 organization-only refactor follows `1fdc9e4`. It separates the
+multiframe planner, trial execution, public types and CLI/FFI adapters described
+above. Public paths, parameter defaults, candidate policy, validation precedence
+and report contracts are retained. No encoder algorithm or dependency changed.
+
+Validated on Windows x86-64, Rust 1.97.1 (`x86_64-pc-windows-msvc`), default
+workspace features and Python 3.10. Cargo used `--locked --offline -j 2`:
+
+| Check | Result |
+| --- | --- |
+| Full workspace tests, four test threads | 2,503 passed, zero failed, 109 ignored across 53 top-level summaries; nested subprocess summaries excluded from the total. |
+| Independent official djxl 0.12/0.13 checks | All 11 `metadata_frame_reference` tests passed with ignored cases enabled, including six normally ignored oracle cases. This overlaps the workspace run, not 11 additional distinct tests. |
+| Python and benchmark harness against the rebuilt Release DLL | 260 passed with CUDA and official decoder checks enabled; two existing non-fatal packaging/toolchain warnings. |
+| Isolated installed Windows wheel | 174 API tests passed with `RS_JXL_NATIVE_LIB` unset; package and DLL paths verified inside the installation. This overlaps the 260 tests above. |
+| Source distribution | All 13 extracted Rust modules/test files and the architecture guide present; no `out/`, `target/` or `.git/` artifacts. |
+| Build and static checks | Release workspace build, strict workspace Clippy (`--all-targets -- -D warnings`), formatting and whitespace checks passed. |
+
+Three focused tests were added for canonical equal-size pruning ties, FFI
+reference-name/default/error projection and automatic-option error precedence.
+Existing extracted tests retain their qualified names; CLI text/JSON report
+assertions now cover the complete emitted structures.
+
+Local logs and package artifacts are under `out/maintenance-20261027/` and are
+not repository content. This checkpoint does not rerun the full image corpus,
+establish a performance improvement or validate another platform. Ignored tests
+remain unverified unless explicitly covered by the oracle run above. Correctness
+is recovered samples/frames or original JPEG bytes, not compressed-file hashes.
+The earlier [stability checkpoint](MULTIFRAME_STABILITY_20261027.md) retains its
+separate feature-validation evidence.
 
 ## Source Provenance
 

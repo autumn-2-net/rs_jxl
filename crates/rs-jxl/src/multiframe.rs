@@ -8,6 +8,7 @@ use std::borrow::Cow;
 
 mod analysis;
 mod auto;
+mod candidates;
 mod diff;
 mod lookahead;
 mod partition;
@@ -15,16 +16,18 @@ mod payload;
 mod references;
 mod regions;
 mod scales;
+mod types;
 pub(crate) use analysis::analyze_in_pool;
 pub use analysis::{
     AnalysisOptions, AnalysisReport, CropAnalysis, DiffStatistics, FrameAnalysis,
     GeometryCandidate, GeometryDiagnostics, GeometrySummary, HistoryAnalysis, RectangleWorkload,
     ReferenceSummary, Suitability, analyze,
 };
+pub use auto::encode_auto;
 pub(crate) use auto::encode_auto_in_pool;
-pub use auto::{
+pub use types::{
     AutoCandidateReport, AutoDiffReport, AutoEncodeResult, AutoFrameReport, AutoOptions,
-    AutoPrunedReport, Strategy, encode_auto,
+    AutoPrunedReport, Strategy,
 };
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
