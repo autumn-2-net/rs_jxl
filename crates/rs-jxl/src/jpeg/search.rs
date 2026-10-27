@@ -84,8 +84,31 @@ where
 pub fn transcode_search(
     input: &[u8],
     options: &TranscodeOptions,
-    mut limits: SearchLimits,
+    limits: SearchLimits,
 ) -> Result<SearchResult> {
+    let (jpeg, settings, limits) = prepare_search(input, options, limits)?;
+    transcode::with_threads(&settings, |pool| {
+        encode_search(&jpeg, options, &settings, limits, pool)
+    })
+}
+
+pub(crate) fn transcode_search_in_pool(
+    input: &[u8],
+    options: &TranscodeOptions,
+    limits: SearchLimits,
+    pool: Option<&rayon::ThreadPool>,
+) -> Result<SearchResult> {
+    let (jpeg, settings, limits) = prepare_search(input, options, limits)?;
+    transcode::with_pool(&settings, pool, |pool| {
+        encode_search(&jpeg, options, &settings, limits, pool)
+    })
+}
+
+fn prepare_search(
+    input: &[u8],
+    options: &TranscodeOptions,
+    mut limits: SearchLimits,
+) -> Result<(super::data::JpegData, transcode::Options, SearchLimits)> {
     let mut settings = options.resolve()?;
     if options.decoding_speed != 0 {
         return Err(Error::InvalidInput(
@@ -103,22 +126,31 @@ pub fn transcode_search(
     if pixels > limits.max_full_pixels {
         return Err(Error::Limit("whole-frame search work"));
     }
-    let retained = transcode::with_threads(&settings, |pool| {
-        let prepared = transcode::Prepared::new(&jpeg, &settings)?;
-        let mut ac_cache = transcode::SearchCache::new(&jpeg);
-        run(options.effort, pixels, limits, |effort, budget| {
-            let candidate = transcode::Options {
-                tier: SpeedTier::try_from(10 - effort as i8)?,
-                max_output_bytes: budget.max_output_bytes,
-                ..settings.clone()
-            };
-            // e1/e2 have only one trial: no AC reuse can repay serialization.
-            if options.effort < 3 {
-                prepared.encode(&jpeg, &candidate, pool)
-            } else {
-                prepared.encode_with_cache(&jpeg, &candidate, pool, &mut ac_cache)
-            }
-        })
+    Ok((jpeg, settings, limits))
+}
+
+fn encode_search(
+    jpeg: &super::data::JpegData,
+    options: &TranscodeOptions,
+    settings: &transcode::Options,
+    limits: SearchLimits,
+    pool: Option<&rayon::ThreadPool>,
+) -> Result<SearchResult> {
+    let pixels = u64::from(jpeg.width) * u64::from(jpeg.height);
+    let prepared = transcode::Prepared::new(jpeg, settings)?;
+    let mut ac_cache = transcode::SearchCache::new(jpeg);
+    let retained = run(options.effort, pixels, limits, |effort, budget| {
+        let candidate = transcode::Options {
+            tier: SpeedTier::try_from(10 - effort as i8)?,
+            max_output_bytes: budget.max_output_bytes,
+            ..settings.clone()
+        };
+        // e1/e2 have only one trial: no AC reuse can repay serialization.
+        if options.effort < 3 {
+            prepared.encode(jpeg, &candidate, pool)
+        } else {
+            prepared.encode_with_cache(jpeg, &candidate, pool, &mut ac_cache)
+        }
     })?;
     Ok(SearchResult {
         data: retained.bytes,

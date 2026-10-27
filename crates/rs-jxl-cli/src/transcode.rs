@@ -3,9 +3,10 @@
 use std::path::PathBuf;
 
 use clap::{Args, ValueEnum};
+use rs_jxl::codec;
 use rs_jxl::jpeg::{
     TranscodeLimits, TranscodeOptions, cfl::CflMode, coefficient_order::OrderPolicy,
-    search::SearchLimits, transcode, transcode_search,
+    search::SearchLimits,
 };
 
 use crate::validators::{parse_sample_limit, parse_threads};
@@ -78,6 +79,10 @@ pub(crate) struct TranscodeArgs {
 }
 
 impl TranscodeArgs {
+    fn search_limits(&self) -> Option<SearchLimits> {
+        self.source_search.then(SearchLimits::default)
+    }
+
     fn options(&self) -> TranscodeOptions {
         TranscodeOptions {
             effort: self.effort,
@@ -115,19 +120,19 @@ fn write_transcoded(
 ) -> Result<()> {
     let encoded = {
         let _encoding = rs_jxl::profile::scope("cli.jpeg_transcode");
-        transcode(input, options)?
+        codec::transcode_jpeg(input, options, None)?
     };
-    publish(&encoded)
+    publish(&encoded.bytes)
 }
 
 pub(crate) fn run(args: TranscodeArgs) -> Result<()> {
     let _total = rs_jxl::profile::scope("cli.total");
     io::check_paths(&args.input, &args.output, args.force)?;
     let bytes = io::read_input(&args.input)?;
-    if args.source_search {
+    if let Some(limits) = args.search_limits() {
         let _encoding = rs_jxl::profile::scope("cli.jpeg_search");
-        let result = transcode_search(&bytes, &args.options(), SearchLimits::default())?;
-        return io::write_output(&args.input, &args.output, args.force, &result.data);
+        let result = codec::transcode_jpeg(&bytes, &args.options(), Some(limits))?;
+        return io::write_output(&args.input, &args.output, args.force, &result.bytes);
     }
     write_transcoded(&bytes, &args.options(), |encoded| {
         io::write_output(&args.input, &args.output, args.force, encoded)
@@ -139,6 +144,7 @@ mod tests {
     use super::*;
     use crate::{Cli, Command};
     use clap::Parser;
+    use rs_jxl::jpeg::transcode;
     use std::{
         ffi::OsString,
         fs,
@@ -215,6 +221,46 @@ mod tests {
             options.limits.input.structural.max_input_bytes,
             defaults.limits.input.structural.max_input_bytes
         );
+    }
+
+    #[test]
+    fn search_limits_are_opt_in_without_rewriting_backend_options() {
+        for effort in 1..=11 {
+            let effort = effort.to_string();
+            let direct = parse(&["--effort", &effort]);
+            assert!(direct.search_limits().is_none());
+            let search = parse(&["--effort", &effort, "--source-search"]);
+            assert_eq!(search.options().effort, direct.options().effort);
+            assert_eq!(search.options().reconstruction_quality, None);
+            let limits = search.search_limits().unwrap();
+            let defaults = SearchLimits::default();
+            assert_eq!(limits.max_full_encodes, defaults.max_full_encodes);
+            assert_eq!(limits.max_full_pixels, defaults.max_full_pixels);
+            assert_eq!(limits.max_output_bytes, defaults.max_output_bytes);
+        }
+        let args = parse(&[
+            "--source-search",
+            "--decoding-speed",
+            "1",
+            "--threads",
+            "2",
+            "--sample-limit",
+            "17",
+            "--brotli-quality",
+            "0",
+            "--no-cfl",
+            "--order",
+            "adaptive",
+        ]);
+        assert!(args.search_limits().is_some());
+        let options = args.options();
+        // Preserve the unsupported speed for the codec's existing error gate.
+        assert_eq!(options.decoding_speed, 1);
+        assert_eq!(options.threads, 2);
+        assert_eq!(options.limits.sample_limit, 17);
+        assert_eq!(options.reconstruction_quality, Some(0));
+        assert_eq!(options.cfl, CflMode::Disabled);
+        assert_eq!(options.order, OrderPolicy::Adaptive);
     }
 
     #[test]

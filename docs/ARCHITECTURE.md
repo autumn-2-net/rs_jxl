@@ -18,8 +18,8 @@ as its runtime implementation.
 | [rs-jxl](../crates/rs-jxl/src/lib.rs) | Typed images, encoding, decoding, JPEG reconstruction, framing and codec policy. Public reexports live at the crate root and in the relevant public modules. | CLI argument parsing, Python objects and filesystem policy. |
 | [rs-jxl-image](../crates/rs-jxl-image/src/lib.rs) | Shared PNG/JPEG pixel input, signature detection, checked image sizes and input metadata handling. `png.rs` and `jpeg.rs` own the format-specific readers. | JXL encoding and byte-reversible JPEG transcoding. |
 | [rs-jxl-cli](../crates/rs-jxl-cli/src/main.rs) | Command selection and diagnostics. `encode.rs`, `decode/`, `multiframe.rs` and `transcode.rs` adapt commands to library calls. `validators.rs` contains shared value parsers; `options.rs` resolves codec controls; `io.rs` owns file/stdio publication. | Duplicated PNG/JPEG readers or codec algorithms. |
-| [rs-jxl-ffi](../crates/rs-jxl-ffi/src/lib.rs) | Versioned C request/result boundary over the Rust libraries. ABI ownership lives in `abi.rs`; structured request validation lives in `request.rs`. | Python interpreter state and Python path/stream handling. |
-| [python/rs_jxl](../python/rs_jxl/) | Python-facing adapters. `_arrays.py` prepares typed sample buffers and layouts, `_io.py` handles paths/binary streams, and `_ffi.py` loads and checks the native ABI and releases results. | Reimplementing codec decisions or silently narrowing samples. |
+| [rs-jxl-ffi](../crates/rs-jxl-ffi/src/lib.rs) | Versioned C request/result boundary over the Rust libraries. `abi.rs` owns result lifetimes, `request.rs` validates operation-specific request views, `error.rs` preserves typed error categories, and `contexts.rs` owns reusable handles. | Python interpreter state and Python path/stream handling. |
+| [python/rs_jxl](../python/rs_jxl/) | Python-facing adapters. `_arrays.py` prepares typed sample buffers and layouts, `_io.py` handles paths/binary streams, `_ffi.py` checks the ABI and releases results, and `contexts.py`/`_context.py` expose synchronized worker reuse. | Reimplementing codec decisions or silently narrowing samples. |
 
 The CLI and FFI depend on `rs-jxl` and `rs-jxl-image`; the image-input crate
 depends on `rs-jxl` for its image representation, not the reverse. Python calls
@@ -35,6 +35,7 @@ Paths in this table are under `crates/rs-jxl/src`.
 
 | Area | Start Here | Responsibility |
 | --- | --- | --- |
+| Application encoding facade | [codec.rs](../crates/rs-jxl/src/codec.rs) | Typed jobs, source-policy dispatch, reports and a reusable `Encoder`. CLI and FFI map their inputs here instead of duplicating still-image effort/search selection. |
 | Public pixel encoding | [image.rs](../crates/rs-jxl/src/image.rs), [encode.rs](../crates/rs-jxl/src/encode.rs), `encode/` | Typed sample/metadata validation, options, budgets, sessions and byte/writer entry points. |
 | Metadata and framing | [metadata.rs](../crates/rs-jxl/src/metadata.rs), `color.rs`, `icc.rs`, `frame.rs`, `codestream.rs`, [container.rs](../crates/rs-jxl/src/container.rs) | Image metadata, color descriptions, frame headers, codestream/container serialization and frame indexes. |
 | Modular encoding | [modular/mod.rs](../crates/rs-jxl/src/modular/mod.rs), `modular/encode.rs`, `layout.rs`, `orchestration.rs`, `group*.rs` | Reversible transforms, global/group layout, predictors, palettes, token generation and entropy handoff. |
@@ -47,6 +48,105 @@ Paths in this table are under `crates/rs-jxl/src`.
 | Byte-reversible JPEG | [jpeg/mod.rs](../crates/rs-jxl/src/jpeg/mod.rs), `reader.rs`, `coefficient_reader.rs`, `transcode.rs`, `archival.rs`, `reconstruction*.rs`, `scan_writer*.rs` | JPEG structure and coefficients, reconstruction metadata, JXL archival frames and recovery of original JPEG bytes. Shares Modular/entropy tools without using a pixel fallback. |
 | Runtime JXL decoding | [decode/mod.rs](../crates/rs-jxl/src/decode/mod.rs), `engine.rs`, `native.rs`, `stream.rs`, `jpeg.rs`, `color*.rs` | Backend adaptation, limits, native samples, streaming state, JPEG coefficient capture/reconstruction and explicit rendered conversions. Backend implementation is in `vendor/jxl-rs`. |
 | Experimental transcripts | [final_plan.rs](../crates/rs-jxl/src/final_plan.rs), `final_plan/` | Transcript schemas and wire helpers. Their presence is not evidence that ordinary codec capture/replay is connected. |
+
+### Unified Jobs and Reusable Resources
+
+`codec::EncodeJob` combines `EncodeOptions` with an optional `SourceRequest`.
+With `source: None`, it executes the explicit manual Modular options. A source
+request carries `CandidateParams`, `NativeBackendOptions` and a typed
+`SourceSearch`: `Disabled`, `Auto`, `Scout` or `Pilot(PilotOptions)`. `Disabled`
+executes one candidate; `Auto` selects the pixel search or the separate effort-11
+Tectonic tournament in the core. Effort 11 without search remains the explicit
+tier -1 backend. No search is implicitly enabled by creating a context.
+Adapters still own their argument compatibility gates and diagnostics.
+
+`codec::encode_job` and `codec::transcode_jpeg` are one-shot facade functions.
+`codec::Encoder::new(threads)` retains worker resources for repeated `encode`,
+`encode_frames`, `encode_auto` and `transcode_jpeg` calls. JPEG search is an
+explicit `Option<SearchLimits>`, separate from pixel search. The CLI's automatic
+multiframe route also uses `Encoder::encode_auto`; its strategy reports and
+output publication remain adapter responsibilities.
+
+`decode::Decoder::new(DecodeOptions)` separately retains decoding workers for
+complete independent inputs, selected frames and original-JPEG reconstruction.
+`set_options` validates per-input settings without rebuilding the pool; a thread
+count change requires a new context. Core contexts accept 1..=256 threads; one
+thread uses the caller without a pool. They require exclusive mutable access.
+Input, parser, frame/reference and candidate-cache state is invocation-local,
+including after an ordinary error; limits are per input, not cumulative.
+Independent contexts can run concurrently, subject to the caller's total worker
+budget. Reuse is not incremental parsing or a persistent frame-reference stream.
+
+The decoder boundary is not fully independent of upstream types:
+`decode::JxlBasicInfo`, `JxlFrameHeader`, color/extra-channel types and other
+public names remain reexports from the maintained `jxl_decoder::api`.
+`StreamDecoder` is a separate Rust interface; Python does not yet expose the
+complete incremental streaming contract.
+
+### Reports and Binding Lifetimes
+
+`EncodeResult` contains bytes and an `EncodeReport`: route, implementation,
+pixel/byte counts, full/probe encode counts, optional winning/effective parameters,
+preparation reuse and typed `SearchDetails` (`None`, `Pixel`, `Tectonic`). The
+facade also returns JPEG trial/winner information. `codec_seconds` measures codec
+work, excluding context/pool creation, external pixel-input decoding and
+transport/I/O. JPEG parsing and coefficient preparation are included in JPEG
+transcode timing. It is not an exact analysis-versus-backend timing split.
+Still-image `bpp` and
+`mpix_per_second` derive from the final bytes, original pixel count and that timer;
+they are not throughput summed over all candidate pixels. The FFI serializes a
+subset under `meta["report"]` for still/JPEG encoding; it does not serialize the
+entire Rust search-detail enum. Multiframe strategy metadata remains separate.
+JSON still-image `implementation` uses stable `modular`/`fast_lossless` values;
+`effective_parameters.patches` uses `auto`/`on`/`off`, not Rust Debug spellings.
+`effective_parameters` projects scheduler `CandidateParams`, not a full backend
+recipe or exact tool list; FJXL uses its own default effort.
+
+Rust source routes preserve `EncodeReport.artifact: Option<NativeArtifact>`,
+`adaptations: Vec<NativeAdaptation>` and `progressive: Option<ProgressiveReport>`.
+The artifact contains the winning source's resolved options, gaps and resource
+limits; manual jobs have no source artifact. Adaptations retain the search's
+diagnostics, including probes and losing trials; direct candidates expose their
+diagnostics through the artifact instead. Progressive diagnostics are present
+when the pilot completes a real-group race. Representation diagnostics requested
+through `record_representations` are retained in the Rust diagnostics. The FFI
+JSON subset is unchanged; these are not additional Python report fields.
+
+The C ABI remains version 1 with the existing request layout and one-shot entry
+point. Optional additive `rs_jxl_context_create`, `rs_jxl_context_execute` and
+`rs_jxl_context_free` symbols expose reusable handles. Callers must serialize
+execute/free for each handle; result ownership is independent of context lifetime.
+The JSON v1 request remains compatible. `ValidatedRequest` gives operation-specific
+views after wire validation, but still borrows the shared option structure;
+buffer and codec-specific validation also occurs in the execution adapters.
+Typed FFI errors preserve `error` and add `error_kind` and optional `error_stage`;
+known Rust error sources retain their category rather than relying on message
+matching. Unclassified/string-only errors still default to `invalid_input`.
+
+Python `Encoder(threads=...)` and `Decoder(threads=...)` serialize same-context
+native execution against `close()` and support context-manager use. The lock
+protects the closed check and native call, not Python result conversion or
+copying: it is released before the result is yielded to conversion code.
+Independent result ownership permits conversion callbacks to close or reenter
+the context without holding that lock. Context-bound PNG/JPEG `read_image` calls
+also use the closed/lifecycle guard, while remaining stateless and not reusing
+JXL decoder workers. Threads are fixed; other options use per-call defaults.
+Mutable encoding inputs are snapshotted by
+default. Explicit `borrow_inputs=True` is best-effort and forbids concurrent
+mutation through any alias during the call; layout/endian normalization and
+multi-buffer consolidation can still copy. Files and streams remain fully
+buffered. Decode results are owned arrays/tensors/bytes copied while the Rust
+result is alive, or copied into a validated preallocated NumPy destination by
+`decode_into`. Public decode return values do not borrow Rust storage. For
+nonempty data results, `_ffi._result_buffer` attaches an `ffi.gc` owner to the
+data pointer; `ffi.buffer` retains it. Temporary derived views, including ones
+retained by an exception traceback, keep the result alive beyond helper scope
+exit. The owner's finalizer releases the result after those references are gone;
+scope exit releases the helper view, not necessarily the native allocation.
+Native error responses and empty-data results still free directly in `finally`.
+This avoids intermediate Python copies where possible, not all Rust allocation
+or codec scratch.
+See [Python API](PYTHON_API.md) and [boundary contract](PYTHON_INTERFACE.md).
 
 ### Extracted Implementation Modules
 
@@ -114,8 +214,10 @@ test filters. A sibling filename alone does not establish a Rust module path.
    file. Writer APIs have different preflight and partial-output contracts;
    do not invent a blanket transactional-write guarantee. At the C boundary,
    validate ABI version/size and buffer ranges; inputs are borrowed for the
-   synchronous call, result buffers live until exactly one free, and Python
-   copies them before freeing. Panic containment cannot validate dangling C
+   synchronous call and result buffers live until exactly one free. Python
+   returns owned copies; internal data views retain the result owner, including
+   across exception tracebacks, until those views can safely be released.
+   Panic containment cannot validate dangling C
    pointers or recover abort/OOM failures. Keep header, protocol and CFFI
    declarations synchronized.
 7. **Keep acceptance separate from compressed identity.** Whole-file JXL hash
@@ -132,6 +234,13 @@ Scale verification to the changed contract. In coordinated work, the parent
 runs builds and tests centrally; file owners report focused targets, necessary
 fixtures and checks they did not run. The following is a selection guide, not a
 record that any suite passed.
+
+The facade/context validation checkpoint is maintained under
+[current verification](PYTHON_API.md#current-verification). It distinguishes the
+full workspace run, focused review-fix tests, native Python checks, the pure
+derived-view lifetime check and tests against an independently installed wheel.
+These results do not establish new performance or cross-platform runtime claims;
+historical checkpoints remain separate.
 
 | Change Surface | Coverage to Select | Review Focus |
 | --- | --- | --- |

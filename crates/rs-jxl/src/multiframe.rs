@@ -8,6 +8,7 @@ use std::borrow::Cow;
 
 mod auto;
 mod regions;
+pub(crate) use auto::encode_auto_in_pool;
 pub use auto::{
     AutoCandidateReport, AutoEncodeResult, AutoFrameReport, AutoOptions, Strategy, encode_auto,
 };

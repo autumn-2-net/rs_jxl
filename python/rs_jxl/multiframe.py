@@ -8,12 +8,12 @@ from ._ffi import execute
 from ._io import write_or_return
 
 
-def _images(frames, *, extra_channels=None, **options):
+def _images(frames, *, extra_channels=None, borrow_inputs=False, **options):
     frames = list(frames)
     if not frames:
         raise ValueError("at least one frame is required")
     extras = list(extra_channels) if extra_channels is not None else []
-    payload, specs = Payload(), []
+    payload, specs = Payload(borrow_inputs=borrow_inputs), []
     for index, image in enumerate(frames):
         channels = []
         for extra in extras:
@@ -33,7 +33,8 @@ def encode_multiframe(frames, output=None, *, layout="auto", durations=1,
                       effort=7, threads=1, lossless=True, distance=0,
                       extra_channels=None, bits_per_sample=0, color_encoding=None,
                       icc_profile=None, allow_device_copy=False, strip_metadata=False,
-                      return_info=False, encoder_options=None, **tool_options):
+                      return_info=False, encoder_options=None, borrow_inputs=False,
+                      _context=None, **tool_options):
     """Preserve every full input state; duration=0 remains a genuine layer.
 
     reference='auto' uses the smaller first/previous crop. strategy='auto'
@@ -45,6 +46,7 @@ def encode_multiframe(frames, output=None, *, layout="auto", durations=1,
     if reference not in references or strategy not in ("crop", "auto"):
         raise ValueError("reference must be auto/first/previous/full; strategy must be crop/auto")
     payload, specs = _images(frames, layout=layout, extra_channels=extra_channels,
+                             borrow_inputs=borrow_inputs,
                              bits_per_sample=bits_per_sample, color_encoding=color_encoding,
                              icc_profile=icc_profile, allow_device_copy=allow_device_copy)
     if durations is None:
@@ -64,7 +66,7 @@ def encode_multiframe(frames, output=None, *, layout="auto", durations=1,
     data, meta = execute({"operation": "encode_multiframe", "images": specs,
                          "options": options, "durations": ticks, "timebase": timebase,
                          "loops": integer(loops, "loops", 0, 0xffffffff),
-                         "reference": references[reference], "auto": strategy == "auto"}, payload.data)
+                         "reference": references[reference], "auto": strategy == "auto"}, payload.data, context=_context)
     result = write_or_return(data, output)
     return (result, meta) if return_info else result
 

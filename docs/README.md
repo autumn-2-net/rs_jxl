@@ -31,18 +31,35 @@ platform certifications.
 
 | Topic | References |
 | --- | --- |
+| Unified encoding jobs, reusable workers and reports | [Facade and context architecture](ARCHITECTURE.md#unified-jobs-and-reusable-resources), [Rust codec facade](../crates/rs-jxl/src/codec.rs), [reports and binding lifetimes](ARCHITECTURE.md#reports-and-binding-lifetimes) |
 | Rust pixel encoding, images and tools | [Pixel API](PIXEL_API.md), [integer and float paths](INTEGER_AND_FLOAT_PATHS.md), [intrinsic dimensions](INTRINSIC_DIMENSIONS.md) |
 | Shared PNG/JPEG pixel input | [rs-jxl-image](../crates/rs-jxl-image/src/lib.rs), [CLI encode adapter](../crates/rs-jxl-cli/src/encode.rs); use the JPEG API below when original file bytes must be recoverable |
 | Runtime JXL decoding and output semantics | [Maintained decoder API/status](DECODER_STATUS.md), [exact native integer decoding](NATIVE_INTEGER_DECODE.md) |
-| Incremental decoding | [Streaming input](STREAMING_INPUT.md) |
+| Incremental decoding | [Rust/CLI streaming input](STREAMING_INPUT.md); full Python incremental streaming is not implemented |
 | Byte-reversible JPEG | [JPEG API](JPEG_API.md), [compatibility and supported-domain distinctions](JPEG_COMPATIBILITY.md) |
 | Frame planning, layers and animation | [Automatic frames](MULTIFRAME_AUTO.md), [multiframe CLI](MULTIFRAME_AUTO_CLI.md), [frame-aware search](MULTIFRAME_SEARCH.md) |
 | Incremental encoding and indexes | [Streaming output](STREAMING_OUTPUT.md), [frame index lifecycle](FRAME_INDEX.md) |
-| Python and the versioned C boundary | [Python API and packaging](PYTHON_API.md), [Python interface](PYTHON_INTERFACE.md), [C ABI protocol](../crates/rs-jxl-ffi/protocol.md), [C header](../crates/rs-jxl-ffi/include/rs_jxl.h) |
+| Python and the versioned C boundary | [Python API and packaging](PYTHON_API.md), [reusable contexts](PYTHON_API.md#reusable-contexts), [input copies/borrowing](PYTHON_API.md#input-copies-and-borrowing), [decode_into](PYTHON_API.md#preallocated-output), [Python interface](PYTHON_INTERFACE.md), [C ABI protocol](../crates/rs-jxl-ffi/protocol.md), [C header](../crates/rs-jxl-ffi/include/rs_jxl.h) |
 | MA limits and exact search pruning | [Tree budgets](MA_TREE_BUDGET.md), [search pruning](MA_SEARCH_PRUNING.md) |
 | Search/probe integration and execution | [Probe API](SCHEDULER_PROBE_API.md), [cooperative execution](PARALLEL_EXECUTION.md), [progressive group scheduler](PROGRESSIVE_GROUP_SCHEDULER.md), [scheduler default routes](../crates/rs-jxl/src/scheduler/DEFAULT_ROUTES.md) |
 
 ## Acceptance and Validation
+
+The parent's last completed checkpoint reports 2,377 Rust tests passed, zero failed,
+107 ignored, the release build completed, 161 full-suite Python tests passed,
+and 42 installed-wheel binding/context tests passed using the bundled DLL.
+Formatting and whitespace checks passed; strict Clippy passed in 1.46 seconds.
+The subsequent Python run passed 165 tests with two warnings, before the DLL
+rebuild for the latest Rust diagnostic-only changes. The parent maintains final
+combined Rust/release/wheel results and counts under
+[current verification](PYTHON_API.md#current-verification) for environments,
+warnings, installed-package checks and the separate pure derived-view lifetime result.
+The C ABI remains version 1 with optional
+additive context symbols. Decoder metadata types still include upstream
+reexports; Python contexts do not provide incremental streaming. Reported
+`codec_seconds` excludes pool creation, external pixel-input decoding and
+transport/I/O; JPEG transcoding includes JPEG parsing and coefficient preparation.
+It does not provide exact analysis/backend phase timings.
 
 - [Complete pixel-lossless port status](PIXEL_LOSSLESS_PORT_STATUS.md): coverage
   and open acceptance gates, not a completion claim implied by its title.

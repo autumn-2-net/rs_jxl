@@ -4,8 +4,9 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use clap::{Args, ValueEnum};
+use rs_jxl::codec::Encoder;
 use rs_jxl::metadata::Animation;
-use rs_jxl::multiframe::{AutoEncodeResult, AutoOptions, Reference, encode_auto};
+use rs_jxl::multiframe::{AutoEncodeResult, AutoOptions, Reference};
 use rs_jxl::{EncodeOptions, Image};
 
 use crate::{Result, input, io, options::Tools, validators::parse_threads};
@@ -358,7 +359,8 @@ pub(crate) fn run(args: EncodeFramesArgs) -> Result<()> {
     );
     let result = {
         let _encoding = rs_jxl::profile::scope("cli.encode_frames");
-        encode_auto(&images, &durations, &options, &args.auto_options())?
+        let mut encoder = Encoder::new(options.threads)?;
+        encoder.encode_auto(&images, &durations, &options, &args.auto_options())?
     };
     write_report(std::io::stderr().lock(), &result)?;
     // Protect every source again before the existing transactional publisher.
@@ -855,6 +857,12 @@ mod tests {
                     "30000/1001",
                     "--loops",
                     "2",
+                    "--threads",
+                    if depth == png::BitDepth::Eight {
+                        "1"
+                    } else {
+                        "2"
+                    },
                 ],
             ))
             .unwrap();

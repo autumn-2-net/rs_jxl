@@ -1,4 +1,6 @@
 import io
+import gc
+import importlib
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
@@ -7,6 +9,7 @@ from unittest.mock import Mock, patch
 
 import numpy as np
 
+import rs_jxl
 from rs_jxl import _arrays, _ffi, _io, _options
 
 
@@ -63,6 +66,25 @@ class ArrayAdapters(unittest.TestCase):
 
 
 class IoAdapters(unittest.TestCase):
+    def test_encoded_inputs_borrow_only_when_explicitly_requested(self):
+        for signature in (b"\xff\xd8", b"\x89PNG"):
+            for borrow in (False, True):
+                source = bytearray(signature + b"sample")
+                snapshot = bytes(source)
+
+                def observe(request, data, **kwargs):
+                    self.assertEqual(bytes(data), snapshot)
+                    self.assertEqual(request["operation"],
+                                     "transcode_jpeg" if signature == b"\xff\xd8" else "encode")
+                    source[-1] ^= 1
+                    self.assertEqual(bytes(data), bytes(source) if borrow else snapshot)
+                    return b"encoded", {}
+
+                with self.subTest(signature=signature, borrow=borrow):
+                    with patch.object(importlib.import_module("rs_jxl.encode"),
+                                      "execute", side_effect=observe):
+                        self.assertEqual(rs_jxl.encode(source, borrow_inputs=borrow), b"encoded")
+
     def test_bytes_paths_streams(self):
         with tempfile.TemporaryDirectory() as root:
             path = Path(root) / "sample.bin"
@@ -85,6 +107,30 @@ class IoAdapters(unittest.TestCase):
 
 
 class AbiAdapters(unittest.TestCase):
+    def test_derived_view_keeps_native_result_alive_after_scope_exit(self):
+        result = _ffi.ffi.cast("RsJxlResult *", 1)
+        json_data = _ffi.ffi.new("uint8_t[]", b"{}")
+        samples = _ffi.ffi.new("uint8_t[]", [1, 2, 3, 4])
+
+        def getter(data, count):
+            def get(_, length):
+                length[0] = count
+                return data
+            return get
+
+        lib = Mock()
+        lib.rs_jxl_result_json.side_effect = getter(json_data, 2)
+        lib.rs_jxl_result_data.side_effect = getter(samples, 4)
+        lib.rs_jxl_result_status.return_value = 0
+        with _ffi._result_buffer(lib, result) as (view, _):
+            derived = np.frombuffer(view, dtype=np.uint8)
+        gc.collect()
+        lib.rs_jxl_result_free.assert_not_called()
+        np.testing.assert_array_equal(derived, [1, 2, 3, 4])
+        del derived
+        gc.collect()
+        lib.rs_jxl_result_free.assert_called_once_with(result)
+
     def test_incomplete_abi_fails_before_creating_a_native_result(self):
         lib = SimpleNamespace(rs_jxl_abi_version=lambda: 1,
                               rs_jxl_request_size=lambda: _ffi.ffi.sizeof("RsJxlRequest"))

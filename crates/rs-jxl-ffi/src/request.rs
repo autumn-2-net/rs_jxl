@@ -140,9 +140,114 @@ pub struct ExtraSpec {
     pub cfa_channel: Option<u32>,
 }
 
+/// Operation-specific views after wire-level validation. Image buffers and
+/// codec-specific option values are still validated by the execution adapters.
+/// Options remain borrowed for compatibility while those adapters migrate.
+#[derive(Debug)]
+pub enum ValidatedRequest<'a> {
+    Encode {
+        image: &'a ImageSpec,
+        options: &'a Options,
+    },
+    EncodeMultiframe {
+        images: &'a [ImageSpec],
+        options: &'a Options,
+        sequence: Sequence<'a>,
+    },
+    AnalyzeMultiframe {
+        images: &'a [ImageSpec],
+        strip_metadata: bool,
+    },
+    TranscodeJpeg {
+        options: &'a Options,
+    },
+    ReconstructJpeg {
+        options: &'a Options,
+    },
+    Decode {
+        options: &'a Options,
+        frame_index: Option<usize>,
+    },
+    DecodeToPng {
+        options: &'a Options,
+        frame_index: usize,
+    },
+    Info {
+        options: &'a Options,
+    },
+    ReadImage {
+        strip_metadata: bool,
+    },
+}
+
+#[derive(Debug)]
+pub struct Sequence<'a> {
+    /// None means one tick for each image; explicit zero durations are retained.
+    pub durations: Option<&'a [u32]>,
+    pub reference: rs_jxl::multiframe::Reference,
+    pub animation: rs_jxl::metadata::Animation,
+    pub automatic: bool,
+}
+
 impl Request {
     pub fn images(&self) -> &[ImageSpec] {
         self.images.as_deref().unwrap_or_default()
+    }
+
+    /// Project the unchanged JSON v1 schema without moving or cloning images.
+    /// `validate()` remains available with its original unit-result contract.
+    pub fn validate_typed(&self) -> Result<ValidatedRequest<'_>> {
+        self.validate()?;
+        use ValidatedRequest::*;
+        let options = &self.options;
+        Ok(match self.operation {
+            Operation::Encode => Encode {
+                image: &self.images()[0],
+                options,
+            },
+            Operation::EncodeMultiframe => {
+                let [n, d] = self.timebase.unwrap_or([1000, 1]);
+                let reference = match self.reference.as_deref().unwrap_or("previous") {
+                    "full" => rs_jxl::multiframe::Reference::Full,
+                    "first" => rs_jxl::multiframe::Reference::First,
+                    "smallest_crop" => rs_jxl::multiframe::Reference::SmallestCrop,
+                    _ => rs_jxl::multiframe::Reference::Previous,
+                };
+                EncodeMultiframe {
+                    images: self.images(),
+                    options,
+                    sequence: Sequence {
+                        durations: self.durations.as_deref(),
+                        reference,
+                        animation: rs_jxl::metadata::Animation {
+                            ticks_per_second_numerator: n,
+                            ticks_per_second_denominator: d,
+                            loops: self.loops.unwrap_or(0),
+                            timecodes: false,
+                        },
+                        automatic: self.auto.unwrap_or(false),
+                    },
+                }
+            }
+            Operation::AnalyzeMultiframe => AnalyzeMultiframe {
+                images: self.images(),
+                strip_metadata: options.strip_metadata.unwrap_or(false),
+            },
+            Operation::TranscodeJpeg => TranscodeJpeg { options },
+            Operation::ReconstructJpeg => ReconstructJpeg { options },
+            Operation::Decode => Decode {
+                options,
+                frame_index: options.frame_index,
+            },
+            Operation::DecodeToPng => DecodeToPng {
+                options,
+                frame_index: options.frame_index.unwrap_or(0),
+            },
+            Operation::Info => Info { options },
+            Operation::ReadImage => ReadImage {
+                strip_metadata: options.strip_metadata.unwrap_or(false),
+            },
+        })
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -258,10 +363,9 @@ impl Request {
         };
         for field in fields {
             if !allowed.contains(&field) {
-                return Err(format!(
-                    "option {field} is unsupported for {:?}",
-                    self.operation
-                ));
+                return Err(
+                    format!("option {field} is unsupported for {:?}", self.operation).into(),
+                );
             }
         }
         if !(1..=256).contains(&o.threads.unwrap_or(1)) {

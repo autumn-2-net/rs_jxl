@@ -46,6 +46,7 @@ pub use native::{
     NativeAcceptance, NativeBackendOptions, NativeImplementation, NativeSearchResult,
     run_native_pixel_search,
 };
+pub(crate) use native_tectonic::run_native_tectonic_in_pool;
 pub use native_tectonic::{NativeTectonicResult, run_native_tectonic};
 pub use params::{Candidate, CandidateParams, PlanOptions, lossless_probe_plan};
 pub use probe::{CandidateScreen, ProbeLimits, ProbeResult, ScreenOptions};

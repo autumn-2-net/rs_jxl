@@ -43,7 +43,7 @@ pub enum NativeAcceptance {
     AllowReportedGaps,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct NativeBackendOptions {
     /// Opt-in immutable preparation reuse across full candidates in this search.
     /// Zero disables it; the cap covers retained buffers, not total process RSS.
@@ -127,7 +127,7 @@ pub(super) struct FrameContext<'a> {
     pub last: bool,
 }
 
-fn encode_full_trial(
+pub(super) fn encode_full_trial(
     image: &Image,
     options: &EncodeOptions,
     beat_bytes: Option<usize>,
@@ -385,6 +385,30 @@ pub fn encode_native_candidate(
     Ok(EncodedOutput { bytes, artifact })
 }
 
+pub(crate) fn encode_native_candidate_in_pool(
+    params: &CandidateParams,
+    image: &Image,
+    base: &EncodeOptions,
+    settings: NativeBackendOptions,
+    pool: Option<&rayon::ThreadPool>,
+) -> Result<EncodedOutput<NativeArtifact>> {
+    let (mut artifact, _) = prepare(params, image, base, settings, NativeTrialKind::Full)?;
+    let bytes =
+        if super::native_fast::eligible(image, &artifact.effective_params, &artifact.options) {
+            let bytes = super::native_fast::encode_in_pool(image, &artifact.options, pool)?;
+            artifact.implementation = NativeImplementation::FastLossless;
+            bytes
+        } else {
+            crate::encode::encode_frames_in_pool(
+                image,
+                &[crate::frame::Frame::new(image)],
+                &artifact.options,
+                pool,
+            )?
+        };
+    Ok(EncodedOutput { bytes, artifact })
+}
+
 /// Concrete full workflow for native integration/round-trip tests. It uses the
 /// generic source driver; only this bridge knows EncodeOptions. Resource errors
 /// propagate and are NEVER converted into TrialOutput::Bounded. The native
@@ -402,11 +426,32 @@ pub fn run_native_pixel_search(
     if !(1..=256).contains(&base.threads) {
         return Err(Error::InvalidInput("threads must be 1..=256".into()));
     }
+    if base.threads == 1 || crate::execution::is_serial() {
+        return run_native_pixel_search_in_pool(
+            image,
+            params,
+            driver_options,
+            base,
+            settings,
+            None,
+        );
+    }
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(base.threads)
         .build()
         .map_err(|e| Error::Encoding(e.to_string()))?;
-    run_native_search_with_pool(image, params, driver_options, base, settings, &pool, None)
+    run_native_pixel_search_in_pool(image, params, driver_options, base, settings, Some(&pool))
+}
+
+pub(crate) fn run_native_pixel_search_in_pool(
+    image: &Image,
+    params: &CandidateParams,
+    driver_options: &DriverOptions,
+    base: &EncodeOptions,
+    settings: NativeBackendOptions,
+    pool: Option<&rayon::ThreadPool>,
+) -> Result<NativeSearchResult> {
+    run_native_search_in_pool(image, params, driver_options, base, settings, pool, None)
 }
 
 pub(super) fn run_native_search_with_pool(
@@ -416,6 +461,47 @@ pub(super) fn run_native_search_with_pool(
     base: &EncodeOptions,
     settings: NativeBackendOptions,
     pool: &rayon::ThreadPool,
+    context: Option<FrameContext<'_>>,
+) -> Result<NativeSearchResult> {
+    run_native_search_in_pool(
+        image,
+        params,
+        driver_options,
+        base,
+        settings,
+        Some(pool),
+        context,
+    )
+}
+
+pub(super) fn run_native_search_in_pool(
+    image: &Image,
+    params: &CandidateParams,
+    driver_options: &DriverOptions,
+    base: &EncodeOptions,
+    settings: NativeBackendOptions,
+    pool: Option<&rayon::ThreadPool>,
+    context: Option<FrameContext<'_>>,
+) -> Result<NativeSearchResult> {
+    if !(1..=256).contains(&base.threads) {
+        return Err(Error::InvalidInput("threads must be 1..=256".into()));
+    }
+    let work =
+        || run_native_search_inner(image, params, driver_options, base, settings, pool, context);
+    if pool.is_none() {
+        crate::execution::serial(work)
+    } else {
+        work()
+    }
+}
+
+fn run_native_search_inner(
+    image: &Image,
+    params: &CandidateParams,
+    driver_options: &DriverOptions,
+    base: &EncodeOptions,
+    settings: NativeBackendOptions,
+    pool: Option<&rayon::ThreadPool>,
     context: Option<FrameContext<'_>>,
 ) -> Result<NativeSearchResult> {
     if driver_options.scout_pilot_consensus && !settings.model_adjusted_probes {
@@ -474,13 +560,8 @@ pub(super) fn run_native_search_with_pool(
                 .max_output_bytes
                 .min(budget.max_output_bytes);
             full_records.borrow_mut().push(record);
-            let trial = encode_full_trial(
-                image,
-                &artifact.options,
-                budget.beat_bytes,
-                Some(pool),
-                context,
-            )?;
+            let trial =
+                encode_full_trial(image, &artifact.options, budget.beat_bytes, pool, context)?;
             if let Some(start) = start {
                 crate::profile::note(
                     "scheduler.full_result",
@@ -505,7 +586,12 @@ pub(super) fn run_native_search_with_pool(
             let (artifact, record) =
                 prepare(params, image, base, settings, NativeTrialKind::Probe)?;
             probe_records.borrow_mut().push(record);
-            let bytes = crate::encode::encode_with_pool(image, &artifact.options, pool)?;
+            let bytes = crate::encode::encode_frames_in_pool(
+                image,
+                &[crate::frame::Frame::new(image)],
+                &artifact.options,
+                pool,
+            )?;
             native_tools::probe_score(
                 bytes.len(),
                 image,
@@ -516,6 +602,8 @@ pub(super) fn run_native_search_with_pool(
         },
         BatchEncoders {
             pilot_overlap: Some(Box::new(|request| {
+                // The overlap bridge already declines null/one-worker execution.
+                let Some(pool) = pool else { return Ok(None) };
                 native_overlap::run(
                     request,
                     base,
@@ -551,7 +639,8 @@ pub(super) fn run_native_search_with_pool(
                     .saturating_add(32 << 20);
                 let plan = if cooperative
                     && tasks.len() == 1
-                    && execution.limits.tasks >= pool.current_num_threads()
+                    && execution.limits.tasks
+                        >= pool.map_or(1, rayon::ThreadPool::current_num_threads)
                 {
                     // One finalist already owns the available pool. Avoid an
                     // extra arena/queue layer around every inner kernel task.
@@ -562,7 +651,7 @@ pub(super) fn run_native_search_with_pool(
                 } else {
                     WorkerPlan::independent(tasks.len(), 64)?
                 };
-                let outcomes = run_plan(Some(pool), &plan, |i, runner| {
+                let outcomes = run_plan(pool, &plan, |i, runner| {
                     let _scope = crate::profile::scope("scheduler.full_encode");
                     let start = crate::profile::enabled().then(std::time::Instant::now);
                     let outcome = match runner {
@@ -625,7 +714,7 @@ pub(super) fn run_native_search_with_pool(
                     artifacts.push(artifact);
                 }
                 let plan = execution.plan_probes(tasks, kind, true)?;
-                run_plan(Some(pool), &plan, |i, runner| {
+                run_plan(pool, &plan, |i, runner| {
                     let bytes = match runner {
                         TaskRunner::Null => {
                             crate::encode::encode_serial(tasks[i].image, &artifacts[i].options)?
@@ -670,7 +759,7 @@ pub(super) fn run_native_search_with_pool(
                     })
                     .collect::<Result<Vec<_>>>()?;
                 let result = run_prefix_screen(
-                    Some(pool),
+                    pool,
                     execution.probe_workers.unwrap_or(execution.limits.tasks),
                     screen,
                     |candidate, tile| {
@@ -700,7 +789,7 @@ pub(super) fn run_native_search_with_pool(
                 }
                 result
             })),
-            scan_pool: Some(pool),
+            scan_pool: pool,
         },
     )?;
     let adaptations = std::mem::take(&mut *adaptations.borrow_mut());
@@ -811,6 +900,74 @@ mod tests {
             PixelData::U8((0..64).map(|i| (i % 4) as u8).collect()),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn reusable_native_pool_keeps_candidates_search_and_failures_isolated() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        let first = image();
+        let second = Image::new(5, 3, PixelLayout::Gray, PixelData::U8(vec![37; 15])).unwrap();
+        let base = EncodeOptions {
+            threads: 2,
+            ..Default::default()
+        };
+        let params = CandidateParams::default().backend(2).unwrap();
+        let settings = NativeBackendOptions {
+            preparation_cache_bytes: 1 << 20,
+            ..Default::default()
+        };
+        for supplied in [None, Some(&pool)] {
+            for image in [&first, &second, &first] {
+                let candidate =
+                    encode_native_candidate_in_pool(&params, image, &base, settings, supplied)
+                        .unwrap();
+                let result = run_native_pixel_search_in_pool(
+                    image,
+                    &params,
+                    &DriverOptions::default(),
+                    &base,
+                    settings,
+                    supplied,
+                )
+                .unwrap();
+                for bytes in [&candidate.bytes, &result.output.bytes] {
+                    let decoded = crate::decode::decode(bytes, &Default::default()).unwrap();
+                    assert_eq!(&decoded.frames[0].pixels, image.pixels());
+                }
+                let limited = EncodeOptions {
+                    max_output_bytes: 1,
+                    ..base.clone()
+                };
+                assert!(matches!(
+                    run_native_pixel_search_in_pool(
+                        image,
+                        &params,
+                        &DriverOptions::default(),
+                        &limited,
+                        settings,
+                        supplied
+                    ),
+                    Err(Error::Limit(_))
+                ));
+                assert!(!crate::execution::is_serial());
+            }
+            let fast = CandidateParams {
+                speed_tier: 9,
+                patches: Override::Off,
+                ..Default::default()
+            };
+            let candidate =
+                encode_native_candidate_in_pool(&fast, &first, &base, settings, supplied).unwrap();
+            assert_eq!(
+                candidate.artifact.implementation,
+                NativeImplementation::FastLossless
+            );
+            let decoded = crate::decode::decode(&candidate.bytes, &Default::default()).unwrap();
+            assert_eq!(&decoded.frames[0].pixels, first.pixels());
+        }
     }
 
     #[test]

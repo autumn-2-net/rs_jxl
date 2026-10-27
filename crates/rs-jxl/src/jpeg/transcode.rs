@@ -240,6 +240,16 @@ pub fn encode_coefficients(jpeg: &JpegData, options: &Options) -> Result<Vec<u8>
     })
 }
 
+pub(crate) fn encode_coefficients_in_pool(
+    jpeg: &JpegData,
+    options: &Options,
+    pool: Option<&rayon::ThreadPool>,
+) -> Result<Vec<u8>> {
+    with_pool(options, pool, |pool| {
+        Prepared::new(jpeg, options)?.encode(jpeg, options, pool)
+    })
+}
+
 fn prepare_ac(
     layout: &TranscodeLayout<'_>,
     geometry: FrameGeometry,
@@ -289,6 +299,32 @@ pub(crate) fn with_threads<T: Send>(
     options: &Options,
     work: impl FnOnce(Option<&rayon::ThreadPool>) -> Result<T> + Send,
 ) -> Result<T> {
+    validate_execution(options)?;
+    if options.threads == 1 || crate::execution::is_serial() {
+        return with_pool(options, None, work);
+    }
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(options.threads)
+        .build()
+        .map_err(|e| Error::Encoding(e.to_string()))?;
+    with_pool(options, Some(&pool), work)
+}
+
+pub(crate) fn with_pool<T: Send>(
+    options: &Options,
+    pool: Option<&rayon::ThreadPool>,
+    work: impl FnOnce(Option<&rayon::ThreadPool>) -> Result<T> + Send,
+) -> Result<T> {
+    validate_execution(options)?;
+    match pool {
+        Some(pool) if !crate::execution::is_serial() => {
+            crate::execution::with_pool(pool, || work(Some(pool)))
+        }
+        _ => crate::execution::serial(|| work(None)),
+    }
+}
+
+fn validate_execution(options: &Options) -> Result<()> {
     if let Some(limits) = options.cooperative_ma {
         limits.validate()?;
     }
@@ -306,14 +342,7 @@ pub(crate) fn with_threads<T: Send>(
     if options.max_output_bytes == 0 || options.max_coefficients == 0 || options.max_tokens == 0 {
         return Err(Error::Limit("JPEG encode budgets must be nonzero"));
     }
-    if options.threads == 1 || crate::execution::is_serial() {
-        return crate::execution::serial(|| work(None));
-    }
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(options.threads)
-        .build()
-        .map_err(|e| Error::Encoding(e.to_string()))?;
-    crate::execution::with_pool(&pool, || work(Some(&pool)))
+    Ok(())
 }
 
 /// Effort-independent data, prepared once for every whole-frame candidate.
@@ -638,6 +667,56 @@ mod tests;
 #[cfg(test)]
 mod resource_error_tests {
     use super::*;
+
+    #[test]
+    fn supplied_pool_and_null_runner_keep_executor_identity_and_restore_scope() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        let options = Options {
+            threads: 3,
+            ..Default::default()
+        };
+        let caller = std::thread::current().id();
+        with_pool(&options, None, |actual| {
+            assert!(actual.is_none());
+            assert!(crate::execution::is_serial());
+            assert_eq!(crate::execution::worker_count(), 1);
+            assert_eq!(std::thread::current().id(), caller);
+            Ok(())
+        })
+        .unwrap();
+        assert!(!crate::execution::is_serial());
+        with_pool(&options, Some(&pool), |actual| {
+            assert!(std::ptr::eq(actual.unwrap(), &pool));
+            assert!(pool.current_thread_index().is_some());
+            assert_eq!(crate::execution::worker_count(), 2);
+            let caller = std::thread::current().id();
+            let failed: Result<()> = with_pool(&options, None, |actual| {
+                assert!(actual.is_none());
+                assert!(crate::execution::is_serial());
+                assert_eq!(std::thread::current().id(), caller);
+                Err(Error::Limit("test failure"))
+            });
+            assert!(failed.is_err());
+            assert!(!crate::execution::is_serial());
+            assert_eq!(crate::execution::worker_count(), 2);
+            Ok(())
+        })
+        .unwrap();
+        for threads in [0, 257] {
+            let invalid = Options {
+                threads,
+                ..options.clone()
+            };
+            for supplied in [None, Some(&pool)] {
+                let result: Result<()> =
+                    with_pool(&invalid, supplied, |_| panic!("invalid threads"));
+                assert!(matches!(result, Err(Error::InvalidInput(_))));
+            }
+        }
+    }
 
     #[test]
     fn metadata_resource_errors_preserve_limit_classification() {

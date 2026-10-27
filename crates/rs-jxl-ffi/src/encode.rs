@@ -4,12 +4,13 @@ use crate::{
 };
 use rs_jxl::{
     EncodeOptions, Image,
+    codec::{EncodeJob, EncodeReport, EncodeRoute, Encoder, SourceRequest, SourceSearch},
     metadata::Animation,
     modular::predictor::Predictor,
     multiframe::{self, Reference},
     scheduler::{
-        self, CandidateParams, NativeBackendOptions, adapter::project_native,
-        native::encode_native_candidate, params::Override,
+        CandidateParams, NativeBackendOptions, NativeImplementation, adapter::project_native,
+        params::Override,
     },
 };
 use serde_json::{Value, json};
@@ -43,39 +44,65 @@ fn candidate(options: &Options) -> Result<(CandidateParams, EncodeOptions)> {
     Ok((params, base))
 }
 
-fn still(image: &Image, options: &Options) -> Result<Vec<u8>> {
+fn still(
+    image: &Image,
+    options: &Options,
+    context: Option<&mut Encoder>,
+) -> Result<rs_jxl::codec::EncodeResult> {
     let (params, base) = candidate(options)?;
-    let settings = NativeBackendOptions::default();
-    if options.source_search.unwrap_or(false) {
-        if options.effort.unwrap_or(7) == 11 {
-            Ok(scheduler::run_native_tectonic(
-                image,
-                &params,
-                Default::default(),
-                Default::default(),
-                &base,
-                settings,
-            )
-            .map_err(message)?
-            .output
-            .bytes)
-        } else {
-            Ok(scheduler::run_native_pixel_search(
-                image,
-                &params,
-                &Default::default(),
-                &base,
-                settings,
-            )
-            .map_err(message)?
-            .output
-            .bytes)
-        }
-    } else {
-        Ok(encode_native_candidate(&params, image, &base, settings)
-            .map_err(message)?
-            .bytes)
+    let job = EncodeJob {
+        options: base,
+        source: Some(SourceRequest {
+            params,
+            search: if options.source_search.unwrap_or(false) {
+                SourceSearch::Auto
+            } else {
+                SourceSearch::Disabled
+            },
+            backend: NativeBackendOptions::default(),
+        }),
+    };
+    match context {
+        Some(context) => context.encode(image, &job),
+        None => rs_jxl::codec::encode_job(image, &job),
     }
+    .map_err(message)
+}
+
+fn report(value: &EncodeReport) -> Value {
+    let effective = value.effective_params.as_ref().map(|params| {
+        json!({
+            "effort": 10 - params.speed_tier,
+            "group_size_shift": params.group_size_shift,
+            "rct": params.rct,
+            "predictor": params.predictor.map(|p| p as u32),
+            "palette_colors": params.palette_colors,
+            "learning_fraction": params.learning_fraction,
+            "patches": match params.patches { Override::Default => "auto", Override::Off => "off", Override::On => "on" },
+        })
+    });
+    json!({
+        "route": match value.route {
+            EncodeRoute::Manual => "manual", EncodeRoute::Candidate => "candidate",
+            EncodeRoute::Search => "search", EncodeRoute::Scout => "scout",
+            EncodeRoute::Pilot => "pilot", EncodeRoute::Tectonic => "tectonic",
+        },
+        "implementation": match value.implementation {
+            NativeImplementation::Modular => "modular", NativeImplementation::FastLossless => "fast_lossless",
+        },
+        "pixels": value.pixels,
+        "bytes": value.encoded_bytes,
+        "bpp": value.bpp(),
+        "codec_seconds": value.codec_seconds,
+        "mpix_per_second": value.mpix_per_second(),
+        "full_encodes": value.full_encodes,
+        "probe_encodes": value.probe_encodes,
+        "winner_index": value.winner_index,
+        "effective_parameters": effective,
+        "preparation_reuse": value.preparation_reuse.map(|r| json!({
+            "hits": r.hits, "misses": r.misses, "retained_bytes": r.retained_bytes,
+        })),
+    })
 }
 
 fn reference(request: &Request) -> Reference {
@@ -99,6 +126,14 @@ fn rect(rect: Option<multiframe::Rect>) -> Value {
 }
 
 pub fn execute(request: &Request, data: &[u8]) -> Result<(Value, Vec<u8>)> {
+    execute_with_context(request, data, None)
+}
+
+pub fn execute_with_context(
+    request: &Request,
+    data: &[u8],
+    context: Option<&mut Encoder>,
+) -> Result<(Value, Vec<u8>)> {
     let mut images = Vec::new();
     let mut jpeg_input = false;
     for spec in request.images() {
@@ -108,14 +143,15 @@ pub fn execute(request: &Request, data: &[u8]) -> Result<(Value, Vec<u8>)> {
         jpeg_input |= jpeg;
     }
     if request.operation == Operation::Encode {
-        let bytes = still(&images[0], &request.options)?;
+        let result = still(&images[0], &request.options, context)?;
         return Ok((
             json!({
                 "operation": "encode",
-                "bytes": bytes.len(),
+                "bytes": result.bytes.len(),
                 "jpeg_input": jpeg_input,
+                "report": report(&result.report),
             }),
-            bytes,
+            result.bytes,
         ));
     }
     if request.operation == Operation::AnalyzeMultiframe {
@@ -183,17 +219,26 @@ pub fn execute(request: &Request, data: &[u8]) -> Result<(Value, Vec<u8>)> {
         "operation": "encode_multiframe",
         "jpeg_input": jpeg_input,
     });
+    let mut owned;
+    let encoder = match context {
+        Some(encoder) => encoder,
+        None => {
+            owned = Encoder::new(options.threads).map_err(message)?;
+            &mut owned
+        }
+    };
     let bytes = if request.auto.unwrap_or(false) {
-        let result = multiframe::encode_auto(
-            &images,
-            &durations,
-            &options,
-            &multiframe::AutoOptions {
-                reference: reference(request),
-                ..Default::default()
-            },
-        )
-        .map_err(message)?;
+        let result = encoder
+            .encode_auto(
+                &images,
+                &durations,
+                &options,
+                &multiframe::AutoOptions {
+                    reference: reference(request),
+                    ..Default::default()
+                },
+            )
+            .map_err(message)?;
         let frames: Vec<_> = result
             .frames
             .iter()
@@ -222,13 +267,23 @@ pub fn execute(request: &Request, data: &[u8]) -> Result<(Value, Vec<u8>)> {
     } else {
         let plan = multiframe::plan(&images, &durations, reference(request)).map_err(message)?;
         let frames: Vec<_> = plan.iter().map(|p| p.as_frame()).collect();
-        rs_jxl::encode_frames(&images[0], &frames, &options).map_err(message)?
+        encoder
+            .encode_frames(&images[0], &frames, &options)
+            .map_err(message)?
     };
     report["bytes"] = json!(bytes.len());
     Ok((report, bytes))
 }
 
 pub fn transcode(request: &Request, data: &[u8]) -> Result<(Value, Vec<u8>)> {
+    transcode_with_context(request, data, None)
+}
+
+pub fn transcode_with_context(
+    request: &Request,
+    data: &[u8],
+    context: Option<&mut Encoder>,
+) -> Result<(Value, Vec<u8>)> {
     use rs_jxl::jpeg::{self, cfl::CflMode, coefficient_order::OrderPolicy};
     let o = &request.options;
     let mut options = jpeg::TranscodeOptions {
@@ -275,18 +330,27 @@ pub fn transcode(request: &Request, data: &[u8]) -> Result<(Value, Vec<u8>)> {
             target.input.max_block_visits = n;
         }
     }
-    let bytes = if o.source_search.unwrap_or(false) {
-        jpeg::transcode_search(data, &options, Default::default())
-            .map_err(message)?
-            .data
-    } else {
-        jpeg::transcode(data, &options).map_err(message)?
-    };
+    let search = o.source_search.unwrap_or(false).then(Default::default);
+    let result = match context {
+        Some(context) => context.transcode_jpeg(data, &options, search),
+        None => rs_jxl::codec::transcode_jpeg(data, &options, search),
+    }
+    .map_err(message)?;
     Ok((
         json!({
             "operation": "transcode_jpeg",
-            "bytes": bytes.len(),
+            "bytes": result.bytes.len(),
+            "report": {
+                "route": if search.is_some() { "jpeg_search" } else { "jpeg_transcode" },
+                "codec_seconds": result.codec_seconds,
+                "backend_effort": result.backend_effort,
+                "winner_index": result.winner_index,
+                "full_encodes": result.trials.len(),
+                "trials": result.trials.iter().map(|t| json!({
+                    "stage": t.stage, "backend_effort": t.backend_effort, "bytes": t.bytes,
+                })).collect::<Vec<_>>(),
+            },
         }),
-        bytes,
+        result.bytes,
     ))
 }

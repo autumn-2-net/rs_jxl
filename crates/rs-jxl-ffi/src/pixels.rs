@@ -89,7 +89,7 @@ fn extra(
         "cfa" => ExtraChannelType::Cfa,
         "thermal" => ExtraChannelType::Thermal,
         "optional" => ExtraChannelType::Optional,
-        _ => return Err(format!("unsupported extra channel type: {}", spec.kind)),
+        _ => return Err(format!("unsupported extra channel type: {}", spec.kind).into()),
     };
     if spec.dim_shift > 3 {
         return Err("dim_shift must be 0..3".into());

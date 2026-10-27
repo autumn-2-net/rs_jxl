@@ -10,7 +10,7 @@ use super::{
         CoefficientReadError, CoefficientReadLimits, read_coefficients_with_limits,
     },
     data::{JpegData, JpegError, JpegRecord},
-    transcode::{Options as CoefficientOptions, encode_coefficients},
+    transcode::{Options as CoefficientOptions, encode_coefficients, encode_coefficients_in_pool},
 };
 use crate::{Error, Result, entropy::options::SpeedTier, scheduler::WorkerLimits};
 
@@ -126,6 +126,16 @@ pub fn transcode(input: &[u8], options: &TranscodeOptions) -> Result<Vec<u8>> {
     encode_coefficients(&jpeg, &settings)
 }
 
+pub(crate) fn transcode_in_pool(
+    input: &[u8],
+    options: &TranscodeOptions,
+    pool: Option<&rayon::ThreadPool>,
+) -> Result<Vec<u8>> {
+    let settings = options.resolve()?;
+    let jpeg = read_input(input, &options.limits.input)?;
+    encode_coefficients_in_pool(&jpeg, &settings, pool)
+}
+
 pub(crate) fn read_input(input: &[u8], limits: &CoefficientReadLimits) -> Result<JpegData> {
     let mut jpeg = read_coefficients_with_limits(input, limits).map_err(|e| match e {
         CoefficientReadError::Jpeg(JpegError::LimitExceeded { resource, .. }) => {
@@ -172,6 +182,59 @@ mod tests {
         }
         bytes.extend([0xff, 0xda, 0, 8, 1, 1, 0, 0, 63, 0, 0x3f, 0xff, 0xd9]);
         bytes
+    }
+
+    #[test]
+    fn reusable_pool_keeps_jpeg_inputs_and_search_caches_invocation_local() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        let first = tiny_jpeg();
+        let mut second = first.clone();
+        second.extend_from_slice(b"second input trailer");
+        let options = TranscodeOptions {
+            effort: 3,
+            threads: 2,
+            ..Default::default()
+        };
+        for supplied in [None, Some(&pool)] {
+            for input in [&first, &second, &first] {
+                let bytes = transcode_in_pool(input, &options, supplied).unwrap();
+                assert_eq!(
+                    crate::decode::reconstruct_jpeg(&bytes, &Default::default()).unwrap(),
+                    *input
+                );
+                let search = super::super::search::transcode_search_in_pool(
+                    input,
+                    &options,
+                    Default::default(),
+                    supplied,
+                )
+                .unwrap();
+                assert_eq!(
+                    crate::decode::reconstruct_jpeg(&search.data, &Default::default()).unwrap(),
+                    *input
+                );
+                assert!(search.trials.len() >= 2);
+                let mut limited = options.clone();
+                limited.limits.max_output_bytes = 1;
+                assert!(matches!(
+                    transcode_in_pool(input, &limited, supplied),
+                    Err(Error::Limit(_))
+                ));
+                assert!(
+                    super::super::search::transcode_search_in_pool(
+                        input,
+                        &limited,
+                        Default::default(),
+                        supplied,
+                    )
+                    .is_err()
+                );
+                assert!(!crate::execution::is_serial());
+            }
+        }
     }
 
     #[test]

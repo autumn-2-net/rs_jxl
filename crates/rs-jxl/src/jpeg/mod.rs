@@ -40,5 +40,7 @@ pub mod transcode_layout;
 #[cfg(test)]
 mod transcode_reference_tests;
 
+pub(crate) use archival::transcode_in_pool;
 pub use archival::{TranscodeLimits, TranscodeOptions, transcode, transcode_to};
 pub use search::transcode_search;
+pub(crate) use search::transcode_search_in_pool;

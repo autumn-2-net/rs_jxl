@@ -43,6 +43,24 @@ RS_JXL_NATIVE_LIB overrides either lookup and fails on an invalid path/ABI.
   stream receives all bytes and returns None. Encoding finishes before writing;
   I/O failure can leave partial output. Encoded inputs are fully buffered.
 
+### Input Copies and Borrowing
+
+`encode` and `encode_multiframe` default to `borrow_inputs=False`: mutable pixel
+buffers, including CPU tensors and read-only views of mutable storage, are
+snapshotted before the native call. Files/streams are read completely into memory;
+this is not a file mapping or incremental input API. Immutable bytes may be
+retained directly. Mutable encoded input passed through `read_bytes` is copied.
+
+`borrow_inputs=True` permits borrowing eligible contiguous encoding buffers for
+one synchronous call. The caller must not mutate the source or any alias until
+the call returns, including from other threads while CFFI releases the GIL.
+Marking one view read-only does not prevent mutation through another alias.
+Exporters are retained through the call. This is best-effort transport borrowing,
+not end-to-end zero-copy encoding: layout/byte-order normalization, GPU-to-CPU
+transfer, multiple frames/extra planes consolidated into one payload, and Rust
+image preparation can still allocate and copy. Borrowing does not bypass dtype,
+layout, metadata or resource checks.
+
 ## Still Images
 
 ```python
@@ -98,6 +116,80 @@ its candidates cannot guarantee them. ma_max_leaves is an explicit resource
 ceiling, not an implicit quality reduction. Raw cjxl flags and numeric libjxl
 frame-setting IDs are not forwarded to another encoder.
 
+## Reports
+
+`encode(..., return_info=True)` and `transcode_jpeg(..., return_info=True)`
+return `(encoded_output, meta)`. The first element keeps the ordinary bytes,
+Path or None behavior of `output`; codec statistics are under `meta["report"]`.
+This also applies when `encode` selects JPEG byte transcoding.
+
+```python
+data, meta = rs_jxl.encode(rgba, effort=9, source_search=True, return_info=True)
+report = meta["report"]
+print(report["route"], report["bytes"], report["codec_seconds"])
+```
+
+Still-image reports expose `route`, `implementation`, `pixels`, `bytes`, `bpp`,
+`codec_seconds`, `mpix_per_second`, `full_encodes`, `probe_encodes`,
+`winner_index`, `effective_parameters` and `preparation_reuse`. Optional values
+can be None; a direct candidate has no search winner index. The Python projection
+does not include the complete Rust search transcript. `implementation` is the
+stable lowercase string `modular` or `fast_lossless`. When effective parameters
+are present, their `patches` value is `auto`, `on` or `off`, not a Rust Debug name.
+`effective_parameters` is a scheduler `CandidateParams` projection, not a full
+backend recipe or exact tool list; FJXL uses its own default effort.
+JPEG reports instead provide `route` (`jpeg_transcode` or `jpeg_search`), `codec_seconds`,
+`backend_effort`, `winner_index`, `full_encodes` and `trials` with each trial's
+stage, backend effort and bytes. Output size also remains in top-level
+`meta["bytes"]`; do not assume identical report fields for both operations.
+
+`codec_seconds` excludes worker-pool creation, external pixel-input decoding,
+Python/FFI transport and external I/O. For JPEG transcoding it includes JPEG
+parsing and coefficient preparation. It covers codec work for the call, including
+search when requested, not an exact analysis/backend breakdown. Still-image bpp is
+final output bits per original pixel; MPix/s uses the original pixel count and
+codec time, not the sum of candidate/probe pixels. These are diagnostics, not
+performance-parity claims. Multiframe `return_info` retains its separate
+strategy metadata described below; no universal timing report is implied.
+
+## Reusable Contexts
+
+```python
+with rs_jxl.Encoder(threads=8) as encoder, rs_jxl.Decoder(threads=8) as decoder:
+    data, meta = encoder.encode(rgba, effort=9, return_info=True)
+    pixels = decoder.decode(data)
+    archived = encoder.transcode_jpeg("input.jpg", effort=7)
+    original_jpeg = decoder.reconstruct_jpeg(archived)
+```
+
+Constructors accept `threads=1`; `threads=0` resolves the CPU count capped at
+256, as in the one-shot API. `Encoder` supplies `encode`, `transcode_jpeg` and
+`encode_multiframe`. `Decoder` supplies `decode`, `decode_into`, `decode_layer`,
+`decode_extra_channel`, `info`, `reconstruct_jpeg` and `decode_to_png`. Options
+and return values match the corresponding module-level functions.
+
+Thread counts are fixed for a context. Methods inherit that count, and an
+explicit `threads` value must normalize to the same count. All other options
+are per-call; effort, limits, frame selection and output format from one call do
+not become defaults for the next. Contexts reuse workers, not input buffers,
+parser state, decoded frames, reference slots or candidate caches. One thread
+does not create a pool. `info` and PNG/JPEG pixel reading are stateless and do
+not reuse JXL decoder workers. Context-bound `decode`/`decode_into` still send
+PNG/JPEG `read_image` requests through the context's closed/lifecycle guard.
+
+`close()` is idempotent; `.threads` and `.closed` expose the context's settings
+and lifetime. Context-manager exit closes it, and operations after close raise
+RuntimeError. The context lock serializes the closed check and native execution
+against close; it is released before Python result conversion or copying.
+Conversion callbacks can close or reenter the context without holding that lock,
+and the current result retains independent ownership. This is not whole-method
+serialization or protection against concurrent mutation of caller buffers.
+Independent contexts can run concurrently; avoid multiplying outer workers by large inner
+thread counts. Ordinary request/codec failures permit reuse. A native panic
+poisons the handle; close it rather than attempting more work. Context creation
+requires the optional native context symbols and raises ImportError when an
+older ABI-v1 library lacks them; one-shot ABI compatibility is unchanged.
+
 ## Extra Channels
 
 ```python
@@ -135,6 +227,10 @@ uses geometry; reference=auto chooses the smaller first/previous bbox, not
 measured bytes. strategy="auto" additionally encodes eligible full/crop/mask/
 multiple-rectangle candidates and retains byte winners, at greater cost.
 return_info=True returns (encoded_output, strategy_report).
+The strategy report is the metadata dictionary itself, with `frames` candidate
+details for strategy="auto"; it is not the still/JPEG `meta["report"]` schema.
+`borrow_inputs` has the same snapshot/borrowing contract as still-image encode,
+though consolidation of several buffers can require copying.
 
 All channels including hidden RGB participate in differences. durations is a
 tick count or list, default 1; tps=(1000,1), loops=0. Zero is a true layer, not
@@ -152,6 +248,36 @@ target-frame decoding. dither="libjxl" affects floating-to-U8 only, not exact
 integers/JPEG bytes. format=u8/u16/f32 explicitly requests sample conversion.
 info reads JXL headers/metadata. decode_to_png exports representable native
 8/16-bit pixels; unsupported float/wide-integer/extra-plane output is rejected.
+Selected-frame decoding does not validate later data. Use frame=None when
+whole-input decoding is required; a selected frame's `complete` flag is not
+whole-file validation.
+
+### Preallocated Output
+
+```python
+destination = np.empty(rgba.shape, dtype=rgba.dtype)
+returned, metadata = rs_jxl.decode_into(data, destination, return_info=True)
+assert returned is destination
+```
+
+`decode_into(src, destination, ...)` decodes one nonnegative frame index (not
+frame=None). The destination must be a writable, C-contiguous NumPy ndarray
+with the exact returned HWC shape, including C=1 for gray, and exact
+native-endian dtype. Torch destinations, reshaping, narrowing and implicit
+destination conversions are not supported. Explicit `format` conversion, when
+requested, occurs in the decoder and the destination must match that result.
+This entry point does not fill separate extra-channel destinations.
+
+Decoding and descriptor/buffer/destination checks complete before any copy;
+decode or validation failures leave the destination untouched. Do not mutate
+the destination or its aliases concurrently with the call. The copy reads the
+live Rust result directly, avoiding intermediate Python bytes and a newly
+allocated returned array. It still uses Rust output storage and codec scratch,
+and is not direct decoding into caller memory or a zero-copy output view.
+Without `return_info`, the destination itself is returned; with it the result
+is `(destination, metadata)`. `Decoder.decode_into` has the same contract.
+
+### Limits and Errors
 
 Decode/info/reconstruction limits={...}: max_input_bytes/max_output_bytes/
 max_metadata_bytes/max_pixels/max_samples/max_frames. decode also accepts
@@ -160,15 +286,38 @@ omission uses core defaults. PNG/JPEG pixel read_image does not expose budgets
 yet. JPEG transcode limits are in the native protocol; unsupported limits fail.
 
 Input pointers live only through the call. Rust owns result handles; Python
-copies buffers and frees results in finally. CFFI checks ABI version/size and
-releases the GIL during native calls. Independent calls have independent pools
-and results; avoid outer-worker times inner-thread oversubscription. Invalid C
-pointers cannot be made safe by an ABI check; see the header's caller contract.
+copies into owned output or the validated destination while the result is live,
+without returning a borrowed Rust view. For nonempty data results, the internal
+`_ffi._result_buffer` attaches an `ffi.gc` owner to the data pointer and
+`ffi.buffer` retains that owner. Temporary derived views retained by an exception
+traceback can therefore safely keep the native result alive beyond helper scope
+exit. Cleanup releases the helper view; the owner's finalizer frees the native
+result once no retaining references remain. Native error responses and empty-data
+results still free directly in `finally`. This lifetime protection does not
+change the public owned-output contract or expose a zero-copy output API.
+
+CFFI checks ABI version/size and releases the GIL during native calls. One-shot
+calls create their own resources; explicit contexts reuse workers, with
+independently owned results. Invalid C pointers cannot be made safe by an ABI
+check; see the header's caller contract.
+
+Native failures raise `CodecError` with the original message and a `.kind`
+category: `invalid_input`, `resource_limit`, `encoding`, `decoding`, `io`,
+`internal` or `unsupported`. The ABI preserves its `error` string and adds
+`error_kind` and optional `error_stage`. Python currently exposes `.kind`, not
+a separate stage attribute; older libraries without a category yield `unknown`.
+Classification follows known typed Rust errors; unclassified/string-only errors
+can still be `invalid_input`. Python argument validation and path/stream failures
+can raise ordinary TypeError, ValueError, IndexError or OSError before/after the
+native call. Do not classify failures by matching message substrings.
 
 [Protocol](../crates/rs-jxl-ffi/protocol.md),
 [C header](../crates/rs-jxl-ffi/include/rs_jxl.h).
-Not implemented: Python incremental streaming, zero-copy outputs, reusable
-decoder contexts, arbitrary manual blend headers, full C++ parameter parity.
+Not implemented: Python incremental streaming, public zero-copy output views,
+direct native decode into user buffers, arbitrary manual blend headers or full
+C++ parameter parity. Reusable contexts and `decode_into` do not close those
+gaps. Native Rust decoder metadata types still include maintained-upstream
+reexports; this is not a complete backend-independent public type layer.
 
 ## Tests
 
@@ -188,9 +337,40 @@ Acceptance compares original samples including hidden RGB, or original JPEG
 bytes, not compressed JXL identity. Cross-platform runtime claims need actual
 tests on those systems, not just a matching wheel platform tag.
 
-### Initial Binding Validation
+### Current Verification
 
-On Windows x86-64 with Python 3.10 and the release DLL:
+Validated on Windows x86-64 with Python 3.10 on 2026-10-27:
+
+- Full Rust workspace regression: 2,377 passed, zero failed, 107 ignored before
+  the final diagnostic-retention review fix. Ignored tests are not passes.
+- After that fix, the complete `codec_context` target passed all 8 tests,
+  including two new artifact/receipt-preservation tests. This focused rerun is
+  separate from the earlier full-workspace count.
+- Final strict workspace Clippy (`--all-targets -- -D warnings`), formatting
+  and whitespace checks passed. Release CLI and FFI builds completed.
+- Full `pytest python/tests` against the final release DLL: 165 passed with
+  official `djxl` interoperability and CUDA transfers enabled. Two preexisting
+  tooling warnings (`pkg_resources` and `Py_DEBUG`) remained non-fatal.
+- The final wheel was installed into `out/python-architecture-final-installed`.
+  From the `out` working directory, with `RS_JXL_NATIVE_LIB` unset and the imported
+  package path asserted to be installed, all 92 binding, context, adapter and
+  buffer tests passed using the bundled DLL. This includes 45 native binding
+  and context tests; packaging tests are included in the 165-test source run.
+
+The pure derived-view test in [test_adapters.py](../python/tests/test_adapters.py)
+uses a mocked result to check owner retention and exactly-once release after a
+derived NumPy view is dropped. Native tests additionally cover closing a context
+from an output-conversion callback, closed PNG/JPEG input callbacks, independent
+concurrent handles, error recovery, multiframe state and byte-exact JPEG recovery.
+
+These are functional and installed-wheel checks, not a performance comparison,
+a full-corpus rerun, a release-profile Rust test run or cross-platform runtime
+certification. The historical counts below describe a different checkpoint.
+
+### Initial Binding Validation (Historical)
+
+The earlier binding checkpoint recorded the following on Windows x86-64 with
+Python 3.10 and the then-current release DLL, before this context/buffer refactor:
 
 - Python suite: 116 passed, including packaging, native bindings, official
   djxl interoperability and CUDA transfers. Two environment/tooling warnings

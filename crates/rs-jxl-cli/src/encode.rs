@@ -3,11 +3,9 @@
 use std::path::PathBuf;
 
 use clap::Args;
-use rs_jxl::scheduler::{
-    CandidateParams, DriverOptions, NativeBackendOptions, native::encode_native_candidate,
-    run_native_pixel_search, run_native_tectonic,
-};
-use rs_jxl::{EncodeOptions, encode};
+use rs_jxl::EncodeOptions;
+use rs_jxl::codec::{self, EncodeJob, SearchDetails, SourceRequest, SourceSearch};
+use rs_jxl::scheduler::{CandidateParams, NativeBackendOptions, pilot::PilotOptions};
 
 use crate::validators::{parse_sample_limit, parse_threads};
 use crate::{Result, input, io, options};
@@ -88,91 +86,99 @@ pub(crate) struct EncodeArgs {
     pub(crate) force: bool,
 }
 
+impl EncodeArgs {
+    pub(crate) fn job(&self) -> Result<EncodeJob> {
+        let mut options = EncodeOptions {
+            threads: self.threads,
+            ..EncodeOptions::default()
+        };
+        let Some(effort) = self.source_effort else {
+            self.tools.apply(&mut options)?;
+            self.ma_budget.apply(&mut options.modular);
+            self.ma_pruning.apply(&mut options.modular);
+            return Ok(EncodeJob {
+                options,
+                source: None,
+            });
+        };
+        self.ma_budget.apply(&mut options.modular);
+        self.ma_pruning.apply(&mut options.modular);
+        options.modular.sample_limit = self.source_sample_limit;
+        let params = CandidateParams::default().backend(effort)?;
+        if self.source_scout && !(9..=10).contains(&effort) {
+            return Err("--source-scout requires --source-effort 9 or 10".into());
+        }
+        if self.source_pilot && !(9..=10).contains(&effort) {
+            return Err("--source-pilot requires --source-effort 9 or 10".into());
+        }
+        let search = if !self.source_search {
+            SourceSearch::Disabled
+        } else if self.source_pilot {
+            SourceSearch::Pilot(PilotOptions {
+                group_race: self.source_progressive_groups.then(Default::default),
+                ..Default::default()
+            })
+        } else if self.source_scout {
+            SourceSearch::Scout
+        } else {
+            SourceSearch::Auto
+        };
+        Ok(EncodeJob {
+            options,
+            source: Some(SourceRequest {
+                params,
+                search,
+                backend: NativeBackendOptions::default(),
+            }),
+        })
+    }
+}
+
 // Both file encoding and the real-image timing harness use this dispatch.
 pub(crate) fn encode_image(image: &rs_jxl::Image, args: &EncodeArgs) -> Result<Vec<u8>> {
-    let mut options = EncodeOptions {
-        threads: args.threads,
-        ..EncodeOptions::default()
-    };
-    let Some(effort) = args.source_effort else {
-        args.tools.apply(&mut options)?;
-        args.ma_budget.apply(&mut options.modular);
-        args.ma_pruning.apply(&mut options.modular);
-        return Ok(encode(image, &options)?);
-    };
-    args.ma_budget.apply(&mut options.modular);
-    args.ma_pruning.apply(&mut options.modular);
-    options.modular.sample_limit = args.source_sample_limit;
-    let params = CandidateParams::default().backend(effort)?;
-    if args.source_scout && !(9..=10).contains(&effort) {
-        return Err("--source-scout requires --source-effort 9 or 10".into());
-    }
-    if args.source_pilot && !(9..=10).contains(&effort) {
-        return Err("--source-pilot requires --source-effort 9 or 10".into());
-    }
-    let settings = NativeBackendOptions::default();
-    eprintln!(
-        "note: experimental pure-Rust source mode: effort={effort} search={} \
+    let job = args.job()?;
+    if let Some(effort) = args.source_effort {
+        eprintln!(
+            "note: experimental pure-Rust source mode: effort={effort} search={} \
          sample_limit={}; no byte-identity or performance-parity claim",
-        args.source_search,
-        args.source_sample_limit
-            .map_or_else(|| "none".to_owned(), |limit| limit.to_string()),
-    );
-    if effort == 11 && !args.source_search {
-        eprintln!(
-            "note: explicit TectonicPlate (-1) backend; no C++ frame-level effort11 tournament"
+            args.source_search,
+            args.source_sample_limit
+                .map_or_else(|| "none".to_owned(), |limit| limit.to_string()),
         );
-    }
-    if args.source_search && effort == 11 {
-        let result = run_native_tectonic(
-            image,
-            &params,
-            Default::default(),
-            Default::default(),
-            &options,
-            settings,
-        )?;
-        eprintln!(
-            "source effort11 tournament: branch={:?} full_encodes={} winner={} winner_effort={}",
-            result.output.report.branch,
-            result.output.report.full_encodes,
-            result.output.report.winner_index,
-            10 - result.output.params.speed_tier
-        );
-        Ok(result.output.bytes)
-    } else if args.source_search {
-        let driver = if args.source_scout {
-            DriverOptions::scout()
-        } else {
-            DriverOptions::default()
-        };
-        let result = if args.source_pilot {
-            rs_jxl::scheduler::pilot::encode_with_options(
-                image,
-                &params,
-                &options,
-                rs_jxl::scheduler::pilot::PilotOptions {
-                    group_race: args.source_progressive_groups.then(Default::default),
-                    ..Default::default()
-                },
-            )?
-        } else {
-            run_native_pixel_search(image, &params, &driver, &options, settings)?
-        };
-        eprintln!(
-            "source search: full_encodes={} probe_encodes={} winner={} winner_effort={}",
-            result.output.report.full_encodes,
-            result.output.report.probe_encodes,
-            result.output.report.winner_index,
-            10 - result.output.params.speed_tier,
-        );
-        if args.source_scout || args.source_pilot {
-            eprintln!("source scout: winner_params={:?}", result.output.params);
+        if effort == 11 && !args.source_search {
+            eprintln!(
+                "note: explicit TectonicPlate (-1) backend; no C++ frame-level effort11 tournament"
+            );
         }
-        Ok(result.output.bytes)
-    } else {
-        Ok(encode_native_candidate(&params, image, &options, settings)?.bytes)
     }
+    let result = codec::encode_job(image, &job)?;
+    match &result.report.details {
+        SearchDetails::Tectonic(report) => {
+            let params = &report.trials[report.winner_index].params;
+            eprintln!(
+                "source effort11 tournament: branch={:?} full_encodes={} winner={} winner_effort={}",
+                report.branch,
+                report.full_encodes,
+                report.winner_index,
+                10 - params.speed_tier
+            );
+        }
+        SearchDetails::Pixel(report) => {
+            let params = &report.trials[report.winner_index].params;
+            eprintln!(
+                "source search: full_encodes={} probe_encodes={} winner={} winner_effort={}",
+                report.full_encodes,
+                report.probe_encodes,
+                report.winner_index,
+                10 - params.speed_tier,
+            );
+            if args.source_scout || args.source_pilot {
+                eprintln!("source scout: winner_params={params:?}");
+            }
+        }
+        SearchDetails::None => {}
+    }
+    Ok(result.bytes)
 }
 
 pub(crate) fn run(args: EncodeArgs) -> Result<()> {

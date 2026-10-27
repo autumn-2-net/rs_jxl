@@ -1,7 +1,14 @@
 use super::*;
 use crate::encode::encode_image;
 use clap::CommandFactory;
-use rs_jxl::scheduler::CandidateParams;
+use rs_jxl::codec::SourceSearch;
+use rs_jxl::scheduler::{CandidateParams, NativeAcceptance, pilot::PilotOptions};
+
+fn encode_args(extra: &[&str]) -> encode::EncodeArgs {
+    let mut argv = vec!["rs-jxl", "encode", "-", "-"];
+    argv.extend_from_slice(extra);
+    expect_encode(Cli::try_parse_from(argv).unwrap().command)
+}
 
 #[test]
 fn cli_shape_and_defaults() {
@@ -84,6 +91,186 @@ fn source_arguments_and_resources() {
         let mut argv = vec!["rs-jxl", "encode", "a", "b"];
         argv.extend(extra);
         assert!(Cli::try_parse_from(argv).is_err());
+    }
+}
+
+#[test]
+fn typed_source_jobs_keep_candidate_and_search_requests_distinct() {
+    for effort in 1..=11 {
+        let effort_arg = effort.to_string();
+        for search in [false, true] {
+            let mut flags = vec!["--source-effort", &effort_arg];
+            if search {
+                flags.push("--source-search");
+            }
+            let job = encode_args(&flags).job().unwrap();
+            assert_eq!(job.options.threads, 1);
+            assert_eq!(job.options.modular.sample_limit, None);
+            assert_eq!(job.options.modular.ma_budget_mode, None);
+            assert_eq!(job.options.modular.ma_max_leaves, None);
+            let source = job.source.unwrap();
+            assert_eq!(
+                source.params,
+                CandidateParams::default().backend(effort).unwrap()
+            );
+            if search {
+                // Effort 11 is still Auto here; the codec owns tournament selection.
+                assert!(matches!(source.search, SourceSearch::Auto));
+            } else {
+                assert!(matches!(source.search, SourceSearch::Disabled));
+            }
+            assert_eq!(source.backend.acceptance, NativeAcceptance::RequireExact);
+            assert_eq!(source.backend.preparation_cache_bytes, 0);
+            assert!(!source.backend.patches_off);
+            assert!(!source.backend.probe_palette);
+            assert!(!source.backend.literal_palette_tools);
+            assert!(!source.backend.routed_tools);
+        }
+    }
+}
+
+#[test]
+fn typed_source_jobs_keep_scout_and_pilot_options_explicit() {
+    for effort in ["9", "10"] {
+        let base = ["--source-effort", effort, "--source-search"];
+        let mut flags = base.to_vec();
+        flags.push("--source-scout");
+        let source = encode_args(&flags).job().unwrap().source.unwrap();
+        assert!(matches!(source.search, SourceSearch::Scout));
+        for progressive in [false, true] {
+            let mut flags = base.to_vec();
+            flags.push("--source-pilot");
+            if progressive {
+                flags.push("--source-progressive-groups");
+            }
+            let source = encode_args(&flags).job().unwrap().source.unwrap();
+            let SourceSearch::Pilot(options) = source.search else {
+                panic!("expected pilot request");
+            };
+            assert_eq!(
+                options,
+                PilotOptions {
+                    group_race: progressive.then(Default::default),
+                    ..Default::default()
+                }
+            );
+        }
+    }
+}
+
+#[test]
+fn typed_jobs_forward_shared_resource_controls_without_changing_modes() {
+    use rs_jxl::modular::ma_train::MaBudgetMode;
+
+    let routes: &[&[&str]] = &[
+        &[],
+        &["--source-effort", "3"],
+        &["--source-effort", "11"],
+        &["--source-effort", "3", "--source-search"],
+        &["--source-effort", "11", "--source-search"],
+        &["--source-effort", "9", "--source-search", "--source-scout"],
+        &[
+            "--source-effort",
+            "10",
+            "--source-search",
+            "--source-pilot",
+            "--source-progressive-groups",
+        ],
+    ];
+    for route in routes {
+        for (mode, expected) in [
+            ("strict", MaBudgetMode::Strict),
+            ("bounded", MaBudgetMode::Bounded),
+        ] {
+            let mut flags = route.to_vec();
+            flags.extend_from_slice(&[
+                "--threads",
+                "2",
+                "--ma-budget-mode",
+                mode,
+                "--ma-max-leaves",
+                "17",
+                "--ma-prune",
+                "--strip-metadata",
+                "--force",
+            ]);
+            if !route.is_empty() {
+                flags.extend_from_slice(&["--source-sample-limit", "4096"]);
+            }
+            let args = encode_args(&flags);
+            assert!(args.strip_metadata && args.force);
+            let job = args.job().unwrap();
+            assert_eq!(job.source.is_some(), !route.is_empty());
+            assert_eq!(job.options.threads, 2);
+            let modular = &job.options.modular;
+            assert_eq!(modular.ma_budget_mode, Some(expected));
+            assert_eq!(modular.ma_max_leaves, Some(17));
+            assert!(modular.source_property_dedup && modular.source_ma_dominance);
+            assert_eq!(modular.sample_limit, (!route.is_empty()).then_some(4096));
+        }
+    }
+}
+
+#[test]
+fn typed_manual_jobs_keep_tool_defaults_overrides_and_validation() {
+    use rs_jxl::modular::predictor::Predictor;
+
+    let job = encode_args(&[]).job().unwrap();
+    assert!(job.source.is_none());
+    assert_eq!(job.options.threads, 1);
+    assert_eq!(job.options.modular.rct, Some(6));
+    assert_eq!(job.options.modular.tree_samples, 1024);
+    assert_eq!(job.options.modular.max_tree_leaves, 16);
+    assert_eq!(job.options.modular.ma_budget_mode, None);
+    assert_eq!(job.options.modular.sample_limit, None);
+
+    let job = encode_args(&[
+        "--rct",
+        "0",
+        "--predictor",
+        "0",
+        "--weighted-preset",
+        "4",
+        "--tree-samples",
+        "2048",
+        "--tree-leaves",
+        "32",
+        "--tree-split-threshold",
+        "24",
+        "--previous-channels",
+        "2",
+        "--squeeze",
+        "horizontal,vertical",
+        "--lz77",
+        "off",
+        "--group-size-shift",
+        "2",
+        "--shared-tree",
+        "--source-patches",
+        "--progressive",
+    ])
+    .job()
+    .unwrap();
+    assert!(job.source.is_none());
+    let options = job.options;
+    assert_eq!(options.modular.rct, Some(0));
+    assert_eq!(options.modular.predictor, Predictor::Zero);
+    assert_eq!(options.modular.weighted_preset, 4);
+    assert_eq!(options.modular.tree_samples, 2048);
+    assert_eq!(options.modular.max_tree_leaves, 32);
+    assert_eq!(options.modular.split_threshold, 24.0);
+    assert_eq!(options.modular.previous_channels, 2);
+    assert_eq!(options.modular.squeeze, [true, false]);
+    assert!(!options.modular.lz77);
+    assert_eq!(options.group_size_shift, 2);
+    assert!(options.shared_tree);
+    assert!(options.source_patches.is_some());
+    assert_eq!(
+        options.passes,
+        rs_jxl::modular::layout::Passes::progressive()
+    );
+    for flag in ["--tree-samples", "--tree-leaves"] {
+        assert!(encode_args(&[flag, "0"]).job().is_err());
     }
 }
 
@@ -201,11 +388,11 @@ fn content_pilot_is_explicit_and_excludes_other_search_presets() {
 fn explicit_effort_eleven_maps_to_tectonic_not_effort_ten() {
     let cli = Cli::try_parse_from(["rs-jxl", "encode", "a", "b", "--source-effort", "11"]).unwrap();
     let args = expect_encode(cli.command);
-    let candidate = CandidateParams::default()
-        .backend(args.source_effort.unwrap())
-        .unwrap();
+    let source = args.job().unwrap().source.unwrap();
+    let candidate = source.params;
     assert_eq!(candidate.speed_tier, -1);
     assert!(!args.source_search);
+    assert!(matches!(source.search, SourceSearch::Disabled));
     assert_ne!(candidate, CandidateParams::default().backend(10).unwrap());
     assert_eq!(candidate.training_policy(3, 22).node_threshold, 61);
 }

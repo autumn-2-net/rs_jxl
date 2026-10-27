@@ -8,12 +8,16 @@ def is_source(value) -> bool:
     return isinstance(value, (str, os.PathLike, bytes, bytearray, memoryview)) or hasattr(value, "read")
 
 
-def read_bytes(value) -> bytes:
+def read_bytes(value, *, borrow=False) -> bytes | memoryview:
     if isinstance(value, (str, os.PathLike)):
         return Path(value).read_bytes()
     if hasattr(value, "read"):
         value = value.read()
     if isinstance(value, (bytes, bytearray, memoryview)):
+        if borrow and not isinstance(value, bytes):
+            view = memoryview(value)
+            if view.c_contiguous:
+                return view.cast("B")
         return bytes(value)
     raise TypeError("expected a path, encoded bytes or a binary readable stream")
 

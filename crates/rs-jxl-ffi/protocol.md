@@ -2,8 +2,127 @@
 
 C structs use native ABI/endian; pixel buffers are packed LITTLE-ENDIAN.
 JSON is UTF-8 without NUL. Status 0=success, 1=request/codec error, 2=caught
-panic. Errors contain {"error":"message"} and empty data. Null result getters
-return status -1 or null with length 0. Results own both buffers until free.
+panic. Errors contain an unchanged `error` message, an `error_kind` category,
+and empty data; see Structured errors below. Null result getters return status
+-1 or null with length 0. Results own both buffers until `rs_jxl_result_free`.
+The ABI version remains 1; context functions are optional additive symbols.
+
+## Structured errors
+
+An error result has this shape; `error_stage` is optional:
+
+```json
+{
+  "error": "resource limit: JXL input bytes",
+  "error_kind": "resource_limit",
+  "error_stage": "context_execute"
+}
+```
+
+`error` preserves the existing human-readable message. `error_kind` is one of
+`invalid_input`, `resource_limit`, `encoding`, `decoding`, `io`, `internal`, or
+`unsupported`. Categories do not replace the status code: ordinary failures use
+status 1 regardless of category. A caught panic uses status 2, `internal`, and
+the message `Rust panic during execution`. Abort and unrecoverable allocation
+failures are not converted to results.
+
+Categories come from typed errors, not message text. Core `InvalidInput`,
+`Limit`, `Encoding`, `Decoding`, and `Io` variants retain their corresponding
+categories. Known boxed reader errors and their sources are inspected without
+changing the outer message. String-only errors and unclassified reader errors
+default to `invalid_input`; words such as "unsupported" or "limit" in a message
+alone do not establish a category. Unsupported ABI versions and context-kind
+mismatches are explicitly categorized as `unsupported`.
+
+`error_stage` adds diagnostic context without prefixing or otherwise changing
+`error`. Current boundary labels include `context_create`, `context_execute`,
+and `serialize_response`; a more specific existing stage is retained. Callers
+must not require a stage, including for panic results. Older v1 libraries may
+omit `error_kind` as well; compatibility clients should retain their existing
+message/status fallback.
+
+## Reusable contexts
+
+The existing `rs_jxl_execute` remains the stateless entry point. Capability-detect
+the following symbols rather than assuming ABI version 1 guarantees contexts:
+
+```c
+RsJxlResult *rs_jxl_context_create(const RsJxlRequest *request,
+                                  RsJxlContext **out_context);
+RsJxlResult *rs_jxl_context_execute(RsJxlContext *context,
+                                   const RsJxlRequest *request);
+void rs_jxl_context_free(RsJxlContext *context);
+```
+
+### Creation
+
+Creation uses the same `RsJxlRequest` ABI envelope, but a separate JSON schema:
+
+```json
+{"kind":"encoder","threads":2}
+```
+
+`kind` is required and must be `encoder` or `decoder`. `threads` defaults to 1
+when omitted, must be an integer in 1..256, and cannot be null. Unknown and
+duplicate fields fail. Operation fields, an `options` object, and a nonempty
+data payload are not accepted.
+
+`out_context` must be writable for one pointer, must not overlap request/input
+storage, and may be unaligned. A null output pointer returns an error. A valid
+output slot is set to null before request validation and remains null on failure.
+Free an existing context before reusing its output slot; creation does not free
+the old handle. Success returns status 0, JSON such as
+`{"kind":"encoder","threads":2}`, empty data, and a new caller-owned handle in
+`*out_context`. Always free the creation result separately, on success or failure.
+
+### Execution
+
+Context execution accepts the unchanged operation-request JSON described below.
+Only the thread count is fixed by the context. Where an operation accepts
+`options.threads`, omission or null inherits the context count; an explicitly
+different count fails with `request threads must match the context`. All other
+settings use each request's values or ordinary operation defaults. Decoder
+options, including limits and output format, do not carry over to the next call.
+
+| Context kind | Operations using reusable resources | Stateless operations also accepted |
+| --- | --- | --- |
+| `encoder` | `encode`, `encode_multiframe`, `transcode_jpeg` | `analyze_multiframe` |
+| `decoder` | `decode`, `decode_to_png`, `reconstruct_jpeg` | `info`, `read_image` |
+
+Other kind/operation combinations fail. The stateless operations above do not
+reuse the context's workers or parser state. Their normal field restrictions
+remain in force: `analyze_multiframe` and `read_image` still reject an explicitly
+supplied nonnull `threads` option. `info` inherits the thread count as usual.
+Per-input parser/frame state and input buffers are not retained between calls.
+
+### Ownership and failure
+
+All calls are synchronous. Request storage follows the same contract as
+`rs_jxl_execute`: a nonnull request exposes the readable native version/size
+prefix, and a matching prefix requires the full struct plus readable, immutable
+storage for each nonempty buffer. Request/input storage must not alias the
+context. Invalid or dangling pointers cannot be detected reliably.
+
+A nonnull context must be a live handle returned by creation. The caller must
+serialize all execute/free access to one context; there is no internal lock.
+Independent contexts may execute concurrently. Null execution handles return an
+error. `rs_jxl_context_free(NULL)` is a no-op; otherwise free exactly once with
+no concurrent use. A context remains live until explicitly freed, even after an
+error.
+
+Ordinary request/codec failures permit reuse of a healthy context. After any
+status-2 result, treat that context as poisoned: free it and create a replacement,
+never attempt further execution. A handle whose internal poison flag is set
+rejects execution with status 1, `error_kind: internal`, and
+`context is unusable after a panic`; this does not restore its usability.
+
+Results and their buffers are independent of context lifetime. Further context
+calls or freeing the context do not invalidate earlier results. Result getters
+return immutable borrowed bytes, valid only until that result is freed. Getter
+length outputs may be null; otherwise they must be writable and must not alias
+result storage. Do not free a result concurrently with its getters/readers.
+Freeing a result does not free its context, and freeing a context does not free
+any results.
 
 ## Requests
 

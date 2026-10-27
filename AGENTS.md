@@ -30,15 +30,16 @@
   nor does a JPEG parser constitute a working byte-reversible JXL transcoder.
   Track missing features in docs/PIXEL_LOSSLESS_PORT_STATUS.md; smoke tests are
   not phase acceptance.
-- Scope: pixel lossless, byte-reversible JPEG transcode, multiframe, and a future
-  Python-facing C ABI. No lossy encoder, no neural scheduling, no CI changes.
+- Scope: pixel lossless, byte-reversible JPEG transcode, multiframe, and
+  now-authorized Python integration through a Rust C ABI. No lossy encoder,
+  no neural scheduling, no CI changes.
 - macOS runtime work is out of the current acceptance scope. Do not start WSL
   or install Linux toolchains without explicit user approval. Cross-platform
   support does not authorize changing or starting a separate runtime environment.
 - For special JPEG inputs, distinguish a normative format limitation from a
   reference implementation limitation. Standard-compatible extensions are
   authorized; private archival boxes or pixel fallbacks are not a substitute for
-  byte-reversible JPEG recompression. Python integration remains deferred.
+  byte-reversible JPEG recompression.
 - Pixel acceptance compares original decoded samples including invisible RGB;
   JPEG acceptance compares original reconstructed JPEG bytes. Identical JXL bytes
   are not a compression goal. Low-level primitive equivalence tests are allowed.

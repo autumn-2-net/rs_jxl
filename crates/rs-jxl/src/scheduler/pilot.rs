@@ -190,6 +190,46 @@ pub fn encode_with_options(
     base: &EncodeOptions,
     options: PilotOptions,
 ) -> Result<NativeSearchResult> {
+    let (driver, native, base) = prepare_policy(image, params, base, options)?;
+    if let Some(group_options) = options.group_race
+        && let Some(result) =
+            super::progressive::try_encode(image, params, &driver, &base, native, group_options)?
+    {
+        return Ok(result);
+    }
+    run_native_pixel_search(image, params, &driver, &base, native)
+}
+
+pub(crate) fn encode_in_pool(
+    image: &Image,
+    params: &CandidateParams,
+    base: &EncodeOptions,
+    options: PilotOptions,
+    pool: Option<&rayon::ThreadPool>,
+) -> Result<NativeSearchResult> {
+    let (driver, native, base) = prepare_policy(image, params, base, options)?;
+    if let Some(group_options) = options.group_race
+        && let Some(result) = super::progressive::try_encode_in_pool(
+            image,
+            params,
+            &driver,
+            &base,
+            native,
+            group_options,
+            pool,
+        )?
+    {
+        return Ok(result);
+    }
+    super::native::run_native_pixel_search_in_pool(image, params, &driver, &base, native, pool)
+}
+
+fn prepare_policy(
+    image: &Image,
+    params: &CandidateParams,
+    base: &EncodeOptions,
+    options: PilotOptions,
+) -> Result<(DriverOptions, NativeBackendOptions, EncodeOptions)> {
     if !matches!(options.context_probe_side, 0 | 256 | 512) {
         return Err(Error::InvalidInput(
             "pilot context probe side must be 0, 256 or 512".into(),
@@ -207,13 +247,7 @@ pub fn encode_with_options(
     let literal = super::scan::literal_evidence(image);
     let (driver, native) = policy(image, literal, base.threads, options);
     let base = execution_options(base, literal);
-    if let Some(group_options) = options.group_race
-        && let Some(result) =
-            super::progressive::try_encode(image, params, &driver, &base, native, group_options)?
-    {
-        return Ok(result);
-    }
-    run_native_pixel_search(image, params, &driver, &base, native)
+    Ok((driver, native, base))
 }
 
 #[cfg(test)]

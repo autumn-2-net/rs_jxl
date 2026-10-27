@@ -56,6 +56,22 @@ pub(super) fn eligible(image: &Image, params: &CandidateParams, base: &EncodeOpt
 
 /// Outer image metadata is not replaced by FJXL's standalone sRGB header.
 pub(super) fn encode(image: &Image, base: &EncodeOptions) -> Result<Vec<u8>> {
+    crate::encode::validate_frames(image, &[crate::frame::Frame::new(image)], base)?;
+    if base.threads == 1 || crate::execution::is_serial() {
+        return encode_in_pool(image, base, None);
+    }
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(base.threads)
+        .build()
+        .map_err(|error| Error::Encoding(error.to_string()))?;
+    encode_in_pool(image, base, Some(&pool))
+}
+
+pub(super) fn encode_in_pool(
+    image: &Image,
+    base: &EncodeOptions,
+    pool: Option<&rayon::ThreadPool>,
+) -> Result<Vec<u8>> {
     let image_view =
         view(image).ok_or_else(|| Error::InvalidInput("ineligible FJXL input".into()))?;
     crate::encode::validate_frames(image, &[crate::frame::Frame::new(image)], base)?;
@@ -73,14 +89,11 @@ pub(super) fn encode(image: &Image, base: &EncodeOptions) -> Result<Vec<u8>> {
         },
         ..Default::default()
     };
-    let bytes = if base.threads == 1 || crate::execution::is_serial() {
-        fast_lossless::encode_frame(image_view, &options, true)?
-    } else {
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(base.threads)
-            .build()
-            .map_err(|error| Error::Encoding(error.to_string()))?;
-        fast_lossless::encode_frame_with_pool(image_view, &options, true, &pool)?
+    let bytes = match pool {
+        Some(pool) => fast_lossless::encode_frame_with_pool(image_view, &options, true, pool)?,
+        None => {
+            crate::execution::serial(|| fast_lossless::encode_frame(image_view, &options, true))?
+        }
     };
     stream
         .try_reserve(bytes.len())

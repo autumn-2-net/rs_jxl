@@ -1,10 +1,10 @@
 //! Native bridge for the separate source effort-11 frame tournament.
 use super::{
     CandidateParams, NativeBackendOptions, WorkerLimits,
-    batch::run_ordered,
     native::{NativeAdaptation, NativeArtifact, NativeTrialKind, prepare},
     search::{EncodedOutput, SearchLimits, TrialBudget},
     tectonic::{self, TectonicOracle, TectonicOutput},
+    worker_pool::{WorkerPlan, run_plan},
 };
 use crate::{EncodeOptions, Error, Image, Result};
 
@@ -15,7 +15,7 @@ pub struct NativeTectonicResult {
 }
 
 struct Oracle<'a> {
-    pool: &'a rayon::ThreadPool,
+    pool: Option<&'a rayon::ThreadPool>,
     base: &'a EncodeOptions,
     settings: NativeBackendOptions,
     workers: WorkerLimits,
@@ -41,7 +41,12 @@ impl TectonicOracle<NativeArtifact> for Oracle<'_> {
             .max_output_bytes
             .min(budget.max_output_bytes);
         self.adaptations.push(record);
-        let bytes = crate::encode::encode_with_pool(image, &artifact.options, self.pool)?;
+        let bytes = crate::encode::encode_frames_in_pool(
+            image,
+            &[crate::frame::Frame::new(image)],
+            &artifact.options,
+            self.pool,
+        )?;
         Ok(EncodedOutput { bytes, artifact })
     }
 
@@ -73,7 +78,8 @@ impl TectonicOracle<NativeArtifact> for Oracle<'_> {
             .saturating_mul(32)
             .saturating_add(32 << 20);
         let slots = self.workers.concurrency(candidates.len(), scratch).max(1);
-        run_ordered(self.pool, candidates.len(), slots, |i| {
+        let plan = WorkerPlan::independent(candidates.len(), slots)?;
+        run_plan(self.pool, &plan, |i, _| {
             Ok(crate::encode::encode_serial(image, &artifacts[i].options)?.len())
         })
     }
@@ -91,6 +97,18 @@ pub fn run_native_tectonic(
     base: &EncodeOptions,
     settings: NativeBackendOptions,
 ) -> Result<NativeTectonicResult> {
+    validate(params, workers, base)?;
+    if base.threads == 1 || crate::execution::is_serial() {
+        return run_native_tectonic_in_pool(image, params, limits, workers, base, settings, None);
+    }
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(base.threads)
+        .build()
+        .map_err(|e| Error::Encoding(e.to_string()))?;
+    run_native_tectonic_in_pool(image, params, limits, workers, base, settings, Some(&pool))
+}
+
+fn validate(params: &CandidateParams, workers: WorkerLimits, base: &EncodeOptions) -> Result<()> {
     if !(1..=256).contains(&base.threads) {
         return Err(Error::InvalidInput("threads must be 1..=256".into()));
     }
@@ -101,18 +119,32 @@ pub fn run_native_tectonic(
             "Tectonic tournament requires effort 11".into(),
         ));
     }
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(base.threads)
-        .build()
-        .map_err(|e| Error::Encoding(e.to_string()))?;
+    Ok(())
+}
+
+pub(crate) fn run_native_tectonic_in_pool(
+    image: &Image,
+    params: &CandidateParams,
+    limits: SearchLimits,
+    workers: WorkerLimits,
+    base: &EncodeOptions,
+    settings: NativeBackendOptions,
+    pool: Option<&rayon::ThreadPool>,
+) -> Result<NativeTectonicResult> {
+    validate(params, workers, base)?;
     let mut oracle = Oracle {
-        pool: &pool,
+        pool,
         base,
         settings,
         workers,
         adaptations: Vec::new(),
     };
-    let output = tectonic::encode(image, params, limits, &mut oracle)?;
+    let mut work = || tectonic::encode(image, params, limits, &mut oracle);
+    let output = if pool.is_none() {
+        crate::execution::serial(work)?
+    } else {
+        work()?
+    };
     Ok(NativeTectonicResult {
         output,
         adaptations: oracle.adaptations,

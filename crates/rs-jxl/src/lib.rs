@@ -24,6 +24,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 pub mod bit_writer;
+pub mod codec;
 pub mod color;
 pub mod decode;
 pub mod entropy;
@@ -51,6 +52,7 @@ pub mod final_plan;
 mod image;
 mod patch_frame;
 pub mod streaming;
+pub use codec::Encoder;
 pub use encode::{EncodeOptions, encode, encode_frames, encode_frames_to, encode_to};
 pub use error::{Error, Result};
 pub use image::{Image, PixelData, PixelLayout};

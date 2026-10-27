@@ -88,6 +88,38 @@ pub fn encode_auto(
     options: &EncodeOptions,
     auto: &AutoOptions,
 ) -> Result<AutoEncodeResult> {
+    validate(images, durations, options, auto)?;
+    if options.threads == 1 || crate::execution::is_serial() {
+        return encode_auto_in_pool(images, durations, options, auto, None);
+    }
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(options.threads)
+        .build()
+        .map_err(|e| Error::Encoding(e.to_string()))?;
+    encode_auto_in_pool(images, durations, options, auto, Some(&pool))
+}
+
+pub(crate) fn encode_auto_in_pool(
+    images: &[Image],
+    durations: &[u32],
+    options: &EncodeOptions,
+    auto: &AutoOptions,
+    pool: Option<&rayon::ThreadPool>,
+) -> Result<AutoEncodeResult> {
+    validate(images, durations, options, auto)?;
+    let work = || encode_inner(images, durations, options, auto);
+    match pool {
+        Some(pool) => crate::execution::with_pool(pool, work),
+        None => crate::execution::serial(work),
+    }
+}
+
+fn validate(
+    images: &[Image],
+    durations: &[u32],
+    options: &EncodeOptions,
+    auto: &AutoOptions,
+) -> Result<()> {
     if images.is_empty() || images.len() != durations.len() {
         return Err(Error::InvalidInput(
             "nonempty images and one duration per frame are required".into(),
@@ -111,15 +143,7 @@ pub fn encode_auto(
             "nonzero durations require animation metadata".into(),
         ));
     }
-    let work = || encode_inner(images, durations, options, auto);
-    if options.threads == 1 || crate::execution::is_serial() {
-        return crate::execution::serial(work);
-    }
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(options.threads)
-        .build()
-        .map_err(|e| Error::Encoding(e.to_string()))?;
-    crate::execution::with_pool(&pool, work)
+    Ok(())
 }
 
 fn candidates(images: &[Image], index: usize, auto: &AutoOptions) -> Result<Vec<Candidate>> {
@@ -341,4 +365,60 @@ fn append(target: &mut Vec<u8>, bytes: Vec<u8>, maximum: usize) -> Result<()> {
         .map_err(|_| Error::Limit("automatic output allocation"))?;
     target.extend(bytes);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{PixelData, PixelLayout, metadata::Animation};
+
+    #[test]
+    fn reusable_auto_pool_does_not_retain_frame_references_or_trial_budgets() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        let options = EncodeOptions {
+            threads: 2,
+            ..Default::default()
+        };
+        for supplied in [None, Some(&pool)] {
+            for value in [3, 91, 3] {
+                let images: Vec<_> = [value, value + 1]
+                    .into_iter()
+                    .map(|value| {
+                        let image =
+                            Image::new(4, 4, PixelLayout::Gray, PixelData::U8(vec![value; 16]))
+                                .unwrap();
+                        let mut metadata = image.metadata().clone();
+                        metadata.animation = Some(Animation::default());
+                        image.with_metadata(metadata, vec![]).unwrap()
+                    })
+                    .collect();
+                let limited = AutoOptions {
+                    max_total_trials: 1,
+                    ..Default::default()
+                };
+                assert!(matches!(
+                    encode_auto_in_pool(&images, &[1, 2], &options, &limited, supplied),
+                    Err(Error::Limit(_))
+                ));
+                let result = encode_auto_in_pool(
+                    &images,
+                    &[1, 2],
+                    &options,
+                    &AutoOptions::default(),
+                    supplied,
+                )
+                .unwrap();
+                let decoded = crate::decode::decode(&result.bytes, &Default::default()).unwrap();
+                assert_eq!(decoded.frames.len(), images.len());
+                for (frame, image) in decoded.frames.iter().zip(&images) {
+                    assert_eq!(&frame.pixels, image.pixels());
+                }
+                assert_eq!(result.frames.len(), images.len());
+                assert!(!crate::execution::is_serial());
+            }
+        }
+    }
 }

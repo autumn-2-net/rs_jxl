@@ -58,7 +58,8 @@ diagnostics, not a requirement to reproduce C++ arithmetic bit for bit.
   eligible binary masks and multiple REPLACE layers, retaining actual winners.
   See [automatic frames](docs/MULTIFRAME_AUTO.md) and
   [encode-frames CLI](docs/MULTIFRAME_AUTO_CLI.md).
-- Owned thread pools, byte-vector/writer APIs, file/stdin/stdout CLI.
+- Typed `codec::EncodeJob` dispatch and reusable `codec::Encoder` workers,
+  alongside `decode::Decoder`, byte-vector/writer APIs and file/stdin/stdout CLI.
 - Incremental pixel decoding with push/EOF, early frame delivery and blocking
   readers; CLI opt-in `decode --stream-input`. See
   [streaming input](docs/STREAMING_INPUT.md).
@@ -119,6 +120,24 @@ subprocess. Decoder integration is tracked
 separately; official `djxl` remains an independent test oracle, not an
 implementation dependency.
 
+## Codec Facade
+
+CLI and FFI still-image adapters map their arguments to
+`codec::EncodeJob { options, source }`. `SourceRequest` selects a direct
+candidate or explicit Auto/Scout/Pilot search; the core owns effort/search and
+effort-11 tournament dispatch. `codec::encode_job` and `codec::transcode_jpeg`
+provide one-shot calls. `codec::Encoder` reuses workers across still, frame,
+automatic multiframe and JPEG calls; `decode::Decoder` separately reuses decoding
+workers. Each input has fresh image/parser/reference state. Threads are fixed per
+context, and one thread uses no pool.
+
+The version-1 C ABI has optional additive context functions, typed error
+categories and still/JPEG reports without changing its request layout or removing
+one-shot calls. Decoder metadata types still include upstream reexports, and
+Python incremental streaming is not implemented. This is not closure of every
+interface or portability gap. See [architecture](docs/ARCHITECTURE.md) and the
+[binding contract](docs/PYTHON_INTERFACE.md).
+
 ## Python
 
 ```powershell
@@ -142,11 +161,38 @@ archived = rs_jxl.transcode_jpeg("input.jpg", effort=9, threads=8)
 original_jpeg = rs_jxl.reconstruct_jpeg(archived)
 ```
 
+For repeated calls, `Encoder(threads=...)` and `Decoder(threads=...)` support
+context-manager use and `close()`. Threads stay fixed; all other options are
+per-call and do not become stored defaults. Native calls and close are serialized,
+but Python result conversion/copying runs after the context lock is released:
+
+```python
+with rs_jxl.Encoder(threads=8) as encoder, rs_jxl.Decoder(threads=8) as decoder:
+    jxl, meta = encoder.encode("input.png", effort=9, return_info=True)
+    pixels = decoder.decode(jxl)
+    print(meta["report"]["codec_seconds"])
+```
+
+`encode` and `transcode_jpeg` accept `return_info=True`, returning output plus
+metadata with codec statistics under `meta["report"]`. `codec_seconds` excludes
+pool creation, external pixel-input decoding and transport/I/O. JPEG transcoding
+includes JPEG parsing and coefficient preparation; there is no exact analysis/
+backend timing split. `effective_parameters` projects scheduler `CandidateParams`,
+not a full backend recipe; FJXL uses its own default effort. Multiframe strategy
+metadata retains its separate shape. Mutable encoding inputs are copied by default; explicit
+`borrow_inputs=True` permits eligible buffers to be borrowed without concurrent
+mutation through any alias, but normalization/consolidation can still copy.
+Files and streams remain fully buffered. Decoding returns owned arrays or uses
+`decode_into` to copy a selected frame into an exact-shape/dtype writable,
+C-contiguous NumPy destination after validation. Public outputs do not borrow
+Rust storage; internal derived views retain their native owner even when held
+by an exception traceback beyond helper scope exit.
+
 The package also accepts arrays/tensors, encoded bytes and binary streams,
 supports extra channels and automatic multiframe strategies, and keeps raw
 zero-duration layers separate from display frames. It does not alias `jxlpy`
 or silently accept unsupported lossy/libjxl options. See the
-[API and build guide](docs/PYTHON_INTERFACE.md),
+[API and build guide](docs/PYTHON_API.md), [FFI boundary](docs/PYTHON_INTERFACE.md),
 [code architecture](docs/ARCHITECTURE.md) and [documentation index](docs/README.md).
 
 ## Build and Run
@@ -269,6 +315,11 @@ cargo fmt --all -- --check
 
 These are verification commands, not a statement that the current editing
 checkpoint passes all of them. The documented full migration remains incomplete.
+Validation of the unified codec facade, contexts, FFI errors/reports and Python
+buffers is recorded under [current verification](docs/PYTHON_API.md#current-verification).
+That checkpoint separates workspace tests, focused review-fix tests, release-DLL
+checks and installed-wheel tests. It does not claim new performance measurements
+or cross-platform runtime coverage.
 
 Independent checks run official `djxl` 0.12/0.13. Configure an OS path list:
 
@@ -285,8 +336,10 @@ external-oracle tests.
 Development host: Rust 1.97.1, Windows x86_64 MSVC. An intermediate checkpoint
 passed `cargo +1.89.0 check --locked --workspace --all-targets` and cross-target
 checks for x86_64 Linux, aarch64 Linux and aarch64 macOS. These are compile/type
-checks, not Linux/macOS/ARM runtime acceptance. Sanitizers and wheel builds are
-not verified. Later changes must repeat the checks; see the checkpoint document.
+checks, not Linux/macOS/ARM runtime acceptance. Sanitizers are not verified.
+Current installed-wheel checks are recorded separately under
+[current verification](docs/PYTHON_API.md#current-verification). Later changes
+must repeat the relevant checks; historical binding validation remains separate.
 
 ## Documentation
 

@@ -65,11 +65,7 @@ pub fn encode(image: &Image, options: &EncodeOptions) -> Result<Vec<u8>> {
 /// worker. Keeps all tool/search/resource settings; threads is still validated
 /// but does not select execution here. Nested core work inherits this scope.
 pub(crate) fn encode_serial(image: &Image, options: &EncodeOptions) -> Result<Vec<u8>> {
-    execution::serial(|| {
-        let frames = [crate::frame::Frame::new(image)];
-        validate_frames(image, &frames, options)?;
-        encode_validated_frames(image, &frames, options)
-    })
+    encode_frames_in_pool(image, &[crate::frame::Frame::new(image)], options, None)
 }
 
 /// Scheduler trials share one bounded pool instead of creating one per trial.
@@ -78,9 +74,12 @@ pub(crate) fn encode_with_pool(
     options: &EncodeOptions,
     pool: &rayon::ThreadPool,
 ) -> Result<Vec<u8>> {
-    let frames = [crate::frame::Frame::new(image)];
-    validate_frames(image, &frames, options)?;
-    execution::with_pool(pool, || encode_validated_frames(image, &frames, options))
+    encode_frames_in_pool(
+        image,
+        &[crate::frame::Frame::new(image)],
+        options,
+        Some(pool),
+    )
 }
 
 pub(crate) fn encode_trial_serial(
@@ -173,14 +172,29 @@ pub fn encode_frames(
 ) -> Result<Vec<u8>> {
     validate_frames(canvas, frames, options)?;
     if options.threads == 1 || execution::is_serial() {
-        return execution::serial(|| encode_validated_frames(canvas, frames, options));
+        return encode_frames_in_pool(canvas, frames, options, None);
     }
     // MA property sweeps may run even when the image has only one group.
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(options.threads)
         .build()
         .map_err(|e| Error::Encoding(e.to_string()))?;
-    execution::with_pool(&pool, || encode_validated_frames(canvas, frames, options))
+    encode_frames_in_pool(canvas, frames, options, Some(&pool))
+}
+
+/// Reuse the supplied executor; a missing pool is a caller-local null runner.
+pub(crate) fn encode_frames_in_pool(
+    canvas: &Image,
+    frames: &[crate::frame::Frame<'_>],
+    options: &EncodeOptions,
+    pool: Option<&rayon::ThreadPool>,
+) -> Result<Vec<u8>> {
+    validate_frames(canvas, frames, options)?;
+    let work = || encode_validated_frames(canvas, frames, options);
+    match pool {
+        Some(pool) => execution::with_pool(pool, work),
+        None => execution::serial(work),
+    }
 }
 
 pub(crate) fn validate_frames(
@@ -698,6 +712,46 @@ mod tests {
             PixelData::U8((0..257 * 3).map(|i| (i % 4) as u8).collect()),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn reusable_frame_executor_roundtrips_after_input_and_budget_changes() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        let first = image();
+        let second = Image::new(3, 2, PixelLayout::Gray, PixelData::U8(vec![71; 6])).unwrap();
+        let options = EncodeOptions {
+            threads: 2,
+            ..Default::default()
+        };
+        for supplied in [None, Some(&pool)] {
+            for image in [&first, &second, &first] {
+                let frames = [crate::frame::Frame::new(image)];
+                let bytes = encode_frames_in_pool(image, &frames, &options, supplied).unwrap();
+                let decoded = crate::decode::decode(&bytes, &Default::default()).unwrap();
+                assert_eq!(&decoded.frames[0].pixels, image.pixels());
+                let limited = EncodeOptions {
+                    max_output_bytes: 1,
+                    ..options.clone()
+                };
+                assert!(matches!(
+                    encode_frames_in_pool(image, &frames, &limited, supplied),
+                    Err(Error::Limit(_))
+                ));
+                assert!(!execution::is_serial());
+            }
+        }
+        pool.install(|| {
+            let caller = std::thread::current().id();
+            let bytes =
+                encode_frames_in_pool(&first, &[crate::frame::Frame::new(&first)], &options, None)
+                    .unwrap();
+            assert!(!bytes.is_empty());
+            assert_eq!(std::thread::current().id(), caller);
+            assert!(!execution::is_serial());
+        });
     }
 
     #[test]

@@ -3,11 +3,11 @@
 use super::*;
 use crate::scheduler::batch::pilot_handoff::{PilotFront, PilotRequest, run_front};
 
-pub(crate) fn run(
+pub(crate) fn run_in_pool(
     request: &PilotRequest<'_>,
     base: &EncodeOptions,
     settings: NativeBackendOptions,
-    pool: &rayon::ThreadPool,
+    pool: Option<&rayon::ThreadPool>,
     records: &mut Vec<NativeAdaptation>,
 ) -> Result<PilotFront> {
     let driver = request.options;
@@ -24,7 +24,7 @@ pub(crate) fn run(
         request,
         Box::new(|tasks, kind| {
             let plan = execution.plan_probes(tasks, kind, true)?;
-            let results = run_plan(Some(pool), &plan, |i, runner| {
+            let results = run_plan(pool, &plan, |i, runner| {
                 let mut record = None;
                 let result = (|| {
                     let (artifact, adaptation) = prepare(

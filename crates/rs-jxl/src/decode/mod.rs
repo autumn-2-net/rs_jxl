@@ -156,6 +156,19 @@ impl Decoder {
         &self.options
     }
 
+    /// Change per-input settings without rebuilding workers. A failed update
+    /// leaves the previous settings intact; changing threads needs a new context.
+    pub fn set_options(&mut self, options: DecodeOptions) -> Result<()> {
+        validate_options(&options)?;
+        if options.threads != self.options.threads {
+            return Err(Error::InvalidInput(
+                "decode threads must match the decoder context".into(),
+            ));
+        }
+        self.options = options;
+        Ok(())
+    }
+
     /// Decode every display frame, or every regular layer without coalescing.
     pub fn decode(&mut self, input: &[u8]) -> Result<DecodedImage> {
         self.decode_impl(input, None)

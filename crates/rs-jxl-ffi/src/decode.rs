@@ -45,12 +45,27 @@ pub(super) fn options(o: &Options) -> Result<DecodeOptions> {
 }
 
 pub fn execute(request: &Request, input: &[u8]) -> Result<(Value, Vec<u8>)> {
+    execute_with_context(request, input, None)
+}
+
+pub fn execute_with_context(
+    request: &Request,
+    input: &[u8],
+    mut context: Option<&mut decode::Decoder>,
+) -> Result<(Value, Vec<u8>)> {
     if request.operation == Operation::ReadImage {
         return read_image(input, request.options.strip_metadata.unwrap_or(false));
     }
     let options = options(&request.options)?;
+    if let Some(decoder) = context.as_mut() {
+        decoder.set_options(options.clone()).map_err(message)?;
+    }
     if request.operation == Operation::ReconstructJpeg {
-        let bytes = decode::reconstruct_jpeg(input, &options).map_err(message)?;
+        let bytes = match context {
+            Some(decoder) => decoder.reconstruct_jpeg(input),
+            None => decode::reconstruct_jpeg(input, &options),
+        }
+        .map_err(message)?;
         return Ok((
             json!({
                 "operation": "reconstruct_jpeg",
@@ -89,9 +104,11 @@ pub fn execute(request: &Request, input: &[u8]) -> Result<(Value, Vec<u8>)> {
     } else {
         request.options.frame_index
     };
-    let image = match target {
-        Some(index) => decode::decode_frame(input, index, &options),
-        None => decode::decode(input, &options),
+    let image = match (context, target) {
+        (Some(decoder), Some(index)) => decoder.decode_frame(input, index),
+        (Some(decoder), None) => decoder.decode(input),
+        (None, Some(index)) => decode::decode_frame(input, index, &options),
+        (None, None) => decode::decode(input, &options),
     }
     .map_err(message)?;
     if request.operation == Operation::DecodeToPng {

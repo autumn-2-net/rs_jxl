@@ -9,7 +9,7 @@ use super::{
     native::{NativeAdaptation, NativeArtifact, NativeTrialKind, prepare, scout_execution_options},
     params::lossless_probe_plan,
     policy::{literal, winner_neighborhood},
-    scan::{LosslessScan, scan_lossless_input_with_pool},
+    scan::{LosslessScan, scan_lossless_input, scan_lossless_input_with_pool},
     search::{EncodedOutput, Search, TrialBudget, TrialOutput},
 };
 use crate::{
@@ -215,9 +215,16 @@ fn retained(
     Ok(size)
 }
 
-fn group_batch(contender: &Contender<'_>, pool: &rayon::ThreadPool) -> usize {
+fn with_pool<T: Send>(pool: Option<&rayon::ThreadPool>, work: impl FnOnce() -> T + Send) -> T {
+    match pool {
+        Some(pool) => crate::execution::with_pool(pool, work),
+        None => crate::execution::serial(work),
+    }
+}
+
+fn group_batch(contender: &Contender<'_>, pool: Option<&rayon::ThreadPool>) -> usize {
     let area = (128usize << contender.artifact.options.group_size_shift).pow(2);
-    pool.current_num_threads()
+    pool.map_or(1, rayon::ThreadPool::current_num_threads)
         .min((4usize << 20).div_ceil(area))
         .max(1)
 }
@@ -226,7 +233,7 @@ fn sample(
     contender: &mut Contender<'_>,
     regions: &[regions::Region],
     image: &Image,
-    pool: &rayon::ThreadPool,
+    pool: Option<&rayon::ThreadPool>,
 ) -> Result<()> {
     let batch = group_batch(contender, pool);
     let groups = regions
@@ -244,7 +251,7 @@ fn sample(
     let session = contender.session.as_mut().expect("active group session");
     let start = Instant::now();
     for ids in pending.chunks(batch) {
-        crate::execution::with_pool(pool, || session.groups.encode_groups(ids))?;
+        with_pool(pool, || session.groups.encode_groups(ids))?;
     }
     contender.report.seconds += start.elapsed().as_secs_f64();
     for (ids, region) in groups.iter().zip(regions) {
@@ -379,10 +386,22 @@ fn finish(
     })
 }
 
+#[cfg(test)]
 fn resume(
     contender: &mut Contender<'_>,
     cutoff: Option<usize>,
     pool: &rayon::ThreadPool,
+    other_retained: usize,
+    options: GroupRaceOptions,
+    peak: &mut usize,
+) -> Result<TrialOutput<NativeArtifact>> {
+    resume_in_pool(contender, cutoff, Some(pool), other_retained, options, peak)
+}
+
+fn resume_in_pool(
+    contender: &mut Contender<'_>,
+    cutoff: Option<usize>,
+    pool: Option<&rayon::ThreadPool>,
     other_retained: usize,
     options: GroupRaceOptions,
     peak: &mut usize,
@@ -400,7 +419,7 @@ fn resume(
             contender.report.state = CandidateState::ByteBounded;
             return Ok(TrialOutput::Bounded { lower_bound: bound });
         }
-        crate::execution::with_pool(pool, || session.groups.encode_groups(ids))?;
+        with_pool(pool, || session.groups.encode_groups(ids))?;
         contender.report.encoded_groups = session.groups.completed_groups();
         for &id in ids {
             let r = session.groups.group_rect(id)?;
@@ -453,6 +472,46 @@ pub(crate) fn try_encode(
     settings: NativeBackendOptions,
     options: GroupRaceOptions,
 ) -> Result<Option<NativeSearchResult>> {
+    if !validate_input(image, input, base, settings, options)? {
+        return Ok(None);
+    }
+    if base.threads == 1 || crate::execution::is_serial() {
+        return try_encode_in_pool(image, input, driver, base, settings, options, None);
+    }
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(base.threads)
+        .build()
+        .map_err(|e| Error::Encoding(e.to_string()))?;
+    try_encode_in_pool(image, input, driver, base, settings, options, Some(&pool))
+}
+
+pub(crate) fn try_encode_in_pool(
+    image: &Image,
+    input: &CandidateParams,
+    driver: &DriverOptions,
+    base: &EncodeOptions,
+    settings: NativeBackendOptions,
+    options: GroupRaceOptions,
+    pool: Option<&rayon::ThreadPool>,
+) -> Result<Option<NativeSearchResult>> {
+    if !validate_input(image, input, base, settings, options)? {
+        return Ok(None);
+    }
+    let work = || try_encode_inner(image, input, driver, base, settings, options, pool);
+    if pool.is_none() {
+        crate::execution::serial(work)
+    } else {
+        work()
+    }
+}
+
+fn validate_input(
+    image: &Image,
+    input: &CandidateParams,
+    base: &EncodeOptions,
+    settings: NativeBackendOptions,
+    options: GroupRaceOptions,
+) -> Result<bool> {
     options.validate()?;
     input.validate()?;
     let pixels = u64::from(image.width()) * u64::from(image.height());
@@ -468,7 +527,7 @@ pub(crate) fn try_encode(
         || !super::policy::default_pixel_options(input)
         || (base.modular.representation_receipt.is_some() && !settings.record_representations)
     {
-        return Ok(None);
+        return Ok(false);
     }
     if !(1..=256).contains(&base.threads) {
         return Err(Error::InvalidInput("threads must be 1..=256".into()));
@@ -479,11 +538,23 @@ pub(crate) fn try_encode(
     if base.max_output_bytes == 0 {
         return Err(Error::Limit("encoded output bytes"));
     }
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(base.threads)
-        .build()
-        .map_err(|e| Error::Encoding(e.to_string()))?;
-    let scan = scan_lossless_input_with_pool(image, driver.scan, &pool);
+    Ok(true)
+}
+
+fn try_encode_inner(
+    image: &Image,
+    input: &CandidateParams,
+    driver: &DriverOptions,
+    base: &EncodeOptions,
+    settings: NativeBackendOptions,
+    options: GroupRaceOptions,
+    pool: Option<&rayon::ThreadPool>,
+) -> Result<Option<NativeSearchResult>> {
+    let pixels = u64::from(image.width()) * u64::from(image.height());
+    let scan = match pool {
+        Some(pool) => scan_lossless_input_with_pool(image, driver.scan, pool),
+        None => scan_lossless_input(image, driver.scan),
+    };
     if options.content_route && !scan.likely_continuous_tone() {
         return Ok(None);
     }
@@ -507,9 +578,7 @@ pub(crate) fn try_encode(
             NativeTrialKind::Full,
         )?;
         let start = Instant::now();
-        let Some(session) =
-            crate::execution::with_pool(&pool, || PixelSession::new(image, &artifact.options))?
-        else {
+        let Some(session) = with_pool(pool, || PixelSession::new(image, &artifact.options))? else {
             return Ok(None);
         };
         let report = GroupCandidateReport {
@@ -558,7 +627,7 @@ pub(crate) fn try_encode(
     if options.content_route {
         let plan: Vec<_> = contenders.iter().map(|c| c.candidate.clone()).collect();
         let automatic = input.backend(9)?;
-        let front = super::native::front::run(
+        let front = super::native::front::run_in_pool(
             &PilotRequest {
                 image,
                 automatic: &automatic,
@@ -574,7 +643,7 @@ pub(crate) fn try_encode(
             },
             &base,
             settings,
-            &pool,
+            pool,
             &mut adaptations,
         )?;
         usage = front.usage;
@@ -621,11 +690,12 @@ pub(crate) fn try_encode(
                         false,
                         &mut |_, _, budget| {
                             Ok(
-                                match crate::encode::encode_trial_with_pool(
+                                match super::native::encode_full_trial(
                                     image,
                                     &artifact.options,
                                     budget.beat_bytes,
-                                    &pool,
+                                    pool,
+                                    None,
                                 )? {
                                     crate::encode::budget::TrialEncode::Complete(bytes) => {
                                         if retained
@@ -674,7 +744,7 @@ pub(crate) fn try_encode(
         if contenders[i].session.is_none() {
             continue;
         }
-        sample(&mut contenders[i], sampled, image, &pool)?;
+        sample(&mut contenders[i], sampled, image, pool)?;
         peak = peak.max(retained(&contenders, 0, options)?);
     }
     for contender in &mut contenders {
@@ -735,10 +805,10 @@ pub(crate) fn try_encode(
                 .retained_bytes();
             let start = Instant::now();
             search.refine(image, 9, witness, baseline, false, &mut |_, _, budget| {
-                resume(
+                resume_in_pool(
                     &mut contenders[index],
                     budget.beat_bytes,
-                    &pool,
+                    pool,
                     other,
                     options,
                     &mut peak,
@@ -753,11 +823,12 @@ pub(crate) fn try_encode(
             let other = retained(&contenders, before.unwrap_or(0), options)?;
             search.refine(image, 9, witness, baseline, false, &mut |_, _, budget| {
                 Ok(
-                    match crate::encode::encode_trial_with_pool(
+                    match super::native::encode_full_trial(
                         image,
                         &artifact.options,
                         budget.beat_bytes,
-                        &pool,
+                        pool,
+                        None,
                     )? {
                         crate::encode::budget::TrialEncode::Complete(bytes) => {
                             let retained = other
@@ -839,7 +910,7 @@ pub(crate) fn try_encode(
                 {
                     break;
                 }
-                sample(&mut contenders[index], &regions[count..end], image, &pool)?;
+                sample(&mut contenders[index], &regions[count..end], image, pool)?;
                 contenders[index].report.estimated_bytes = estimate(
                     &contenders[index].report.sampled_region_bytes,
                     &regions[..end],
@@ -866,10 +937,10 @@ pub(crate) fn try_encode(
         let params = contenders[index].candidate.params.clone();
         let start = Instant::now();
         search.refine(image, 9, params, baseline, false, &mut |_, _, budget| {
-            resume(
+            resume_in_pool(
                 &mut contenders[index],
                 budget.beat_bytes,
-                &pool,
+                pool,
                 other,
                 options,
                 &mut peak,
@@ -903,6 +974,31 @@ pub(crate) fn try_encode(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn optional_group_executor_uses_supplied_workers_and_null_stays_local() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        let caller = std::thread::current().id();
+        with_pool(None, || {
+            assert!(crate::execution::is_serial());
+            assert_eq!(crate::execution::worker_count(), 1);
+            assert_eq!(std::thread::current().id(), caller);
+        });
+        with_pool(Some(&pool), || {
+            assert!(pool.current_thread_index().is_some());
+            assert_eq!(crate::execution::worker_count(), 2);
+            let caller = std::thread::current().id();
+            with_pool(None, || {
+                assert!(crate::execution::is_serial());
+                assert_eq!(std::thread::current().id(), caller);
+            });
+            assert!(!crate::execution::is_serial());
+        });
+        assert!(!crate::execution::is_serial());
+    }
 
     #[test]
     fn retained_byte_defaults_are_unlimited_but_explicit_budgets_still_apply() {

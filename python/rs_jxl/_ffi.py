@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from contextlib import contextmanager
 import os
 from pathlib import Path
 import sys
@@ -38,6 +39,10 @@ _lock = threading.Lock()
 
 class CodecError(RuntimeError):
     """The Rust codec rejected input, options or an exhausted resource budget."""
+
+    def __init__(self, message, *, kind="unknown"):
+        super().__init__(message)
+        self.kind = kind
 
 
 def native_name() -> str:
@@ -116,8 +121,7 @@ def _copy(getter, result) -> bytes:
     return bytes(ffi.buffer(pointer, length[0]))
 
 
-def execute(request: dict, data: bytes | bytearray | memoryview = b"") -> tuple[bytes, dict]:
-    lib = library()
+def _request(request: dict, data):
     encoded = json.dumps(request, allow_nan=False, separators=(",", ":")).encode("utf-8")
     payload = memoryview(data)
     if not payload.c_contiguous:
@@ -130,14 +134,56 @@ def execute(request: dict, data: bytes | bytearray | memoryview = b"") -> tuple[
         "json": c_json, "json_len": len(encoded),
         "data": c_data, "data_len": payload.nbytes,
     })
-    # Keep Python-owned input buffers alive throughout the synchronous call.
-    result = lib.rs_jxl_execute(native_request)
+    return native_request, (encoded, payload, c_json, c_data)
+
+
+@contextmanager
+def _result_buffer(lib, result):
+    """Internal view with native ownership attached, including exception paths."""
     if result == ffi.NULL:
         raise CodecError("Rust native call returned no result")
+    view = None
+    managed = None
     try:
         meta = json.loads(_copy(lib.rs_jxl_result_json, result))
         if lib.rs_jxl_result_status(result):
-            raise CodecError(meta.get("error", "Rust codec operation failed"))
-        return _copy(lib.rs_jxl_result_data, result), meta
+            raise CodecError(meta.get("error", "Rust codec operation failed"),
+                             kind=meta.get("error_kind", "unknown"))
+        length = ffi.new("size_t *")
+        pointer = lib.rs_jxl_result_data(result, length)
+        if length[0] and pointer == ffi.NULL:
+            raise CodecError("Native result has a null nonempty buffer", kind="internal")
+        if length[0]:
+            # CFFI buffers retain their original cdata. A derived NumPy view
+            # retained by an exception traceback must keep the result alive too.
+            managed = ffi.gc(pointer, lambda _: lib.rs_jxl_result_free(result))
+            view = memoryview(ffi.buffer(managed, length[0]))
+        else:
+            view = memoryview(b"")
+        yield view, meta
     finally:
-        lib.rs_jxl_result_free(result)
+        if view is not None:
+            view.release()
+        if managed is None:
+            lib.rs_jxl_result_free(result)
+
+
+@contextmanager
+def execute_buffer(request: dict, data=b"", *, context=None):
+    """Internal transport that never exposes a freed native view to API users."""
+    if context is not None:
+        with context.execute_buffer(request, data) as result:
+            yield result
+        return
+    lib = library()
+    native_request, owners = _request(request, data)
+    # owners retains every exporter while the GIL is released in native code.
+    result = lib.rs_jxl_execute(native_request)
+    with _result_buffer(lib, result) as value:
+        yield value
+    del owners
+
+
+def execute(request: dict, data=b"", *, context=None) -> tuple[bytes, dict]:
+    with execute_buffer(request, data, context=context) as (buffer, meta):
+        return bytes(buffer), meta

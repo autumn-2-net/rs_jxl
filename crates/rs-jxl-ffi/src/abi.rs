@@ -24,12 +24,30 @@ pub struct RsJxlResult {
 }
 
 impl RsJxlResult {
-    fn error(code: i32, error: String) -> Self {
+    fn error(code: i32, error: crate::Error) -> Self {
+        let mut json = serde_json::json!({
+            "error": error.message,
+            "error_kind": error.kind,
+        });
+        if let Some(stage) = error.stage {
+            json["error_stage"] = stage.into();
+        }
         Self {
-            json: serde_json::json!({"error": error}).to_string().into_bytes(),
+            json: json.to_string().into_bytes(),
             data: Vec::new(),
             code,
         }
+    }
+
+    pub(crate) fn success(json: serde_json::Value, data: Vec<u8>) -> crate::Result<Self> {
+        Ok(Self {
+            json: serde_json::to_vec(&json).map_err(|error| {
+                crate::Error::new(crate::ErrorKind::Internal, error.to_string())
+                    .at_stage("serialize_response")
+            })?,
+            data,
+            code: 0,
+        })
     }
 }
 
@@ -65,7 +83,9 @@ unsafe fn input<'a>(pointer: *const u8, length: usize) -> crate::Result<&'a [u8]
     Ok(unsafe { slice::from_raw_parts(pointer, length) })
 }
 
-unsafe fn execute(request: *const RsJxlRequest) -> crate::Result<RsJxlResult> {
+pub(crate) unsafe fn request_input<'a>(
+    request: *const RsJxlRequest,
+) -> crate::Result<(&'a [u8], &'a [u8])> {
     if request.is_null() {
         return Err("null request".into());
     }
@@ -74,7 +94,10 @@ unsafe fn execute(request: *const RsJxlRequest) -> crate::Result<RsJxlResult> {
     bounds(request.cast(), size_offset + mem::size_of::<usize>())?;
     let version = unsafe { ptr::read_unaligned(request.cast::<u32>()) };
     if version != RS_JXL_ABI_VERSION {
-        return Err("unsupported ABI version".into());
+        return Err(crate::Error::new(
+            crate::ErrorKind::Unsupported,
+            "unsupported ABI version",
+        ));
     }
     let size =
         unsafe { ptr::read_unaligned(request.cast::<u8>().add(size_offset).cast::<usize>()) };
@@ -88,12 +111,13 @@ unsafe fn execute(request: *const RsJxlRequest) -> crate::Result<RsJxlResult> {
     bounds(request.data, request.data_len)?;
     let json = unsafe { input(request.json, request.json_len)? };
     let data = unsafe { input(request.data, request.data_len)? };
+    Ok((json, data))
+}
+
+unsafe fn execute(request: *const RsJxlRequest) -> crate::Result<RsJxlResult> {
+    let (json, data) = unsafe { request_input(request) }?;
     let (json, data) = crate::execute_json(json, data)?;
-    Ok(RsJxlResult {
-        json: serde_json::to_vec(&json).map_err(crate::message)?,
-        data,
-        code: 0,
-    })
+    RsJxlResult::success(json, data)
 }
 
 /// Execute synchronously. No input pointers are retained.
@@ -109,7 +133,7 @@ pub unsafe extern "C" fn rs_jxl_execute(request: *const RsJxlRequest) -> *mut Rs
     Box::into_raw(Box::new(protect(|| unsafe { execute(request) })))
 }
 
-fn protect(operation: impl FnOnce() -> crate::Result<RsJxlResult>) -> RsJxlResult {
+pub(crate) fn protect(operation: impl FnOnce() -> crate::Result<RsJxlResult>) -> RsJxlResult {
     let result = catch_unwind(AssertUnwindSafe(operation));
     match result {
         Ok(Ok(result)) => result,
@@ -117,7 +141,10 @@ fn protect(operation: impl FnOnce() -> crate::Result<RsJxlResult>) -> RsJxlResul
         Err(payload) => {
             // A hostile panic payload may itself panic in Drop; do not unwind into C.
             mem::forget(payload);
-            RsJxlResult::error(2, "Rust panic during execution".into())
+            RsJxlResult::error(
+                2,
+                crate::Error::new(crate::ErrorKind::Internal, "Rust panic during execution"),
+            )
         }
     }
 }
@@ -192,10 +219,9 @@ mod tests {
     fn panic_is_a_result_not_an_unwind() {
         let result = protect(|| panic!("test panic"));
         assert_eq!(result.code, 2);
-        assert_eq!(
-            serde_json::from_slice::<serde_json::Value>(&result.json).unwrap()["error"],
-            "Rust panic during execution"
-        );
+        let json: serde_json::Value = serde_json::from_slice(&result.json).unwrap();
+        assert_eq!(json["error"], "Rust panic during execution");
+        assert_eq!(json["error_kind"], "internal");
         assert!(result.data.is_empty());
     }
 }
