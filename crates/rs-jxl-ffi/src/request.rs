@@ -29,6 +29,103 @@ pub struct Request {
     pub auto: Option<bool>,
     #[serde(default, deserialize_with = "deserialize_auto_options")]
     pub auto_options: Option<AutoOptions>,
+    #[serde(default, deserialize_with = "deserialize_analysis_options")]
+    pub analysis_options: Option<AnalysisOptions>,
+}
+
+fn deserialize_analysis_options<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<AnalysisOptions>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct Object;
+    impl<'de> serde::de::Visitor<'de> for Object {
+        type Value = Option<AnalysisOptions>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("an analysis_options object")
+        }
+
+        fn visit_map<A: serde::de::MapAccess<'de>>(
+            self,
+            map: A,
+        ) -> std::result::Result<Self::Value, A::Error> {
+            AnalysisOptions::deserialize(serde::de::value::MapAccessDeserializer::new(map))
+                .map(Some)
+        }
+    }
+    deserializer.deserialize_map(Object)
+}
+
+fn deserialize_analysis_reference<'de, D>(
+    deserializer: D,
+) -> std::result::Result<rs_jxl::multiframe::Reference, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use rs_jxl::multiframe::Reference;
+    match String::deserialize(deserializer)?.as_str() {
+        "full" => Ok(Reference::Full),
+        "previous" => Ok(Reference::Previous),
+        "first" => Ok(Reference::First),
+        "smallest_crop" => Ok(Reference::SmallestCrop),
+        _ => Err(serde::de::Error::custom("unsupported analysis reference")),
+    }
+}
+
+/// Geometric controls only. Worker count belongs to options/context resources.
+#[derive(Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AnalysisOptions {
+    #[serde(deserialize_with = "deserialize_analysis_reference")]
+    pub reference: rs_jxl::multiframe::Reference,
+    pub allow_mask: bool,
+    pub allow_multi_rect: bool,
+    pub adaptive_rectangles: bool,
+    pub tile_size: u32,
+    pub max_rectangles: usize,
+    pub rectangle_bytes_per_pixel: f64,
+}
+
+impl Default for AnalysisOptions {
+    fn default() -> Self {
+        let native = rs_jxl::multiframe::AnalysisOptions::default();
+        Self {
+            reference: native.reference,
+            allow_mask: native.allow_mask,
+            allow_multi_rect: native.allow_multi_rect,
+            adaptive_rectangles: native.adaptive_rectangles,
+            tile_size: native.tile_size,
+            max_rectangles: native.max_rectangles,
+            rectangle_bytes_per_pixel: native.rectangle_bytes_per_pixel,
+        }
+    }
+}
+
+impl AnalysisOptions {
+    pub fn native(&self, threads: usize) -> rs_jxl::multiframe::AnalysisOptions {
+        rs_jxl::multiframe::AnalysisOptions {
+            reference: self.reference,
+            allow_mask: self.allow_mask,
+            allow_multi_rect: self.allow_multi_rect,
+            adaptive_rectangles: self.adaptive_rectangles,
+            tile_size: self.tile_size,
+            max_rectangles: self.max_rectangles,
+            rectangle_bytes_per_pixel: self.rectangle_bytes_per_pixel,
+            threads,
+        }
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.tile_size == 0 || self.max_rectangles == 0 {
+            return Err("tile_size and max_rectangles must be positive".into());
+        }
+        if !self.rectangle_bytes_per_pixel.is_finite() || self.rectangle_bytes_per_pixel < 0.0 {
+            return Err("rectangle_bytes_per_pixel must be finite and nonnegative".into());
+        }
+        Ok(())
+    }
 }
 
 fn deserialize_auto_options<'de, D>(
@@ -251,6 +348,8 @@ pub enum ValidatedRequest<'a> {
     AnalyzeMultiframe {
         images: &'a [ImageSpec],
         strip_metadata: bool,
+        options: &'a Options,
+        analysis_options: Option<&'a AnalysisOptions>,
     },
     TranscodeJpeg {
         options: &'a Options,
@@ -328,6 +427,8 @@ impl Request {
             Operation::AnalyzeMultiframe => AnalyzeMultiframe {
                 images: self.images(),
                 strip_metadata: options.strip_metadata.unwrap_or(false),
+                options,
+                analysis_options: self.analysis_options.as_ref(),
             },
             Operation::TranscodeJpeg => TranscodeJpeg { options },
             Operation::ReconstructJpeg => ReconstructJpeg { options },
@@ -366,6 +467,12 @@ impl Request {
             if auto.tile_size == 0 || auto.max_rectangles == 0 {
                 return Err("tile_size and max_rectangles must be positive".into());
             }
+        }
+        if let Some(analysis) = &self.analysis_options {
+            if self.operation != AnalyzeMultiframe {
+                return Err("analysis_options require analyze_multiframe".into());
+            }
+            analysis.validate()?;
         }
         if !matches!(
             self.operation,
@@ -443,7 +550,8 @@ impl Request {
                 "learning_fraction",
                 "ma_max_leaves",
             ],
-            AnalyzeMultiframe | ReadImage => &["strip_metadata"],
+            AnalyzeMultiframe => &["threads", "strip_metadata"],
+            ReadImage => &["strip_metadata"],
             Decode | DecodeToPng => &[
                 "threads",
                 "frame_index",

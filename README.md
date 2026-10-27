@@ -54,6 +54,9 @@ diagnostics, not a requirement to reproduce C++ arithmetic bit for bit.
   [streaming API](docs/STREAMING_OUTPUT.md).
 - Full-frame difference planning against the previous or first frame, including
   hidden RGB and extra planes. Crop area is a heuristic, not an encoded-size claim.
+- Native [multiframe analysis](docs/MULTIFRAME_ANALYSIS.md) reports exact changed
+  pixels, reference-policy geometry, mask eligibility and rectangle proposals
+  without encoding; reusable Rust contexts and Python share the same planner.
 - Separate byte-selected automatic multiframe encoding compares full/crop,
   eligible binary masks and multiple REPLACE layers, retaining actual winners.
   See [automatic frames](docs/MULTIFRAME_AUTO.md) and

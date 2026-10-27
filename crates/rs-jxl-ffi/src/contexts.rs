@@ -12,7 +12,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::{
-    Error, ErrorKind, Result, RsJxlRequest, RsJxlResult, abi, decode, encode, message,
+    Error, ErrorKind, Result, RsJxlRequest, RsJxlResult, abi, analysis, decode, encode, message,
     request::{Operation, Request, ValidatedRequest},
 };
 
@@ -62,10 +62,7 @@ impl RsJxlContext {
             if threads != self.threads {
                 return Err("request threads must match the context".into());
             }
-        } else if !matches!(
-            request.operation,
-            Operation::ReadImage | Operation::AnalyzeMultiframe
-        ) {
+        } else if request.operation != Operation::ReadImage {
             request.options.threads = Some(self.threads);
         }
         let request_kind = request.validate_typed()?;
@@ -80,7 +77,9 @@ impl RsJxlContext {
             (Resources::Encoder(encoder), TranscodeJpeg { .. }) => {
                 encode::transcode_with_context(&request, data, Some(encoder))
             }
-            (Resources::Encoder(_), AnalyzeMultiframe { .. }) => encode::execute(&request, data),
+            (Resources::Encoder(encoder), AnalyzeMultiframe { .. }) => {
+                analysis::execute(&request, data, Some(encoder))
+            }
             (
                 Resources::Decoder(decoder),
                 Decode { .. } | DecodeToPng { .. } | ReconstructJpeg { .. },
@@ -159,7 +158,7 @@ pub unsafe extern "C" fn rs_jxl_context_create(
 
 /// Execute JSON v1 with fixed context threads. Omitted threads inherit; explicit
 /// mismatches fail. All other options use per-call defaults, never stored defaults.
-/// Encoder contexts also allow stateless analysis; decoder contexts allow
+/// Encoder contexts also reuse workers for analysis; decoder contexts allow
 /// stateless info/read_image. Ordinary errors permit reuse; a panic poisons it.
 ///
 /// # Safety

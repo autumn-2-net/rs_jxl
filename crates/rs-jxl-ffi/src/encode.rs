@@ -203,40 +203,6 @@ pub fn execute_with_context(
             result.bytes,
         ));
     }
-    if request.operation == Operation::AnalyzeMultiframe {
-        let mut frames = Vec::new();
-        for (index, image) in images.iter().enumerate() {
-            // The first frame is the full initial canvas, not an empty difference.
-            let full = Some(multiframe::Rect {
-                x: 0,
-                y: 0,
-                width: image.width(),
-                height: image.height(),
-            });
-            let previous = if index == 0 {
-                full
-            } else {
-                multiframe::difference_bounds(&images[index - 1], image).map_err(message)?
-            };
-            let first = if index == 0 {
-                full
-            } else {
-                multiframe::difference_bounds(&images[0], image).map_err(message)?
-            };
-            frames.push(json!({
-                "index": index,
-                "previous": rect(previous),
-                "first": rect(first),
-            }));
-        }
-        return Ok((
-            json!({
-                "operation": "analyze_multiframe",
-                "frames": frames,
-            }),
-            Vec::new(),
-        ));
-    }
     let timebase = request.timebase.unwrap_or([1000, 1]);
     let animation = Animation {
         ticks_per_second_numerator: timebase[0],

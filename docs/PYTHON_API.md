@@ -45,13 +45,14 @@ RS_JXL_NATIVE_LIB overrides either lookup and fails on an invalid path/ABI.
 
 ### Input Copies and Borrowing
 
-`encode` and `encode_multiframe` default to `borrow_inputs=False`: mutable pixel
-buffers, including CPU tensors and read-only views of mutable storage, are
+`encode`, `encode_multiframe` and `analyze_multiframe` default to
+`borrow_inputs=False`: mutable pixel buffers, including CPU tensors and read-only
+views of mutable storage, are
 snapshotted before the native call. Files/streams are read completely into memory;
 this is not a file mapping or incremental input API. Immutable bytes may be
 retained directly. Mutable encoded input passed through `read_bytes` is copied.
 
-`borrow_inputs=True` permits borrowing eligible contiguous encoding buffers for
+`borrow_inputs=True` permits borrowing eligible contiguous input buffers for
 one synchronous call. The caller must not mutate the source or any alias until
 the call returns, including from other threads while CFFI releases the GIL.
 Marking one view read-only does not prevent mutation through another alias.
@@ -163,9 +164,10 @@ with rs_jxl.Encoder(threads=8) as encoder, rs_jxl.Decoder(threads=8) as decoder:
 ```
 
 Constructors accept `threads=1`; `threads=0` resolves the CPU count capped at
-256, as in the one-shot API. `Encoder` supplies `encode`, `transcode_jpeg` and
-`encode_multiframe`. `Decoder` supplies `decode`, `decode_into`, `decode_layer`,
-`decode_extra_channel`, `info`, `reconstruct_jpeg` and `decode_to_png`. Options
+256, as in the one-shot API. `Encoder` supplies `encode`, `transcode_jpeg`,
+`encode_multiframe` and `analyze_multiframe`. `Decoder` supplies `decode`,
+`decode_into`, `decode_layer`, `decode_extra_channel`, `info`, `reconstruct_jpeg`
+and `decode_to_png`. Options
 and return values match the corresponding module-level functions.
 
 Thread counts are fixed for a context. Methods inherit that count, and an
@@ -219,7 +221,8 @@ data = rs_jxl.encode_multiframe(
 )
 second = rs_jxl.decode(data, frame=1)
 all_frames = rs_jxl.decode(data, frame=None)
-bounds = rs_jxl.analyze_multiframe([rgba, changed])
+analysis = rs_jxl.analyze_multiframe([rgba, changed])
+bounds = analysis["frames"][1]["previous"]
 ```
 
 reference=previous/first/full/auto (none aliases full). Default strategy="crop"
@@ -305,9 +308,122 @@ a fabricated display duration; visible-frame count can differ from layer count.
 decode_layer(data, layer=N) returns (raw_layer_pixels, metadata), with crop,
 blend and references under header. This is not signed arithmetic residuals.
 Multiframe extra data accepts a shared plane or list/tuple of one plane per
-input. analyze_multiframe returns exact previous/first bounds, not byte estimates.
+input. `analyze_multiframe` returns exact previous/first bounds and geometry-only
+statistics/plans, not byte estimates (see below).
 JPEG frame input remains pixel-lossless relative to the input decoder, not
 byte-reversible; use `transcode_jpeg`/`reconstruct_jpeg` for original JPEG bytes.
+
+### Geometry-Only Analysis
+
+```python
+analysis = rs_jxl.analyze_multiframe(
+    [rgba, changed, changed], reference="auto", threads=8,
+    analysis_options={"tile_size": 16, "max_rectangles": 32,
+                      "allow_mask": True, "rectangle_bytes_per_pixel": 1.0},
+)
+change = analysis["frames"][1]["previous_stats"]
+identical = analysis["frames"][2]["previous_stats"]["changed_pixels"] == 0
+geometric_reference = analysis["best_geometric_reference"]
+
+with rs_jxl.Encoder(threads=8) as encoder:
+    analysis = encoder.analyze_multiframe([rgba, changed])  # inherits eight workers
+    data, measured = encoder.encode_multiframe(
+        [rgba, changed], strategy="auto", effort=3, return_info=True,
+    )
+```
+
+`analyze_multiframe` compares full input states in Rust without encoding, cropping
+pixel buffers or running NumPy difference analysis. It accepts the same paths,
+encoded bytes, streams, arrays and tensors as multiframe encoding, with `layout`,
+`extra_channels`, `allow_device_copy`, `strip_metadata`, `bits_per_sample`,
+`color_encoding`, `icc_profile` and `borrow_inputs`. Metadata overrides and
+separate extra planes require array/tensor inputs, as for encode. Inputs must
+match in canvas size, channel layout, sample depth and metadata; analysis never
+pads, resizes, narrows samples or silently converts colors to make them match.
+All channels participate, including RGB under zero alpha and exact float sample
+words (signed zero and NaN payloads). Extra-channel changes count their covered
+canvas pixels, taking the union with color changes rather than counting twice.
+
+The default `reference="auto"` maps to native `smallest_crop`, like encoding.
+`previous`, `first`, `full` and the `none` alias for `full` are also accepted.
+`threads=1` is the one-shot default; zero resolves CPU count capped at 256.
+`Encoder.analyze_multiframe` inherits the context's thread count and rejects
+explicit mismatches and calls after close. Calls retain no reference-image state.
+
+`analysis_options=None` or `{}` leaves all remaining controls at Rust defaults.
+The adapter sends this as a top-level native `analysis_options` object, separate
+from `options.threads`/`options.strip_metadata`, and returns native JSON unchanged.
+Like `auto_options`, the mapping rejects unknown/duplicate keys and a nested
+`reference`; use only the explicit Python `reference` argument. Boolean and
+integer validation follows `auto_options`, including rejection of `None` values.
+Encoding/search controls such as effort, prune and trial budgets are not analysis
+options. These controls affect candidate proposals, not exact pair statistics.
+
+| Analysis Option | Accepted Value | Native Default |
+| --- | --- | --- |
+| `allow_mask` | bool | true |
+| `allow_multi_rect` | bool | true |
+| `adaptive_rectangles` | bool | true |
+| `tile_size` | positive u32 integer | 32 |
+| `max_rectangles` | positive native usize integer | 32 |
+| `rectangle_bytes_per_pixel` | finite nonnegative real number, not bool | 1.0 |
+
+`rectangle_bytes_per_pixel` is only a cost estimate for adaptive rectangle
+planning. It is not measured compression, an output-size prediction or a bit
+depth. Zero is accepted. Analysis does not obtain this value by encoding; actual
+`strategy="auto"` encoding measures an initial full-frame payload and selects
+among real candidate encodes by bytes. Minimum geometric area does not imply
+minimum compressed bytes. Do not treat `best_geometric_reference` or a suitability
+label as an encoder winner or speed prediction.
+
+The report contains `width`, `height`, `channels` (including extra channels),
+`frame_count`, native `reference`, `crop_supported`, `rectangle_bytes_per_pixel`,
+`analysis_seconds`, `frames`, `reference_modes` and `best_geometric_reference`.
+`analysis_seconds` is native analysis/planning time, excluding input decoding,
+context creation and Python/FFI transport. Ignore it when comparing equivalent
+reports. Rectangles are `{x, y, width, height}` in canvas coordinates; JSON null
+becomes Python `None`.
+
+Each `frames` entry contains:
+
+- `index` and the existing `previous`/`first` bbox-or-`None` fields. Frame zero
+  retains full-canvas bounds; later identical comparisons have `None` bounds.
+- `previous_stats`/`first_stats`, both `None` for frame zero. Otherwise each has
+  `changed_pixels`, `changed_ratio`, `bbox_pixels`, `bbox_ratio`, `bbox_fill_ratio`,
+  `bounds` and `mask_eligible`. Ratios use canvas area except `bbox_fill_ratio`,
+  which is changed pixels divided by bbox area (zero for identical frames).
+  Bounds may expand to align subsampled extra planes. Mask eligibility describes
+  the exact opaque integer GA/RGBA requirements, even when `allow_mask=False`.
+- `plan`: `reference_index`, `source`, `region`, `changed`, `layer_pixels` and
+  `layer_area_ratio` for the selected single-crop reference mode. `reference_index`
+  indexes input frames, or is `None` for a full replacement; `source` is the JXL
+  reference slot (0 full, 1 first, 2 previous). An identical crop has `changed=None`
+  but a 1x1 placeholder region and one submitted pixel, not a zero-area layer.
+- `candidates`: geometry proposals with `strategy`, `reference_index`, `source`,
+  `rectangles`, `layer_pixels`, `layer_area_ratio` and `layer_count`. These are not
+  encode trials: there are no encoded byte sizes or winner indices. Layer pixels
+  sum submitted rectangle areas, including the entire bbox for a mask proposal.
+  Strategy names are `full`, `crop_previous`, `crop_first`, `mask_previous`,
+  `mask_first`, `tiles_previous`, `tiles_first`, `merged_previous`, `merged_first`.
+
+`reference_modes` summarizes `full`, `previous`, `first` and `smallest_crop`.
+Each entry has `reference`, `layer_pixels`, `layer_area_ratio`,
+`average_changed_ratio`, `crop_frames`, `identical_frames` and `suitability`.
+Total layer area includes the initial full frame; its ratio divides by canvas
+area times frame count. Average change and frame counts exclude the initial
+frame. `best_geometric_reference` minimizes total single-bbox submitted area,
+not multi-rectangle candidates or bytes.
+
+Suitability is `single_frame` for one input. Otherwise it is `strong` for a mean
+submitted bbox-area ratio below 0.3 over subsequent frames, `moderate` below 0.7,
+and `limited` otherwise. This uses subsequent frames, not the report's total
+`layer_area_ratio`. Subsampled extra channels disable crop plans and produce
+`full_frames_required` for multi-input sequences. Full replacements count as
+change ratio 1 and zero identical frames in summaries, including explicit `full`
+mode and the subsampled fallback. Per-pair `previous_stats`/`first_stats` still
+report actual differences regardless of selected mode or fallback.
+
+See [Native Multiframe Analysis](MULTIFRAME_ANALYSIS.md) for the core contract.
 
 ## Decoding and Safety
 

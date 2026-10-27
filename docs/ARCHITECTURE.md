@@ -62,10 +62,16 @@ Adapters still own their argument compatibility gates and diagnostics.
 
 `codec::encode_job` and `codec::transcode_jpeg` are one-shot facade functions.
 `codec::Encoder::new(threads)` retains worker resources for repeated `encode`,
-`encode_frames`, `encode_auto` and `transcode_jpeg` calls. JPEG search is an
+`encode_frames`, `encode_auto`, `analyze_multiframe` and `transcode_jpeg` calls. JPEG search is an
 explicit `Option<SearchLimits>`, separate from pixel search. The CLI's automatic
 multiframe route also uses `Encoder::encode_auto`; its strategy reports and
 output publication remain adapter responsibilities.
+
+`multiframe::analyze` and the context method share the packed difference maps,
+reference choice and candidate geometry builders with multiframe encoding.
+They report geometry, not estimated encoded bytes; no crop buffers or encoding
+trials are created. The FFI serializer is a separate `analysis.rs` module, and
+Python remains transport-only. See [analysis contract](MULTIFRAME_ANALYSIS.md).
 
 `decode::Decoder::new(DecodeOptions)` separately retains decoding workers for
 complete independent inputs, selected frames and original-JPEG reconstruction.

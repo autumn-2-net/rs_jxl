@@ -125,6 +125,17 @@ impl Encoder {
         self.threads
     }
 
+    /// Inspect exact frame differences and candidate geometry without encoding.
+    /// Reuses this context's workers, but retains no image state after the call.
+    pub fn analyze_multiframe(
+        &mut self,
+        images: &[Image],
+        options: &multiframe::AnalysisOptions,
+    ) -> Result<multiframe::AnalysisReport> {
+        self.check_threads(options.threads)?;
+        multiframe::analyze_in_pool(images, options, self.pool.as_ref())
+    }
+
     fn check_threads(&self, threads: usize) -> Result<()> {
         if threads != self.threads {
             return Err(Error::InvalidInput(

@@ -101,11 +101,11 @@ pub struct AutoEncodeResult {
     pub frames: Vec<AutoFrameReport>,
 }
 
-struct Candidate {
-    strategy: Strategy,
+pub(super) struct Candidate {
+    pub(super) strategy: Strategy,
     diff: Option<Arc<DiffMap>>,
-    source: u8,
-    rects: Vec<Rect>,
+    pub(super) source: u8,
+    pub(super) rects: Vec<Rect>,
     mask: bool,
 }
 
@@ -197,7 +197,49 @@ fn candidates(
     bytes_per_pixel: f64,
     differences: &mut Vec<AutoDiffReport>,
 ) -> Result<Vec<Candidate>> {
-    let current = &images[index];
+    let mut maps = Vec::new();
+    if index != 0
+        && auto.reference != Reference::Full
+        && !images[index]
+            .metadata()
+            .extra_channels
+            .iter()
+            .any(|e| e.dim_shift != 0)
+    {
+        for reference in reference_indices(index, auto.reference) {
+            let diff = Arc::new(DiffMap::between(&images[reference], &images[index])?);
+            differences.push(AutoDiffReport {
+                reference,
+                changed_pixels: diff.changed_pixels(),
+                bounds: diff.bounds(),
+            });
+            maps.push((reference, diff));
+        }
+    }
+    candidates_from_maps(&images[index], index, auto, bytes_per_pixel, &maps)
+}
+
+pub(super) fn reference_indices(index: usize, reference: Reference) -> Vec<usize> {
+    if index == 0 || reference == Reference::Full {
+        return Vec::new();
+    }
+    match reference {
+        Reference::Previous => vec![index - 1],
+        Reference::First => vec![0],
+        _ if index == 1 => vec![0],
+        _ => vec![index - 1, 0],
+    }
+}
+
+/// Shared geometry proposal stage. Maps are computed once per reference pair;
+/// analysis never materializes cropped images or starts an encode trial.
+pub(super) fn candidates_from_maps(
+    current: &Image,
+    index: usize,
+    auto: &AutoOptions,
+    bytes_per_pixel: f64,
+    maps: &[(usize, Arc<DiffMap>)],
+) -> Result<Vec<Candidate>> {
     let full = Rect {
         x: 0,
         y: 0,
@@ -221,24 +263,11 @@ fn candidates(
     {
         return Ok(result);
     }
-    let references = match auto.reference {
-        Reference::Previous => vec![index - 1],
-        Reference::First => vec![0],
-        _ if index == 1 => vec![0],
-        _ => vec![index - 1, 0],
-    };
     let mut merged = Vec::new();
-    for reference in references {
-        let previous = &images[reference];
+    for &(reference, ref diff) in maps {
         let first = reference == 0 && (index != 1 || auto.reference == Reference::First);
         let source = if reference == 0 { 1 } else { 2 };
-        let diff = Arc::new(DiffMap::between(previous, current)?);
         let bounds = diff.bounds();
-        differences.push(AutoDiffReport {
-            reference,
-            changed_pixels: diff.changed_pixels(),
-            bounds,
-        });
         let rect = bounds.unwrap_or(Rect {
             x: 0,
             y: 0,
@@ -269,15 +298,14 @@ fn candidates(
                 } else {
                     Strategy::MaskPrevious
                 },
-                diff: Some(Arc::clone(&diff)),
+                diff: Some(Arc::clone(diff)),
                 source,
                 rects: vec![rect],
                 mask: true,
             });
         }
         if auto.allow_multi_rect
-            && let Some(rects) =
-                regions::tiles_from_map(&diff, auto.tile_size, auto.max_rectangles)?
+            && let Some(rects) = regions::tiles_from_map(diff, auto.tile_size, auto.max_rectangles)?
             && rects.len() > 1
         {
             result.push(Candidate {
@@ -295,7 +323,7 @@ fn candidates(
         if auto.allow_multi_rect
             && auto.adaptive_rectangles
             && let Some(rects) =
-                partition::propose(&diff, auto.tile_size, auto.max_rectangles, bytes_per_pixel)?
+                partition::propose(diff, auto.tile_size, auto.max_rectangles, bytes_per_pixel)?
             && rects.len() > 1
             && !result.iter().any(|candidate| {
                 !candidate.mask && candidate.source == source && candidate.rects == rects

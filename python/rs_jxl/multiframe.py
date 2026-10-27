@@ -1,6 +1,8 @@
 """Exact full/crop and byte-selected automatic multiframe strategies."""
 
 from collections.abc import Mapping
+import math
+from numbers import Real
 import sys
 
 from . import _options
@@ -36,6 +38,41 @@ def _auto_options(value, strategy):
             result[name] = integer(item, name, *integers[name])
         else:
             raise TypeError(f"unknown auto option: {name}")
+    return result
+
+
+def _analysis_options(value):
+    if value is None:
+        return {}
+    if not isinstance(value, Mapping):
+        raise TypeError("analysis_options must be a mapping of Rust option names")
+    booleans = {"allow_mask", "allow_multi_rect", "adaptive_rectangles"}
+    integers = {"tile_size": (1, 0xffffffff),
+                "max_rectangles": (1, sys.maxsize * 2 + 1)}
+    result = {}
+    for name, item in value.items():
+        if name == "reference":
+            raise ValueError("reference must use the explicit reference argument")
+        if name in result:
+            raise ValueError(f"duplicate analysis option: {name}")
+        if name in booleans:
+            if not isinstance(item, bool):
+                raise TypeError(f"{name} must be a boolean")
+            result[name] = item
+        elif name in integers:
+            result[name] = integer(item, name, *integers[name])
+        elif name == "rectangle_bytes_per_pixel":
+            if isinstance(item, bool) or not isinstance(item, Real):
+                raise TypeError(f"{name} must be a real number, not a boolean")
+            try:
+                estimate = float(item)
+            except OverflowError as error:
+                raise ValueError(f"{name} must be finite and nonnegative") from error
+            if not math.isfinite(estimate) or estimate < 0:
+                raise ValueError(f"{name} must be finite and nonnegative")
+            result[name] = estimate
+        else:
+            raise TypeError(f"unknown analysis option: {name}")
     return result
 
 
@@ -109,10 +146,36 @@ def encode_multiframe(frames, output=None, *, layout="auto", durations=1,
 
 
 def analyze_multiframe(frames, *, layout="auto", extra_channels=None,
-                       allow_device_copy=False, strip_metadata=False):
-    """Return exact change bounds against previous/first, including invisible RGB."""
+                       allow_device_copy=False, strip_metadata=False,
+                       reference="auto", threads=1, analysis_options=None,
+                       bits_per_sample=0, color_encoding=None, icc_profile=None,
+                       borrow_inputs=False, _context=None):
+    """Return native exact differences and geometry plans without encoding.
+
+    All channels, hidden RGB and float sample words participate. Inputs must
+    have matching geometry and metadata. Existing previous/first bounds remain
+    in frames alongside statistics, a crop plan and eligible geometry candidates.
+    reference='auto' means the smaller first/previous crop, not fewest bytes.
+
+    analysis_options accepts allow_mask, allow_multi_rect, adaptive_rectangles,
+    tile_size, max_rectangles and rectangle_bytes_per_pixel. Omitted controls
+    retain Rust defaults; reference must use the explicit argument. The native
+    rectangle_bytes_per_pixel default of 1.0 is only an adaptive planning
+    estimate, never an output-size prediction. Use encode_multiframe with
+    strategy='auto' to select by actual encoded bytes.
+    """
+    references = {"auto": "smallest_crop", "first": "first", "previous": "previous",
+                  "full": "full", "none": "full"}
+    if not isinstance(reference, str) or reference not in references:
+        raise ValueError("reference must be auto/first/previous/full")
+    analysis = _analysis_options(analysis_options)
+    analysis["reference"] = references[reference]
+    options = {"strip_metadata": strip_metadata, "threads": _options.threads(threads)}
     payload, specs = _images(frames, layout=layout, extra_channels=extra_channels,
+                             borrow_inputs=borrow_inputs, bits_per_sample=bits_per_sample,
+                             color_encoding=color_encoding, icc_profile=icc_profile,
                              allow_device_copy=allow_device_copy)
     _, meta = execute({"operation": "analyze_multiframe", "images": specs,
-                      "options": {"strip_metadata": strip_metadata}}, payload.data)
+                      "options": options, "analysis_options": analysis}, payload.data,
+                      context=_context)
     return meta

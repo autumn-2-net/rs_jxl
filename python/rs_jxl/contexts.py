@@ -4,7 +4,7 @@ from ._context import NativeContext
 from ._options import threads as normalize_threads
 from .encode import encode, transcode_jpeg
 from .decode import decode, decode_into, decode_layer, decode_extra_channel, info, reconstruct_jpeg, decode_to_png
-from .multiframe import encode_multiframe
+from .multiframe import analyze_multiframe, encode_multiframe
 
 
 class _Context:
@@ -44,7 +44,7 @@ class _Context:
 
 
 class Encoder(_Context):
-    """Reuse workers across lossless encodes; concurrent calls are serialized."""
+    """Reuse workers for lossless encoding/analysis; native calls are serialized."""
     _kind = "encoder"
 
     def encode(self, src, output=None, **options):
@@ -55,6 +55,9 @@ class Encoder(_Context):
 
     def encode_multiframe(self, frames, output=None, **options):
         return self._call(encode_multiframe, frames, output, **options)
+
+    def analyze_multiframe(self, frames, **options):
+        return self._call(analyze_multiframe, frames, **options)
 
 
 class Decoder(_Context):

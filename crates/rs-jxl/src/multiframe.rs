@@ -6,10 +6,16 @@ use crate::{
 };
 use std::borrow::Cow;
 
+mod analysis;
 mod auto;
 mod diff;
 mod partition;
 mod regions;
+pub(crate) use analysis::analyze_in_pool;
+pub use analysis::{
+    AnalysisOptions, AnalysisReport, CropAnalysis, DiffStatistics, FrameAnalysis,
+    GeometryCandidate, ReferenceSummary, Suitability, analyze,
+};
 pub(crate) use auto::encode_auto_in_pool;
 pub use auto::{
     AutoCandidateReport, AutoDiffReport, AutoEncodeResult, AutoFrameReport, AutoOptions,
@@ -187,6 +193,22 @@ pub fn crop(image: &Image, rect: Rect) -> Result<Image> {
         .with_metadata(image.metadata().clone(), extras)
 }
 
+fn select_reference(
+    index: usize,
+    reference: Reference,
+    previous: Option<Rect>,
+    first: Option<Rect>,
+) -> (Option<Rect>, u8, usize) {
+    let area = |rect: Option<Rect>| rect.map_or(0, |r| u64::from(r.width) * u64::from(r.height));
+    if reference == Reference::First
+        || (reference == Reference::SmallestCrop && area(first) < area(previous))
+    {
+        (first, 1, 0)
+    } else {
+        (previous, if index == 1 { 1 } else { 2 }, index - 1)
+    }
+}
+
 /// Bbox is a geometric heuristic, not an encoded-byte estimator. SmallestCrop
 /// compares previous/first areas; it never claims to choose the smallest JXL.
 /// The immutable first reference uses slot 1; subsequent references use slot 2.
@@ -248,20 +270,11 @@ pub fn plan<'a>(
             continue;
         }
         let previous = difference_bounds(&images[i - 1], image)?;
-        let (changed, source) = match reference {
-            Reference::First => (difference_bounds(&images[0], image)?, 1),
-            Reference::SmallestCrop => {
-                let first = difference_bounds(&images[0], image)?;
-                let area =
-                    |r: Option<Rect>| r.map_or(0, |r| u64::from(r.width) * u64::from(r.height));
-                if area(first) < area(previous) {
-                    (first, 1)
-                } else {
-                    (previous, if i == 1 { 1 } else { 2 })
-                }
-            }
-            _ => (previous, if i == 1 { 1 } else { 2 }),
+        let first = match reference {
+            Reference::First | Reference::SmallestCrop => difference_bounds(&images[0], image)?,
+            _ => None,
         };
+        let (changed, source, _) = select_reference(i, reference, previous, first);
         // JXL layers cannot have zero dimensions. An identical frame repeats one
         // exact sample while its duration/reference semantics remain unchanged.
         let rect = changed.unwrap_or(Rect {

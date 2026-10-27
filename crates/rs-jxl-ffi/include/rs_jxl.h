@@ -31,7 +31,15 @@ RS_JXL_API size_t rs_jxl_request_size(void);
    the entire struct and each nonempty buffer must be readable, immutable and
    allocated for its advertised length throughout the call. Null buffers are
    allowed only for length zero. Inputs are not retained. Arbitrary dangling
-   pointers cannot be validated. Panics are caught except abort/OOM failures. */
+   pointers cannot be validated. Panics are caught except abort/OOM failures.
+   analyze_multiframe returns empty data and a native geometric JSON report:
+   legacy frames[].previous/first bounds remain rect-or-null; added statistics,
+   plans, candidates and reference summaries contain no encoded-size estimates.
+   Its top-level analysis_options must be an object (not null), accepts only
+   reference, allow_mask, allow_multi_rect, adaptive_rectangles, tile_size,
+   max_rectangles and rectangle_bytes_per_pixel, and is invalid for other
+   operations. Unknown/duplicate fields fail; omitted members use native defaults.
+   Analysis accepts only options.threads and options.strip_metadata. See protocol.md. */
 RS_JXL_API RsJxlResult *rs_jxl_execute(const RsJxlRequest *request);
 /* Optional additive v1 symbols; callers may capability-detect their presence.
    Constructor JSON is {"kind":"encoder"|"decoder","threads":N}; threads
@@ -48,8 +56,9 @@ RS_JXL_API RsJxlResult *rs_jxl_context_create(const RsJxlRequest *request,
    parallel. Request buffers follow rs_jxl_execute and must not alias context.
    Omitted options.threads inherits context threads; explicit mismatch is an error.
    All other options have per-request defaults; no decoder defaults are retained.
-   Encoder supports encode/encode_multiframe/transcode_jpeg and stateless
-   analyze_multiframe. Decoder supports decode/decode_to_png/reconstruct_jpeg and
+   Encoder supports encode/encode_multiframe/transcode_jpeg/analyze_multiframe;
+   analysis reuses its worker pool and obeys the same thread inheritance/mismatch
+   rules. Decoder supports decode/decode_to_png/reconstruct_jpeg and
    stateless info/read_image (no parser/worker reuse for those two operations).
    A kind mismatch is an error. No input buffers are retained. Ordinary errors
    permit reuse; status 2 poisons the context, which must then only be freed.

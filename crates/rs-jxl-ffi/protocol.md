@@ -86,13 +86,15 @@ options, including limits and output format, do not carry over to the next call.
 
 | Context kind | Operations using reusable resources | Stateless operations also accepted |
 | --- | --- | --- |
-| `encoder` | `encode`, `encode_multiframe`, `transcode_jpeg` | `analyze_multiframe` |
+| `encoder` | `encode`, `encode_multiframe`, `transcode_jpeg`, `analyze_multiframe` | none |
 | `decoder` | `decode`, `decode_to_png`, `reconstruct_jpeg` | `info`, `read_image` |
 
 Other kind/operation combinations fail. The stateless operations above do not
 reuse the context's workers or parser state. Their normal field restrictions
-remain in force: `analyze_multiframe` and `read_image` still reject an explicitly
-supplied nonnull `threads` option. `info` inherits the thread count as usual.
+remain in force: `read_image` rejects an explicitly supplied nonnull `threads`
+option. `info` inherits the thread count as usual. `analyze_multiframe` inherits
+the encoder context's threads, reuses its worker pool, and rejects an explicit
+thread-count mismatch just like encoding.
 Per-input parser/frame state and input buffers are not retained between calls.
 
 ### Ownership and failure
@@ -127,10 +129,13 @@ any results.
 ## Requests
 
 Unknown, duplicate and inapplicable fields fail. Optional fields may be omitted
-or null, except supplied members of `auto_options` must have their declared types.
+or null, except `options` and `analysis_options` must be objects when supplied,
+and supplied members of `auto_options`/`analysis_options` must have their declared
+types (not null).
 Top-level keys: operation (required), options (default {}), images (default []),
-durations, reference, timebase, loops, auto, auto_options. Sequence keys only for
-encode_multiframe.
+durations, reference, timebase, loops, auto, auto_options, analysis_options.
+Sequence keys only for encode_multiframe; analysis_options only for
+analyze_multiframe.
 Operations: encode, encode_multiframe, analyze_multiframe, transcode_jpeg,
 reconstruct_jpeg, decode, decode_to_png, info, read_image.
 encode requires one image; multiframe requires nonempty images. Other operations
@@ -177,6 +182,47 @@ an estimate. `adaptive_rectangles` permits additional `MergedPrevious` and
 estimate proposes geometry only; selection still uses actual completed encodes.
 All difference analysis, candidate generation, pruning and selection run in Rust.
 
+### Multiframe Analysis Options
+
+`analysis_options` is a top-level object accepted only for
+`operation="analyze_multiframe"`. Omission or `{}` uses native
+`multiframe::AnalysisOptions::default()`; null is invalid. This operation analyzes
+matching complete image states, not encoded layers, and performs no trial encodes.
+
+```json
+{
+  "operation": "analyze_multiframe",
+  "options": {"threads": 2, "strip_metadata": false},
+  "analysis_options": {"reference": "smallest_crop", "tile_size": 32},
+  "images": [
+    {"width": 2, "height": 1, "channels": 1, "dtype": "u8", "length": 2},
+    {"width": 2, "height": 1, "channels": 1, "dtype": "u8", "offset": 2, "length": 2}
+  ]
+}
+```
+
+| Member | Type | Native Default |
+| --- | --- | --- |
+| `reference` | `full` / `previous` / `first` / `smallest_crop` | `smallest_crop` |
+| `allow_mask` | boolean | true |
+| `allow_multi_rect` | boolean | true |
+| `adaptive_rectangles` | boolean | true |
+| `tile_size` | positive u32 | 32 |
+| `max_rectangles` | positive usize | 32 |
+| `rectangle_bytes_per_pixel` | finite nonnegative number | 1.0 |
+
+Unknown/duplicate members, null members, numeric booleans, fractional/string
+integers, and values outside native ranges fail. Geometry remains positive even
+when optional candidates are disabled. Zero `rectangle_bytes_per_pixel` is valid;
+the value controls native rectangle-merge proposals only and is not a measured or
+predicted compression ratio. The only accepted `options` are `threads` (1..256,
+default 1 stateless, inherited for contexts) and `strip_metadata` (default false).
+`analysis_options.threads`, nested `options.analysis_options`, encoding effort,
+tool overrides, `auto_options`, and encoding-only sequence fields are rejected.
+The analysis reference is nested here, not in the outer encoding `reference`.
+
+### Image Inputs
+
 ImageSpec: {format:"pixels",offset:0,length,width,height,channels,dtype,
 bits_per_sample?,exponent_bits_per_sample?,extra_channels:[],icc?,
 color_encoding?,orientation?}. length required; pixels require dimensions,
@@ -200,8 +246,9 @@ fails if unsupported by encoder. spot_color is four floats, cfa_channel integer.
   patches(bool),learning_fraction,ma_max_leaves. Effort/overrides map to native
   candidates. Unsupported projections fail. source_search only for still images,
   cannot combine with explicit tool overrides (ma_max_leaves is allowed).
-- analyze_multiframe: strip_metadata only. Result {frames:[{index,previous,first}]}
-  where each bbox is null or {x,y,width,height}.
+- analyze_multiframe: threads=1, strip_metadata=false; geometric controls are in
+  top-level analysis_options. Returns a native geometric report and empty data;
+  see Multiframe Analysis Results below.
 - decode/decode_to_png: threads=1, frame_index=null, coalescing=true,
   format=native (native/u8/u16/f32), include_extra_channels=true,
   adjust_orientation=true,dither=jxl-rs (jxl-rs/libjxl),limits={}.
@@ -225,6 +272,65 @@ metadata byte budget; use max_input_bytes instead.
 
 Encode/JPEG/PNG: data holds file bytes, JSON {operation,bytes,...}. Encoded JPEG
 pixel input reports jpeg_input:true and is NOT byte-reversible transcoding.
+
+### Multiframe Analysis Results
+
+Analysis returns empty data and a JSON object containing:
+
+- `operation`: `analyze_multiframe`.
+- `width`, `height`, `channels`, `frame_count`: native canvas and input counts;
+  channels include extra channels.
+- `reference`: selected analysis reference, using the option strings above.
+- `crop_supported`: whether native cropped replacement is supported; subsampled
+  extra channels require complete-frame replacement.
+- `rectangle_bytes_per_pixel`: the rectangle-proposal parameter used, not an
+  encoded-size result.
+- `frames`: one entry per input, in input order, with the fields below.
+- `reference_modes`: one summary each for `full`, `previous`, `first`, and
+  `smallest_crop`, regardless of the selected analysis reference.
+- `best_geometric_reference`: the native minimum-total-bbox-area reference, not
+  a compressed-size winner or encoding recommendation.
+- `analysis_seconds`: native `analysis_elapsed.as_secs_f64()`, excluding input
+  decoding, context creation and JSON transport work.
+
+Every `frames[]` entry contains:
+
+- `index`: zero-based input index.
+- `previous`, `first`: backward-compatible `null` or `{x,y,width,height}` bounds.
+  Both are the full canvas for frame zero; null later means identical pixels.
+- `previous_stats`, `first_stats`: null for frame zero, otherwise objects with
+  `bounds`, `changed_pixels`, `changed_ratio`, `bbox_pixels`, `bbox_ratio`,
+  `bbox_fill_ratio`, and `mask_eligible`. Counts are geometric pixel areas, not
+  sample/byte counts. Changed and bbox ratios divide by the canvas area; fill
+  ratio divides changed area by bbox area and is zero for identical frames.
+  Comparisons include invisible RGB, exact float words, and extra channels.
+  `mask_eligible` reports native binary-alpha eligibility, not candidate selection.
+- `plan`: `{reference_index,source,region,changed,layer_pixels,layer_area_ratio}`
+  for the chosen reference. `reference_index` is a logical input index or null;
+  `source` is the native JXL reference slot. `region` is always a rectangle;
+  `changed` is a rectangle or null. Identical cropped frames retain the native
+  1x1 placeholder layer, so zero changed pixels need not mean zero layer area.
+- `candidates`: geometric alternatives with
+  `{strategy,reference_index,source,rectangles,layer_pixels,layer_area_ratio,layer_count}`.
+  `rectangles` is an array of `{x,y,width,height}`. Strategies are snake_case:
+  `full`, `crop_previous`, `crop_first`, `mask_previous`, `mask_first`,
+  `tiles_previous`, `tiles_first`, `merged_previous`, `merged_first`.
+  Candidate area is the sum of submitted rectangle areas; mask candidates still
+  submit the full bounding rectangle, not only changed pixels. Per-frame layer
+  area ratios divide by the canvas area. No candidate is trial-encoded.
+
+Each `reference_modes[]` entry has `reference`, `layer_pixels`, `layer_area_ratio`,
+`average_changed_ratio`, `crop_frames`, `identical_frames`, and `suitability`.
+Total area includes the initial full frame and each subsequent planned bbox or
+placeholder. Its ratio divides by `width * height * frame_count`.
+`average_changed_ratio` excludes the initial frame (zero for single-frame input);
+full-frame replacement treats subsequent pixels as new. Crop/identical counts
+also exclude the initial frame. Suitability is `single_frame`, `strong`,
+`moderate`, `limited`, or `full_frames_required`, as classified by the native
+analyzer. These are geometric reuse labels, not speed or compression guarantees.
+No estimated encoded sizes, savings, or measured encoding throughput are returned.
+
+### Automatic Multiframe Results
 
 Automatic multiframe JSON includes `frames`, one entry per logical input:
 
