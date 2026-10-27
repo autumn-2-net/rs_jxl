@@ -2,9 +2,12 @@
 
 import argparse
 import hashlib
+import os
 from pathlib import Path
 import tarfile
 import zipfile
+
+from prepare_ci_version import release_version
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -25,17 +28,19 @@ NOTICES = (
 )
 
 
-def archive_cli(root, cli, destination, platform):
+def archive_cli(root, cli, destination, platform, version=None):
     root, cli, destination = Path(root), Path(cli), Path(destination)
     if platform not in ("windows-x86_64", "linux-x86_64"):
         raise ValueError(f"Unsupported CI platform: {platform}")
+    if version is not None:
+        version = release_version(version)
     binary_name = "rs-jxl.exe" if platform == "windows-x86_64" else "rs-jxl"
     files = [(cli, binary_name)] + [(root / name, name) for name in NOTICES]
     for path, _ in files:
         if not path.is_file():
             raise FileNotFoundError(path)
     destination.mkdir(parents=True, exist_ok=True)
-    prefix = f"rs-jxl-{platform}"
+    prefix = f"rs-jxl-{version}-{platform}" if version is not None else f"rs-jxl-{platform}"
     if platform == "windows-x86_64":
         result = destination / f"{prefix}.zip"
         with zipfile.ZipFile(result, "w", compression=zipfile.ZIP_DEFLATED) as archive:
@@ -72,11 +77,12 @@ def main():
     parser.add_argument("--platform", choices=("windows-x86_64", "linux-x86_64"), required=True)
     parser.add_argument("--cli", type=Path, required=True)
     parser.add_argument("--dist", type=Path, default=Path("dist"))
+    parser.add_argument("--version", default=os.environ.get("RS_JXL_RELEASE_VERSION"))
     args = parser.parse_args()
     wheels = sorted(args.dist.glob("rs_jxl-*.whl"))
     if len(wheels) != 1:
         parser.error(f"Expected exactly one rs_jxl wheel in {args.dist}, found {len(wheels)}")
-    archive = archive_cli(ROOT, args.cli, args.dist, args.platform)
+    archive = archive_cli(ROOT, args.cli, args.dist, args.platform, args.version)
     checksums = write_checksums(args.dist, [archive, *wheels])
     for path in [*wheels, archive, checksums]:
         print(f"Artifact: {path} ({path.stat().st_size} bytes)")

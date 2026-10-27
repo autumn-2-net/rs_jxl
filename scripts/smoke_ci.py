@@ -1,6 +1,7 @@
 """Smoke-test an installed wheel and CLI using only small generated fixtures."""
 
 import argparse
+from importlib.metadata import version as package_version
 import os
 from pathlib import Path
 import subprocess
@@ -42,6 +43,10 @@ def installed_codec():
             f"Native library is not bundled in the installed package: {native}")
     require(_ffi._native is None, "Native library was loaded before installation checks")
     _ffi.library()  # Load the verified bundled path and validate the C ABI.
+    require(rs_jxl.__version__ == package_version("rs-jxl"),
+            "Python __version__ differs from wheel metadata")
+    expected = os.environ.get("RS_JXL_RELEASE_VERSION", rs_jxl.__version__)
+    require(rs_jxl.__version__ == expected, "Installed wheel has the wrong build version")
     print(f"PASS installed package: {package}", flush=True)
     print(f"PASS bundled native ABI: {native}", flush=True)
     return rs_jxl
@@ -143,6 +148,10 @@ def main():
     cli = args.cli.resolve(strict=True)
     require(cli.is_file(), f"CLI is not a file: {cli}")
     codec = installed_codec()
+    reported = subprocess.run([str(cli), "--version"], check=True, capture_output=True,
+                              text=True, timeout=30).stdout.strip()
+    require(reported == f"rs-jxl {codec.__version__}",
+            f"CLI and wheel versions disagree: {reported!r}, {codec.__version__!r}")
     with tempfile.TemporaryDirectory(prefix="rs-jxl-ci-") as directory:
         smoke(codec, cli, Path(directory))
     print("PASS all installed-wheel and CLI smoke checks", flush=True)

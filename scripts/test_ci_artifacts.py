@@ -58,6 +58,17 @@ class ArtifactTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             package_ci.archive_cli(self.root, self.cli, self.dist, "macos")
 
+    def test_versioned_archive_uses_normalized_version(self):
+        path = package_ci.archive_cli(self.root, self.cli, self.dist, "windows-x86_64", "v1.2.3")
+        self.assertEqual(path.name, "rs-jxl-1.2.3-windows-x86_64.zip")
+        with zipfile.ZipFile(path) as archive:
+            self.assertIn("rs-jxl-1.2.3-windows-x86_64/rs-jxl.exe", archive.namelist())
+
+    def test_version_cannot_escape_output_directory(self):
+        with self.assertRaises(ValueError):
+            package_ci.archive_cli(self.root, self.cli, self.dist, "windows-x86_64", "../1.2.3")
+        self.assertFalse(self.dist.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

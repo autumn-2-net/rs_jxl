@@ -1,17 +1,33 @@
 # CLI and Python Wheel CI
 
 The [build workflow](../.github/workflows/build.yml) builds and tests **Windows
-x86_64 and Linux x86_64 only**. It runs on pushes to `main`, pull requests and
-manual **Actions -> Build CLI and Python wheels -> Run workflow** requests.
+x86_64 and Linux x86_64 only**. It runs **only** through
+**Actions -> Build CLI and Python wheels -> Run workflow**. Pushes, tags and pull
+requests do not trigger builds.
 There are no macOS, ARM, WSL, CUDA or PyPI-publishing jobs. The workflow needs
 only read access to repository contents and does not create releases or tags.
+
+## Optional Version
+
+The manual form's `version` field accepts `1.2.3` or `v1.2.3`. Leave it empty to
+keep the checked-out project's version. Only stable `X.Y.Z` release versions are
+accepted; prerelease suffixes and leading zeroes are rejected before compilation.
+An initial `v` and surrounding whitespace are removed.
+
+The override updates the disposable CI checkout's Cargo workspace version,
+local workspace entries in `Cargo.lock`, Python project version and
+`rs_jxl.__version__`. Third-party dependency versions/checksums remain locked.
+The installed-wheel check also requires the wheel metadata, Python version and
+CLI `--version` to agree. Artifact names and CLI archive names include this
+normalized version. The script does not commit changes back, tag the repository,
+publish a Release or upload to PyPI.
 
 ## Build Outputs
 
 | Job | Build environment | Downloadable artifact |
 | --- | --- | --- |
-| `build-windows` | `windows-2022`, stable Rust/MSVC, Python 3.10 x64 | `rs-jxl-windows-x86_64`: `py3-none-win_amd64.whl`, CLI ZIP and `SHA256SUMS` |
-| `build-linux` | `ubuntu-22.04` host with the PyPA `manylinux_2_28_x86_64` container, stable Rust, Python 3.10 | `rs-jxl-linux-x86_64`: auditwheel-repaired manylinux wheel, CLI tar.gz and `SHA256SUMS` |
+| `build-windows` | `windows-2022`, stable Rust/MSVC, Python 3.10 x64 | `rs-jxl-<version>-windows-x86_64`: `py3-none-win_amd64.whl`, versioned CLI ZIP and `SHA256SUMS` |
+| `build-linux` | `ubuntu-22.04` host with the PyPA `manylinux_2_28_x86_64` container, stable Rust, Python 3.10 | `rs-jxl-<version>-linux-x86_64`: auditwheel-repaired manylinux wheel, versioned CLI tar.gz and `SHA256SUMS` |
 
 Download these from the completed run's **Artifacts** section. Retention is
 14 days. The wheel contains the Python package and its Rust native library;
@@ -34,14 +50,16 @@ This workflow does not certify the declared Rust MSRV either.
 
 ## Validation Gates
 
-1. Fetch the exact `Cargo.lock` dependencies, then build the Release workspace
+1. Validate/apply the optional version, fetch the exact `Cargo.lock` dependencies,
+   then build the Release workspace
    offline. Only Cargo dependency downloads are cached, not native build outputs.
 2. Run ordinary workspace tests with two test threads in Cargo's default test
    profile. Release CLI/library outputs are tested separately below. Explicitly
    ignored corpus/oracle/subprocess tests remain ignored; no private dataset is needed.
 3. Build the wheel using the native library from that build, without a second
    implicit Cargo build or a different dependency resolution.
-4. Test archive assembly, required notices, executable permissions and checksums.
+4. Test version synchronization, invalid input rejection, archive assembly,
+   required notices, executable permissions and checksums.
 5. Create a fresh temporary virtual environment, install the built wheel and
    test dependencies, and clear `PYTHONPATH`, `PYTHONHOME` and native-library
    overrides. Python runs with `-I` outside the checkout. Smoke checks verify
@@ -67,17 +85,20 @@ Python environment or starts WSL.
 cargo fetch --locked
 cargo build --release --locked --offline --workspace
 cargo test --locked --offline --workspace --no-fail-fast -- --test-threads=2
-python -m pip install "setuptools>=68" "wheel>=0.38"
+python -m pip install "setuptools>=68" "wheel>=0.38" "tomlkit>=0.12,<1"
 $env:RS_JXL_NATIVE_LIB = "$PWD/target/release/rs_jxl_ffi.dll"
 python -m pip wheel . --no-deps --no-build-isolation --wheel-dir out/ci/wheels
 Remove-Item Env:RS_JXL_NATIVE_LIB
-python -B -m unittest discover -s scripts -p test_ci_artifacts.py -v
+python -B -m unittest discover -s scripts -p "test_ci_*.py" -v
 python -B scripts/test_ci_wheel.py --wheel-dir out/ci/wheels --cli target/release/rs-jxl.exe
 python -B scripts/package_ci.py --platform windows-x86_64 --cli target/release/rs-jxl.exe --dist out/ci/wheels
 ```
 
 Use a wheel directory containing exactly one wheel. Helpers reject ambiguous
 directories instead of accidentally validating or publishing a stale version.
+These local commands keep the project version. `prepare_ci_version.py` is
+intended for a disposable CI checkout; running it locally with a nonempty
+`RS_JXL_BUILD_VERSION` deliberately edits that checkout's version files.
 
 ## Evidence Boundary
 
@@ -91,5 +112,6 @@ The CI helpers were exercised locally on Windows on 2026-10-27: all five
 archive tests passed, a real wheel and CLI ZIP/checksums were produced, and the
 fresh-venv CLI/wheel smoke checks passed. The installed-wheel pytest run passed
 235 tests with 12 optional cases skipped and two non-fatal tooling warnings.
-Actionlint 1.7.12 accepted the workflow (shellcheck/pyflakes were not installed
+After the manual-only/version-input correction, all 13 archive/version tests
+passed. Actionlint 1.7.12 accepted the workflow (shellcheck/pyflakes were not installed
 or run). This is local helper validation, not a hosted Windows or Linux run.

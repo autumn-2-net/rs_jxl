@@ -27,9 +27,10 @@ diagnostics, not a requirement to reproduce C++ arithmetic bit for bit.
 
 ## CI Artifacts
 
-The [GitHub Actions build](.github/workflows/build.yml) produces tested Python
+The manual-only [GitHub Actions build](.github/workflows/build.yml) produces tested Python
 wheels and CLI archives for Windows x86_64 and Linux x86_64, with no macOS job.
-See [CI and artifact guide](docs/CI.md) for manual runs, download locations,
+An optional version input overrides the build version; pushes and pull requests
+do not trigger builds. See [CI and artifact guide](docs/CI.md) for manual runs, download locations,
 platform requirements and the installed-wheel validation gates. Artifacts are
 not automatically published to PyPI or GitHub Releases.
 

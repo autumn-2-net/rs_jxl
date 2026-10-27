@@ -1,17 +1,20 @@
 name: Build CLI and Python wheels
 
 on:
-  push:
-    branches: [main]
-  pull_request:
   workflow_dispatch:
+    inputs:
+      version:
+        description: 'Optional release version, e.g. 1.2.3 or v1.2.3 (empty: project version)'
+        required: false
+        default: ''
+        type: string
 
 permissions:
   contents: read
 
 concurrency:
   group: build-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 env:
   CARGO_BUILD_JOBS: '2'
@@ -46,6 +49,15 @@ jobs:
             ~/.cargo/git
           key: windows-x86_64-cargo-${{ hashFiles('Cargo.lock') }}
 
+      - name: Install wheel build tools
+        run: python -m pip install --upgrade pip "setuptools>=68" "wheel>=0.38" "tomlkit>=0.12,<1"
+
+      - name: Prepare optional build version
+        id: version
+        env:
+          RS_JXL_BUILD_VERSION: ${{ inputs.version }}
+        run: python -B scripts/prepare_ci_version.py
+
       - name: Fetch locked dependencies
         run: cargo fetch --locked
 
@@ -55,16 +67,13 @@ jobs:
       - name: Test Rust workspace
         run: cargo test --locked --offline --workspace --no-fail-fast -- --test-threads=2
 
-      - name: Install wheel build tools
-        run: python -m pip install --upgrade pip "setuptools>=68" "wheel>=0.38"
-
       - name: Build wheel with the compiled DLL
         env:
           RS_JXL_NATIVE_LIB: ${{ github.workspace }}/target/release/rs_jxl_ffi.dll
         run: python -m pip wheel . --no-deps --no-build-isolation --wheel-dir dist
 
       - name: Test packaging helpers
-        run: python -B -m unittest discover -s scripts -p test_ci_artifacts.py -v
+        run: python -B -m unittest discover -s scripts -p "test_ci_*.py" -v
 
       - name: Test installed wheel and CLI
         run: python -B scripts/test_ci_wheel.py --wheel-dir dist --cli target/release/rs-jxl.exe
@@ -75,7 +84,7 @@ jobs:
       - name: Upload Windows artifacts
         uses: actions/upload-artifact@v7
         with:
-          name: rs-jxl-windows-x86_64
+          name: rs-jxl-${{ steps.version.outputs.version }}-windows-x86_64
           path: |
             dist/*.whl
             dist/*.zip
@@ -112,6 +121,15 @@ jobs:
             ~/.cargo/git
           key: manylinux-2-28-x86_64-cargo-${{ hashFiles('Cargo.lock') }}
 
+      - name: Install wheel build tools
+        run: python -m pip install --upgrade pip 'setuptools>=68' 'wheel>=0.38' 'tomlkit>=0.12,<1'
+
+      - name: Prepare optional build version
+        id: version
+        env:
+          RS_JXL_BUILD_VERSION: ${{ inputs.version }}
+        run: python -B scripts/prepare_ci_version.py
+
       - name: Fetch locked dependencies
         run: cargo fetch --locked
 
@@ -120,9 +138,6 @@ jobs:
 
       - name: Test Rust workspace
         run: cargo test --locked --offline --workspace --no-fail-fast -- --test-threads=2
-
-      - name: Install wheel build tools
-        run: python -m pip install --upgrade pip 'setuptools>=68' 'wheel>=0.38'
 
       - name: Build wheel with the compiled shared library
         env:
@@ -137,7 +152,7 @@ jobs:
           auditwheel repair --plat manylinux_2_28_x86_64 --wheel-dir dist "${wheels[0]}"
 
       - name: Test packaging helpers
-        run: python -B -m unittest discover -s scripts -p test_ci_artifacts.py -v
+        run: python -B -m unittest discover -s scripts -p 'test_ci_*.py' -v
 
       - name: Test repaired wheel and CLI
         run: python -B scripts/test_ci_wheel.py --wheel-dir dist --cli target/release/rs-jxl
@@ -148,7 +163,7 @@ jobs:
       - name: Upload Linux artifacts
         uses: actions/upload-artifact@v7
         with:
-          name: rs-jxl-linux-x86_64
+          name: rs-jxl-${{ steps.version.outputs.version }}-linux-x86_64
           path: |
             dist/*.whl
             dist/*.tar.gz
