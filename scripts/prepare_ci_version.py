@@ -82,11 +82,14 @@ def prepare(root, requested):
 
 
 def main():
-    version = prepare(ROOT, os.environ.get("RS_JXL_BUILD_VERSION", ""))
+    requested = os.environ.get("RS_JXL_BUILD_VERSION", "")
+    version = prepare(ROOT, requested)
     for variable, key in (("GITHUB_OUTPUT", "version"), ("GITHUB_ENV", "RS_JXL_RELEASE_VERSION")):
         if os.environ.get(variable):
             with Path(os.environ[variable]).open("a", encoding="utf-8") as output:
                 output.write(f"{key}={version}\n")
+                if variable == "GITHUB_OUTPUT":
+                    output.write(f"publish_release={str(bool(requested.strip())).lower()}\n")
     print(f"Build version: {version}")
 
 

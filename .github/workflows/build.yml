@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Optional release version, e.g. 1.2.3 or v1.2.3 (empty: project version)'
+        description: 'Version to publish, e.g. 1.2.3 or v1.2.3 (empty: build artifacts only)'
         required: false
         default: ''
         type: string
@@ -27,6 +27,9 @@ jobs:
   build-windows:
     runs-on: windows-2022
     timeout-minutes: 60
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      publish_release: ${{ steps.version.outputs.publish_release }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -95,6 +98,9 @@ jobs:
   build-linux:
     runs-on: ubuntu-22.04
     timeout-minutes: 60
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      publish_release: ${{ steps.version.outputs.publish_release }}
     container:
       image: quay.io/pypa/manylinux_2_28_x86_64
     defaults:
@@ -170,3 +176,61 @@ jobs:
             dist/SHA256SUMS
           if-no-files-found: error
           retention-days: 14
+
+  publish-release:
+    needs: [build-windows, build-linux]
+    if: needs.build-windows.outputs.publish_release == 'true' && needs.build-linux.outputs.publish_release == 'true'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    concurrency:
+      group: release-${{ needs.build-windows.outputs.version }}
+      cancel-in-progress: false
+    env:
+      BUILD_VERSION: ${{ needs.build-windows.outputs.version }}
+      LINUX_VERSION: ${{ needs.build-linux.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.10'
+
+      - name: Download this run's platform artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: rs-jxl-${{ needs.build-windows.outputs.version }}-*-x86_64
+          path: out/release-input
+          merge-multiple: false
+
+      - name: Verify and assemble release assets
+        shell: bash
+        run: |
+          test "$BUILD_VERSION" = "$LINUX_VERSION"
+          python -B scripts/prepare_ci_release.py --artifacts out/release-input --output out/release-assets --version "$BUILD_VERSION"
+
+      - name: Publish versioned GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="v$BUILD_VERSION"
+          if git show-ref --verify --quiet "refs/tags/$tag"; then
+            tag_commit="$(git rev-parse "refs/tags/$tag^{commit}")"
+            if [ "$tag_commit" != "$GITHUB_SHA" ]; then
+              echo "::error::Tag $tag already points to another commit; refusing to replace it."
+              exit 1
+            fi
+          fi
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::Release $tag already exists; use a new version."
+            exit 1
+          fi
+          gh release create "$tag" --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" --title "$tag" --generate-notes --draft \
+            out/release-assets/*
+          gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --draft=false

@@ -4,13 +4,16 @@ The [build workflow](../.github/workflows/build.yml) builds and tests **Windows
 x86_64 and Linux x86_64 only**. It runs **only** through
 **Actions -> Build CLI and Python wheels -> Run workflow**. Pushes, tags and pull
 requests do not trigger builds.
-There are no macOS, ARM, WSL, CUDA or PyPI-publishing jobs. The workflow needs
-only read access to repository contents and does not create releases or tags.
+There are no macOS, ARM, WSL, CUDA or PyPI-publishing jobs. Build jobs use read-only
+repository permissions. Only the conditional GitHub Release job requests
+`contents: write`.
 
 ## Optional Version
 
 The manual form's `version` field accepts `1.2.3` or `v1.2.3`. Leave it empty to
-keep the checked-out project's version. Only stable `X.Y.Z` release versions are
+keep the checked-out project's version and **build artifacts only**. Supplying a
+version also requests a GitHub Release after both platforms pass. Whitespace-only
+input counts as empty. Only stable `X.Y.Z` release versions are
 accepted; prerelease suffixes and leading zeroes are rejected before compilation.
 An initial `v` and surrounding whitespace are removed.
 
@@ -19,8 +22,9 @@ local workspace entries in `Cargo.lock`, Python project version and
 `rs_jxl.__version__`. Third-party dependency versions/checksums remain locked.
 The installed-wheel check also requires the wheel metadata, Python version and
 CLI `--version` to agree. Artifact names and CLI archive names include this
-normalized version. The script does not commit changes back, tag the repository,
-publish a Release or upload to PyPI.
+normalized version. The version-preparation script does not commit changes back;
+the separate publication job handles tags and GitHub Releases. Nothing is uploaded
+to PyPI.
 
 ## Build Outputs
 
@@ -35,6 +39,11 @@ the CLI archive contains `rs-jxl`/`rs-jxl.exe`, parameter documentation and
 third-party notices. Linux archives retain the executable permission. Neither
 artifact needs the source checkout or a runtime Rust compiler.
 
+Both CLI executables and the wheel's DLL/shared library come from
+`cargo build --release --locked --offline --workspace` and `target/release`.
+The workspace's Release profile uses thin LTO and one codegen unit. Default-profile
+test binaries are separate and never become release assets.
+
 The Linux build targets glibc 2.28 or newer, not musl/Alpine. The wheel is
 audited/repaired before it is installed for testing; a raw `linux_x86_64` wheel
 is not uploaded. This follows the [PyPA manylinux environment](https://github.com/pypa/manylinux#manylinux_2_28-almalinux-8-based)
@@ -47,6 +56,36 @@ CI does not enable `target-cpu=native` or require AVX512.
 The CFFI package is Python-ABI-independent (`py3-none`); it is built and tested
 here on Python 3.10, not on every Python version permitted by package metadata.
 This workflow does not certify the declared Rust MSRV either.
+
+## GitHub Releases
+
+For example, enter `1.2.3` in the manual form. After Windows and Linux builds,
+tests and artifact uploads succeed, `publish-release` verifies both jobs reported
+that version, downloads only this run's artifacts, verifies their checksums and
+assembles five assets:
+
+- Windows wheel.
+- Linux manylinux wheel.
+- `rs-jxl-1.2.3-windows-x86_64.zip`.
+- `rs-jxl-1.2.3-linux-x86_64.tar.gz`.
+- One combined `SHA256SUMS` covering all four downloads.
+
+The job creates Release/tag `v1.2.3` targeting the workflow's exact source commit,
+not whatever the branch points to later. Existing tags pointing elsewhere and
+existing Releases (including drafts) are rejected; no force-update or asset
+overwrite is attempted. Choose a new version for another release.
+
+Assets are uploaded to a draft first, then the draft is published only after
+the upload command succeeds, using the documented
+[GitHub CLI create](https://cli.github.com/manual/gh_release_create) and
+[edit](https://cli.github.com/manual/gh_release_edit) commands. An upload failure
+may leave a draft for manual inspection; the workflow does not delete it. Tag
+protection or repository policies that prohibit the token's write access cause
+publication to fail rather than bypassing those restrictions.
+
+The tag's source still contains its committed default versions: the requested
+version is a build-time override in the disposable checkout. GitHub's automatic
+source archives are not pre-versioned wheels or binary archives.
 
 ## Validation Gates
 
@@ -68,6 +107,8 @@ This workflow does not certify the declared Rust MSRV either.
    smoke checks, then discover all `python/tests` against the installed wheel.
    Optional torch/CUDA and official `djxl` checks are not enabled in this CI.
 7. Package and upload artifacts only after every required command succeeds.
+8. With an explicit version only, validate both platforms' assets and publish
+   the versioned GitHub Release. Empty input skips this job entirely.
 
 Checksums identify downloads, not compression correctness. Correctness checks
 compare recovered pixel samples/frames and reconstructed JPEG bytes. Smoke
@@ -115,3 +156,9 @@ fresh-venv CLI/wheel smoke checks passed. The installed-wheel pytest run passed
 After the manual-only/version-input correction, all 13 archive/version tests
 passed. Actionlint 1.7.12 accepted the workflow (shellcheck/pyflakes were not installed
 or run). This is local helper validation, not a hosted Windows or Linux run.
+
+After adding conditional GitHub Release publication, all 27 archive/version/
+release-assembly tests passed on Windows, including symlink rejection and Linux
+multi-tag wheel filename fixtures. Actionlint 1.7.12 accepted the updated workflow
+with shellcheck/pyflakes disabled. No GitHub Release was created and no hosted
+workflow was triggered during this local verification.

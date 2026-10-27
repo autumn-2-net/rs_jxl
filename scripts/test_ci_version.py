@@ -90,8 +90,18 @@ class VersionTests(unittest.TestCase):
             "GITHUB_ENV": str(environment),
         }):
             ci_version.main()
-        self.assertEqual(output.read_text(), "version=1.2.3\n")
+        self.assertEqual(output.read_text(), "version=1.2.3\npublish_release=true\n")
         self.assertEqual(environment.read_text(), "RS_JXL_RELEASE_VERSION=1.2.3\n")
+
+    def test_blank_version_never_requests_publication(self):
+        output = self.root / "github-output"
+        for value in ("", "   "):
+            with self.subTest(value=value), patch.object(ci_version, "ROOT", self.root), patch.dict(
+                "os.environ", {"RS_JXL_BUILD_VERSION": value, "GITHUB_OUTPUT": str(output), "GITHUB_ENV": ""}
+            ):
+                output.write_text("")
+                ci_version.main()
+                self.assertEqual(output.read_text(), "version=0.1.0\npublish_release=false\n")
 
 
 if __name__ == "__main__":

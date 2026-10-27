@@ -31,8 +31,9 @@ The manual-only [GitHub Actions build](.github/workflows/build.yml) produces tes
 wheels and CLI archives for Windows x86_64 and Linux x86_64, with no macOS job.
 An optional version input overrides the build version; pushes and pull requests
 do not trigger builds. See [CI and artifact guide](docs/CI.md) for manual runs, download locations,
-platform requirements and the installed-wheel validation gates. Artifacts are
-not automatically published to PyPI or GitHub Releases.
+platform requirements and the installed-wheel validation gates. A supplied
+version publishes a GitHub Release after both platforms pass; empty input builds
+Actions artifacts only. Nothing is published to PyPI.
 
 ## Active Paths
 
