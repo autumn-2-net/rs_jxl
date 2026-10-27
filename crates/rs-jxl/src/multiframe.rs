@@ -7,10 +7,13 @@ use crate::{
 use std::borrow::Cow;
 
 mod auto;
+mod diff;
+mod partition;
 mod regions;
 pub(crate) use auto::encode_auto_in_pool;
 pub use auto::{
-    AutoCandidateReport, AutoEncodeResult, AutoFrameReport, AutoOptions, Strategy, encode_auto,
+    AutoCandidateReport, AutoDiffReport, AutoEncodeResult, AutoFrameReport, AutoOptions,
+    AutoPrunedReport, Strategy, encode_auto,
 };
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

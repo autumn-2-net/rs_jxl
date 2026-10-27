@@ -1,11 +1,13 @@
 //! Per-logical-frame search using real encoded layers, with retained winners.
-use super::{Rect, Reference, compatible, crop, difference_bounds, regions};
+use super::{Rect, Reference, compatible, crop, diff::DiffMap, partition, regions};
 use crate::{
     EncodeOptions, Error, Image, Result,
+    encode::budget::{SectionBudget, TrialEncode},
     frame::{BlendInfo, BlendMode, Frame, FrameOptions},
 };
 use std::{
     borrow::Cow,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -17,6 +19,10 @@ pub struct AutoOptions {
     pub allow_multi_rect: bool,
     pub tile_size: u32,
     pub max_rectangles: usize,
+    /// Stop only when finalized output proves a trial cannot beat the winner.
+    pub prune: bool,
+    /// Add a cost-estimated rectangle proposal; retain all legacy candidates.
+    pub adaptive_rectangles: bool,
     /// Logical input frames, independent of inserted zero-duration layers.
     pub max_frames: usize,
     pub max_total_trials: usize,
@@ -31,6 +37,8 @@ impl Default for AutoOptions {
             allow_multi_rect: true,
             tile_size: 32,
             max_rectangles: 32,
+            prune: true,
+            adaptive_rectangles: true,
             max_frames: usize::MAX,
             max_total_trials: usize::MAX,
             max_trial_pixels: u64::MAX,
@@ -47,6 +55,8 @@ pub enum Strategy {
     MaskFirst,
     TilesPrevious,
     TilesFirst,
+    MergedPrevious,
+    MergedFirst,
 }
 
 #[derive(Debug)]
@@ -56,12 +66,33 @@ pub struct AutoCandidateReport {
     pub encoded_bytes: usize,
     /// Regular layers, excluding private reference-only patch frames.
     pub encoded_frames: usize,
+    /// Pixel area actually submitted to the encoder, excluding analysis scans.
+    pub trial_pixels: u64,
     pub elapsed: Duration,
+}
+#[derive(Debug)]
+pub struct AutoPrunedReport {
+    pub strategy: Strategy,
+    /// Proven size lower bound, not an estimated or complete encoded byte count.
+    pub lower_bound: usize,
+    pub encoded_frames: usize,
+    pub planned_frames: usize,
+    pub trial_pixels: u64,
+    pub elapsed: Duration,
+}
+#[derive(Debug)]
+pub struct AutoDiffReport {
+    pub reference: usize,
+    pub changed_pixels: u64,
+    pub bounds: Option<Rect>,
 }
 #[derive(Debug)]
 pub struct AutoFrameReport {
     pub winner_index: usize,
     pub candidates: Vec<AutoCandidateReport>,
+    pub pruned: Vec<AutoPrunedReport>,
+    pub differences: Vec<AutoDiffReport>,
+    pub analysis_elapsed: Duration,
 }
 #[derive(Debug)]
 pub struct AutoEncodeResult {
@@ -72,10 +103,23 @@ pub struct AutoEncodeResult {
 
 struct Candidate {
     strategy: Strategy,
-    reference: Option<usize>,
+    diff: Option<Arc<DiffMap>>,
     source: u8,
     rects: Vec<Rect>,
     mask: bool,
+}
+
+impl Candidate {
+    // Ranking only. No candidate is discarded using this estimate.
+    fn estimated_work(&self) -> u64 {
+        let area = self.rects.iter().fold(0u64, |sum, rect| {
+            sum.saturating_add(u64::from(rect.width) * u64::from(rect.height))
+        });
+        let pixels = self.diff.as_ref().map_or(area, |diff| {
+            diff.changed_pixels().saturating_add(area.div_ceil(64))
+        });
+        pixels.saturating_add((self.rects.len() as u64).saturating_mul(64))
+    }
 }
 
 /// Encode exact full-image states. Candidates share metadata, final reference
@@ -146,7 +190,13 @@ fn validate(
     Ok(())
 }
 
-fn candidates(images: &[Image], index: usize, auto: &AutoOptions) -> Result<Vec<Candidate>> {
+fn candidates(
+    images: &[Image],
+    index: usize,
+    auto: &AutoOptions,
+    bytes_per_pixel: f64,
+    differences: &mut Vec<AutoDiffReport>,
+) -> Result<Vec<Candidate>> {
     let current = &images[index];
     let full = Rect {
         x: 0,
@@ -156,7 +206,7 @@ fn candidates(images: &[Image], index: usize, auto: &AutoOptions) -> Result<Vec<
     };
     let mut result = vec![Candidate {
         strategy: Strategy::Full,
-        reference: None,
+        diff: None,
         source: 0,
         rects: vec![full],
         mask: false,
@@ -177,11 +227,18 @@ fn candidates(images: &[Image], index: usize, auto: &AutoOptions) -> Result<Vec<
         _ if index == 1 => vec![0],
         _ => vec![index - 1, 0],
     };
+    let mut merged = Vec::new();
     for reference in references {
         let previous = &images[reference];
         let first = reference == 0 && (index != 1 || auto.reference == Reference::First);
         let source = if reference == 0 { 1 } else { 2 };
-        let bounds = difference_bounds(previous, current)?;
+        let diff = Arc::new(DiffMap::between(previous, current)?);
+        let bounds = diff.bounds();
+        differences.push(AutoDiffReport {
+            reference,
+            changed_pixels: diff.changed_pixels(),
+            bounds,
+        });
         let rect = bounds.unwrap_or(Rect {
             x: 0,
             y: 0,
@@ -196,7 +253,7 @@ fn candidates(images: &[Image], index: usize, auto: &AutoOptions) -> Result<Vec<
                 } else {
                     Strategy::CropPrevious
                 },
-                reference: Some(reference),
+                diff: None,
                 source,
                 rects: vec![rect],
                 mask: false,
@@ -205,14 +262,14 @@ fn candidates(images: &[Image], index: usize, auto: &AutoOptions) -> Result<Vec<
         if bounds.is_none() {
             continue;
         }
-        if auto.allow_mask && regions::mask_eligible(current) && regions::mask_eligible(previous) {
+        if auto.allow_mask && diff.mask_eligible() {
             result.push(Candidate {
                 strategy: if first {
                     Strategy::MaskFirst
                 } else {
                     Strategy::MaskPrevious
                 },
-                reference: Some(reference),
+                diff: Some(Arc::clone(&diff)),
                 source,
                 rects: vec![rect],
                 mask: true,
@@ -220,7 +277,7 @@ fn candidates(images: &[Image], index: usize, auto: &AutoOptions) -> Result<Vec<
         }
         if auto.allow_multi_rect
             && let Some(rects) =
-                regions::tiles(previous, current, auto.tile_size, auto.max_rectangles)
+                regions::tiles_from_map(&diff, auto.tile_size, auto.max_rectangles)?
             && rects.len() > 1
         {
             result.push(Candidate {
@@ -229,13 +286,36 @@ fn candidates(images: &[Image], index: usize, auto: &AutoOptions) -> Result<Vec<
                 } else {
                     Strategy::TilesPrevious
                 },
-                reference: Some(reference),
+                diff: None,
+                source,
+                rects,
+                mask: false,
+            });
+        }
+        if auto.allow_multi_rect
+            && auto.adaptive_rectangles
+            && let Some(rects) =
+                partition::propose(&diff, auto.tile_size, auto.max_rectangles, bytes_per_pixel)?
+            && rects.len() > 1
+            && !result.iter().any(|candidate| {
+                !candidate.mask && candidate.source == source && candidate.rects == rects
+            })
+        {
+            merged.push(Candidate {
+                strategy: if first {
+                    Strategy::MergedFirst
+                } else {
+                    Strategy::MergedPrevious
+                },
+                diff: None,
                 source,
                 rects,
                 mask: false,
             });
         }
     }
+    // Keep every legacy candidate ahead of new proposals for equal-size ties.
+    result.extend(merged);
     Ok(result)
 }
 
@@ -254,22 +334,57 @@ fn encode_inner(
     let mut available = [None; 4];
     let mut trials = 0usize;
     let mut pixels = 0u64;
+    let mut anchor_bytes_per_pixel = 1.0;
     for (index, image) in images.iter().enumerate() {
-        let mut report = AutoFrameReport {
-            winner_index: 0,
-            candidates: Vec::new(),
-        };
-        let mut winner: Option<Vec<u8>> = None;
+        let analysis_started = Instant::now();
+        let mut differences = Vec::new();
+        let mut candidates: Vec<_> = candidates(
+            images,
+            index,
+            auto,
+            anchor_bytes_per_pixel,
+            &mut differences,
+        )?
+        .into_iter()
+        .enumerate()
+        .collect();
+        if auto.prune {
+            candidates.sort_by_key(|(rank, candidate)| (candidate.estimated_work(), *rank));
+        }
+        let analysis_elapsed = analysis_started.elapsed();
+        let mut completed = Vec::new();
+        let mut pruned = Vec::new();
+        let mut winner: Option<(usize, Vec<u8>)> = None;
         let mut winner_references = available;
-        for candidate in candidates(images, index, auto)? {
+        for (rank, candidate) in candidates {
             trials = trials
                 .checked_add(1)
                 .filter(|&n| n <= auto.max_total_trials)
                 .ok_or(Error::Limit("automatic trial count"))?;
             let mut trial_refs = available;
             let started = Instant::now();
+            let initial_pixels = pixels;
             let mut bytes = Vec::new();
+            let mut encoded_frames = 0;
+            let mut lower_bound = None;
+            // Earlier canonical candidates may win equal-byte ties even if
+            // cheap-first execution measured a later candidate first.
+            let cutoff = if auto.prune {
+                winner.as_ref().and_then(|(best_rank, best)| {
+                    if rank < *best_rank {
+                        best.len().checked_add(1)
+                    } else {
+                        Some(best.len())
+                    }
+                })
+            } else {
+                None
+            };
             for (part, &rect) in candidate.rects.iter().enumerate() {
+                if cutoff.is_some_and(|maximum| bytes.len() >= maximum) {
+                    lower_bound = Some(bytes.len());
+                    break;
+                }
                 pixels = pixels
                     .checked_add(u64::from(rect.width) * u64::from(rect.height))
                     .filter(|&n| n <= auto.max_trial_pixels)
@@ -277,10 +392,10 @@ fn encode_inner(
                 let final_part = part + 1 == candidate.rects.len();
                 let last = index + 1 == images.len() && final_part;
                 let frame_image = if candidate.mask {
-                    Cow::Owned(regions::mask(
-                        &images[candidate.reference.expect("mask reference")],
+                    Cow::Owned(regions::mask_from_map(
                         image,
                         rect,
+                        candidate.diff.as_ref().expect("mask difference map"),
                     )?)
                 } else if rect.x == 0
                     && rect.y == 0
@@ -323,30 +438,84 @@ fn encode_inner(
                     last,
                     trial_refs,
                 )?;
-                let encoded =
-                    crate::encode::encode_logical_frame_trial(canvas, &frame, options, last, None)?
-                        .into_complete()?;
-                append(&mut bytes, encoded, options.max_output_bytes)?;
+                let budget = SectionBudget::new(
+                    cutoff.map(|maximum| maximum - bytes.len()),
+                    options.max_output_bytes,
+                );
+                match crate::encode::encode_logical_frame_trial(
+                    canvas,
+                    &frame,
+                    options,
+                    last,
+                    budget.as_ref(),
+                )? {
+                    TrialEncode::Complete(encoded) => {
+                        append(&mut bytes, encoded, options.max_output_bytes)?;
+                        encoded_frames += 1;
+                    }
+                    TrialEncode::Bounded { lower_bound: bound } => {
+                        lower_bound = Some(
+                            bytes
+                                .len()
+                                .checked_add(bound)
+                                .ok_or(Error::Limit("automatic candidate size lower bound"))?,
+                        );
+                        break;
+                    }
+                }
             }
-            report.candidates.push(AutoCandidateReport {
-                strategy: candidate.strategy,
-                encoded_bytes: bytes.len(),
-                encoded_frames: candidate.rects.len(),
-                elapsed: started.elapsed(),
-            });
-            if winner.as_ref().is_none_or(|best| bytes.len() < best.len()) {
-                report.winner_index = report.candidates.len() - 1;
+            if let Some(lower_bound) = lower_bound {
+                pruned.push((
+                    rank,
+                    AutoPrunedReport {
+                        strategy: candidate.strategy,
+                        lower_bound,
+                        encoded_frames,
+                        planned_frames: candidate.rects.len(),
+                        trial_pixels: pixels - initial_pixels,
+                        elapsed: started.elapsed(),
+                    },
+                ));
+                continue;
+            }
+            completed.push((
+                rank,
+                AutoCandidateReport {
+                    strategy: candidate.strategy,
+                    encoded_bytes: bytes.len(),
+                    encoded_frames,
+                    trial_pixels: pixels - initial_pixels,
+                    elapsed: started.elapsed(),
+                },
+            ));
+            if winner
+                .as_ref()
+                .is_none_or(|(best_rank, best)| (bytes.len(), rank) < (best.len(), *best_rank))
+            {
                 winner_references = trial_refs;
-                winner = Some(bytes);
+                winner = Some((rank, bytes));
             }
         }
-        append(
-            &mut stream,
-            winner.expect("full candidate always exists"),
-            options.max_output_bytes,
-        )?;
+        let (winner_rank, winner_bytes) = winner.expect("at least one complete candidate");
+        if index == 0 {
+            anchor_bytes_per_pixel = winner_bytes.len() as f64
+                / (u64::from(canvas.width()) * u64::from(canvas.height())) as f64;
+        }
+        completed.sort_by_key(|(rank, _)| *rank);
+        pruned.sort_by_key(|(rank, _)| *rank);
+        let winner_index = completed
+            .iter()
+            .position(|(rank, _)| *rank == winner_rank)
+            .expect("winner has a complete report");
+        append(&mut stream, winner_bytes, options.max_output_bytes)?;
         available = winner_references;
-        reports.push(report);
+        reports.push(AutoFrameReport {
+            winner_index,
+            candidates: completed.into_iter().map(|(_, report)| report).collect(),
+            pruned: pruned.into_iter().map(|(_, report)| report).collect(),
+            differences,
+            analysis_elapsed,
+        });
     }
     Ok(AutoEncodeResult {
         bytes: crate::encode::wrap_stream(canvas, stream, options.max_output_bytes)?,

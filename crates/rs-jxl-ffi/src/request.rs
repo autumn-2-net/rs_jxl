@@ -27,6 +27,100 @@ pub struct Request {
     pub timebase: Option<[u32; 2]>,
     pub loops: Option<u32>,
     pub auto: Option<bool>,
+    #[serde(default, deserialize_with = "deserialize_auto_options")]
+    pub auto_options: Option<AutoOptions>,
+}
+
+fn deserialize_auto_options<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<AutoOptions>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct Object;
+    impl<'de> serde::de::Visitor<'de> for Object {
+        type Value = Option<AutoOptions>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("an auto_options object or null")
+        }
+
+        fn visit_none<E: serde::de::Error>(self) -> std::result::Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_unit<E: serde::de::Error>(self) -> std::result::Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_some<D: serde::Deserializer<'de>>(
+            self,
+            deserializer: D,
+        ) -> std::result::Result<Self::Value, D::Error> {
+            deserializer.deserialize_map(self)
+        }
+
+        fn visit_map<A: serde::de::MapAccess<'de>>(
+            self,
+            map: A,
+        ) -> std::result::Result<Self::Value, A::Error> {
+            // Preserve duplicate keys for derived serde validation, unlike Value.
+            AutoOptions::deserialize(serde::de::value::MapAccessDeserializer::new(map)).map(Some)
+        }
+    }
+    deserializer.deserialize_option(Object)
+}
+
+/// Wire overrides use native defaults; reference belongs to the outer request.
+#[derive(Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AutoOptions {
+    pub allow_mask: bool,
+    pub allow_multi_rect: bool,
+    pub tile_size: u32,
+    pub max_rectangles: usize,
+    pub prune: bool,
+    pub adaptive_rectangles: bool,
+    pub max_frames: usize,
+    pub max_total_trials: usize,
+    pub max_trial_pixels: u64,
+}
+
+impl Default for AutoOptions {
+    fn default() -> Self {
+        let native = rs_jxl::multiframe::AutoOptions::default();
+        Self {
+            allow_mask: native.allow_mask,
+            allow_multi_rect: native.allow_multi_rect,
+            tile_size: native.tile_size,
+            max_rectangles: native.max_rectangles,
+            prune: native.prune,
+            adaptive_rectangles: native.adaptive_rectangles,
+            max_frames: native.max_frames,
+            max_total_trials: native.max_total_trials,
+            max_trial_pixels: native.max_trial_pixels,
+        }
+    }
+}
+
+impl AutoOptions {
+    pub fn native(
+        &self,
+        reference: rs_jxl::multiframe::Reference,
+    ) -> rs_jxl::multiframe::AutoOptions {
+        rs_jxl::multiframe::AutoOptions {
+            reference,
+            allow_mask: self.allow_mask,
+            allow_multi_rect: self.allow_multi_rect,
+            tile_size: self.tile_size,
+            max_rectangles: self.max_rectangles,
+            prune: self.prune,
+            adaptive_rectangles: self.adaptive_rectangles,
+            max_frames: self.max_frames,
+            max_total_trials: self.max_total_trials,
+            max_trial_pixels: self.max_trial_pixels,
+        }
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -187,6 +281,7 @@ pub struct Sequence<'a> {
     pub reference: rs_jxl::multiframe::Reference,
     pub animation: rs_jxl::metadata::Animation,
     pub automatic: bool,
+    pub auto_options: Option<&'a AutoOptions>,
 }
 
 impl Request {
@@ -194,7 +289,7 @@ impl Request {
         self.images.as_deref().unwrap_or_default()
     }
 
-    /// Project the unchanged JSON v1 schema without moving or cloning images.
+    /// Project the JSON v1 schema without moving or cloning images.
     /// `validate()` remains available with its original unit-result contract.
     pub fn validate_typed(&self) -> Result<ValidatedRequest<'_>> {
         self.validate()?;
@@ -226,6 +321,7 @@ impl Request {
                             timecodes: false,
                         },
                         automatic: self.auto.unwrap_or(false),
+                        auto_options: self.auto_options.as_ref(),
                     },
                 }
             }
@@ -258,9 +354,18 @@ impl Request {
                 || self.reference.is_some()
                 || self.timebase.is_some()
                 || self.loops.is_some()
-                || self.auto.is_some())
+                || self.auto.is_some()
+                || self.auto_options.is_some())
         {
             return Err("sequence fields require encode_multiframe".into());
+        }
+        if let Some(auto) = &self.auto_options {
+            if !self.auto.unwrap_or(false) {
+                return Err("auto_options require auto=true".into());
+            }
+            if auto.tile_size == 0 || auto.max_rectangles == 0 {
+                return Err("tile_size and max_rectangles must be positive".into());
+            }
         }
         if !matches!(
             self.operation,
@@ -425,5 +530,158 @@ impl Limits {
         } else {
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rs_jxl::multiframe::Reference;
+    use serde_json::json;
+
+    fn automatic(options: serde_json::Value) -> Request {
+        serde_json::from_value(json!({
+            "operation": "encode_multiframe",
+            "images": [{"length": 0}],
+            "auto": true,
+            "reference": "first",
+            "auto_options": options,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn auto_options_default_to_native_and_keep_outer_reference() {
+        let request = automatic(json!({}));
+        let ValidatedRequest::EncodeMultiframe { sequence, .. } = request.validate_typed().unwrap()
+        else {
+            panic!("expected multiframe");
+        };
+        let wire = sequence.auto_options.unwrap();
+        assert!(std::ptr::eq(wire, request.auto_options.as_ref().unwrap()));
+        let actual = wire.native(sequence.reference);
+        let default = rs_jxl::multiframe::AutoOptions::default();
+        assert_eq!(actual.reference, Reference::First);
+        assert_eq!(actual.allow_mask, default.allow_mask);
+        assert_eq!(actual.allow_multi_rect, default.allow_multi_rect);
+        assert_eq!(actual.tile_size, default.tile_size);
+        assert_eq!(actual.max_rectangles, default.max_rectangles);
+        assert_eq!(actual.prune, default.prune);
+        assert_eq!(actual.adaptive_rectangles, default.adaptive_rectangles);
+        assert_eq!(actual.max_frames, default.max_frames);
+        assert_eq!(actual.max_total_trials, default.max_total_trials);
+        assert_eq!(actual.max_trial_pixels, default.max_trial_pixels);
+        let omitted: Request = serde_json::from_value(json!({
+            "operation": "encode_multiframe", "images": [{"length": 0}], "auto": true,
+        }))
+        .unwrap();
+        assert!(omitted.auto_options.is_none());
+        omitted.validate().unwrap();
+        assert!(automatic(serde_json::Value::Null).auto_options.is_none());
+    }
+
+    #[test]
+    fn auto_options_forward_all_overrides_and_zero_budgets() {
+        let request = automatic(json!({
+            "allow_mask": false,
+            "allow_multi_rect": false,
+            "tile_size": 8,
+            "max_rectangles": 4097,
+            "prune": false,
+            "adaptive_rectangles": false,
+            "max_frames": 0,
+            "max_total_trials": 0,
+            "max_trial_pixels": 0,
+        }));
+        request.validate().unwrap();
+        let auto = request.auto_options.unwrap().native(Reference::Previous);
+        assert_eq!(auto.reference, Reference::Previous);
+        assert!(!auto.allow_mask && !auto.allow_multi_rect);
+        assert!(!auto.prune && !auto.adaptive_rectangles);
+        assert_eq!((auto.tile_size, auto.max_rectangles), (8, 4097));
+        assert_eq!(
+            (
+                auto.max_frames,
+                auto.max_total_trials,
+                auto.max_trial_pixels
+            ),
+            (0, 0, 0)
+        );
+    }
+
+    #[test]
+    fn auto_options_require_automatic_multiframe_and_positive_geometry() {
+        for operation in [
+            Operation::Encode,
+            Operation::AnalyzeMultiframe,
+            Operation::TranscodeJpeg,
+            Operation::ReconstructJpeg,
+            Operation::Decode,
+            Operation::DecodeToPng,
+            Operation::Info,
+            Operation::ReadImage,
+        ] {
+            let mut request = automatic(json!({}));
+            request.operation = operation;
+            request.auto = None;
+            request.reference = None;
+            assert!(request.validate().is_err());
+        }
+        for auto in [None, Some(false)] {
+            let mut request = automatic(json!({}));
+            request.auto = auto;
+            assert!(request.validate().is_err());
+        }
+        for field in ["tile_size", "max_rectangles"] {
+            assert!(automatic(json!({field: 0})).validate().is_err());
+        }
+    }
+
+    #[test]
+    fn auto_options_serde_rejects_unknown_duplicate_and_wrong_types() {
+        for options in [
+            r#"{"unknown":true}"#,
+            r#"{"reference":"first"}"#,
+            r#"{"prune":true,"prune":false}"#,
+            r#"{"max_frames":1,"max_frames":2}"#,
+            r#"[]"#,
+            r#"true"#,
+            r#"{"tile_size":4294967296}"#,
+            r#"{"max_trial_pixels":18446744073709551616}"#,
+        ] {
+            let request =
+                format!(r#"{{"operation":"encode_multiframe","auto_options":{options}}}"#);
+            assert!(
+                serde_json::from_str::<Request>(&request).is_err(),
+                "{options}"
+            );
+        }
+        for field in [
+            "allow_mask",
+            "allow_multi_rect",
+            "prune",
+            "adaptive_rectangles",
+        ] {
+            for value in [json!(0), json!(1), json!("true"), json!(null)] {
+                assert!(serde_json::from_value::<AutoOptions>(json!({field: value})).is_err());
+            }
+        }
+        for field in [
+            "tile_size",
+            "max_rectangles",
+            "max_frames",
+            "max_total_trials",
+            "max_trial_pixels",
+        ] {
+            for value in [json!(true), json!(-1), json!(1.5), json!("1"), json!(null)] {
+                assert!(serde_json::from_value::<AutoOptions>(json!({field: value})).is_err());
+            }
+        }
+        assert!(
+            serde_json::from_str::<Request>(
+                r#"{"operation":"encode_multiframe","auto_options":{},"auto_options":{}}"#,
+            )
+            .is_err()
+        );
     }
 }

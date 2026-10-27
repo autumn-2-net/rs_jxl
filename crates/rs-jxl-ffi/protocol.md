@@ -126,9 +126,11 @@ any results.
 
 ## Requests
 
-Unknown/inapplicable fields fail. Optional fields may be omitted or null.
+Unknown, duplicate and inapplicable fields fail. Optional fields may be omitted
+or null, except supplied members of `auto_options` must have their declared types.
 Top-level keys: operation (required), options (default {}), images (default []),
-durations, reference, timebase, loops, auto. Sequence keys only for encode_multiframe.
+durations, reference, timebase, loops, auto, auto_options. Sequence keys only for
+encode_multiframe.
 Operations: encode, encode_multiframe, analyze_multiframe, transcode_jpeg,
 reconstruct_jpeg, decode, decode_to_png, info, read_image.
 encode requires one image; multiframe requires nonempty images. Other operations
@@ -138,7 +140,42 @@ read_image is shared PNG/JPEG pixel input decoding.
 durations defaults to one tick per image; supplied length must equal image count,
 zeros remain zeros. reference=previous (full/previous/first/smallest_crop),
 timebase=[1000,1] (ticks per second numerator/denominator), loops=0, auto=false.
-encode_multiframe always sets animation metadata. auto uses existing search.
+encode_multiframe always sets animation metadata. auto uses the native automatic
+multiframe search, not still-image source-search.
+
+### Automatic Multiframe Options
+
+`auto_options` is a top-level object, not a member of `options`. It is accepted
+only for `operation="encode_multiframe"` with `auto=true`. Omission/null retains
+native defaults; an empty object explicitly requests those defaults and still
+requires `auto=true`. The outer `reference` remains authoritative; a nested
+`auto_options.reference` is rejected even if it agrees with the outer value.
+
+| Member | Type | Native Default |
+| --- | --- | --- |
+| `allow_mask` | boolean | true |
+| `allow_multi_rect` | boolean | true |
+| `tile_size` | positive u32 | 32 |
+| `max_rectangles` | positive usize | 32 |
+| `prune` | boolean | true |
+| `adaptive_rectangles` | boolean | true |
+| `max_frames` | nonnegative usize | usize::MAX |
+| `max_total_trials` | nonnegative usize | usize::MAX |
+| `max_trial_pixels` | nonnegative u64 | u64::MAX |
+
+Missing members are filled from Rust `multiframe::AutoOptions::default()`, not
+Python defaults. Serde rejects unknown/duplicate members, null member values,
+numeric booleans, fractional/string integers and values outside native ranges.
+Geometry must be positive even if rectangle candidates are disabled. Zero work
+budgets are valid requests that explicitly fail when work exceeds them; they do
+not mean unlimited. These controls add no new limits to the codec.
+
+`prune` stops a candidate only when a proven byte lower bound cannot win under
+the canonical tie rule; it does not remove existing eligible candidates using
+an estimate. `adaptive_rectangles` permits additional `MergedPrevious` and
+`MergedFirst` proposals when multi-rectangle candidates are enabled. Their cost
+estimate proposes geometry only; selection still uses actual completed encodes.
+All difference analysis, candidate generation, pruning and selection run in Rust.
 
 ImageSpec: {format:"pixels",offset:0,length,width,height,channels,dtype,
 bits_per_sample?,exponent_bits_per_sample?,extra_channels:[],icc?,
@@ -188,6 +225,37 @@ metadata byte budget; use max_input_bytes instead.
 
 Encode/JPEG/PNG: data holds file bytes, JSON {operation,bytes,...}. Encoded JPEG
 pixel input reports jpeg_input:true and is NOT byte-reversible transcoding.
+
+Automatic multiframe JSON includes `frames`, one entry per logical input:
+
+- `index`: zero-based logical input index.
+- `winner_index`: zero-based index into `candidates`, never into `pruned` or an
+  execution-order list. Completed candidates retain canonical order, even when
+  cheap candidates execute first. The new Merged candidates follow all legacy
+  candidates, preserving existing equal-byte preferences.
+- `candidates`: completed trials only, each with `strategy`, `encoded_bytes`,
+  `encoded_frames`, `trial_pixels`, `elapsed_seconds`. Byte counts are actual
+  layer sizes including headers/private patch frames, excluding shared
+  image/container headers. Layer counts exclude private reference-only frames.
+- `pruned`: separate records with `strategy`, `lower_bound`, `encoded_frames`,
+  `planned_frames`, `trial_pixels`, `elapsed_seconds`. `lower_bound` is a proven
+  byte bound, never an actual size or an `encoded_bytes` field. `encoded_frames`
+  counts only fully finished regular layers, not a partially encoded layer;
+  `planned_frames` is the candidate's total planned regular-layer count.
+- `analysis_seconds`: native elapsed difference/planning time for this input.
+- `differences`: native `{reference,changed_pixels,bounds}` entries for analyzed
+  references. `reference` is a zero-based logical input index, not a JXL reference
+  slot. `bounds` is null for no differences, otherwise `{x,y,width,height}`.
+
+All time fields above are native `Duration::as_secs_f64()` seconds, not Python
+wall-clock measurements. `trial_pixels` counts pixel areas submitted to trial
+encoding, including work for an interrupted layer, not analysis scans or just
+the winner. An empty difference list means no reference analysis was needed;
+it does not assert that the frame equals another frame. Strategies use Rust
+Debug names, including `MergedPrevious`/`MergedFirst`. With `prune=false`, all
+eligible trials complete or the operation fails; `pruned` is empty. No throughput
+or compressed-size improvement is claimed by these report additions.
+
 Decode/read_image: top metadata plus frames:[{index,width,height,channels,dtype,
 offset,length,duration,name,complete,extra_channels:[...],header:{...}}].
 Main data is interleaved; extras are packed planes with offset,length,width,

@@ -323,6 +323,103 @@ fn automatic_byte_selected_layers_match_official_decoders() {
     );
 }
 
+#[test]
+#[ignore = "requires RS_JXL_DJXL; new merged rectangles must actually win"]
+fn merged_rectangles_match_official_decoders() {
+    use rs_jxl::multiframe::{AutoOptions, Strategy, encode_auto};
+    let decoders = decoder_paths();
+    let scratch = ScratchDir::new();
+    for bits in [8, 16] {
+        let (width, height) = (129usize, 97usize);
+        let mut state = 0x1234_5678u32;
+        let base: Vec<u16> = (0..width * height)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                (state & ((1 << bits) - 1)) as u16
+            })
+            .collect();
+        let mut changed = base.clone();
+        for (left, top) in [(3, 3), (110, 78)] {
+            for y in 0..3 {
+                for x in 0..3 {
+                    changed[(top + y * 4) * width + left + x * 4] ^= 0x55;
+                }
+            }
+        }
+        let images: Vec<_> = [base, changed]
+            .into_iter()
+            .map(|values| {
+                let pixels = if bits == 8 {
+                    PixelData::U8(values.into_iter().map(|v| v as u8).collect())
+                } else {
+                    PixelData::U16(values)
+                };
+                let image =
+                    Image::new(width as u32, height as u32, PixelLayout::Gray, pixels).unwrap();
+                let mut metadata = image.metadata().clone();
+                metadata.animation = Some(Animation::default());
+                image.with_metadata(metadata, vec![]).unwrap()
+            })
+            .collect();
+        for durations in [[1, 2], [0, 0]] {
+            let frames: Vec<_> = images
+                .iter()
+                .zip(durations)
+                .map(|(image, duration)| Frame {
+                    image,
+                    options: FrameOptions {
+                        duration,
+                        ..Default::default()
+                    },
+                })
+                .collect();
+            let full_path = scratch.0.join("merged-full.jxl");
+            fs::write(
+                &full_path,
+                rs_jxl::encode_frames(&images[0], &frames, &options()).unwrap(),
+            )
+            .unwrap();
+            for reference in [Reference::Previous, Reference::First] {
+                let result = encode_auto(
+                    &images,
+                    &durations,
+                    &options(),
+                    &AutoOptions {
+                        reference,
+                        tile_size: 4,
+                        max_rectangles: 2,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                let report = &result.frames[1];
+                let winner = &report.candidates[report.winner_index];
+                assert!(matches!(
+                    winner.strategy,
+                    Strategy::MergedPrevious | Strategy::MergedFirst
+                ));
+                assert_eq!(winner.encoded_frames, 2);
+                let path = scratch.0.join("merged.jxl");
+                fs::write(&path, result.bytes).unwrap();
+                let visible = if durations[0] == 0 {
+                    vec![1]
+                } else {
+                    vec![0, 1]
+                };
+                for decoder in &decoders {
+                    let context = format!("merged {bits} {durations:?} {reference:?}");
+                    let expected = decode(decoder, &full_path, &scratch, &context);
+                    let actual = decode(decoder, &path, &scratch, &context);
+                    assert_decoded_equal(&actual, &expected, &context);
+                    assert_original_colors(&actual, &images, &visible, &context);
+                }
+            }
+        }
+    }
+}
+
 fn assert_full_plan(images: &[Image], durations: &[u32], plan: &[PlannedFrame<'_>]) {
     assert_eq!(plan.len(), images.len());
     for (i, planned) in plan.iter().enumerate() {

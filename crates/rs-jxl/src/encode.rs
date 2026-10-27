@@ -600,14 +600,15 @@ fn encode_frame_trial(
                 patches,
             )?
         } else {
-            (
-                if single {
-                    Vec::new()
-                } else {
-                    modular::empty_global(options.max_output_bytes, patches)?
-                },
-                execution::try_map(&groups, |_, group| job(group))?,
-            )
+            let global = if single {
+                Vec::new()
+            } else {
+                modular::empty_global(options.max_output_bytes, patches)?
+            };
+            let global = complete_or_return!(budget::section(budget, || Ok(global)));
+            let encoded =
+                complete_or_return!(budget::sections(budget, &groups, |_, group| job(group)));
+            (global, encoded)
         };
         let mut sections = Vec::new();
         if !single {

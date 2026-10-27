@@ -81,9 +81,12 @@ value per input. Zero ticks mean a non-display layer, not a one-tick substitute.
 Automatic selection measures encoded bytes, not elapsed time. --reference auto \
 permits previous and first references. Mask and multi-rectangle candidates are \
 enabled by default when lossless and compatible. These are multiframe strategies, \
-not source-search or an effort mapping. Manual tool options and --threads apply.\n\
+not source-search or an effort mapping. Proven-bound pruning and adaptive rectangle \
+proposals are enabled by default; --no-prune and --no-adaptive-rectangles disable \
+them independently. Manual tool options and --threads apply.\n\
 No extra CLI input, decoded-sample or retained-sequence byte cap is imposed. \
-Frame, trial and trial-pixel budgets are unlimited unless explicitly supplied. \
+Frame, trial and trial-pixel budgets are unlimited unless explicitly supplied; \
+zero budgets explicitly refuse work. \
 Format bounds, size-overflow checks and allocation failures still apply; errors \
 do not silently disable tools or discard frames.\n\
 Use '-' for at most one input from stdin, or -o - for binary stdout. Candidate \
@@ -125,6 +128,12 @@ pub(crate) struct EncodeFramesArgs {
     /// Disable the safe multi-rectangle candidate
     #[arg(long)]
     no_multi_rect: bool,
+    /// Disable proven-bound pruning; complete every eligible candidate
+    #[arg(long)]
+    no_prune: bool,
+    /// Disable additional cost-guided rectangle proposals; retain tile candidates
+    #[arg(long)]
+    no_adaptive_rectangles: bool,
     /// Tile side length for multi-rectangle planning
     #[arg(long, default_value_t = AutoOptions::default().tile_size, value_parser = clap::value_parser!(u32).range(1..), value_name = "PIXELS")]
     tile_size: u32,
@@ -132,13 +141,13 @@ pub(crate) struct EncodeFramesArgs {
     #[arg(long, default_value_t = AutoOptions::default().max_rectangles, value_parser = positive_usize, value_name = "N")]
     max_rectangles: usize,
     /// Logical input frame budget (omitted: unlimited; generated layers not counted)
-    #[arg(long, default_value_t = AutoOptions::default().max_frames, hide_default_value = true, value_parser = positive_usize, value_name = "N")]
+    #[arg(long, default_value_t = AutoOptions::default().max_frames, hide_default_value = true, value_name = "N")]
     max_frames: usize,
     /// Hard total trial-encode budget (omitted: unlimited)
-    #[arg(long, default_value_t = AutoOptions::default().max_total_trials, hide_default_value = true, value_parser = positive_usize, value_name = "N")]
+    #[arg(long, default_value_t = AutoOptions::default().max_total_trials, hide_default_value = true, value_name = "N")]
     max_total_trials: usize,
     /// Hard trial-pixel budget (omitted: unlimited)
-    #[arg(long, default_value_t = AutoOptions::default().max_trial_pixels, hide_default_value = true, value_parser = clap::value_parser!(u64).range(1..), value_name = "N")]
+    #[arg(long, default_value_t = AutoOptions::default().max_trial_pixels, hide_default_value = true, value_name = "N")]
     max_trial_pixels: u64,
     /// Encoder worker count (1..=256)
     #[arg(long, default_value = "1", value_parser = parse_threads, value_name = "N")]
@@ -157,6 +166,8 @@ impl EncodeFramesArgs {
             reference: self.reference.core(),
             allow_mask: !self.no_mask,
             allow_multi_rect: !self.no_multi_rect,
+            prune: !self.no_prune,
+            adaptive_rectangles: !self.no_adaptive_rectangles,
             tile_size: self.tile_size,
             max_rectangles: self.max_rectangles,
             max_frames: self.max_frames,
@@ -307,24 +318,46 @@ fn write_report(mut output: impl Write, result: &AutoEncodeResult) -> std::io::R
     for (frame_index, frame) in result.frames.iter().enumerate() {
         writeln!(
             output,
-            "frame {}: winner={} candidates={}",
+            "frame {}: winner={} candidates={} pruned={} analysis_elapsed={:?}",
             frame_index + 1,
             frame.winner_index,
-            frame.candidates.len()
+            frame.candidates.len(),
+            frame.pruned.len(),
+            frame.analysis_elapsed
         )?;
+        for difference in &frame.differences {
+            writeln!(
+                output,
+                "  difference reference={} changed_pixels={} bounds={:?}",
+                difference.reference, difference.changed_pixels, difference.bounds,
+            )?;
+        }
         for (index, candidate) in frame.candidates.iter().enumerate() {
             writeln!(
                 output,
-                "  candidate={index} strategy={:?} encoded_bytes={} encoded_frames={} elapsed={:?}{}",
+                "  candidate={index} strategy={:?} encoded_bytes={} encoded_frames={} trial_pixels={} elapsed={:?}{}",
                 candidate.strategy,
                 candidate.encoded_bytes,
                 candidate.encoded_frames,
+                candidate.trial_pixels,
                 candidate.elapsed,
                 if index == frame.winner_index {
                     " winner"
                 } else {
                     ""
                 }
+            )?;
+        }
+        for (index, candidate) in frame.pruned.iter().enumerate() {
+            writeln!(
+                output,
+                "  pruned={index} strategy={:?} lower_bound={} encoded_frames={} planned_frames={} trial_pixels={} elapsed={:?}",
+                candidate.strategy,
+                candidate.lower_bound,
+                candidate.encoded_frames,
+                candidate.planned_frames,
+                candidate.trial_pixels,
+                candidate.elapsed,
             )?;
         }
     }
@@ -404,6 +437,11 @@ mod tests {
         let auto = args.auto_options();
         assert_eq!(auto.reference, Reference::SmallestCrop);
         assert!(auto.allow_mask && auto.allow_multi_rect);
+        assert_eq!(auto.prune, AutoOptions::default().prune);
+        assert_eq!(
+            auto.adaptive_rectangles,
+            AutoOptions::default().adaptive_rectangles
+        );
         assert_eq!(auto.tile_size, AutoOptions::default().tile_size);
         assert_eq!(auto.max_rectangles, AutoOptions::default().max_rectangles);
         assert_eq!(auto.max_frames, usize::MAX);
@@ -445,6 +483,8 @@ mod tests {
             "2",
             "--no-mask",
             "--no-multi-rect",
+            "--no-prune",
+            "--no-adaptive-rectangles",
             "--tile-size",
             "8",
             "--max-rectangles",
@@ -474,6 +514,7 @@ mod tests {
         );
         let auto = args.auto_options();
         assert!(!auto.allow_mask && !auto.allow_multi_rect);
+        assert!(!auto.prune && !auto.adaptive_rectangles);
         assert_eq!(
             (auto.tile_size, auto.max_rectangles, auto.max_frames),
             (8, 7, 100)
@@ -495,6 +536,27 @@ mod tests {
                 reference
             );
         }
+    }
+
+    #[test]
+    fn pruning_and_adaptive_controls_are_independent_and_budgets_accept_zero() {
+        let auto = parse(&["--no-prune"]).auto_options();
+        assert!(!auto.prune && auto.adaptive_rectangles && auto.allow_multi_rect);
+        let auto = parse(&["--no-adaptive-rectangles"]).auto_options();
+        assert!(auto.prune && !auto.adaptive_rectangles && auto.allow_multi_rect);
+        let args = parse(&[
+            "--max-frames",
+            "0",
+            "--max-total-trials",
+            "0",
+            "--max-trial-pixels",
+            "0",
+        ]);
+        let auto = args.auto_options();
+        assert_eq!(auto.max_frames, 0);
+        assert_eq!(auto.max_total_trials, 0);
+        assert_eq!(auto.max_trial_pixels, 0);
+        assert!(args.check_paths().is_err());
     }
 
     #[test]
@@ -546,9 +608,9 @@ mod tests {
         for extra in [
             vec!["--tile-size", "0"],
             vec!["--max-rectangles", "0"],
-            vec!["--max-frames", "0"],
-            vec!["--max-total-trials", "0"],
-            vec!["--max-trial-pixels", "0"],
+            vec!["--max-frames", "-1"],
+            vec!["--max-total-trials", "-1"],
+            vec!["--max-trial-pixels", "-1"],
             vec!["--threads", "257"],
             vec!["--duration", "4294967296"],
             vec!["--durations", "1,,2"],
@@ -642,7 +704,9 @@ mod tests {
 
     #[test]
     fn report_uses_actual_candidate_statistics_and_core_winner() {
-        use rs_jxl::multiframe::{AutoCandidateReport, AutoFrameReport, Strategy};
+        use rs_jxl::multiframe::{
+            AutoCandidateReport, AutoDiffReport, AutoFrameReport, AutoPrunedReport, Strategy,
+        };
         use std::time::Duration;
 
         let result = AutoEncodeResult {
@@ -654,25 +718,53 @@ mod tests {
                         strategy: Strategy::Full,
                         encoded_bytes: 100,
                         encoded_frames: 1,
+                        trial_pixels: 100,
                         elapsed: Duration::from_secs(1),
                     },
                     AutoCandidateReport {
                         strategy: Strategy::CropPrevious,
                         encoded_bytes: 70,
                         encoded_frames: 2,
+                        trial_pixels: 50,
                         elapsed: Duration::from_secs(3),
                     },
                 ],
+                pruned: vec![AutoPrunedReport {
+                    strategy: Strategy::MergedPrevious,
+                    lower_bound: 80,
+                    encoded_frames: 1,
+                    planned_frames: 3,
+                    trial_pixels: 40,
+                    elapsed: Duration::from_millis(500),
+                }],
+                analysis_elapsed: Duration::from_millis(250),
+                differences: vec![AutoDiffReport {
+                    reference: 0,
+                    changed_pixels: 0,
+                    bounds: None,
+                }],
             }],
         };
         let mut report = Vec::new();
         write_report(&mut report, &result).unwrap();
         let report = String::from_utf8(report).unwrap();
-        assert!(report.contains("frame 1: winner=1 candidates=2"));
-        assert!(report.contains("strategy=Full encoded_bytes=100 encoded_frames=1 elapsed=1s\n"));
+        assert!(report.contains("frame 1: winner=1 candidates=2 pruned=1 analysis_elapsed=250ms"));
+        assert!(report.contains("difference reference=0 changed_pixels=0 bounds=None"));
         assert!(report.contains(
-            "strategy=CropPrevious encoded_bytes=70 encoded_frames=2 elapsed=3s winner\n"
+            "strategy=Full encoded_bytes=100 encoded_frames=1 trial_pixels=100 elapsed=1s\n"
         ));
+        assert!(report.contains(
+            "strategy=CropPrevious encoded_bytes=70 encoded_frames=2 trial_pixels=50 elapsed=3s winner\n"
+        ));
+        let pruned = report
+            .lines()
+            .find(|line| line.contains("pruned=0 "))
+            .unwrap();
+        assert_eq!(
+            pruned,
+            "  pruned=0 strategy=MergedPrevious lower_bound=80 encoded_frames=1 planned_frames=3 trial_pixels=40 elapsed=500ms"
+        );
+        assert!(!pruned.contains("encoded_bytes=") && !pruned.contains("winner"));
         assert!(report.contains("sequence: inputs=1 output_bytes=123"));
     }
 

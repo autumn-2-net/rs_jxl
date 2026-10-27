@@ -14,6 +14,7 @@ For an already-built binary:
 rs-jxl encode-frames frame000.png frame001.png frame002.png -o animation.jxl --durations 1,2,1 --tps 30000/1001 --loops 2 --threads 4
 rs-jxl encode-frames first.png second.png -o animation.jxl --reference previous --no-mask --no-multi-rect --rct 0 --predictor 0
 rs-jxl encode-frames first.png second.png -o animation.jxl --tile-size 16 --max-rectangles 32
+rs-jxl encode-frames first.png second.png -o animation.jxl --no-prune --no-adaptive-rectangles
 ```
 
 ## Ordering And Timing
@@ -49,23 +50,48 @@ where the core can preserve samples and metadata exactly:
   existing opaque integer gray-alpha/RGBA image with exactly one alpha channel;
   it does not insert alpha, reinterpret partial transparency or discard hidden
   color samples. Eligibility remains the core encoder's decision.
-- `--no-multi-rect` disables multi-rectangle candidates. Intermediate rectangles
-  have zero duration; the final rectangle carries the input duration.
+- `--no-multi-rect` disables both tile and adaptive multi-rectangle candidates.
+  Intermediate rectangles have zero duration; the final rectangle carries the
+  input duration.
+- `--no-prune` disables proven-bound pruning. All eligible trials then complete
+  or the command fails explicitly on an error. By default, inexpensive candidates
+  may execute first; a candidate stops only when a provable byte lower bound
+  cannot win under the canonical tie rule. Estimates cannot remove old candidates.
+- `--no-adaptive-rectangles` disables the additional `MergedPrevious`/`MergedFirst`
+  proposals, retaining legacy tile candidates. The estimate uses the initial full
+  frame's measured bytes per pixel only to propose rectangles; actual encoded
+  bytes select the winner. This control is independent of pruning.
 - `--tile-size PIXELS` defaults to 32 and must be positive.
-- `--max-rectangles N` defaults to 32 and accepts `1..=4096`.
+- `--max-rectangles N` defaults to 32 and accepts positive native `usize` values,
+  with no extra 4096 cap. Geometry is validated even if candidates are disabled.
 
 Candidate reports identify each logical input frame (one-based), the winner
-index and all evaluated candidates (zero-based). Each candidate reports its
-strategy via Rust `Debug`, actual `encoded_bytes`, `encoded_frames` and measured
-`elapsed`. Bytes include layer headers and private patch atlas bytes; frame
-counts refer to regular layers, excluding private reference-only patch frames.
+index, completed candidate count, pruned count and native `analysis_elapsed`.
+The zero-based winner index addresses completed candidates in canonical order,
+not execution order. New Merged candidates follow all legacy candidates to keep
+existing equal-byte preferences. `candidate=N` lines report strategy via Rust
+`Debug`, actual `encoded_bytes`, `encoded_frames`, `trial_pixels` and measured
+`elapsed`. Bytes include layer headers and private patch atlas bytes; frame counts
+refer to regular layers, excluding private reference-only patch frames.
+
+Separate `pruned=N` lines report strategy, proven `lower_bound`, `encoded_frames`,
+`planned_frames`, `trial_pixels` and `elapsed`. They never report `encoded_bytes`
+or claim to be winners. `encoded_frames` counts fully finished regular layers,
+excluding a partially encoded layer; `planned_frames` is the total planned layer
+count. Trial pixels include areas submitted for interrupted layers, not analysis
+scans. `difference` lines expose native zero-based input `reference`, exact
+`changed_pixels` and `bounds` (`None` for no changes); reference indices are not
+JXL reference-slot numbers. No reference analysis gives no difference lines.
+All timings and difference statistics come from Rust, without adapter analysis.
+
 The final line gives the complete output byte count, including shared headers
 and any container overhead. Candidate byte counts are not standalone JXL sizes.
 
 Selection minimizes encoded bytes, not time; ties and candidate eligibility
 follow the core API. This is a per-input local minimum among eligible trials,
 not a proof of globally optimal compression. No synthetic effort or timing
-estimate is reported.
+estimate is reported. With sufficient budgets, pruning preserves the winner for
+the same eligible set. No performance or compression improvement is claimed yet.
 
 The existing manual `Tools` flags (for example `--rct`, `--predictor`,
 `--entropy`, `--lz77`, palette and squeeze options) and `--threads 1..=256` are
@@ -100,24 +126,25 @@ The existing input policy is unchanged:
 
 ## Limits And Publication
 
-Existing per-input limits remain: 512 MiB encoded bytes, 16,384 pixels per
-dimension, 64,000,000 pixels and 512 MiB decoded samples. Retained sequence
-sample buffers plus ICC profiles are additionally capped at 512 MiB. This is
-not a total process-memory limit: input decoding, metadata attachment, encoder
-scratch space and candidate/output storage also consume memory.
+No additional CLI input-byte, decoded-sample or retained-sequence byte cap is
+imposed. Format bounds, checked size arithmetic, allocation failures and existing
+codec limits still apply. Work budgets are not total process-memory limits:
+input decoding, metadata attachment, analysis, encoder scratch and retained
+candidate/output storage also consume memory.
 
 Core defaults are used directly for:
 
 | Option | Current Default | Scope |
 | --- | ---: | --- |
-| `--max-frames` | 10000 | Logical inputs, not generated layers |
-| `--max-total-trials` | 100000 | Candidate trials across the sequence |
-| `--max-trial-pixels` | 4000000000 | Sum of pixel areas submitted across trials |
+| `--max-frames` | usize::MAX (unlimited) | Logical inputs, not generated layers |
+| `--max-total-trials` | usize::MAX (unlimited) | Candidate trials across the sequence |
+| `--max-trial-pixels` | u64::MAX (unlimited) | Sum of pixel areas submitted across trials |
 
-These overrides must be positive. Resource exhaustion is an error; there is no
+These overrides accept zero, explicitly refusing work rather than meaning
+unlimited. Geometry controls remain positive. Resource exhaustion is an error; there is no
 silent frame dropping, strategy downgrade or partial output. Core output and
 pixel limits still apply. Check `encode-frames --help` for defaults if the core
-configuration changes.
+configuration changes. These changes add no new codec limits.
 
 The output is checked against every input before decoding and again before
 publication, using the existing path/alias checks. Existing files require
@@ -128,6 +155,14 @@ is written only after encoding succeeds, but stdout itself cannot be rolled back
 after an I/O failure.
 
 ## Verification
+
+On 2026-10-27 the release CLI built successfully, and all 79 non-ignored CLI
+tests passed, including the new pruning/adaptive controls and separate
+completed/pruned reporting. Two unrelated opt-in CLI tests were not run.
+The core also passed independent official djxl 0.12/0.13 checks, including
+actual merged-rectangle winners. Native logic and acceptance details are in
+[MULTIFRAME_AUTO.md](MULTIFRAME_AUTO.md); real-image tradeoffs are in
+[MULTIFRAME_NATIVE_BENCHMARK.md](MULTIFRAME_NATIVE_BENCHMARK.md).
 
 Unit tests live in `crates/rs-jxl-cli/src/multiframe.rs`. They cover CLI/default
 mapping, timing and limits, absent effort/search modes, metadata/storage/alpha

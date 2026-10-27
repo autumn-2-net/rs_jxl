@@ -248,7 +248,7 @@ fn streaming_bound_skips_next_area_preparation_and_remaining_local_encodes() {
 }
 
 #[test]
-fn collapsed_frames_and_legacy_nonlayout_route_remain_complete() {
+fn collapsed_frames_remain_complete_and_nonlayout_independent_groups_can_prune() {
     for shared in [false, true] {
         let image = gray(17, 3);
         let options = options(shared, false);
@@ -267,10 +267,20 @@ fn collapsed_frames_and_legacy_nonlayout_route_remain_complete() {
         let image = gray(257, 3);
         let mut legacy = options;
         legacy.modular.palette_policy = None;
-        assert!(matches!(
-            encode::encode_trial_serial(&image, &legacy, Some(1)).unwrap(),
-            TrialEncode::Complete(_)
-        ));
+        let bounded = encode::encode_trial_serial(&image, &legacy, Some(1)).unwrap();
+        if shared {
+            assert!(matches!(bounded, TrialEncode::Complete(_)));
+        } else {
+            assert!(matches!(bounded, TrialEncode::Bounded { lower_bound: 1 }));
+        }
+        let full = encode::encode_serial(&image, &legacy).unwrap();
+        let complete = encode::encode_trial_serial(&image, &legacy, Some(full.len() + 1))
+            .unwrap()
+            .into_complete()
+            .unwrap();
+        assert_eq!(complete.len(), full.len());
+        let decoded = crate::decode::decode(&complete, &Default::default()).unwrap();
+        assert_eq!(&decoded.frames[0].pixels, image.pixels());
     }
 }
 

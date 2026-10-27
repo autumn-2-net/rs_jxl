@@ -125,6 +125,55 @@ fn rect(rect: Option<multiframe::Rect>) -> Value {
     })
 }
 
+fn auto_frame_report(index: usize, frame: &multiframe::AutoFrameReport) -> Value {
+    let candidates: Vec<_> = frame
+        .candidates
+        .iter()
+        .map(|candidate| {
+            json!({
+                "strategy": format!("{:?}", candidate.strategy),
+                "encoded_bytes": candidate.encoded_bytes,
+                "encoded_frames": candidate.encoded_frames,
+                "trial_pixels": candidate.trial_pixels,
+                "elapsed_seconds": candidate.elapsed.as_secs_f64(),
+            })
+        })
+        .collect();
+    let pruned: Vec<_> = frame
+        .pruned
+        .iter()
+        .map(|candidate| {
+            json!({
+                "strategy": format!("{:?}", candidate.strategy),
+                "lower_bound": candidate.lower_bound,
+                "encoded_frames": candidate.encoded_frames,
+                "planned_frames": candidate.planned_frames,
+                "trial_pixels": candidate.trial_pixels,
+                "elapsed_seconds": candidate.elapsed.as_secs_f64(),
+            })
+        })
+        .collect();
+    let differences: Vec<_> = frame
+        .differences
+        .iter()
+        .map(|difference| {
+            json!({
+                "reference": difference.reference,
+                "changed_pixels": difference.changed_pixels,
+                "bounds": rect(difference.bounds),
+            })
+        })
+        .collect();
+    json!({
+        "index": index,
+        "winner_index": frame.winner_index,
+        "candidates": candidates,
+        "pruned": pruned,
+        "analysis_seconds": frame.analysis_elapsed.as_secs_f64(),
+        "differences": differences,
+    })
+}
+
 pub fn execute(request: &Request, data: &[u8]) -> Result<(Value, Vec<u8>)> {
     execute_with_context(request, data, None)
 }
@@ -228,39 +277,21 @@ pub fn execute_with_context(
         }
     };
     let bytes = if request.auto.unwrap_or(false) {
+        let auto = request.auto_options.as_ref().map_or_else(
+            || multiframe::AutoOptions {
+                reference: reference(request),
+                ..Default::default()
+            },
+            |auto| auto.native(reference(request)),
+        );
         let result = encoder
-            .encode_auto(
-                &images,
-                &durations,
-                &options,
-                &multiframe::AutoOptions {
-                    reference: reference(request),
-                    ..Default::default()
-                },
-            )
+            .encode_auto(&images, &durations, &options, &auto)
             .map_err(message)?;
         let frames: Vec<_> = result
             .frames
             .iter()
             .enumerate()
-            .map(|(index, frame)| {
-                let candidates: Vec<_> = frame
-                    .candidates
-                    .iter()
-                    .map(|candidate| {
-                        json!({
-                            "strategy": format!("{:?}", candidate.strategy),
-                            "encoded_bytes": candidate.encoded_bytes,
-                            "encoded_frames": candidate.encoded_frames,
-                        })
-                    })
-                    .collect();
-                json!({
-                    "index": index,
-                    "winner_index": frame.winner_index,
-                    "candidates": candidates,
-                })
-            })
+            .map(|(index, frame)| auto_frame_report(index, frame))
             .collect();
         report["frames"] = json!(frames);
         result.bytes
@@ -353,4 +384,75 @@ pub fn transcode_with_context(
         }),
         result.bytes,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use multiframe::{
+        AutoCandidateReport, AutoDiffReport, AutoFrameReport, AutoPrunedReport, Strategy,
+    };
+    use std::time::Duration;
+
+    #[test]
+    fn auto_report_keeps_native_statistics_and_separates_pruned_bounds() {
+        let frame = AutoFrameReport {
+            winner_index: 0,
+            candidates: vec![AutoCandidateReport {
+                strategy: Strategy::Full,
+                encoded_bytes: 80,
+                encoded_frames: 1,
+                trial_pixels: 100,
+                elapsed: Duration::from_millis(125),
+            }],
+            pruned: vec![AutoPrunedReport {
+                strategy: Strategy::MergedFirst,
+                lower_bound: 90,
+                encoded_frames: 1,
+                planned_frames: 3,
+                trial_pixels: 30,
+                elapsed: Duration::from_millis(250),
+            }],
+            analysis_elapsed: Duration::from_millis(500),
+            differences: vec![
+                AutoDiffReport {
+                    reference: 0,
+                    changed_pixels: 0,
+                    bounds: None,
+                },
+                AutoDiffReport {
+                    reference: 1,
+                    changed_pixels: 2,
+                    bounds: Some(multiframe::Rect {
+                        x: 3,
+                        y: 4,
+                        width: 5,
+                        height: 6,
+                    }),
+                },
+            ],
+        };
+        assert_eq!(
+            auto_frame_report(2, &frame),
+            json!({
+                "index": 2,
+                "winner_index": 0,
+                "candidates": [{
+                    "strategy": "Full", "encoded_bytes": 80, "encoded_frames": 1,
+                    "trial_pixels": 100, "elapsed_seconds": 0.125,
+                }],
+                "pruned": [{
+                    "strategy": "MergedFirst", "lower_bound": 90,
+                    "encoded_frames": 1, "planned_frames": 3,
+                    "trial_pixels": 30, "elapsed_seconds": 0.25,
+                }],
+                "analysis_seconds": 0.5,
+                "differences": [
+                    {"reference": 0, "changed_pixels": 0, "bounds": null},
+                    {"reference": 1, "changed_pixels": 2,
+                     "bounds": {"x": 3, "y": 4, "width": 5, "height": 6}},
+                ],
+            })
+        );
+    }
 }

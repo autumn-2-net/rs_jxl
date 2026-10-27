@@ -198,6 +198,7 @@ fn zero_duration_extra_only_states_preserve_reference_slots() {
             &AutoOptions {
                 reference,
                 tile_size: 16,
+                adaptive_rectangles: false,
                 ..Default::default()
             },
             1,
@@ -226,7 +227,10 @@ fn zero_duration_extra_only_states_preserve_reference_slots() {
             let winner = &report.candidates[report.winner_index];
             let source = match winner.strategy {
                 Strategy::Full => 0,
-                Strategy::CropFirst | Strategy::MaskFirst | Strategy::TilesFirst => 1,
+                Strategy::CropFirst
+                | Strategy::MaskFirst
+                | Strategy::TilesFirst
+                | Strategy::MergedFirst => 1,
                 _ if index == 1 => 1,
                 _ => 2,
             };
@@ -297,6 +301,7 @@ fn opaque_masks_preserve_unequal_color_and_alpha_depths() {
             &AutoOptions {
                 reference: Reference::Previous,
                 allow_multi_rect: false,
+                adaptive_rectangles: false,
                 ..Default::default()
             },
         )
@@ -354,6 +359,7 @@ fn exact_input_output_and_trial_budget_boundaries() {
     let auto = AutoOptions {
         allow_mask: false,
         allow_multi_rect: false,
+        adaptive_rectangles: false,
         max_frames: 3,
         max_total_trials: 6,
         max_trial_pixels: 48,
@@ -368,9 +374,20 @@ fn exact_input_output_and_trial_budget_boundaries() {
         result
             .frames
             .iter()
-            .map(|f| f.candidates.len())
+            .map(|f| f.candidates.len() + f.pruned.len())
             .collect::<Vec<_>>(),
         [1, 2, 3]
+    );
+    assert_eq!(
+        result
+            .frames
+            .iter()
+            .map(|f| {
+                f.candidates.iter().map(|c| c.trial_pixels).sum::<u64>()
+                    + f.pruned.iter().map(|c| c.trial_pixels).sum::<u64>()
+            })
+            .sum::<u64>(),
+        48
     );
     assert_eq!(&result.bytes[..12], b"\0\0\0\x0cJXL \x0d\x0a\x87\x0a");
     let bounded = EncodeOptions {
@@ -432,6 +449,7 @@ fn scattered_changes_select_multiple_replace_layers() {
     let images = sequence(PixelLayout::Rgba, 8, true);
     let auto = AutoOptions {
         tile_size: 16,
+        adaptive_rectangles: false,
         ..Default::default()
     };
     let result = encode_auto(&images, &[1; 4], &EncodeOptions::default(), &auto).unwrap();
@@ -451,7 +469,9 @@ fn scattered_changes_select_multiple_replace_layers() {
         !second
             .candidates
             .iter()
-            .any(|c| matches!(c.strategy, Strategy::MaskPrevious | Strategy::MaskFirst))
+            .map(|c| c.strategy)
+            .chain(second.pruned.iter().map(|c| c.strategy))
+            .any(|strategy| matches!(strategy, Strategy::MaskPrevious | Strategy::MaskFirst))
     );
     verify(&images, &[1; 4], &auto, 1);
 }
@@ -463,6 +483,7 @@ fn binary_mask_is_tested_only_for_opaque_existing_alpha() {
             let images = sequence(layout, bits, false);
             let auto = AutoOptions {
                 allow_multi_rect: false,
+                adaptive_rectangles: false,
                 ..Default::default()
             };
             let result = encode_auto(&images, &[1; 4], &EncodeOptions::default(), &auto).unwrap();
@@ -485,13 +506,11 @@ fn binary_mask_is_tested_only_for_opaque_existing_alpha() {
 #[test]
 fn first_reference_and_identical_frames_remain_available() {
     let images = sequence(PixelLayout::Rgb, 16, false);
-    let result = encode_auto(
-        &images,
-        &[1; 4],
-        &EncodeOptions::default(),
-        &AutoOptions::default(),
-    )
-    .unwrap();
+    let auto = AutoOptions {
+        adaptive_rectangles: false,
+        ..Default::default()
+    };
+    let result = encode_auto(&images, &[1; 4], &EncodeOptions::default(), &auto).unwrap();
     let last = result.frames.last().unwrap();
     assert_eq!(
         last.candidates[last.winner_index].strategy,
@@ -502,7 +521,7 @@ fn first_reference_and_identical_frames_remain_available() {
         same.candidates[same.winner_index].strategy,
         Strategy::CropPrevious
     );
-    verify(&images, &[1; 4], &AutoOptions::default(), 1);
+    verify(&images, &[1; 4], &auto, 1);
 }
 
 #[test]
@@ -546,7 +565,12 @@ fn planar_extras_participate_and_subsampled_extras_force_full_frames() {
             assert_eq!(frame.extra_planes, expected.extra_planes);
         }
         if shift != 0 {
-            assert!(result.frames.iter().all(|f| f.candidates.len() == 1));
+            assert!(
+                result
+                    .frames
+                    .iter()
+                    .all(|f| f.candidates.len() == 1 && f.pruned.is_empty())
+            );
         }
     }
 }
@@ -642,8 +666,13 @@ fn premultiplied_or_additional_alpha_is_never_implicitly_masked() {
             result
                 .frames
                 .iter()
-                .flat_map(|f| &f.candidates)
-                .all(|c| !matches!(c.strategy, Strategy::MaskPrevious | Strategy::MaskFirst))
+                .flat_map(|f| {
+                    f.candidates
+                        .iter()
+                        .map(|c| c.strategy)
+                        .chain(f.pruned.iter().map(|c| c.strategy))
+                })
+                .all(|strategy| !matches!(strategy, Strategy::MaskPrevious | Strategy::MaskFirst))
         );
         verify(&images, &[1; 4], &AutoOptions::default(), 1);
     }

@@ -225,12 +225,79 @@ bounds = rs_jxl.analyze_multiframe([rgba, changed])
 reference=previous/first/full/auto (none aliases full). Default strategy="crop"
 uses geometry; reference=auto chooses the smaller first/previous bbox, not
 measured bytes. strategy="auto" additionally encodes eligible full/crop/mask/
-multiple-rectangle candidates and retains byte winners, at greater cost.
+multiple-rectangle candidates and retains byte winners. Proven-bound pruning
+and additional adaptive rectangle proposals are enabled by native defaults.
 return_info=True returns (encoded_output, strategy_report).
 The strategy report is the metadata dictionary itself, with `frames` candidate
 details for strategy="auto"; it is not the still/JPEG `meta["report"]` schema.
 `borrow_inputs` has the same snapshot/borrowing contract as still-image encode,
 though consolidation of several buffers can require copying.
+
+```python
+data, report = rs_jxl.encode_multiframe(
+    [rgba, changed], strategy="auto", reference="previous", effort=3,
+    auto_options={"prune": True, "adaptive_rectangles": True, "tile_size": 16},
+    return_info=True,
+)
+frame_report = report["frames"][1]
+winner = frame_report["candidates"][frame_report["winner_index"]]
+```
+
+`auto_options=None` is the default. A mapping, including `{}`, is legal only
+with `strategy="auto"` on `encode_multiframe` (including the `Encoder` method).
+It is forwarded as a structured top-level native request field, separate from
+`encoder_options`. Omitted entries use Rust defaults; Python does not fill in
+search defaults or perform difference analysis, planning or selection.
+
+| Auto Option | Accepted Value | Native Default |
+| --- | --- | --- |
+| `allow_mask` | bool | true |
+| `allow_multi_rect` | bool | true |
+| `tile_size` | positive u32 integer | 32 |
+| `max_rectangles` | positive native usize integer | 32 |
+| `prune` | bool | true |
+| `adaptive_rectangles` | bool | true |
+| `max_frames` | nonnegative native usize integer | usize::MAX |
+| `max_total_trials` | nonnegative native usize integer | usize::MAX |
+| `max_trial_pixels` | nonnegative u64 integer | u64::MAX |
+
+Unknown options and a nested `reference` are rejected; only the explicit outer
+`reference` argument controls references. Boolean options require Python booleans,
+not integers or strings. Integer options accept integer-index values (including
+NumPy integers), not booleans, floats or strings; explicit `None` member values
+are invalid. Geometry remains positive even if multi-rectangle candidates are
+disabled. Zero budgets are forwarded unchanged and cause explicit native resource
+failures when work exceeds them. Omitting budgets uses native unlimited defaults,
+not new Python limits. Direct ABI requests also enforce these types with serde
+and reject duplicate members.
+
+Automatic frame reports distinguish completed work from pruning:
+
+- `candidates` contains only completed trials in canonical order. Entries have
+  `strategy`, actual `encoded_bytes`, `encoded_frames`, `trial_pixels` and
+  `elapsed_seconds`. `winner_index` indexes this list, not execution order.
+- `pruned` contains `strategy`, proven `lower_bound`, fully finished
+  `encoded_frames`, `planned_frames`, `trial_pixels` and `elapsed_seconds`.
+  These entries do not have `encoded_bytes`; a lower bound is not an actual size.
+- `analysis_seconds` is native difference/planning time. `differences` contains
+  native `{reference, changed_pixels, bounds}` records, with zero-based input
+  reference indices and null bounds for no changes. An empty list means no
+  reference analysis was needed.
+
+Timing values are native elapsed seconds, not Python measurements. Trial pixels
+are areas submitted to the encoder, including interrupted layers, not analysis
+scans. Regular-layer counts exclude private reference-only patch frames; in a
+pruned record they also exclude a partially encoded layer. Candidate bytes include
+layer headers/private patch frames but exclude shared image/container overhead.
+
+Pruning can reorder execution, but only proven byte bounds can stop losing trials;
+it preserves selection and stable ties for the same eligible set with sufficient
+budgets. `prune=False` completes all eligible candidates or fails. Adaptive
+`MergedPrevious`/`MergedFirst` proposals follow all legacy candidates and are
+selected only by actual encoded bytes. Their cost estimate uses the initial full
+frame's measured bytes per pixel only to propose geometry. Disable them with
+`adaptive_rectangles=False`; `allow_multi_rect=False` disables both tile and merged
+proposals. No performance or compression improvement is claimed yet.
 
 All channels including hidden RGB participate in differences. durations is a
 tick count or list, default 1; tps=(1000,1), loops=0. Zero is a true layer, not
@@ -239,6 +306,8 @@ decode_layer(data, layer=N) returns (raw_layer_pixels, metadata), with crop,
 blend and references under header. This is not signed arithmetic residuals.
 Multiframe extra data accepts a shared plane or list/tuple of one plane per
 input. analyze_multiframe returns exact previous/first bounds, not byte estimates.
+JPEG frame input remains pixel-lossless relative to the input decoder, not
+byte-reversible; use `transcode_jpeg`/`reconstruct_jpeg` for original JPEG bytes.
 
 ## Decoding and Safety
 
@@ -338,6 +407,17 @@ bytes, not compressed JXL identity. Cross-platform runtime claims need actual
 tests on those systems, not just a matching wheel platform tag.
 
 ### Current Verification
+
+The native automatic-option/report update on 2026-10-27 passed all 173 Python
+tests against the rebuilt release DLL, with official djxl interoperability and
+CUDA transfer checks enabled. Two existing packaging warnings remained non-fatal.
+Difference analysis, candidate generation, pruning and timing are native Rust;
+Python validates and forwards controls and returns the native report unchanged.
+See [MULTIFRAME_AUTO.md](MULTIFRAME_AUTO.md) for native acceptance and
+[MULTIFRAME_NATIVE_BENCHMARK.md](MULTIFRAME_NATIVE_BENCHMARK.md) for size/speed
+tradeoffs. No cross-platform runtime claim is implied.
+
+The following architecture checkpoint predates the automatic-option additions:
 
 Validated on Windows x86-64 with Python 3.10 on 2026-10-27:
 
