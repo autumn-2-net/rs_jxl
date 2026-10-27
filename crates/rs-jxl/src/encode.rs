@@ -203,27 +203,37 @@ pub(crate) fn validate_frames(
     options: &EncodeOptions,
 ) -> Result<()> {
     validate(canvas, options)?;
+    validate_frame_sequence(canvas.into(), canvas.layout(), frames, options)
+}
+
+pub(crate) fn validate_frame_sequence(
+    canvas: crate::frame::Geometry<'_>,
+    layout: crate::PixelLayout,
+    frames: &[crate::frame::Frame<'_>],
+    options: &EncodeOptions,
+) -> Result<()> {
     if frames.is_empty() {
         return Err(Error::InvalidInput(
             "frame sequence must not be empty".into(),
         ));
     }
-    // None is unsaved; Some(true) is a pre-transform patch-only reference.
+    // None is the standard zero background; Some(true) is a pre-transform
+    // patch-only reference, which cannot be used for frame blending.
     let mut available = [None; 4];
     for (i, frame) in frames.iter().enumerate() {
         validate(frame.image, options)?;
         frame
             .options
-            .validate(canvas, frame.image, i + 1 == frames.len())?;
+            .validate_geometry(canvas, frame.image.into(), i + 1 == frames.len())?;
         let mut metadata = frame.image.metadata().clone();
         metadata.animation = canvas.metadata().animation;
-        if metadata != *canvas.metadata() || frame.image.layout() != canvas.layout() {
+        if metadata != *canvas.metadata() || frame.image.layout() != layout {
             return Err(Error::InvalidInput(
                 "all frames must use the canvas sample/color/extra metadata".into(),
             ));
         }
         available = validate_frame_references(
-            canvas.into(),
+            canvas,
             frame.image.into(),
             &frame.options,
             options,
@@ -254,15 +264,10 @@ pub(crate) fn validate_frame_references(
                 || blend.mode != crate::frame::BlendMode::Replace
             {
                 match available[usize::from(blend.source)] {
-                    Some(false) => {}
+                    None | Some(false) => {}
                     Some(true) => {
                         return Err(Error::InvalidInput(
                             "frame blending cannot use a pre-transform reference".into(),
-                        ));
-                    }
-                    None => {
-                        return Err(Error::InvalidInput(
-                            "frame uses an unsaved reference".into(),
                         ));
                     }
                 }

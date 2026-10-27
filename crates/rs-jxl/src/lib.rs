@@ -31,6 +31,7 @@ pub mod entropy;
 pub mod frame;
 pub mod icc;
 pub mod jpeg;
+pub mod layers;
 pub mod metadata;
 pub mod modular;
 pub mod multiframe;

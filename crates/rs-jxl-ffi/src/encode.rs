@@ -44,6 +44,14 @@ fn candidate(options: &Options) -> Result<(CandidateParams, EncodeOptions)> {
     Ok((params, base))
 }
 
+pub(crate) fn pixel_options(image: &Image, options: &Options) -> Result<EncodeOptions> {
+    let (params, base) = candidate(options)?;
+    project_native(&params, image, &base)
+        .map_err(message)?
+        .exact_options()
+        .map_err(message)
+}
+
 fn still(
     image: &Image,
     options: &Options,
@@ -225,11 +233,7 @@ pub fn execute_with_context(
         .durations
         .clone()
         .unwrap_or_else(|| vec![1; images.len()]);
-    let (params, base) = candidate(&request.options)?;
-    let options = project_native(&params, &images[0], &base)
-        .map_err(message)?
-        .exact_options()
-        .map_err(message)?;
+    let options = pixel_options(&images[0], &request.options)?;
     let mut report = json!({
         "operation": "encode_multiframe",
         "jpeg_input": jpeg_input,

@@ -292,6 +292,18 @@ impl Encoder {
         multiframe::encode_auto_in_pool(images, durations, options, automatic, self.pool.as_ref())
     }
 
+    /// Encode original-size layers on an inferred or explicit shared canvas.
+    /// Unlike automatic differencing, no equal-size input requirement applies.
+    pub fn encode_layers(
+        &mut self,
+        images: &[Image],
+        options: &EncodeOptions,
+        layers: &crate::layers::LayerOptions,
+    ) -> Result<crate::layers::LayerEncodeResult> {
+        self.check_threads(options.threads)?;
+        crate::layers::encode_in_pool(images, options, layers, self.pool.as_ref())
+    }
+
     pub fn transcode_jpeg(
         &mut self,
         input: &[u8],

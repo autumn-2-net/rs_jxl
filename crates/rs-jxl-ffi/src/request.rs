@@ -1,11 +1,15 @@
 use crate::Result;
 use serde::Deserialize;
 
+mod layers;
+pub use layers::{LayerAnimation, LayerBlendInfo, LayerFrameOptions, LayerOptions};
+
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Operation {
     Encode,
     EncodeMultiframe,
+    EncodeLayers,
     AnalyzeMultiframe,
     TranscodeJpeg,
     ReconstructJpeg,
@@ -15,11 +19,9 @@ pub enum Operation {
     ReadImage,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug)]
 pub struct Request {
     pub operation: Operation,
-    #[serde(default)]
     pub options: Options,
     pub images: Option<Vec<ImageSpec>>,
     pub durations: Option<Vec<u32>>,
@@ -27,10 +29,122 @@ pub struct Request {
     pub timebase: Option<[u32; 2]>,
     pub loops: Option<u32>,
     pub auto: Option<bool>,
-    #[serde(default, deserialize_with = "deserialize_auto_options")]
     pub auto_options: Option<AutoOptions>,
-    #[serde(default, deserialize_with = "deserialize_analysis_options")]
     pub analysis_options: Option<AnalysisOptions>,
+    pub layer_options: Option<LayerOptions>,
+}
+
+impl<'de> Deserialize<'de> for Request {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Auto(#[serde(deserialize_with = "deserialize_auto_options")] Option<AutoOptions>);
+        #[derive(Deserialize)]
+        struct Analysis(
+            #[serde(deserialize_with = "deserialize_analysis_options")] Option<AnalysisOptions>,
+        );
+
+        struct Object;
+        impl<'de> serde::de::Visitor<'de> for Object {
+            type Value = Request;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a request object")
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> std::result::Result<Request, A::Error> {
+                const FIELDS: &[&str] = &[
+                    "operation",
+                    "options",
+                    "images",
+                    "durations",
+                    "reference",
+                    "timebase",
+                    "loops",
+                    "auto",
+                    "auto_options",
+                    "analysis_options",
+                    "layer_options",
+                ];
+                let mut request = Request {
+                    operation: Operation::Encode,
+                    options: Options::default(),
+                    images: None,
+                    durations: None,
+                    reference: None,
+                    timebase: None,
+                    loops: None,
+                    auto: None,
+                    auto_options: None,
+                    analysis_options: None,
+                    layer_options: None,
+                };
+                let mut seen = [false; FIELDS.len()];
+                while let Some(key) = map.next_key::<String>()? {
+                    let index = FIELDS
+                        .iter()
+                        .position(|field| *field == key)
+                        .ok_or_else(|| {
+                            <A::Error as serde::de::Error>::unknown_field(&key, FIELDS)
+                        })?;
+                    if std::mem::replace(&mut seen[index], true) {
+                        return Err(serde::de::Error::duplicate_field(FIELDS[index]));
+                    }
+                    match key.as_str() {
+                        "operation" => request.operation = map.next_value()?,
+                        "options" => request.options = map.next_value()?,
+                        "images" => request.images = map.next_value()?,
+                        "durations" => request.durations = map.next_value()?,
+                        "reference" => request.reference = map.next_value()?,
+                        "timebase" => request.timebase = map.next_value()?,
+                        "loops" => request.loops = map.next_value()?,
+                        "auto" => request.auto = map.next_value()?,
+                        "auto_options" => request.auto_options = map.next_value::<Auto>()?.0,
+                        "analysis_options" => {
+                            request.analysis_options = map.next_value::<Analysis>()?.0
+                        }
+                        "layer_options" => {
+                            request.layer_options =
+                                Some(map.next_value::<layers::Object<LayerOptions>>()?.0);
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+                if !seen[0] {
+                    return Err(serde::de::Error::missing_field("operation"));
+                }
+                // Old operations retain null-as-omitted semantics. Layers reject
+                // legacy sequence/analysis keys even when their values are null.
+                if request.operation == Operation::EncodeLayers {
+                    for field in [
+                        "durations",
+                        "reference",
+                        "timebase",
+                        "loops",
+                        "auto",
+                        "auto_options",
+                        "analysis_options",
+                    ] {
+                        if FIELDS
+                            .iter()
+                            .zip(seen)
+                            .any(|(key, present)| *key == field && present)
+                        {
+                            return Err(serde::de::Error::custom(format!(
+                                "{field} is unsupported for encode_layers"
+                            )));
+                        }
+                    }
+                }
+                Ok(request)
+            }
+        }
+        deserializer.deserialize_map(Object)
+    }
 }
 
 fn deserialize_analysis_options<'de, D>(
@@ -345,6 +459,11 @@ pub enum ValidatedRequest<'a> {
         options: &'a Options,
         sequence: Sequence<'a>,
     },
+    EncodeLayers {
+        images: &'a [ImageSpec],
+        options: &'a Options,
+        layer_options: Option<&'a LayerOptions>,
+    },
     AnalyzeMultiframe {
         images: &'a [ImageSpec],
         strip_metadata: bool,
@@ -424,6 +543,11 @@ impl Request {
                     },
                 }
             }
+            Operation::EncodeLayers => EncodeLayers {
+                images: self.images(),
+                options,
+                layer_options: self.layer_options.as_ref(),
+            },
             Operation::AnalyzeMultiframe => AnalyzeMultiframe {
                 images: self.images(),
                 strip_metadata: options.strip_metadata.unwrap_or(false),
@@ -450,6 +574,12 @@ impl Request {
     pub fn validate(&self) -> Result<()> {
         use Operation::*;
         let sequence = matches!(self.operation, EncodeMultiframe | AnalyzeMultiframe);
+        if let Some(layers) = &self.layer_options {
+            if self.operation != EncodeLayers {
+                return Err("layer_options require encode_layers".into());
+            }
+            layers.validate(self.images().len())?;
+        }
         if self.operation != EncodeMultiframe
             && (self.durations.is_some()
                 || self.reference.is_some()
@@ -476,7 +606,7 @@ impl Request {
         }
         if !matches!(
             self.operation,
-            Encode | EncodeMultiframe | AnalyzeMultiframe
+            Encode | EncodeMultiframe | EncodeLayers | AnalyzeMultiframe
         ) && self.images.is_some()
         {
             return Err(
@@ -488,6 +618,9 @@ impl Request {
         }
         if sequence && self.images().is_empty() {
             return Err("multiframe requires nonempty images".into());
+        }
+        if self.operation == EncodeLayers && self.images().is_empty() {
+            return Err("encode_layers requires nonempty images".into());
         }
         if let Some(durations) = &self.durations
             && durations.len() != self.images().len()
@@ -537,7 +670,7 @@ impl Request {
             order
         );
         let allowed: &[&str] = match self.operation {
-            Encode | EncodeMultiframe => &[
+            Encode | EncodeMultiframe | EncodeLayers => &[
                 "threads",
                 "effort",
                 "source_search",
@@ -600,6 +733,9 @@ impl Request {
         }
         if o.source_search.unwrap_or(false) && self.operation == EncodeMultiframe {
             return Err("source_search is unsupported for multiframe; use auto".into());
+        }
+        if o.source_search.unwrap_or(false) && self.operation == EncodeLayers {
+            return Err("source_search is unsupported for encode_layers".into());
         }
         if o.source_search.unwrap_or(false) && o.has_tool_overrides() {
             return Err("source_search cannot guarantee explicit tool overrides".into());

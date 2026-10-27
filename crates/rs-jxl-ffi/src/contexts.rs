@@ -12,7 +12,8 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::{
-    Error, ErrorKind, Result, RsJxlRequest, RsJxlResult, abi, analysis, decode, encode, message,
+    Error, ErrorKind, Result, RsJxlRequest, RsJxlResult, abi, analysis, decode, encode, layers,
+    message,
     request::{Operation, Request, ValidatedRequest},
 };
 
@@ -73,6 +74,9 @@ impl RsJxlContext {
         let result = match (&mut self.resources, request_kind) {
             (Resources::Encoder(encoder), Encode { .. } | EncodeMultiframe { .. }) => {
                 encode::execute_with_context(&request, data, Some(encoder))
+            }
+            (Resources::Encoder(encoder), EncodeLayers { .. }) => {
+                layers::execute(&request, data, Some(encoder))
             }
             (Resources::Encoder(encoder), TranscodeJpeg { .. }) => {
                 encode::transcode_with_context(&request, data, Some(encoder))

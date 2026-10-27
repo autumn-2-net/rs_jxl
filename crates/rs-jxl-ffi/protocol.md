@@ -86,7 +86,7 @@ options, including limits and output format, do not carry over to the next call.
 
 | Context kind | Operations using reusable resources | Stateless operations also accepted |
 | --- | --- | --- |
-| `encoder` | `encode`, `encode_multiframe`, `transcode_jpeg`, `analyze_multiframe` | none |
+| `encoder` | `encode`, `encode_multiframe`, `encode_layers`, `transcode_jpeg`, `analyze_multiframe` | none |
 | `decoder` | `decode`, `decode_to_png`, `reconstruct_jpeg` | `info`, `read_image` |
 
 Other kind/operation combinations fail. The stateless operations above do not
@@ -129,16 +129,17 @@ any results.
 ## Requests
 
 Unknown, duplicate and inapplicable fields fail. Optional fields may be omitted
-or null, except `options` and `analysis_options` must be objects when supplied,
-and supplied members of `auto_options`/`analysis_options` must have their declared
-types (not null).
+or null, except `options`, `analysis_options`, and `layer_options` must be objects
+when supplied. Supplied members of `auto_options`/`analysis_options` must have
+their declared types (not null); layer field types are specified below.
 Top-level keys: operation (required), options (default {}), images (default []),
-durations, reference, timebase, loops, auto, auto_options, analysis_options.
+durations, reference, timebase, loops, auto, auto_options, analysis_options,
+layer_options.
 Sequence keys only for encode_multiframe; analysis_options only for
-analyze_multiframe.
-Operations: encode, encode_multiframe, analyze_multiframe, transcode_jpeg,
+analyze_multiframe; layer_options only for encode_layers.
+Operations: encode, encode_multiframe, encode_layers, analyze_multiframe, transcode_jpeg,
 reconstruct_jpeg, decode, decode_to_png, info, read_image.
-encode requires one image; multiframe requires nonempty images. Other operations
+encode requires one image; multiframe and encode_layers require nonempty images. Other operations
 consume entire data buffer and reject images. info is JXL header inspection;
 read_image is shared PNG/JPEG pixel input decoding.
 
@@ -147,6 +148,89 @@ zeros remain zeros. reference=previous (full/previous/first/smallest_crop),
 timebase=[1000,1] (ticks per second numerator/denominator), loops=0, auto=false.
 encode_multiframe always sets animation metadata. auto uses the native automatic
 multiframe search, not still-image source-search.
+
+### Heterogeneous Layers
+
+`encode_layers` encodes original-size pixel images on a shared canvas. Inputs
+may have different dimensions, but native validation requires compatible image
+metadata, sample formats, color encodings and extra-channel layouts. Input
+decoding and native pixel words follow the ordinary ImageSpec contract below;
+there is no padding, resizing, color conversion, or synthetic canvas frame.
+
+`layer_options` is a top-level object, not a member of `options`, and is valid
+only for this operation. Omission or `{}` uses native defaults; null is invalid.
+The legacy top-level keys `durations`, `reference`, `timebase`, `loops`, `auto`,
+`auto_options`, and `analysis_options` are rejected even when explicitly null.
+
+| Member | Type | Default |
+| --- | --- | --- |
+| `canvas` | `[u32, u32]` or null | inferred |
+| `frames` | array of frame objects or null | defaults for every input |
+| `animation` | animation object or null | native inference |
+
+An explicit `frames` array must contain exactly one object per input image; an
+empty array is invalid for the required nonempty image sequence. Omitted/null
+frames map to an empty native vector, meaning defaults for every input. Canvas
+inference uses maximum positive layer extents, including origins. Negative
+origins require an explicit canvas. The canvas clips composited output only;
+non-coalesced decoding retains original layer dimensions and sample words.
+Canvas validity, metadata compatibility, frame/reference semantics and timing
+are checked by native code before encoding.
+
+Each frame object accepts only:
+
+| Member | Type | Default |
+| --- | --- | --- |
+| `origin` | `[i32, i32]` | `[0, 0]` |
+| `duration` | u32 | 0 |
+| `timecode` | u32 | 0 |
+| `name` | string | `""` |
+| `blend` | blend object | defaults below |
+| `extra_blend` | array of blend objects | `[]` |
+| `save_as_reference` | u8 | 0 |
+
+A blend object accepts only `mode` (string: `replace`, `add`, `blend`,
+`alpha_weighted_add`, or `multiply`; default `replace`), `source` (u8, default 1),
+`alpha_channel` (u8, default 0), and `clamp` (boolean, default false). Every blend
+object, including entries of `extra_blend`, uses these defaults. An empty
+`extra_blend` applies the color blend rule to every extra channel. Native checks
+reference slots, alpha-channel applicability, extra-blend count, and other
+format constraints; the u8 wire type does not make every value a valid slot.
+Neither `reference_only` nor `save_before_color_transform` is exposed here.
+
+Default source 1 preserves a zero background independently for each layer.
+Nonfinal zero-duration layers implicitly save slot 0 when `save_as_reference`
+is 0, leaving slot 1 untouched. An explicit source 0 reuses that composited
+state; explicit saves may overwrite other slots. Uninitialized reference slots
+have the standard zero background. Zero duration is never replaced with one.
+
+An animation object accepts only `ticks_per_second_numerator` (u32, default
+1000), `ticks_per_second_denominator` (u32, default 1), `loops` (u32, default 0),
+and `timecodes` (boolean, default false). Numerator/denominator must satisfy
+native animation limits. `{}` explicitly enables default animation metadata;
+omission/null leaves inference to native code, which adds default timing when
+durations/timecodes require it and enables timecodes when needed. Nonzero
+timecodes conflict with an explicit animation whose `timecodes` is false.
+
+All layer/frame/blend/animation objects reject unknown and duplicate keys;
+positional arrays are not objects. Frame, blend, and animation members cannot
+be null. Integer fields reject booleans, fractions, strings, and out-of-range
+values. Only the three optional `layer_options` members allow null.
+
+```json
+{
+  "operation": "encode_layers",
+  "options": {"effort": 2},
+  "layer_options": {
+    "canvas": [3, 2],
+    "frames": [{"origin": [-1, 0]}, {"origin": [2, 0]}]
+  },
+  "images": [
+    {"width": 2, "height": 1, "channels": 1, "dtype": "u8", "length": 2},
+    {"width": 1, "height": 2, "channels": 1, "dtype": "u8", "offset": 2, "length": 2}
+  ]
+}
+```
 
 ### Automatic Multiframe Options
 
@@ -241,11 +325,12 @@ fails if unsupported by encoder. spot_color is four floats, cfa_channel integer.
 
 ## Options
 
-- encode/encode_multiframe: threads=1, effort=7, source_search=false,
+- encode/encode_multiframe/encode_layers: threads=1, effort=7, source_search=false,
   strip_metadata=false; optional group_size_shift,rct,predictor,palette_colors,
   patches(bool),learning_fraction,ma_max_leaves. Effort/overrides map to native
   candidates. Unsupported projections fail. source_search only for still images,
   cannot combine with explicit tool overrides (ma_max_leaves is allowed).
+  encode_layers rejects source_search=true; it has no automatic strategy search.
 - analyze_multiframe: threads=1, strip_metadata=false; geometric controls are in
   top-level analysis_options. Returns a native geometric report and empty data;
   see Multiframe Analysis Results below.
@@ -272,6 +357,38 @@ metadata byte budget; use max_input_bytes instead.
 
 Encode/JPEG/PNG: data holds file bytes, JSON {operation,bytes,...}. Encoded JPEG
 pixel input reports jpeg_input:true and is NOT byte-reversible transcoding.
+
+### Layer Results
+
+`encode_layers` returns JXL bytes in data and this JSON shape:
+
+```json
+{
+  "operation": "encode_layers",
+  "bytes": 123,
+  "jpeg_input": false,
+  "canvas": {"width": 3, "height": 2},
+  "codec_seconds": 0.001,
+  "layers": [
+    {
+      "index": 0, "width": 2, "height": 1, "origin": [-1, 0],
+      "duration": 0, "timecode": 0, "name": "",
+      "blend": {"mode": "replace", "source": 1, "alpha_channel": 0, "clamp": false},
+      "extra_blend": [], "save_as_reference": 0
+    }
+  ]
+}
+```
+
+The example shows one layer entry; actual results contain exactly one per input,
+in input order, using native result dimensions and frame settings. `bytes` is the
+data length, not a per-layer estimate. `codec_seconds` is native planning/coding
+time, excluding pool construction, input decoding and JSON transport. `jpeg_input`
+is true if any input was decoded from JPEG pixels, not a byte-transcode claim.
+Blend mode strings here are snake_case, unlike legacy decode/info Debug names.
+Encoder contexts reuse their workers and enforce the ordinary thread-count
+inheritance/mismatch rules; no layer settings persist between calls. Decoder
+contexts reject this operation. The C ABI layout and ownership rules are unchanged.
 
 ### Multiframe Analysis Results
 

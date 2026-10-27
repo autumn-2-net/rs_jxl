@@ -115,8 +115,9 @@ reference-only frames and per-extra blending use the existing frame validation
 and header machinery. Extra requests are in current-frame native coordinates,
 not canvas coordinates. There is no inferred difference crop or decoder-side
 compositing in this API. Reference state commits only after successful output;
-unsaved or pre-transform references cannot be used for visible color/extra
-blending. Generated patch references are supported only by explicit fallback,
+unsaved slots provide a standard all-zero background for color/extra blending,
+whereas pre-transform references cannot be used for this blending. Generated
+patch references are supported only by explicit fallback,
 and their actual creation updates the reserved slot's state.
 
 The new writer declares Level 10 before the first codestream fragment. This is

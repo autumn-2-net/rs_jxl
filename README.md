@@ -198,6 +198,14 @@ or silently accept unsupported lossy/libjxl options. See the
 [API and build guide](docs/PYTHON_API.md), [FFI boundary](docs/PYTHON_INTERFACE.md),
 [code architecture](docs/ARCHITECTURE.md) and [documentation index](docs/README.md).
 
+`rs_jxl.encode_layers(images)` stores different-size images as original-size
+layers on a shared canvas; `rs_jxl.decode_layer(data, layer=i)` retrieves one
+without canvas padding or compositing. Layout, depth, color and extra-channel
+metadata must agree. See [heterogeneous layers](docs/HETEROGENEOUS_LAYERS.md) for
+placement, timing, reference semantics and the distinction from automatic diff
+encoding. [Stronger temporal reuse](docs/MULTIFRAME_REUSE_ROADMAP.md) is a future
+encoder-search direction using standard JXL references and patches.
+
 ## Build and Run
 
 The decoder's AVX-512 kernels are optional: add `--features decoder-avx512`

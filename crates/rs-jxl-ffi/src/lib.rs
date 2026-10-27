@@ -7,6 +7,7 @@ mod contexts;
 mod decode;
 mod encode;
 mod error;
+mod layers;
 mod pixels;
 pub mod request;
 
@@ -19,6 +20,7 @@ fn execute_json(json: &[u8], data: &[u8]) -> Result<(serde_json::Value, Vec<u8>)
     use request::ValidatedRequest::*;
     match request.validate_typed()? {
         Encode { .. } | EncodeMultiframe { .. } => encode::execute(&request, data),
+        EncodeLayers { .. } => layers::execute(&request, data, None),
         AnalyzeMultiframe { .. } => analysis::execute(&request, data, None),
         TranscodeJpeg { .. } => encode::transcode(&request, data),
         Decode { .. }

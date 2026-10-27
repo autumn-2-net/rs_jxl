@@ -44,7 +44,7 @@ Paths in this table are under `crates/rs-jxl/src`.
 | Entropy and matching | [entropy/mod.rs](../crates/rs-jxl/src/entropy/mod.rs), [tools/mod.rs](../crates/rs-jxl/src/tools/mod.rs) | Hybrid integers, histograms/clustering, prefix/rANS streams, LZ77 matching/parsing, MA kernels and patch tools. |
 | Search policy | [scheduler/mod.rs](../crates/rs-jxl/src/scheduler/mod.rs), `params.rs`, `routes.rs`, `driver.rs`, `native*.rs` | Candidate identities, probes, search budgets, feedback and native encoding of selected candidates. Explicit tool execution and candidate search are distinct operations. |
 | Parallel execution | [execution.rs](../crates/rs-jxl/src/execution.rs), [execution/arena.rs](../crates/rs-jxl/src/execution/arena.rs), `scheduler/worker_pool.rs` | Caller-owned worker resources, serial/null execution and bounded cooperative nested work. Codec code uses these helpers instead of creating independent nested pools. |
-| Frames and incremental output | [multiframe.rs](../crates/rs-jxl/src/multiframe.rs), `multiframe/`, [streaming.rs](../crates/rs-jxl/src/streaming.rs), [region_input.rs](../crates/rs-jxl/src/region_input.rs) | Difference/crop planning, frame references and timing, region loans, sequence/seekable output and TOC/index lifecycles. |
+| Frames and incremental output | [multiframe.rs](../crates/rs-jxl/src/multiframe.rs), `multiframe/`, [layers.rs](../crates/rs-jxl/src/layers.rs), [streaming.rs](../crates/rs-jxl/src/streaming.rs), [region_input.rs](../crates/rs-jxl/src/region_input.rs) | Difference/crop planning, explicit heterogeneous-size layers, frame references and timing, region loans, sequence/seekable output and TOC/index lifecycles. |
 | Byte-reversible JPEG | [jpeg/mod.rs](../crates/rs-jxl/src/jpeg/mod.rs), `reader.rs`, `coefficient_reader.rs`, `transcode.rs`, `archival.rs`, `reconstruction*.rs`, `scan_writer*.rs` | JPEG structure and coefficients, reconstruction metadata, JXL archival frames and recovery of original JPEG bytes. Shares Modular/entropy tools without using a pixel fallback. |
 | Runtime JXL decoding | [decode/mod.rs](../crates/rs-jxl/src/decode/mod.rs), `engine.rs`, `native.rs`, `stream.rs`, `jpeg.rs`, `color*.rs` | Backend adaptation, limits, native samples, streaming state, JPEG coefficient capture/reconstruction and explicit rendered conversions. Backend implementation is in `vendor/jxl-rs`. |
 | Experimental transcripts | [final_plan.rs](../crates/rs-jxl/src/final_plan.rs), `final_plan/` | Transcript schemas and wire helpers. Their presence is not evidence that ordinary codec capture/replay is connected. |
@@ -62,7 +62,7 @@ Adapters still own their argument compatibility gates and diagnostics.
 
 `codec::encode_job` and `codec::transcode_jpeg` are one-shot facade functions.
 `codec::Encoder::new(threads)` retains worker resources for repeated `encode`,
-`encode_frames`, `encode_auto`, `analyze_multiframe` and `transcode_jpeg` calls. JPEG search is an
+`encode_frames`, `encode_layers`, `encode_auto`, `analyze_multiframe` and `transcode_jpeg` calls. JPEG search is an
 explicit `Option<SearchLimits>`, separate from pixel search. The CLI's automatic
 multiframe route also uses `Encoder::encode_auto`; its strategy reports and
 output publication remain adapter responsibilities.

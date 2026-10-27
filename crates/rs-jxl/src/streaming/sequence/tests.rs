@@ -291,6 +291,7 @@ fn rejection_before_callbacks_is_retryable_and_limits_are_stream_wide() {
     let invalid = FrameOptions {
         blend: BlendInfo {
             mode: BlendMode::Add,
+            source: 4,
             ..Default::default()
         },
         ..Default::default()

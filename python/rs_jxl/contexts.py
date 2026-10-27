@@ -5,6 +5,7 @@ from ._options import threads as normalize_threads
 from .encode import encode, transcode_jpeg
 from .decode import decode, decode_into, decode_layer, decode_extra_channel, info, reconstruct_jpeg, decode_to_png
 from .multiframe import analyze_multiframe, encode_multiframe
+from .layers import encode_layers
 
 
 class _Context:
@@ -55,6 +56,9 @@ class Encoder(_Context):
 
     def encode_multiframe(self, frames, output=None, **options):
         return self._call(encode_multiframe, frames, output, **options)
+
+    def encode_layers(self, images, output=None, **options):
+        return self._call(encode_layers, images, output, **options)
 
     def analyze_multiframe(self, frames, **options):
         return self._call(analyze_multiframe, frames, **options)

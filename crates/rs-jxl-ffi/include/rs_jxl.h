@@ -39,7 +39,12 @@ RS_JXL_API size_t rs_jxl_request_size(void);
    reference, allow_mask, allow_multi_rect, adaptive_rectangles, tile_size,
    max_rectangles and rectangle_bytes_per_pixel, and is invalid for other
    operations. Unknown/duplicate fields fail; omitted members use native defaults.
-   Analysis accepts only options.threads and options.strip_metadata. See protocol.md. */
+   Analysis accepts only options.threads and options.strip_metadata.
+   encode_layers accepts nonempty original-size images and top-level layer_options
+   (object, not null) with canvas, frames and animation. Supplied frames must match
+   the image count. It rejects legacy sequence/analysis keys, even if null, and
+   source_search=true. Results contain JXL data, canvas, codec_seconds and layers;
+   no synthetic canvas pixels are created. See protocol.md for the strict schema. */
 RS_JXL_API RsJxlResult *rs_jxl_execute(const RsJxlRequest *request);
 /* Optional additive v1 symbols; callers may capability-detect their presence.
    Constructor JSON is {"kind":"encoder"|"decoder","threads":N}; threads
@@ -56,7 +61,7 @@ RS_JXL_API RsJxlResult *rs_jxl_context_create(const RsJxlRequest *request,
    parallel. Request buffers follow rs_jxl_execute and must not alias context.
    Omitted options.threads inherits context threads; explicit mismatch is an error.
    All other options have per-request defaults; no decoder defaults are retained.
-   Encoder supports encode/encode_multiframe/transcode_jpeg/analyze_multiframe;
+   Encoder supports encode/encode_multiframe/encode_layers/transcode_jpeg/analyze_multiframe;
    analysis reuses its worker pool and obeys the same thread inheritance/mismatch
    rules. Decoder supports decode/decode_to_png/reconstruct_jpeg and
    stateless info/read_image (no parser/worker reuse for those two operations).

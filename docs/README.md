@@ -38,6 +38,7 @@ platform certifications.
 | Incremental decoding | [Rust/CLI streaming input](STREAMING_INPUT.md); full Python incremental streaming is not implemented |
 | Byte-reversible JPEG | [JPEG API](JPEG_API.md), [compatibility and supported-domain distinctions](JPEG_COMPATIBILITY.md) |
 | Frame planning, layers and animation | [Automatic frames](MULTIFRAME_AUTO.md), [multiframe CLI](MULTIFRAME_AUTO_CLI.md), [frame-aware search](MULTIFRAME_SEARCH.md) |
+| Different-size images and future temporal reuse | [Heterogeneous layers](HETEROGENEOUS_LAYERS.md), [standard-bitstream reuse roadmap](MULTIFRAME_REUSE_ROADMAP.md) |
 | Incremental encoding and indexes | [Streaming output](STREAMING_OUTPUT.md), [frame index lifecycle](FRAME_INDEX.md) |
 | Python and the versioned C boundary | [Python API and packaging](PYTHON_API.md), [reusable contexts](PYTHON_API.md#reusable-contexts), [input copies/borrowing](PYTHON_API.md#input-copies-and-borrowing), [decode_into](PYTHON_API.md#preallocated-output), [Python interface](PYTHON_INTERFACE.md), [C ABI protocol](../crates/rs-jxl-ffi/protocol.md), [C header](../crates/rs-jxl-ffi/include/rs_jxl.h) |
 | MA limits and exact search pruning | [Tree budgets](MA_TREE_BUDGET.md), [search pruning](MA_SEARCH_PRUNING.md) |

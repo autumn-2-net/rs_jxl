@@ -45,7 +45,7 @@ RS_JXL_NATIVE_LIB overrides either lookup and fails on an invalid path/ABI.
 
 ### Input Copies and Borrowing
 
-`encode`, `encode_multiframe` and `analyze_multiframe` default to
+`encode`, `encode_layers`, `encode_multiframe` and `analyze_multiframe` default to
 `borrow_inputs=False`: mutable pixel buffers, including CPU tensors and read-only
 views of mutable storage, are
 snapshotted before the native call. Files/streams are read completely into memory;
@@ -165,7 +165,7 @@ with rs_jxl.Encoder(threads=8) as encoder, rs_jxl.Decoder(threads=8) as decoder:
 
 Constructors accept `threads=1`; `threads=0` resolves the CPU count capped at
 256, as in the one-shot API. `Encoder` supplies `encode`, `transcode_jpeg`,
-`encode_multiframe` and `analyze_multiframe`. `Decoder` supplies `decode`,
+`encode_layers`, `encode_multiframe` and `analyze_multiframe`. `Decoder` supplies `decode`,
 `decode_into`, `decode_layer`, `decode_extra_channel`, `info`, `reconstruct_jpeg`
 and `decode_to_png`. Options
 and return values match the corresponding module-level functions.
@@ -305,8 +305,10 @@ proposals. No performance or compression improvement is claimed yet.
 All channels including hidden RGB participate in differences. durations is a
 tick count or list, default 1; tps=(1000,1), loops=0. Zero is a true layer, not
 a fabricated display duration; visible-frame count can differ from layer count.
-decode_layer(data, layer=N) returns (raw_layer_pixels, metadata), with crop,
-blend and references under header. This is not signed arithmetic residuals.
+`decode_layer(data, layer=N)` defaults to `return_info=True` and returns
+`(raw_layer_pixels, metadata)`, with crop, blend and references under `header`.
+Use `adjust_orientation=False` for original stored coordinates and sample order
+when orientation is not 1. This is not signed arithmetic residuals.
 Multiframe extra data accepts a shared plane or list/tuple of one plane per
 input. `analyze_multiframe` returns exact previous/first bounds and geometry-only
 statistics/plans, not byte estimates (see below).
@@ -425,6 +427,134 @@ report actual differences regardless of selected mode or fallback.
 
 See [Native Multiframe Analysis](MULTIFRAME_ANALYSIS.md) for the core contract.
 
+## Explicit Layers
+
+`encode_layers` encodes supplied raw layer images without automatic differences,
+crops, resizing or padding. Unlike `encode_multiframe` and `analyze_multiframe`,
+layer widths and heights may differ. Channel layout, sample depth and color/extra
+metadata must still match; native code validates compatibility. The existing
+automatic multiframe and analysis APIs continue to require same-size input states.
+
+```python
+background = np.full((6, 8, 4), 65535, dtype=np.uint16)
+overlay = np.zeros((2, 3, 4), dtype=np.uint16)
+overlay[..., 0] = 12345  # exact even under zero alpha
+
+data, report = rs_jxl.encode_layers([background, overlay], effort=3, return_info=True)
+raw, layer_info = rs_jxl.decode_layer(data, layer=1, adjust_orientation=False)
+assert np.array_equal(raw, overlay)
+displayed = rs_jxl.decode(data)  # 6x8 canvas, only overlay over an empty background
+assert displayed.shape == (6, 8, 4)
+assert not displayed[2:, :].any()
+
+with rs_jxl.Encoder(threads=8) as encoder:
+    composed = encoder.encode_layers(
+        [background, overlay], canvas=(8, 6), effort=3,
+        layer_options=[{"name": "background"},
+                       {"origin": (2, 1), "name": "overlay", "blend": {"source": 0}}],
+    )
+```
+
+The full signature is:
+
+```python
+encode_layers(images, output=None, *, canvas=None, layer_options=None,
+              tps=None, loops=0, layout="auto", effort=7, threads=1,
+              lossless=True, distance=0, extra_channels=None, bits_per_sample=0,
+              color_encoding=None, icc_profile=None, allow_device_copy=False,
+              strip_metadata=False, return_info=False, encoder_options=None,
+              borrow_inputs=False, _context=None, **tool_options)
+```
+
+`images` is a nonempty iterable using the shared multiframe transport: paths,
+encoded bytes, readable streams, arrays or tensors. Extra-channel data accepts a
+shared plane or one plane per input, each matching that layer's dimensions and
+subsampling. Array metadata overrides are unavailable for encoded inputs.
+`output`, layout, borrowing, GPU transfer and lossless/tool controls have the
+existing encode contracts. `source_search=True` is rejected by native code;
+there is no layer search scheduler. `Encoder.encode_layers` inherits context
+threads, rejects mismatches and closed handles, and retains no reference state
+between calls. `_context` is internal, not an override for a bound encoder.
+
+`canvas=(width, height)` is optional. Native code infers the maximum right/bottom
+extent of nonnegative origins when omitted. Any negative origin requires an
+explicit canvas. Raw samples outside an explicit canvas remain encoded and are
+returned by `decode_layer`; normal `decode` composites and clips to the canvas.
+`decode_layer` defaults to `return_info=True`, returning `(pixels, metadata)`;
+use `return_info=False` for pixels alone. Raw decoding disables coalescing, not
+orientation adjustment: pass `adjust_orientation=False` to preserve original
+stored coordinates and sample order when image orientation is not 1.
+Raw layer selection and coalesced display-frame selection use different indices:
+zero-duration layers are not separate display frames. These are standard JPEG XL
+frame headers and pixels, not a new format, private archive or Python canvas.
+Python performs no pixel padding, difference analysis or blend computation.
+
+`layer_options=None` retains native defaults. Otherwise supply one mapping per
+image; empty mappings retain defaults. Only these frame fields are accepted:
+
+| Field | Value | Native Default |
+| --- | --- | --- |
+| `origin` | `(x, y)` signed integer coordinates | `(0, 0)` |
+| `duration` | nonnegative u32 tick count | `0` |
+| `timecode` | nonnegative u32 timecode | `0` |
+| `name` | string, native UTF-8 header-length validation | `""` |
+| `blend` | blend mapping described below | replace, source 1 |
+| `extra_blend` | list of blend mappings, one per extra channel including alpha | `[]`, inherits color blend |
+| `save_as_reference` | reference slot `0..3` | `0` |
+
+Blend mappings accept `mode` (`replace`, `add`, `blend`, `alpha_weighted_add` or
+`multiply`), `source` (slot `0..3`, default `1`), `alpha_channel` (extra-channel
+index, default `0`) and `clamp` (bool, default `False`). Native code validates
+which fields are meaningful for the selected blend mode, alpha-channel existence,
+extra-blend counts and reference constraints. The last layer cannot save a
+nonzero reference slot. `reference_only` and `save_before_color_transform` are
+not exposed by this Python API.
+
+Default source slot 1 remains blank because preceding zero-duration layers save
+to slot 0 by default. Thus default layers independently replace their supplied
+region over an empty canvas, not over the preceding image. Explicit `source=0`
+can reuse the preceding zero-duration composite. Timed frames do not implicitly
+save their composite to slot 0: save to a nonzero slot and select that slot when
+later frames need it. Explicitly saving slot 1 also changes later default-source
+backgrounds. Blend source numbers are reference slots, not input indices.
+
+```python
+animation = rs_jxl.encode_layers(
+    [background, overlay], canvas=(8, 6), tps=(24, 1), loops=2, effort=3,
+    layer_options=[{"duration": 12, "save_as_reference": 2, "timecode": 1},
+                   {"origin": (2, 1), "duration": 12, "timecode": 2,
+                    "blend": {"source": 2}}],
+)
+```
+
+All-zero durations are genuine layers and do not add an animation header by
+default. Any positive duration makes native code infer `1000/1` ticks per second
+unless a timebase is supplied. Explicit `tps`, nonzero `loops`, or any nonzero
+timecode sends animation metadata even for all-zero durations. A nonzero timecode
+also makes Python enable `animation.timecodes`. For direct ABI callers, omitted
+or null animation metadata lets native code infer timing and timecode support.
+When animation metadata is explicitly supplied, nonzero frame timecodes require
+`animation.timecodes=true`; an explicit `timecodes=false` is rejected.
+`loops=0` means unlimited repetition when animation is present.
+
+Unknown and duplicate frame/blend fields, nonmapping entries and mismatched
+frame counts fail. Numeric fields accept integer-index values including NumPy
+integers, but not booleans, floats or numeric strings; `clamp` requires a Python
+bool. Pairs and frame/blend lists accept lists or tuples. Python normalizes JSON
+integer types/ranges; native code owns wire limits, canvas inference, sample/color
+compatibility, reference semantics and final frame validation. It does not
+silently convert inputs to satisfy those constraints.
+
+`return_info=True` returns `(encoded_output, report)`, preserving the normal
+bytes/Path/None output behavior. The native JSON report is returned unchanged:
+`operation="encode_layers"`, `bytes`, `jpeg_input`, `canvas={width,height}`,
+`codec_seconds`, and `layers`. Each layer reports `index`, `width`, `height`,
+`origin=[x,y]`, `duration`, `timecode`, `name`, `blend={mode,source,alpha_channel,clamp}`,
+`extra_blend`, and `save_as_reference`. Timing is native codec time, not a Python
+measurement. `jpeg_input` indicates JPEG pixel input, not byte transcoding:
+`encode_layers` preserves the input decoder's samples, never original JPEG bytes.
+Use `transcode_jpeg` and `reconstruct_jpeg` for byte-reversible JPEG storage.
+
 ## Decoding and Safety
 
 decode defaults to frame=0, coalesced native samples, orientation adjustment,
@@ -499,8 +629,8 @@ native call. Do not classify failures by matching message substrings.
 [Protocol](../crates/rs-jxl-ffi/protocol.md),
 [C header](../crates/rs-jxl-ffi/include/rs_jxl.h).
 Not implemented: Python incremental streaming, public zero-copy output views,
-direct native decode into user buffers, arbitrary manual blend headers or full
-C++ parameter parity. Reusable contexts and `decode_into` do not close those
+direct native decode into user buffers, reference-only/pre-color-transform layer
+controls or full C++ parameter parity. Reusable contexts and `decode_into` do not close those
 gaps. Native Rust decoder metadata types still include maintained-upstream
 reexports; this is not a complete backend-independent public type layer.
 

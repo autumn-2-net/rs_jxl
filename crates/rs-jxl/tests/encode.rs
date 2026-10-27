@@ -22,7 +22,7 @@ fn frames_validate_references_and_animation_without_partial_output() {
         image: &crop,
         options: FrameOptions {
             blend: BlendInfo {
-                source: 1,
+                source: 4,
                 ..Default::default()
             },
             ..Default::default()

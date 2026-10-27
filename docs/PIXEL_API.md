@@ -233,7 +233,9 @@ timecode, color/extra blending, reference ID and reference-only status.
 
 - Duration zero is preserved as a layer. It is never replaced with one tick.
 - Nonzero durations require `canvas.metadata().animation` with a valid timebase.
-- Reference IDs are 0..3. Referencing an unsaved frame is rejected.
+- Reference IDs are 0..3. An unsaved slot is a standard all-zero blending
+  background, not a missing-frame error. A pre-transform slot is not a legal
+  frame-blending background; patches separately require an actual saved source.
 - Pre-transform references are for patches, not ordinary frame blending backgrounds.
 - Reference-only frames cannot be last or have a display duration.
 - The final visible frame cannot save another reference.
