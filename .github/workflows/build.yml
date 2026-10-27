@@ -1,0 +1,157 @@
+name: Build CLI and Python wheels
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_BUILD_JOBS: '2'
+  CARGO_INCREMENTAL: '0'
+  CARGO_TERM_COLOR: always
+  RUSTUP_TOOLCHAIN: stable
+  PYTHONDONTWRITEBYTECODE: '1'
+
+jobs:
+  build-windows:
+    runs-on: windows-2022
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.10'
+          architecture: x64
+          cache: pip
+
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: windows-x86_64-cargo-${{ hashFiles('Cargo.lock') }}
+
+      - name: Fetch locked dependencies
+        run: cargo fetch --locked
+
+      - name: Build CLI and native Python library
+        run: cargo build --release --locked --offline --workspace
+
+      - name: Test Rust workspace
+        run: cargo test --locked --offline --workspace --no-fail-fast -- --test-threads=2
+
+      - name: Install wheel build tools
+        run: python -m pip install --upgrade pip "setuptools>=68" "wheel>=0.38"
+
+      - name: Build wheel with the compiled DLL
+        env:
+          RS_JXL_NATIVE_LIB: ${{ github.workspace }}/target/release/rs_jxl_ffi.dll
+        run: python -m pip wheel . --no-deps --no-build-isolation --wheel-dir dist
+
+      - name: Test packaging helpers
+        run: python -B -m unittest discover -s scripts -p test_ci_artifacts.py -v
+
+      - name: Test installed wheel and CLI
+        run: python -B scripts/test_ci_wheel.py --wheel-dir dist --cli target/release/rs-jxl.exe
+
+      - name: Package CLI and checksums
+        run: python -B scripts/package_ci.py --platform windows-x86_64 --cli target/release/rs-jxl.exe --dist dist
+
+      - name: Upload Windows artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: rs-jxl-windows-x86_64
+          path: |
+            dist/*.whl
+            dist/*.zip
+            dist/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 14
+
+  build-linux:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    container:
+      image: quay.io/pypa/manylinux_2_28_x86_64
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Select Python and install Rust
+        run: |
+          test -x /opt/python/cp310-cp310/bin/python
+          echo /opt/python/cp310-cp310/bin >> "$GITHUB_PATH"
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o "$RUNNER_TEMP/rustup-init.sh"
+          sh "$RUNNER_TEMP/rustup-init.sh" -y --profile minimal --default-toolchain stable --no-modify-path
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: manylinux-2-28-x86_64-cargo-${{ hashFiles('Cargo.lock') }}
+
+      - name: Fetch locked dependencies
+        run: cargo fetch --locked
+
+      - name: Build CLI and native Python library
+        run: cargo build --release --locked --offline --workspace
+
+      - name: Test Rust workspace
+        run: cargo test --locked --offline --workspace --no-fail-fast -- --test-threads=2
+
+      - name: Install wheel build tools
+        run: python -m pip install --upgrade pip 'setuptools>=68' 'wheel>=0.38'
+
+      - name: Build wheel with the compiled shared library
+        env:
+          RS_JXL_NATIVE_LIB: ${{ github.workspace }}/target/release/librs_jxl_ffi.so
+        run: python -m pip wheel . --no-deps --no-build-isolation --wheel-dir out/ci/raw-wheels
+
+      - name: Audit and repair the Linux wheel
+        run: |
+          wheels=(out/ci/raw-wheels/*.whl)
+          test "${#wheels[@]}" -eq 1
+          auditwheel show "${wheels[0]}"
+          auditwheel repair --plat manylinux_2_28_x86_64 --wheel-dir dist "${wheels[0]}"
+
+      - name: Test packaging helpers
+        run: python -B -m unittest discover -s scripts -p test_ci_artifacts.py -v
+
+      - name: Test repaired wheel and CLI
+        run: python -B scripts/test_ci_wheel.py --wheel-dir dist --cli target/release/rs-jxl
+
+      - name: Package CLI and checksums
+        run: python -B scripts/package_ci.py --platform linux-x86_64 --cli target/release/rs-jxl --dist dist
+
+      - name: Upload Linux artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: rs-jxl-linux-x86_64
+          path: |
+            dist/*.whl
+            dist/*.tar.gz
+            dist/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 14

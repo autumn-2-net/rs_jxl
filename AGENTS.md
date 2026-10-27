@@ -31,8 +31,9 @@
   Track missing features in docs/PIXEL_LOSSLESS_PORT_STATUS.md; smoke tests are
   not phase acceptance.
 - Scope: pixel lossless, byte-reversible JPEG transcode, multiframe, and
-  now-authorized Python integration through a Rust C ABI. No lossy encoder,
-  no neural scheduling, no CI changes.
+  now-authorized Python integration through a Rust C ABI. No lossy encoder
+  or neural scheduling. Linux/Windows x86_64 CI for the CLI and Python wheels
+  is authorized; macOS CI and local WSL remain out of scope.
 - macOS runtime work is out of the current acceptance scope. Do not start WSL
   or install Linux toolchains without explicit user approval. Cross-platform
   support does not authorize changing or starting a separate runtime environment.

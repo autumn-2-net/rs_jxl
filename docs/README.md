@@ -31,6 +31,7 @@ platform certifications.
 
 | Topic | References |
 | --- | --- |
+| Windows/Linux wheel and CLI builds | [CI and artifact guide](CI.md), [build workflow](../.github/workflows/build.yml) |
 | Encoding parameters, defaults and tradeoffs | [Encoding parameter guide (Chinese)](ENCODING_PARAMETERS.md) |
 | Unified encoding jobs, reusable workers and reports | [Facade and context architecture](ARCHITECTURE.md#unified-jobs-and-reusable-resources), [Rust codec facade](../crates/rs-jxl/src/codec.rs), [reports and binding lifetimes](ARCHITECTURE.md#reports-and-binding-lifetimes) |
 | Rust pixel encoding, images and tools | [Pixel API](PIXEL_API.md), [integer and float paths](INTEGER_AND_FLOAT_PATHS.md), [intrinsic dimensions](INTRINSIC_DIMENSIONS.md) |

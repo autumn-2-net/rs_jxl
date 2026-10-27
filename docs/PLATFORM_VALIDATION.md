@@ -12,6 +12,11 @@ scope.
 
 ## Current Stop Status
 
+The user subsequently authorized **hosted Linux/Windows CI** for CLI and Python
+wheel builds. See [CI guide](CI.md). That permission does not resume local WSL
+work; Linux runtime acceptance still requires an actual successful hosted run.
+The stopped local preparation below remains historical evidence only.
+
 Linux runtime acceptance is **NOT complete**. WSL work was stopped at the user's
 request. Do not launch any further WSL commands, including distribution listing,
 or Linux Cargo builds/tests without a new explicit instruction. Windows runs of

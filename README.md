@@ -25,6 +25,14 @@ Acceptance prioritizes exact lossless samples, original JPEG bytes and composed
 frames. Small finite differences in lossy floating rendering are recorded
 diagnostics, not a requirement to reproduce C++ arithmetic bit for bit.
 
+## CI Artifacts
+
+The [GitHub Actions build](.github/workflows/build.yml) produces tested Python
+wheels and CLI archives for Windows x86_64 and Linux x86_64, with no macOS job.
+See [CI and artifact guide](docs/CI.md) for manual runs, download locations,
+platform requirements and the installed-wheel validation gates. Artifacts are
+not automatically published to PyPI or GitHub Releases.
+
 ## Active Paths
 
 - Gray, GrayAlpha, RGB and RGBA, preserving invisible RGB; U8/U16/U32 and
