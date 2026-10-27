@@ -11,6 +11,12 @@ from ._ffi import execute
 from ._io import write_or_return
 
 
+def _tile_sizes(value):
+    if not isinstance(value, (list, tuple)):
+        raise TypeError("extra_tile_sizes must be a list or tuple of positive integers")
+    return [integer(item, "extra_tile_sizes entry", 1, 0xffffffff) for item in value]
+
+
 def _auto_options(value, strategy):
     if value is None:
         return None
@@ -18,7 +24,8 @@ def _auto_options(value, strategy):
         raise ValueError("auto_options require strategy='auto'")
     if not isinstance(value, Mapping):
         raise TypeError("auto_options must be a mapping of Rust option names")
-    booleans = {"allow_mask", "allow_multi_rect", "prune", "adaptive_rectangles"}
+    booleans = {"allow_mask", "allow_multi_rect", "prune", "adaptive_rectangles",
+                "retained_reference", "reference_lookahead"}
     integers = {"tile_size": (1, 0xffffffff),
                 "max_rectangles": (1, sys.maxsize * 2 + 1),
                 "max_frames": (0, sys.maxsize * 2 + 1),
@@ -36,8 +43,12 @@ def _auto_options(value, strategy):
             result[name] = item
         elif name in integers:
             result[name] = integer(item, name, *integers[name])
+        elif name == "extra_tile_sizes":
+            result[name] = _tile_sizes(item)
         else:
             raise TypeError(f"unknown auto option: {name}")
+    if result.get("reference_lookahead", False) and not result.get("retained_reference", False):
+        raise ValueError("reference_lookahead requires retained_reference=True")
     return result
 
 
@@ -48,7 +59,8 @@ def _analysis_options(value):
         raise TypeError("analysis_options must be a mapping of Rust option names")
     booleans = {"allow_mask", "allow_multi_rect", "adaptive_rectangles"}
     integers = {"tile_size": (1, 0xffffffff),
-                "max_rectangles": (1, sys.maxsize * 2 + 1)}
+                "max_rectangles": (1, sys.maxsize * 2 + 1),
+                "history_window": (0, sys.maxsize * 2 + 1)}
     result = {}
     for name, item in value.items():
         if name == "reference":
@@ -61,6 +73,8 @@ def _analysis_options(value):
             result[name] = item
         elif name in integers:
             result[name] = integer(item, name, *integers[name])
+        elif name == "extra_tile_sizes":
+            result[name] = _tile_sizes(item)
         elif name == "rectangle_bytes_per_pixel":
             if isinstance(item, bool) or not isinstance(item, Real):
                 raise TypeError(f"{name} must be a real number, not a boolean")
@@ -109,6 +123,15 @@ def encode_multiframe(frames, output=None, *, layout="auto", durations=1,
     additionally compares eligible full/crop/mask/multiple-rectangle encodes.
     auto_options is an optional mapping of native automatic-search controls;
     omitted fields retain Rust defaults. Analysis and selection stay in Rust.
+    retained_reference=True opts into a rotating two-reference policy and
+    requires both strategy='auto' and reference='auto'.
+    reference_lookahead=True additionally requires retained_reference=True;
+    it uses exact differences against only the next input to choose which old
+    state to retain, without encoding future inputs or guaranteeing fewer bytes.
+    Both flags default to False in Rust.
+    extra_tile_sizes=[16, 64] adds partition grids without replacing tile_size.
+    Duplicate partitions are skipped; extra trials may take longer. For a fixed
+    reference state selection uses bytes, not minimum rectangle area.
     """
     _options.lossless_only(lossless, distance)
     references = {"auto": "smallest_crop", "first": "first", "previous": "previous",
@@ -116,6 +139,8 @@ def encode_multiframe(frames, output=None, *, layout="auto", durations=1,
     if reference not in references or strategy not in ("crop", "auto"):
         raise ValueError("reference must be auto/first/previous/full; strategy must be crop/auto")
     automatic = _auto_options(auto_options, strategy)
+    if automatic and automatic.get("retained_reference", False) and reference != "auto":
+        raise ValueError("retained_reference requires reference='auto'")
     payload, specs = _images(frames, layout=layout, extra_channels=extra_channels,
                              borrow_inputs=borrow_inputs,
                              bits_per_sample=bits_per_sample, color_encoding=color_encoding,
@@ -158,11 +183,14 @@ def analyze_multiframe(frames, *, layout="auto", extra_channels=None,
     reference='auto' means the smaller first/previous crop, not fewest bytes.
 
     analysis_options accepts allow_mask, allow_multi_rect, adaptive_rectangles,
-    tile_size, max_rectangles and rectangle_bytes_per_pixel. Omitted controls
+    tile_size, extra_tile_sizes, max_rectangles, history_window and
+    rectangle_bytes_per_pixel. Omitted controls
     retain Rust defaults; reference must use the explicit argument. The native
     rectangle_bytes_per_pixel default of 1.0 is only an adaptive planning
     estimate, never an output-size prediction. Use encode_multiframe with
     strategy='auto' to select by actual encoded bytes.
+    history_window defaults to 0; positive values inspect additional older
+    inputs as reuse opportunities, not as currently live reference slots.
     """
     references = {"auto": "smallest_crop", "first": "first", "previous": "previous",
                   "full": "full", "none": "full"}

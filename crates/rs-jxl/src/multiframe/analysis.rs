@@ -1,5 +1,11 @@
 //! Exact difference statistics and geometry-only compression opportunity analysis.
 //! No entropy coding, image crops, or guessed compressed sizes are produced.
+mod geometry;
+mod history;
+
+pub use geometry::{GeometryDiagnostics, GeometrySummary, RectangleWorkload};
+pub use history::HistoryAnalysis;
+
 use super::{
     AutoOptions, Rect, Reference, Strategy, auto, compatible, diff::DiffMap, select_reference,
 };
@@ -16,7 +22,13 @@ pub struct AnalysisOptions {
     pub allow_multi_rect: bool,
     pub adaptive_rectangles: bool,
     pub tile_size: u32,
+    /// Additional positive rectangle grids. The shared encoder planner removes
+    /// equivalent proposals; empty preserves the original candidate set.
+    pub extra_tile_sizes: Vec<u32>,
     pub max_rectangles: usize,
+    /// Preceding positions to inspect, newest first, skipping first/previous
+    /// which are already compared. These are opportunities, not live slots.
+    pub history_window: usize,
     /// Rectangle merge cost estimate only. Actual automatic encoding measures
     /// this value from its first full-frame payload; analysis does not encode.
     pub rectangle_bytes_per_pixel: f64,
@@ -31,7 +43,9 @@ impl Default for AnalysisOptions {
             allow_multi_rect: true,
             adaptive_rectangles: true,
             tile_size: 32,
+            extra_tile_sizes: Vec::new(),
             max_rectangles: 32,
+            history_window: 0,
             rectangle_bytes_per_pixel: 1.0,
             threads: 1,
         }
@@ -66,6 +80,8 @@ pub struct CropAnalysis {
 #[derive(Debug)]
 pub struct GeometryCandidate {
     pub strategy: Strategy,
+    /// Grid that proposed this partition; None for full/crop/mask candidates.
+    pub tile_size: Option<u32>,
     pub reference_index: Option<usize>,
     pub source: u8,
     pub rectangles: Vec<Rect>,
@@ -84,8 +100,11 @@ pub struct FrameAnalysis {
     /// The first frame has no reference comparison, so these are None.
     pub previous_stats: Option<DiffStatistics>,
     pub first_stats: Option<DiffStatistics>,
+    /// Exact older-input comparisons, never additional live decoder slots.
+    pub history: Vec<HistoryAnalysis>,
     pub plan: CropAnalysis,
     pub candidates: Vec<GeometryCandidate>,
+    pub geometry: GeometryDiagnostics,
 }
 
 /// Geometric reuse labels, not predictions of encoded bytes or encoding speed.
@@ -121,8 +140,12 @@ pub struct AnalysisReport {
     /// False when subsampled extra channels require complete-frame replacement.
     pub crop_supported: bool,
     pub rectangle_bytes_per_pixel: f64,
+    pub history_window: usize,
     pub frames: Vec<FrameAnalysis>,
     pub reference_modes: Vec<ReferenceSummary>,
+    /// Minimum-area proposals, including multiple rectangles. Independent of
+    /// the compatibility single-bbox summaries in reference_modes.
+    pub geometry: GeometrySummary,
     /// Minimum total single-bbox area only, not an encoding recommendation.
     pub best_geometric_reference: Reference,
     /// Excludes input decoding, context creation, and transport serialization.
@@ -159,12 +182,13 @@ fn validate(images: &[Image], options: &AnalysisOptions) -> Result<()> {
     };
     if !(1..=256).contains(&options.threads)
         || options.tile_size == 0
+        || options.extra_tile_sizes.contains(&0)
         || options.max_rectangles == 0
         || !options.rectangle_bytes_per_pixel.is_finite()
         || options.rectangle_bytes_per_pixel < 0.0
     {
         return Err(Error::InvalidInput(
-            "threads must be 1..=256, tile_size and max_rectangles positive, and rectangle_bytes_per_pixel finite and nonnegative".into(),
+            "threads must be 1..=256, tile_size, extra_tile_sizes and max_rectangles positive, and rectangle_bytes_per_pixel finite and nonnegative".into(),
         ));
     }
     for image in images {
@@ -174,7 +198,32 @@ fn validate(images: &[Image], options: &AnalysisOptions) -> Result<()> {
 }
 
 fn area(rect: Rect) -> u64 {
+    // Both factors are u32, so their product always fits u64.
     u64::from(rect.width) * u64::from(rect.height)
+}
+
+fn suitability(
+    frame_count: usize,
+    crop_supported: bool,
+    layer_pixels: u64,
+    pixels: u64,
+    full_pixels: u64,
+) -> Suitability {
+    if frame_count == 1 {
+        return Suitability::SingleFrame;
+    }
+    if !crop_supported {
+        return Suitability::FullFramesRequired;
+    }
+    // Every sequence has one complete initial frame; all frames are nonempty.
+    let subsequent_ratio = (layer_pixels - pixels) as f64 / (full_pixels - pixels) as f64;
+    if subsequent_ratio < 0.3 {
+        Suitability::Strong
+    } else if subsequent_ratio < 0.7 {
+        Suitability::Moderate
+    } else {
+        Suitability::Limited
+    }
 }
 
 fn statistics(map: &DiffMap, pixels: u64) -> DiffStatistics {
@@ -239,8 +288,10 @@ fn analyze_inner(images: &[Image], options: &AnalysisOptions) -> Result<Analysis
         height: canvas.height(),
     };
     let pixels = area(full);
+    let frame_count =
+        u64::try_from(images.len()).map_err(|_| Error::Limit("analysis frame count"))?;
     let full_pixels = pixels
-        .checked_mul(images.len() as u64)
+        .checked_mul(frame_count)
         .ok_or(Error::Limit("analysis total pixel area"))?;
     let crop_supported = !canvas
         .metadata()
@@ -253,6 +304,7 @@ fn analyze_inner(images: &[Image], options: &AnalysisOptions) -> Result<Analysis
         allow_multi_rect: options.allow_multi_rect,
         adaptive_rectangles: options.adaptive_rectangles,
         tile_size: options.tile_size,
+        extra_tile_sizes: options.extra_tile_sizes.clone(),
         max_rectangles: options.max_rectangles,
         ..Default::default()
     };
@@ -278,7 +330,7 @@ fn analyze_inner(images: &[Image], options: &AnalysisOptions) -> Result<Analysis
         .try_reserve_exact(images.len())
         .map_err(|_| Error::Limit("analysis frame reports"))?;
     for (index, image) in images.iter().enumerate() {
-        // Only two reference maps live at once; frame one shares its map.
+        // Only the static first/previous maps are retained; frame one shares its map.
         let previous_map = if index == 0 {
             None
         } else {
@@ -291,6 +343,15 @@ fn analyze_inner(images: &[Image], options: &AnalysisOptions) -> Result<Analysis
         };
         let previous_stats = previous_map.as_ref().map(|m| statistics(m, pixels));
         let first_stats = first_map.as_ref().map(|m| statistics(m, pixels));
+        let history = history::analyze(
+            images,
+            index,
+            options.history_window,
+            crop_supported,
+            pixels,
+            previous_stats.as_ref(),
+            first_stats.as_ref(),
+        )?;
         let previous = previous_stats.as_ref().map_or(Some(full), |s| s.bounds);
         let first = first_stats.as_ref().map_or(Some(full), |s| s.bounds);
         for summary in &mut summaries {
@@ -313,9 +374,14 @@ fn analyze_inner(images: &[Image], options: &AnalysisOptions) -> Result<Analysis
                     None => None,
                 };
                 summary.average_changed_ratio += stats.map_or(1.0, |s| s.changed_ratio);
-                summary.identical_frames +=
-                    usize::from(stats.is_some_and(|s| s.changed_pixels == 0));
-                summary.crop_frames += usize::from(plan.region != full);
+                summary.identical_frames = summary
+                    .identical_frames
+                    .checked_add(usize::from(stats.is_some_and(|s| s.changed_pixels == 0)))
+                    .ok_or(Error::Limit("analysis identical frame count"))?;
+                summary.crop_frames = summary
+                    .crop_frames
+                    .checked_add(usize::from(plan.region != full))
+                    .ok_or(Error::Limit("analysis crop frame count"))?;
             }
         }
         let maps: Vec<_> = auto::reference_indices(index, options.reference)
@@ -347,11 +413,8 @@ fn analyze_inner(images: &[Image], options: &AnalysisOptions) -> Result<Analysis
             })?;
             Ok(GeometryCandidate {
                 strategy: candidate.strategy,
-                reference_index: match candidate.source {
-                    1 => Some(0),
-                    2 => Some(index - 1),
-                    _ => None,
-                },
+                tile_size: candidate.tile_size,
+                reference_index: candidate.reference_index,
                 source: candidate.source,
                 layer_count: candidate.rects.len(),
                 rectangles: candidate.rects,
@@ -360,12 +423,14 @@ fn analyze_inner(images: &[Image], options: &AnalysisOptions) -> Result<Analysis
             })
         })
         .collect::<Result<Vec<_>>>()?;
+        let geometry = geometry::diagnostics(&candidates)?;
         frames.push(FrameAnalysis {
             index,
             previous,
             first,
             previous_stats,
             first_stats,
+            history,
             plan: crop_plan(
                 index,
                 options.reference,
@@ -375,30 +440,28 @@ fn analyze_inner(images: &[Image], options: &AnalysisOptions) -> Result<Analysis
                 first,
             ),
             candidates,
+            geometry,
         });
     }
     for summary in &mut summaries {
         summary.layer_area_ratio = summary.layer_pixels as f64 / full_pixels as f64;
         if images.len() > 1 {
             summary.average_changed_ratio /= (images.len() - 1) as f64;
-            let subsequent_ratio =
-                (summary.layer_pixels - pixels) as f64 / (full_pixels - pixels) as f64;
-            summary.suitability = if !crop_supported {
-                Suitability::FullFramesRequired
-            } else if subsequent_ratio < 0.3 {
-                Suitability::Strong
-            } else if subsequent_ratio < 0.7 {
-                Suitability::Moderate
-            } else {
-                Suitability::Limited
-            };
         }
+        summary.suitability = suitability(
+            images.len(),
+            crop_supported,
+            summary.layer_pixels,
+            pixels,
+            full_pixels,
+        );
     }
     let best_geometric_reference = summaries
         .iter()
         .min_by_key(|s| s.layer_pixels)
         .expect("four reference modes")
         .reference;
+    let geometry = geometry::summarize(&frames, pixels, full_pixels, crop_supported)?;
     Ok(AnalysisReport {
         width: full.width,
         height: full.height,
@@ -407,8 +470,10 @@ fn analyze_inner(images: &[Image], options: &AnalysisOptions) -> Result<Analysis
         reference: options.reference,
         crop_supported,
         rectangle_bytes_per_pixel: options.rectangle_bytes_per_pixel,
+        history_window: options.history_window,
         frames,
         reference_modes: summaries,
+        geometry,
         best_geometric_reference,
         analysis_elapsed: started.elapsed(),
     })

@@ -198,6 +198,8 @@ pub struct AnalysisOptions {
     pub allow_multi_rect: bool,
     pub adaptive_rectangles: bool,
     pub tile_size: u32,
+    pub extra_tile_sizes: Vec<u32>,
+    pub history_window: usize,
     pub max_rectangles: usize,
     pub rectangle_bytes_per_pixel: f64,
 }
@@ -211,6 +213,8 @@ impl Default for AnalysisOptions {
             allow_multi_rect: native.allow_multi_rect,
             adaptive_rectangles: native.adaptive_rectangles,
             tile_size: native.tile_size,
+            extra_tile_sizes: native.extra_tile_sizes,
+            history_window: native.history_window,
             max_rectangles: native.max_rectangles,
             rectangle_bytes_per_pixel: native.rectangle_bytes_per_pixel,
         }
@@ -225,6 +229,8 @@ impl AnalysisOptions {
             allow_multi_rect: self.allow_multi_rect,
             adaptive_rectangles: self.adaptive_rectangles,
             tile_size: self.tile_size,
+            extra_tile_sizes: self.extra_tile_sizes.clone(),
+            history_window: self.history_window,
             max_rectangles: self.max_rectangles,
             rectangle_bytes_per_pixel: self.rectangle_bytes_per_pixel,
             threads,
@@ -232,6 +238,9 @@ impl AnalysisOptions {
     }
 
     fn validate(&self) -> Result<()> {
+        if self.extra_tile_sizes.contains(&0) {
+            return Err("extra_tile_sizes must be positive".into());
+        }
         if self.tile_size == 0 || self.max_rectangles == 0 {
             return Err("tile_size and max_rectangles must be positive".into());
         }
@@ -286,9 +295,12 @@ where
 #[derive(Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AutoOptions {
+    pub retained_reference: bool,
+    pub reference_lookahead: bool,
     pub allow_mask: bool,
     pub allow_multi_rect: bool,
     pub tile_size: u32,
+    pub extra_tile_sizes: Vec<u32>,
     pub max_rectangles: usize,
     pub prune: bool,
     pub adaptive_rectangles: bool,
@@ -301,9 +313,12 @@ impl Default for AutoOptions {
     fn default() -> Self {
         let native = rs_jxl::multiframe::AutoOptions::default();
         Self {
+            retained_reference: native.retained_reference,
+            reference_lookahead: native.reference_lookahead,
             allow_mask: native.allow_mask,
             allow_multi_rect: native.allow_multi_rect,
             tile_size: native.tile_size,
+            extra_tile_sizes: native.extra_tile_sizes,
             max_rectangles: native.max_rectangles,
             prune: native.prune,
             adaptive_rectangles: native.adaptive_rectangles,
@@ -321,9 +336,12 @@ impl AutoOptions {
     ) -> rs_jxl::multiframe::AutoOptions {
         rs_jxl::multiframe::AutoOptions {
             reference,
+            retained_reference: self.retained_reference,
+            reference_lookahead: self.reference_lookahead,
             allow_mask: self.allow_mask,
             allow_multi_rect: self.allow_multi_rect,
             tile_size: self.tile_size,
+            extra_tile_sizes: self.extra_tile_sizes.clone(),
             max_rectangles: self.max_rectangles,
             prune: self.prune,
             adaptive_rectangles: self.adaptive_rectangles,
@@ -591,8 +609,17 @@ impl Request {
             return Err("sequence fields require encode_multiframe".into());
         }
         if let Some(auto) = &self.auto_options {
+            if auto.extra_tile_sizes.contains(&0) {
+                return Err("extra_tile_sizes must be positive".into());
+            }
             if !self.auto.unwrap_or(false) {
                 return Err("auto_options require auto=true".into());
+            }
+            if auto.reference_lookahead && !auto.retained_reference {
+                return Err("reference_lookahead requires retained_reference=true".into());
+            }
+            if auto.retained_reference && self.reference.as_deref() != Some("smallest_crop") {
+                return Err("retained_reference requires reference=smallest_crop".into());
             }
             if auto.tile_size == 0 || auto.max_rectangles == 0 {
                 return Err("tile_size and max_rectangles must be positive".into());
@@ -806,9 +833,14 @@ mod tests {
         let actual = wire.native(sequence.reference);
         let default = rs_jxl::multiframe::AutoOptions::default();
         assert_eq!(actual.reference, Reference::First);
+        assert_eq!(actual.retained_reference, default.retained_reference);
+        assert!(!actual.retained_reference);
+        assert_eq!(actual.reference_lookahead, default.reference_lookahead);
+        assert!(!actual.reference_lookahead);
         assert_eq!(actual.allow_mask, default.allow_mask);
         assert_eq!(actual.allow_multi_rect, default.allow_multi_rect);
         assert_eq!(actual.tile_size, default.tile_size);
+        assert_eq!(actual.extra_tile_sizes, default.extra_tile_sizes);
         assert_eq!(actual.max_rectangles, default.max_rectangles);
         assert_eq!(actual.prune, default.prune);
         assert_eq!(actual.adaptive_rectangles, default.adaptive_rectangles);
@@ -830,6 +862,7 @@ mod tests {
             "allow_mask": false,
             "allow_multi_rect": false,
             "tile_size": 8,
+            "extra_tile_sizes": [16, 64],
             "max_rectangles": 4097,
             "prune": false,
             "adaptive_rectangles": false,
@@ -840,9 +873,12 @@ mod tests {
         request.validate().unwrap();
         let auto = request.auto_options.unwrap().native(Reference::Previous);
         assert_eq!(auto.reference, Reference::Previous);
+        assert!(!auto.retained_reference);
+        assert!(!auto.reference_lookahead);
         assert!(!auto.allow_mask && !auto.allow_multi_rect);
         assert!(!auto.prune && !auto.adaptive_rectangles);
         assert_eq!((auto.tile_size, auto.max_rectangles), (8, 4097));
+        assert_eq!(auto.extra_tile_sizes, [16, 64]);
         assert_eq!(
             (
                 auto.max_frames,
@@ -851,6 +887,91 @@ mod tests {
             ),
             (0, 0, 0)
         );
+    }
+
+    #[test]
+    fn retained_reference_requires_automatic_smallest_crop_and_forwards_native_flag() {
+        let mut request = automatic(json!({"retained_reference": true}));
+        for reference in [None, Some("previous"), Some("first"), Some("full")] {
+            request.reference = reference.map(str::to_owned);
+            assert_eq!(
+                request.validate().unwrap_err().message,
+                "retained_reference requires reference=smallest_crop"
+            );
+        }
+        request.reference = Some("smallest_crop".into());
+        request.validate().unwrap();
+        let actual = request
+            .auto_options
+            .as_ref()
+            .unwrap()
+            .native(Reference::SmallestCrop);
+        assert!(actual.retained_reference);
+        assert_eq!(actual.reference, Reference::SmallestCrop);
+        request.auto = Some(false);
+        assert!(request.validate().is_err());
+        for reference in [
+            None,
+            Some("previous"),
+            Some("first"),
+            Some("full"),
+            Some("smallest_crop"),
+        ] {
+            let mut disabled = automatic(json!({"retained_reference": false}));
+            disabled.reference = reference.map(str::to_owned);
+            disabled.validate().unwrap();
+        }
+    }
+
+    #[test]
+    fn reference_lookahead_requires_retained_reference_and_forwards_native_flag() {
+        for options in [
+            json!({"reference_lookahead": true}),
+            json!({"reference_lookahead": true, "retained_reference": false}),
+        ] {
+            let mut request = automatic(options);
+            request.images = None;
+            assert_eq!(
+                request.validate().unwrap_err().message,
+                "reference_lookahead requires retained_reference=true"
+            );
+        }
+        let mut request = automatic(json!({
+            "reference_lookahead": true, "retained_reference": true,
+        }));
+        for reference in [None, Some("previous"), Some("first"), Some("full")] {
+            request.reference = reference.map(str::to_owned);
+            assert_eq!(
+                request.validate().unwrap_err().message,
+                "retained_reference requires reference=smallest_crop"
+            );
+        }
+        request.reference = Some("smallest_crop".into());
+        let ValidatedRequest::EncodeMultiframe { sequence, .. } = request.validate_typed().unwrap()
+        else {
+            panic!("expected multiframe");
+        };
+        let native = sequence.auto_options.unwrap().native(sequence.reference);
+        assert!(native.reference_lookahead && native.retained_reference);
+        assert_eq!(native.reference, Reference::SmallestCrop);
+        for auto in [None, Some(false)] {
+            request.auto = auto;
+            assert_eq!(
+                request.validate().unwrap_err().message,
+                "auto_options require auto=true"
+            );
+        }
+        for reference in [
+            None,
+            Some("previous"),
+            Some("first"),
+            Some("full"),
+            Some("smallest_crop"),
+        ] {
+            let mut disabled = automatic(json!({"reference_lookahead": false}));
+            disabled.reference = reference.map(str::to_owned);
+            disabled.validate().unwrap();
+        }
     }
 
     #[test]
@@ -883,10 +1004,31 @@ mod tests {
 
     #[test]
     fn auto_options_serde_rejects_unknown_duplicate_and_wrong_types() {
+        assert!(
+            automatic(json!({"extra_tile_sizes": [0]}))
+                .validate()
+                .is_err()
+        );
+        for value in [
+            json!(null),
+            json!(false),
+            json!(8),
+            json!("8"),
+            json!([false]),
+            json!([-1]),
+            json!([1.5]),
+            json!([4294967296u64]),
+        ] {
+            assert!(
+                serde_json::from_value::<AutoOptions>(json!({"extra_tile_sizes": value})).is_err()
+            );
+        }
         for options in [
             r#"{"unknown":true}"#,
             r#"{"reference":"first"}"#,
             r#"{"prune":true,"prune":false}"#,
+            r#"{"retained_reference":true,"retained_reference":false}"#,
+            r#"{"reference_lookahead":true,"reference_lookahead":false}"#,
             r#"{"max_frames":1,"max_frames":2}"#,
             r#"[]"#,
             r#"true"#,
@@ -901,12 +1043,22 @@ mod tests {
             );
         }
         for field in [
+            "retained_reference",
+            "reference_lookahead",
             "allow_mask",
             "allow_multi_rect",
             "prune",
             "adaptive_rectangles",
         ] {
-            for value in [json!(0), json!(1), json!("true"), json!(null)] {
+            for value in [
+                json!(0),
+                json!(1),
+                json!(1.0),
+                json!("true"),
+                json!(null),
+                json!([]),
+                json!({}),
+            ] {
                 assert!(serde_json::from_value::<AutoOptions>(json!({field: value})).is_err());
             }
         }

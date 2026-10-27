@@ -9,12 +9,17 @@ use std::borrow::Cow;
 mod analysis;
 mod auto;
 mod diff;
+mod lookahead;
 mod partition;
+mod payload;
+mod references;
 mod regions;
+mod scales;
 pub(crate) use analysis::analyze_in_pool;
 pub use analysis::{
     AnalysisOptions, AnalysisReport, CropAnalysis, DiffStatistics, FrameAnalysis,
-    GeometryCandidate, ReferenceSummary, Suitability, analyze,
+    GeometryCandidate, GeometryDiagnostics, GeometrySummary, HistoryAnalysis, RectangleWorkload,
+    ReferenceSummary, Suitability, analyze,
 };
 pub(crate) use auto::encode_auto_in_pool;
 pub use auto::{

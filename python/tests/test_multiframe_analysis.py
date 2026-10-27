@@ -48,6 +48,22 @@ def _without_timing(report):
 
 
 class MultiframeAnalysisAdapters(unittest.TestCase):
+    def test_extra_grids_and_history_window_are_native_controls(self):
+        options = {"extra_tile_sizes": (8, np.uint32(64)), "history_window": np.uint64(4)}
+        request = self.request(analysis_options=options)
+        self.assertEqual(request["analysis_options"], {
+            "reference": "smallest_crop", "extra_tile_sizes": [8, 64], "history_window": 4})
+        json.dumps(request)
+        for value in (True, 1.5, None, "4"):
+            with self.subTest(value=value), self.assertRaises(TypeError):
+                self.request(analysis_options={"history_window": value})
+        for value in (-1, sys.maxsize * 2 + 2):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                self.request(analysis_options={"history_window": value})
+        for value in ([0], [-1], [1 << 32]):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                self.request(analysis_options={"extra_tile_sizes": value})
+
     def request(self, **options):
         report = {"frames": [], "analysis_seconds": 0.125}
         with patch.object(multiframe, "execute", return_value=(b"", report)) as execute:

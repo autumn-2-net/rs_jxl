@@ -138,6 +138,7 @@ fn sparse_mask_and_regions_share_actual_encoder_planning() {
         .zip(&encoded.frames[1].candidates)
     {
         assert_eq!(analysis.strategy, actual.strategy);
+        assert_eq!(analysis.tile_size, actual.tile_size);
         assert_eq!(analysis.layer_count, actual.encoded_frames);
         assert_eq!(analysis.layer_pixels, actual.trial_pixels);
     }
@@ -288,6 +289,11 @@ fn validation_and_single_frame_analysis() {
             ..Default::default()
         },
         AnalysisOptions {
+            extra_tile_sizes: vec![16, 0, 64],
+            allow_multi_rect: false,
+            ..Default::default()
+        },
+        AnalysisOptions {
             max_rectangles: 0,
             ..Default::default()
         },
@@ -402,4 +408,352 @@ fn disabling_proposals_does_not_disable_exact_comparison() {
             .changed_pixels,
         2
     );
+}
+
+#[test]
+fn history_window_measures_preceding_positions_and_excludes_static_references() {
+    let images: Vec<_> = [0, 17, 29, 17, 17]
+        .into_iter()
+        .map(|value| Image::new(3, 2, PixelLayout::Gray, PixelData::U8(vec![value; 6])).unwrap())
+        .collect();
+    let baseline = multiframe::analyze(&images, &Default::default()).unwrap();
+    assert_eq!(baseline.history_window, 0);
+    assert!(baseline.frames.iter().all(|frame| frame.history.is_empty()));
+    for window in [0, 1, 2, 3, usize::MAX] {
+        let report = multiframe::analyze(
+            &images,
+            &AnalysisOptions {
+                history_window: window,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(report.history_window, window);
+        for (index, frame) in report.frames.iter().enumerate() {
+            let expected: Vec<_> = (index.saturating_sub(window)..index)
+                .rev()
+                .filter(|&reference| reference != 0 && reference + 1 != index)
+                .collect();
+            assert_eq!(
+                frame
+                    .history
+                    .iter()
+                    .map(|entry| entry.reference_index)
+                    .collect::<Vec<_>>(),
+                expected,
+            );
+            // Observations cannot create new candidate references or slots.
+            assert_eq!(
+                frame.plan.reference_index,
+                baseline.frames[index].plan.reference_index
+            );
+            assert_eq!(
+                frame.candidates.len(),
+                baseline.frames[index].candidates.len()
+            );
+            assert!(frame.candidates.iter().all(|candidate| {
+                candidate
+                    .reference_index
+                    .is_none_or(|reference| reference == 0 || reference + 1 == index)
+            }));
+        }
+        if window >= 2 {
+            let entry = &report.frames[3].history[0];
+            assert_eq!(entry.reference_index, 1);
+            assert_eq!(entry.stats.changed_pixels, 0);
+            assert!(entry.improves_static_bbox);
+        }
+        if window >= 3 {
+            let entry = &report.frames[4].history[1];
+            assert_eq!(entry.reference_index, 1);
+            assert_eq!(entry.stats.bbox_pixels, 0);
+            assert!(!entry.improves_static_bbox); // Previous already has zero bbox.
+        }
+    }
+}
+
+#[test]
+fn history_reports_hidden_color_float_words_and_extra_planes_exactly() {
+    let hidden_base = rgba(4, 3, &[], 0);
+    let hidden_changed = rgba(4, 3, &[(2, 1)], 0);
+    let cases = [
+        (hidden_base, hidden_changed),
+        (
+            Image::new(
+                3,
+                1,
+                PixelLayout::Gray,
+                PixelData::F16(vec![0, 0x7e01, 0x7e01]),
+            )
+            .unwrap(),
+            Image::new(
+                3,
+                1,
+                PixelLayout::Gray,
+                PixelData::F16(vec![0x8000, 0x7e02, 0x7e01]),
+            )
+            .unwrap(),
+        ),
+        (
+            Image::new(
+                3,
+                1,
+                PixelLayout::Gray,
+                PixelData::F32(vec![
+                    0.0,
+                    f32::from_bits(0x7fc0_0001),
+                    f32::from_bits(0x7fc0_0001),
+                ]),
+            )
+            .unwrap(),
+            Image::new(
+                3,
+                1,
+                PixelLayout::Gray,
+                PixelData::F32(vec![
+                    -0.0,
+                    f32::from_bits(0x7fc0_0002),
+                    f32::from_bits(0x7fc0_0001),
+                ]),
+            )
+            .unwrap(),
+        ),
+    ];
+    for (case, (base, changed)) in cases.into_iter().enumerate() {
+        let images = [base.clone(), base.clone(), base, changed];
+        let report = multiframe::analyze(
+            &images,
+            &AnalysisOptions {
+                history_window: 2,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let stats = &report.frames[3].history[0].stats;
+        assert_eq!(stats.changed_pixels, if case == 0 { 1 } else { 2 });
+        assert_eq!(
+            stats.bounds,
+            report.frames[3].previous_stats.as_ref().unwrap().bounds
+        );
+        assert!(!stats.mask_eligible);
+        assert!(!report.frames[3].history[0].improves_static_bbox);
+    }
+
+    let base = rgba(7, 5, &[], 255);
+    let mut metadata = base.metadata().clone();
+    metadata
+        .extra_channels
+        .push(ExtraChannelInfo::new(ExtraChannelType::Depth, 16).unwrap());
+    let a = base
+        .clone()
+        .with_metadata(metadata.clone(), vec![PixelData::U16(vec![0; 35])])
+        .unwrap();
+    let mut samples = vec![0; 35];
+    samples[10] = 65535;
+    let b = base
+        .with_metadata(metadata, vec![PixelData::U16(samples)])
+        .unwrap();
+    let report = multiframe::analyze(
+        &[a.clone(), a.clone(), a, b],
+        &AnalysisOptions {
+            history_window: 2,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(report.frames[3].history[0].stats.changed_pixels, 1);
+    assert!(!report.frames[3].history[0].stats.mask_eligible);
+}
+
+#[test]
+fn subsampled_history_is_observed_but_never_recommends_crop() {
+    let base = rgba(7, 5, &[], 255);
+    let mut metadata = base.metadata().clone();
+    let mut extra = ExtraChannelInfo::new(ExtraChannelType::Depth, 8).unwrap();
+    extra.dim_shift = 1;
+    metadata.extra_channels.push(extra);
+    let a = base
+        .clone()
+        .with_metadata(metadata.clone(), vec![PixelData::U8(vec![0; 12])])
+        .unwrap();
+    let b = base
+        .with_metadata(metadata, vec![PixelData::U8(vec![1; 12])])
+        .unwrap();
+    let report = multiframe::analyze(
+        &[a.clone(), b.clone(), a, b],
+        &AnalysisOptions {
+            history_window: usize::MAX,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(!report.crop_supported);
+    let entry = &report.frames[3].history[0];
+    assert_eq!(entry.reference_index, 1);
+    assert_eq!(entry.stats.changed_pixels, 0);
+    assert!(!entry.improves_static_bbox);
+    assert_eq!(report.geometry.suitability, Suitability::FullFramesRequired);
+    assert_eq!(report.geometry.layer_pixels, 4 * 35);
+    assert_eq!(report.geometry.layer_count, 4);
+    assert_eq!(report.geometry.crop_frames, 0);
+    assert_eq!(report.geometry.multi_rect_frames, 0);
+    assert!(
+        report
+            .frames
+            .iter()
+            .all(|frame| frame.candidates.len() == 1)
+    );
+}
+
+#[test]
+fn geometry_summary_accounts_for_sparse_regions_without_changing_bbox_semantics() {
+    let images = [
+        rgba(80, 72, &[], 255),
+        rgba(80, 72, &[(1, 1), (65, 65)], 255),
+    ];
+    let report = multiframe::analyze(
+        &images,
+        &AnalysisOptions {
+            tile_size: 16,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let previous = report
+        .reference_modes
+        .iter()
+        .find(|s| s.reference == Reference::Previous)
+        .unwrap();
+    assert_eq!(previous.layer_pixels, 80 * 72 + 65 * 65);
+    assert_eq!(previous.suitability, Suitability::Limited);
+    let frame = &report.frames[1];
+    let best = &frame.candidates[frame.geometry.best_area_candidate_index];
+    assert_eq!(best.layer_pixels, 2);
+    assert_eq!(best.layer_count, 2);
+    assert_eq!(best.tile_size, Some(16));
+    assert_eq!(report.geometry.layer_pixels, 80 * 72 + 2);
+    assert_eq!(report.geometry.layer_count, 3);
+    assert_eq!(report.geometry.crop_frames, 1);
+    assert_eq!(report.geometry.multi_rect_frames, 1);
+    assert_eq!(report.geometry.suitability, Suitability::Strong);
+    assert_eq!(frame.geometry.candidate_count, frame.candidates.len());
+    assert_eq!(
+        frame.geometry.trial_pixels,
+        frame.candidates.iter().map(|c| c.layer_pixels).sum::<u64>()
+    );
+    assert_eq!(
+        frame.geometry.trial_layers,
+        frame
+            .candidates
+            .iter()
+            .map(|c| c.layer_count)
+            .sum::<usize>()
+    );
+    assert_eq!(
+        report.geometry.trial_pixels,
+        report
+            .frames
+            .iter()
+            .map(|f| f.geometry.trial_pixels)
+            .sum::<u64>()
+    );
+    assert_eq!(
+        report.geometry.trial_layers,
+        report
+            .frames
+            .iter()
+            .map(|f| f.geometry.trial_layers)
+            .sum::<usize>()
+    );
+}
+
+#[test]
+fn repeated_rectangle_work_is_scoped_to_one_input_and_excludes_masks() {
+    let images: Vec<_> = [0, 10, 20]
+        .into_iter()
+        .map(|value| {
+            let mut samples = vec![0; 64];
+            samples[9] = value;
+            Image::new(8, 8, PixelLayout::Gray, PixelData::U8(samples)).unwrap()
+        })
+        .collect();
+    let options = AnalysisOptions {
+        allow_multi_rect: false,
+        ..Default::default()
+    };
+    let report = multiframe::analyze(&images, &options).unwrap();
+    let geometry = &report.frames[2].geometry;
+    assert_eq!(geometry.best_area_candidate_index, 1); // Previous wins canonical tie.
+    assert_eq!(geometry.candidate_count, 3);
+    assert_eq!((geometry.trial_pixels, geometry.trial_layers), (66, 3));
+    let work = &geometry.unmasked_rectangles;
+    assert_eq!((work.total_pixels, work.total_layers), (66, 3));
+    assert_eq!((work.unique_pixels, work.unique_rectangles), (65, 2));
+    assert_eq!((work.repeated_pixels, work.repeated_layers), (1, 1));
+    let total = &report.geometry.unmasked_rectangles;
+    assert_eq!((total.total_pixels, total.total_layers), (195, 6));
+    assert_eq!((total.unique_pixels, total.unique_rectangles), (194, 5));
+    assert_eq!((total.repeated_pixels, total.repeated_layers), (1, 1));
+    assert_eq!(
+        (report.geometry.layer_pixels, report.geometry.layer_count),
+        (66, 3)
+    );
+
+    let report = multiframe::analyze(
+        &[rgba(8, 8, &[], 255), rgba(8, 8, &[(1, 1)], 255)],
+        &options,
+    )
+    .unwrap();
+    let geometry = &report.frames[1].geometry;
+    assert!(
+        report.frames[1]
+            .candidates
+            .iter()
+            .any(|c| c.strategy == Strategy::MaskPrevious)
+    );
+    assert_eq!(geometry.best_area_candidate_index, 1); // Crop before equal-area mask.
+    assert_eq!((geometry.trial_pixels, geometry.trial_layers), (66, 3));
+    assert_eq!(
+        (
+            geometry.unmasked_rectangles.total_pixels,
+            geometry.unmasked_rectangles.total_layers
+        ),
+        (65, 2)
+    );
+    assert_eq!(geometry.unmasked_rectangles.repeated_layers, 0);
+    assert_eq!(geometry.unmasked_rectangles.repeated_pixels, 0);
+}
+
+#[test]
+fn multiscale_geometry_is_forwarded_and_equivalent_plans_are_not_counted_twice() {
+    let images = [
+        rgba(64, 64, &[], 255),
+        rgba(64, 64, &[(1, 1), (25, 25)], 255),
+    ];
+    let options = AnalysisOptions {
+        tile_size: 64,
+        allow_mask: false,
+        adaptive_rectangles: false,
+        ..Default::default()
+    };
+    let baseline = multiframe::analyze(&images, &options).unwrap();
+    let scaled = multiframe::analyze(
+        &images,
+        &AnalysisOptions {
+            extra_tile_sizes: vec![16, 8, 64, 16],
+            ..options
+        },
+    )
+    .unwrap();
+    assert_eq!(baseline.frames[1].candidates.len(), 2);
+    assert_eq!(scaled.frames[1].candidates.len(), 3);
+    let frame = &scaled.frames[1];
+    let best = &frame.candidates[frame.geometry.best_area_candidate_index];
+    assert_eq!(best.strategy, Strategy::TilesPrevious);
+    assert_eq!(best.tile_size, Some(16));
+    assert_eq!(best.layer_pixels, 2);
+    assert_eq!(best.layer_count, 2);
+    assert_eq!(frame.geometry.trial_pixels, 64 * 64 + 25 * 25 + 2);
+    assert_eq!(frame.geometry.trial_layers, 4);
+    assert!(frame.candidates[..2].iter().all(|c| c.tile_size.is_none()));
 }

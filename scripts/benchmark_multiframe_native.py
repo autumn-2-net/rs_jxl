@@ -19,11 +19,18 @@ import sys
 from time import perf_counter
 
 
-MODES = ("crop", "auto-legacy", "auto-pruned", "auto-adaptive", "independent", "jpeg")
+DEFAULT_MODES = ("crop", "auto-legacy", "auto-pruned", "auto-adaptive", "independent", "jpeg")
+MODES = (*DEFAULT_MODES[:-2], "auto-retained", "auto-lookahead", "auto-multiscale", *DEFAULT_MODES[-2:])
 AUTO_OPTIONS = {
     "auto-legacy": {"prune": False, "adaptive_rectangles": False},
     "auto-pruned": {"prune": True, "adaptive_rectangles": False},
     "auto-adaptive": {"prune": True, "adaptive_rectangles": True},
+    "auto-retained": {"prune": True, "adaptive_rectangles": True, "retained_reference": True},
+    "auto-lookahead": {"prune": True, "adaptive_rectangles": True,
+                       "retained_reference": True, "reference_lookahead": True},
+    "auto-multiscale": {"prune": True, "adaptive_rectangles": True,
+                        "retained_reference": True, "reference_lookahead": True,
+                        "extra_tile_sizes": [8, 16, 64]},
 }
 
 
@@ -44,7 +51,7 @@ def parse_args(argv=None):
         parser.error("supply at least one folder, positionally or with --folders")
     if not 1 <= args.effort <= 9 or args.threads < 1:
         parser.error("effort must be 1..9 and threads must be positive")
-    modes = args.modes or (["crop", "auto", "independent", "jpeg"] if args.legacy else MODES)
+    modes = args.modes or (["crop", "auto", "independent", "jpeg"] if args.legacy else DEFAULT_MODES)
     args.modes = []
     for group in modes:
         for mode in group.split(","):
@@ -54,8 +61,10 @@ def parse_args(argv=None):
                 parser.error(f"unknown mode: {mode}")
             if mode not in args.modes:
                 args.modes.append(mode)
-    if args.legacy and any(mode in ("auto-pruned", "auto-adaptive") for mode in args.modes):
-        parser.error("--legacy cannot measure pruned/adaptive modes")
+    if args.legacy and any(mode in ("auto-pruned", "auto-adaptive", "auto-retained", "auto-lookahead", "auto-multiscale") for mode in args.modes):
+        parser.error("--legacy cannot measure pruned/adaptive/retained modes")
+    if any(mode in ("auto-retained", "auto-lookahead", "auto-multiscale") for mode in args.modes) and args.reference != "auto":
+        parser.error("auto-retained/auto-lookahead/auto-multiscale require --reference auto")
     return args
 
 
@@ -169,6 +178,8 @@ def search_statistics(info, require_new=False):
         "trial_pixels": sum(c["trial_pixels"] for c in attempts) if attempts and all("trial_pixels" in c for c in attempts) else None,
         "analysis_seconds": sum(f["analysis_seconds"] for f in frames) if frames and all("analysis_seconds" in f for f in frames) else None,
         "candidate_seconds": sum(c["elapsed_seconds"] for c in attempts) if attempts and all("elapsed_seconds" in c for c in attempts) else None,
+        **{key: sum(f[key] for f in frames) if frames and all(key in f for f in frames) else None
+           for key in ("lookahead_comparisons", "reused_payloads", "reused_payload_pixels")},
     }
 
 
@@ -243,8 +254,10 @@ def markdown(report):
         if "error" in dataset:
             lines += [dataset["error"], ""]
             continue
+        input_seconds = dataset.get("input_seconds")
+        input_time = "not measured" if input_seconds is None else f"{input_seconds:.6f} s"
         lines += [f"{dataset['width']} x {dataset['height']}, {dataset['frames']} frames; "
-                  f"input read/decode: {dataset['input_seconds']:.6f} s", "",
+                  f"input read/decode: {input_time}", "",
                   "| Mode | Bytes | bpp | Encode s | Decode s | Encode MPix/s | Decode MPix/s | Completed | Pruned | Trial pixels | Analysis s | Status |",
                   "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |"]
         notes = []

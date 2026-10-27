@@ -432,8 +432,23 @@ fn zero_duration_crop_validates_each_extra_reference_and_metadata() {
             },
         ]
     };
-    assert!(rs_jxl::encode_frames(&full, &make(1), &options()).is_ok());
-    codec_error_without_writes(&full, &make(2), &options());
+    for source in 0..4 {
+        let bytes = rs_jxl::encode_frames(&full, &make(source), &options()).unwrap();
+        let decoded = rs_jxl::decode::decode(&bytes, &Default::default()).unwrap();
+        assert_eq!(decoded.frames.len(), 1);
+        assert_eq!(decoded.frames[0].pixels, PixelData::U8(vec![11, 23]));
+        // Color uses saved slot 1; each extra independently selects its source.
+        // Unsaved slots are valid zero backgrounds, not missing references.
+        assert_eq!(
+            decoded.frames[0].extra_planes,
+            vec![PixelData::U16(vec![
+                if source == 1 { 257 } else { 0 },
+                65535
+            ])],
+            "extra source={source}"
+        );
+    }
+    codec_error_without_writes(&full, &make(4), &options());
     let mut changed = crop.metadata().clone();
     changed.extra_channels[0].name = "different-depth-name".into();
     let different = crop

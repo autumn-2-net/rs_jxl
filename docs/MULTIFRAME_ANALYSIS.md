@@ -1,5 +1,9 @@
 # Native Multiframe Analysis
 
+Start with the [practical analysis guide (Chinese)](MULTIFRAME_ANALYSIS_GUIDE.md)
+for report interpretation, example calls and deciding when more search is not
+worth its cost. This page is the detailed API/field reference.
+
 `rs_jxl::multiframe::analyze` inspects whether a sequence of full-image states
 has useful spatial reuse. It does not compress anything. Difference scanning,
 reference selection, mask eligibility and rectangle proposals run in Rust.
@@ -19,6 +23,8 @@ fn inspect(images: &[Image]) -> Result<AnalysisReport> {
     let mut encoder = Encoder::new(4)?;
     encoder.analyze_multiframe(images, &AnalysisOptions {
         reference: Reference::SmallestCrop,
+        history_window: 8,
+        extra_tile_sizes: vec![16, 64],
         threads: 4,
         ..Default::default()
     })
@@ -39,7 +45,10 @@ report = analyze_multiframe(
     ["state0.png", "state1.png", "state2.png"],
     reference="auto",
     threads=4,
-    analysis_options={"tile_size": 32, "max_rectangles": 32},
+    analysis_options={
+        "tile_size": 32, "max_rectangles": 32,
+        "extra_tile_sizes": [16, 64], "history_window": 8,
+    },
 )
 
 with Encoder(threads=4) as encoder:
@@ -51,6 +60,12 @@ for frame in report["frames"][1:]:
     for candidate in frame["candidates"]:
         print(candidate["strategy"], candidate["layer_count"],
               candidate["layer_area_ratio"])
+    best = frame["candidates"][frame["geometry"]["best_area_candidate_index"]]
+    print("minimum submitted area", best["layer_pixels"], best["layer_count"])
+    for opportunity in frame["history"]:
+        print("historical input", opportunity["reference_index"],
+              opportunity["stats"]["changed_ratio"],
+              opportunity["improves_static_bbox"])
 ```
 
 Paths, encoded image bytes and NumPy/Torch inputs use the binding's normal
@@ -68,7 +83,9 @@ available; see [Python API](PYTHON_API.md).
 | `allow_multi_rect` | `true` | Include multiple nonoverlapping REPLACE rectangles. |
 | `adaptive_rectangles` | `true` | Include the hierarchy/merge proposal in addition to legacy tiled regions. |
 | `tile_size` | `32` | Positive initial grid size in pixels. |
+| `extra_tile_sizes` | `[]` | Additional positive grid sizes for multi-rectangle proposals. Empty keeps the original candidate set; duplicate grids/equivalent plans are not repeated. |
 | `max_rectangles` | `32` | Positive layer cap for a multi-rectangle proposal. |
+| `history_window` | `0` | Number of preceding input positions to inspect for historical opportunities, skipping first/previous comparisons already performed. Zero disables this extra work. |
 | `rectangle_bytes_per_pixel` | `1.0` | Finite, nonnegative cost estimate used only by adaptive rectangle merging. |
 | `threads` | `1` | Worker count, 1 through 256. |
 
@@ -81,6 +98,14 @@ therefore differ unless the caller provides that same cost estimate. Mask and
 region eligibility and proposal code are shared with the encoder, not copied
 implementations. Analysis does not accept trial limits or a pruning switch
 because it executes no encoding trials.
+
+Additional grids affect candidate geometry only when `allow_multi_rect=true`.
+They use the same optional-scale planner as automatic encoding. Every grid must
+still be positive when multiple-rectangle proposals are disabled. An extra grid
+does not change a strategy name: a `tiles_previous` candidate can have
+`tile_size=16` while another has `tile_size=32`. Full/crop/mask candidates have
+`tile_size=null`. Increasing the number of grids can increase proposal work and
+the number of real trials if the same options are later used for encoding.
 
 ## Report Semantics
 
@@ -106,10 +131,15 @@ Multiply by 100 only for presentation.
   2 previous, 0 full replacement).
 - `candidates` describes full, crop, eligible mask and multiple-rectangle
   proposals for the selected reference policy. It reports rectangles,
-  `layer_count`, submitted `layer_pixels` and `layer_area_ratio`. Masks still
+  `tile_size`, `layer_count`, submitted `layer_pixels` and `layer_area_ratio`. Masks still
   submit the entire bbox; changed-pixel count is not their submitted area.
   The layer count is the number of regular image layers, not any private patch
   reference frames an encoder might later insert.
+- `frames[i].history` contains optional exact comparisons to older logical inputs.
+  These observations do not add candidates or change `plan` or `reference_modes`.
+- `frames[i].geometry` reports the minimum-area candidate and total proposal
+  workload. Top-level `geometry` aggregates those minima, including multi-rect
+  candidates, independently of the existing single-bbox reference summaries.
 - `reference_modes` compares full/previous/first/smallest-crop single-bbox
   policies. Total area includes the first full frame and identical-state
   placeholders. `average_changed_ratio` excludes the initial frame and uses
@@ -132,6 +162,118 @@ Mask eligibility currently requires both images to be fully opaque integer
 GA/RGBA at up to 16 bits, with unassociated primary alpha and no additional
 extra planes. Analysis never creates synthetic alpha for RGB, ignores hidden
 RGB, or suggests BLEND for partial transparency.
+
+## Historical Opportunities
+
+For logical input `i`, `history_window=w` considers the preceding positions
+`[i.saturating_sub(w), i)`. It skips `0` and `i-1` because first/previous were
+already analyzed, and returns the remaining entries newest first. Examples:
+
+| Current index | Window | Additional `history` reference indices |
+| ---: | ---: | --- |
+| 5 | 0 or 1 | `[]` |
+| 5 | 2 | `[3]` |
+| 5 | 4 | `[3, 2, 1]` |
+| 5 | 100 | `[3, 2, 1]` |
+| 2 | 100 | `[]` |
+
+The window is a positional distance, not a requested count of extra comparisons.
+Top-level `history_window` echoes the requested value, even when the sequence
+is too short to fill it. No unrequested hidden history cap is applied.
+
+Each entry has:
+
+- `reference_index`: the historical **logical input index**, never a slot ID.
+- `stats`: the complete `DiffStatistics` object with the same exact sample-word
+  comparisons as first/previous, including hidden RGB, extra channels, float
+  signed zeros and NaN payload bits.
+- `improves_static_bbox`: true only if cropping is supported and this reference
+  has a strictly smaller `bbox_pixels` than **both** first and previous. This
+  always compares against those two baselines, independent of `reference`.
+  Equal bbox area is not an improvement, even if changed-pixel count is lower.
+
+Identical states have `bbox_pixels=0`; actual encoding still requires its legal
+1x1 repeat placeholder. If `crop_supported=false`, history still reports exact
+observations, but `improves_static_bbox` is always false and all candidate plans
+remain full-frame replacements.
+
+**Historical opportunities are not actually available decoder reference slots.**
+The encoder has a bounded set of saved canvases; an old matching input may have
+already been evicted. The analyzer neither assigns a slot to history entries
+nor simulates byte-selected retained-reference/lookahead decisions. A promising
+entry identifies a reason to investigate reference retention, not a valid new
+source slot or proof of compression savings. Increasing this window alone does
+not change automatic encoding behavior.
+
+## Candidate Workload
+
+`frames[i].geometry` uses these fields:
+
+| Field | Meaning |
+| --- | --- |
+| `best_area_candidate_index` | Index into that frame's `candidates`, minimizing `(layer_pixels, layer_count, canonical index)`. |
+| `candidate_count` | Number of proposed candidates, after the shared planner's deduplication. |
+| `trial_pixels` | Sum of submitted rectangle areas across **all** candidates, including masks and repeated rectangles. |
+| `trial_layers` | Sum of regular-layer counts across all candidates. |
+| `unmasked_rectangles` | Exact-rectangle repetition diagnostics, defined below. |
+
+These `trial_*` fields describe hypothetical work before encoding/pruning. No
+trial has actually been run, and no encoding time is measured by this API.
+Geometry-only ordering is not compression ordering. The encoder can prefer a
+larger rectangle that costs fewer bytes, or prune candidates before finishing.
+Regular-layer counts exclude any private patch reference frames that an encoder
+might insert. Additional layers also impose decode/header costs, not quantified
+by their pixel area.
+
+`unmasked_rectangles` identifies equal `(x, y, width, height)` rectangles within
+one input frame, independent of their reference slot or tile-grid provenance:
+
+| Field | Meaning |
+| --- | --- |
+| `total_pixels`, `total_layers` | Area and occurrences of every unmasked rectangle across candidates. |
+| `unique_pixels`, `unique_rectangles` | Area and count of distinct rectangle keys. Area is a sum, **not** the spatial union of overlapping rectangles. |
+| `repeated_pixels`, `repeated_layers` | Area and occurrences after the first occurrence of each key. |
+
+`total_pixels = unique_pixels + repeated_pixels`, and
+`total_layers = unique_rectangles + repeated_layers`. Mask candidates contribute
+to `trial_*` but are entirely excluded from this reuse accounting: their pixel
+payload depends on the compared reference, even for identical bounds. Partially
+overlapping rectangles are not identical keys and are not counted as reusable.
+
+This is an **upper bound on potentially reusable unmasked work**, not a cache-hit
+prediction. Actual patch plans can bypass the cache; pruning can prevent trials
+from reaching a rectangle or completing a reusable payload. Reference headers
+must still be regenerated. The analyzer has no encoder settings and cannot infer
+those decisions or compressed payload bytes.
+
+## Aggregate Geometry
+
+Top-level `geometry` contains:
+
+- `layer_pixels`, `layer_area_ratio`, `layer_count`: sums of the per-frame
+  minimum-area candidates, including the initial full canvas and any 1x1 repeat
+  placeholders. The ratio divides by `width * height * frame_count`.
+- `crop_frames`: inputs for which that minimum candidate submits less than one
+  full canvas. `multi_rect_frames` counts minimum candidates with multiple layers.
+- `suitability`: the same area thresholds as `reference_modes`, but using these
+  multi-candidate minima. It excludes the initial full canvas when applying the
+  30%/70% thresholds. Single input and subsampled-extra restrictions retain the
+  `single_frame` / `full_frames_required` semantics.
+- `candidate_count`, `trial_pixels`, `trial_layers`, `unmasked_rectangles`: sums
+  of the corresponding per-input diagnostics. Reuse is never inferred between
+  different logical input frames, even if their rectangle coordinates match.
+
+For two changed pixels far apart, the single bbox may cover most of the canvas
+and be labeled `limited`, while a two-rectangle proposal submits only two pixels
+and is labeled `strong`. Both reports are valid and intentionally remain separate.
+The new summary does not rewrite `reference_modes`, `best_geometric_reference`,
+or the compatibility single-bbox plan. Nor does it imply the multiple-layer
+candidate is smaller or faster to encode than the bbox candidate.
+
+All area/count accumulations use checked arithmetic; overflow is an analysis
+error rather than a wrapped workload estimate. No compressed byte estimate is
+added to any result. `rectangle_bytes_per_pixel` remains only the caller's
+existing adaptive-merge cost parameter, not an observed or predicted size.
 
 ## Comparing Actual Compression
 
@@ -177,15 +319,30 @@ the analyzer does not silently pad the differently sized frame.
 
 ## Implementation and Tests
 
-The implementation is in `crates/rs-jxl/src/multiframe/analysis.rs`, with shared
-`diff.rs`, candidate geometry in `auto.rs`, and the existing rectangle planners.
-Only two reference maps are live per input state, and the second frame shares
-its first/previous map. Reports retain geometry and statistics, not image
-copies or bitmaps. Exact scanning is linear in compared samples; adaptive
-region construction adds work proportional to occupied tiles.
+The implementation is in `crates/rs-jxl/src/multiframe/analysis.rs` and its
+`analysis/history.rs` and `analysis/geometry.rs` submodules, with shared `diff.rs`,
+candidate geometry in `auto.rs`/`scales.rs`, and the existing rectangle planners.
+At most two static reference maps are retained per input; the second frame shares
+its first/previous map. History scanning creates and releases one additional map
+at a time. It does not retain all historical bitmaps, cropped images or encoded
+payloads. Reports retain geometry and statistics only.
+
+Exact scanning is linear in compared samples per comparison. Increasing the
+history window increases the number of scans and stored statistics, up to
+quadratic comparison count for an unbounded sequence-wide window. It is opt-in,
+not a free extension of decoder reference capacity. Rectangle proposals add
+work proportional to occupied tiles and requested distinct scales. Workload
+diagnostics use ordered rectangle keys and never rescan image samples.
 
 `crates/rs-jxl/tests/multiframe_analysis.rs` covers exact statistics, all reference
 policies, hidden RGB, float words, wide integer samples, extra-channel unions,
 subsampling restrictions, identical states, worker reuse and invalid controls.
 It also compares reported candidate areas and layer counts with actual encoder
 trials using the same measured merge cost and verifies the decoded final state.
+Additional coverage includes history-window boundaries, strict bbox improvement,
+subsampled history restrictions, hidden/float/extra history samples, multiscale
+deduplication, sparse-region versus bbox suitability, canonical area/layer ties,
+mask exclusion, per-input reuse scope and checked-counter overflow. FFI tests in
+`crates/rs-jxl-ffi/src/analysis.rs` check the full JSON projection and that analysis
+returns no encoded data. Central test execution is handled by the parent task;
+these additions do not themselves assert a new benchmark or conformance result.

@@ -11,7 +11,7 @@ use rs_jxl::{EncodeOptions, Image};
 
 use crate::{Result, input, io, options::Tools, validators::parse_threads};
 
-#[derive(Clone, Copy, Debug, ValueEnum)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum ReferenceArg {
     Auto,
     Previous,
@@ -79,7 +79,12 @@ Durations are integer ticks: seconds = ticks * tps denominator / tps numerator. 
 --duration applies to every input; --durations requires one comma-separated \
 value per input. Zero ticks mean a non-display layer, not a one-tick substitute.\n\
 Automatic selection measures encoded bytes, not elapsed time. --reference auto \
-permits previous and first references. Mask and multi-rectangle candidates are \
+permits previous and first references. --retained-reference requires auto and \
+rotates two reference slots to also reuse a retained older canvas; the first \
+frame is no longer permanently pinned. --reference-lookahead additionally requires \
+--retained-reference and uses exact differences against at most the next input to \
+choose an old state to retain, without future trial encodes or a global size guarantee. \
+Both reference flags are off by default. Mask and multi-rectangle candidates are \
 enabled by default when lossless and compatible. These are multiframe strategies, \
 not source-search or an effort mapping. Proven-bound pruning and adaptive rectangle \
 proposals are enabled by default; --no-prune and --no-adaptive-rectangles disable \
@@ -122,6 +127,12 @@ pub(crate) struct EncodeFramesArgs {
     /// Reference candidates: auto permits both previous and first
     #[arg(long, value_enum, default_value = "auto")]
     reference: ReferenceArg,
+    /// Rotate retained reference canvases (requires --reference auto)
+    #[arg(long)]
+    retained_reference: bool,
+    /// Choose retained states using the next input (opt-in; no future encoding)
+    #[arg(long, requires = "retained_reference")]
+    reference_lookahead: bool,
     /// Disable the safe mask candidate
     #[arg(long)]
     no_mask: bool,
@@ -137,6 +148,9 @@ pub(crate) struct EncodeFramesArgs {
     /// Tile side length for multi-rectangle planning
     #[arg(long, default_value_t = AutoOptions::default().tile_size, value_parser = clap::value_parser!(u32).range(1..), value_name = "PIXELS")]
     tile_size: u32,
+    /// Extra rectangle grids (comma-separated); actual bytes select the winner
+    #[arg(long, value_delimiter = ',', value_parser = clap::value_parser!(u32).range(1..), value_name = "PIXELS,...")]
+    extra_tile_sizes: Vec<u32>,
     /// Maximum rectangles in a multi-rectangle candidate (positive integer)
     #[arg(long, default_value_t = AutoOptions::default().max_rectangles, value_parser = positive_usize, value_name = "N")]
     max_rectangles: usize,
@@ -152,6 +166,9 @@ pub(crate) struct EncodeFramesArgs {
     /// Encoder worker count (1..=256)
     #[arg(long, default_value = "1", value_parser = parse_threads, value_name = "N")]
     threads: usize,
+    /// Write the candidate report as a single JSON line to stderr
+    #[arg(long)]
+    report_json: bool,
     /// Discard unsupported metadata; retain supported color metadata and samples
     #[arg(long)]
     strip_metadata: bool,
@@ -164,16 +181,29 @@ impl EncodeFramesArgs {
     fn auto_options(&self) -> AutoOptions {
         AutoOptions {
             reference: self.reference.core(),
+            retained_reference: self.retained_reference,
+            reference_lookahead: self.reference_lookahead,
             allow_mask: !self.no_mask,
             allow_multi_rect: !self.no_multi_rect,
             prune: !self.no_prune,
             adaptive_rectangles: !self.no_adaptive_rectangles,
             tile_size: self.tile_size,
+            extra_tile_sizes: self.extra_tile_sizes.clone(),
             max_rectangles: self.max_rectangles,
             max_frames: self.max_frames,
             max_total_trials: self.max_total_trials,
             max_trial_pixels: self.max_trial_pixels,
         }
+    }
+
+    fn validate_options(&self) -> Result<()> {
+        if self.reference_lookahead && !self.retained_reference {
+            return Err("--reference-lookahead requires --retained-reference".into());
+        }
+        if self.retained_reference && self.reference != ReferenceArg::Auto {
+            return Err("--retained-reference requires --reference auto".into());
+        }
+        Ok(())
     }
 
     fn animation(&self) -> Animation {
@@ -318,25 +348,38 @@ fn write_report(mut output: impl Write, result: &AutoEncodeResult) -> std::io::R
     for (frame_index, frame) in result.frames.iter().enumerate() {
         writeln!(
             output,
-            "frame {}: winner={} candidates={} pruned={} analysis_elapsed={:?}",
+            "frame {}: winner={} candidates={} pruned={} analysis_elapsed={:?} retained_reference={} reference_lookahead={} lookahead_comparisons={} reused_payloads={} reused_payload_pixels={} references_before={:?} references_after={:?}",
             frame_index + 1,
             frame.winner_index,
             frame.candidates.len(),
             frame.pruned.len(),
-            frame.analysis_elapsed
+            frame.analysis_elapsed,
+            frame.retained_reference,
+            frame.reference_lookahead,
+            frame.lookahead_comparisons,
+            frame.reused_payloads,
+            frame.reused_payload_pixels,
+            frame.references_before,
+            frame.references_after,
         )?;
         for difference in &frame.differences {
             writeln!(
                 output,
-                "  difference reference={} changed_pixels={} bounds={:?}",
-                difference.reference, difference.changed_pixels, difference.bounds,
+                "  difference reference={} source={} changed_pixels={} bounds={:?}",
+                difference.reference,
+                difference.source,
+                difference.changed_pixels,
+                difference.bounds,
             )?;
         }
         for (index, candidate) in frame.candidates.iter().enumerate() {
             writeln!(
                 output,
-                "  candidate={index} strategy={:?} encoded_bytes={} encoded_frames={} trial_pixels={} elapsed={:?}{}",
+                "  candidate={index} strategy={:?} reference_index={:?} source={} save_as_reference={} encoded_bytes={} encoded_frames={} trial_pixels={} elapsed={:?}{}",
                 candidate.strategy,
+                candidate.reference_index,
+                candidate.source,
+                candidate.save_as_reference,
                 candidate.encoded_bytes,
                 candidate.encoded_frames,
                 candidate.trial_pixels,
@@ -351,8 +394,11 @@ fn write_report(mut output: impl Write, result: &AutoEncodeResult) -> std::io::R
         for (index, candidate) in frame.pruned.iter().enumerate() {
             writeln!(
                 output,
-                "  pruned={index} strategy={:?} lower_bound={} encoded_frames={} planned_frames={} trial_pixels={} elapsed={:?}",
+                "  pruned={index} strategy={:?} reference_index={:?} source={} save_as_reference={} lower_bound={} encoded_frames={} planned_frames={} trial_pixels={} elapsed={:?}",
                 candidate.strategy,
+                candidate.reference_index,
+                candidate.source,
+                candidate.save_as_reference,
                 candidate.lower_bound,
                 candidate.encoded_frames,
                 candidate.planned_frames,
@@ -369,8 +415,91 @@ fn write_report(mut output: impl Write, result: &AutoEncodeResult) -> std::io::R
     )
 }
 
+fn write_json_report(mut output: impl Write, result: &AutoEncodeResult) -> Result<()> {
+    use serde_json::json;
+
+    let frames: Vec<_> =
+        result
+            .frames
+            .iter()
+            .enumerate()
+            .map(|(index, frame)| {
+                let candidates: Vec<_> = frame
+                    .candidates
+                    .iter()
+                    .map(|candidate| {
+                        json!({
+                            "strategy": format!("{:?}", candidate.strategy),
+                            "tile_size": candidate.tile_size,
+                            "reference_index": candidate.reference_index,
+                            "source": candidate.source,
+                            "save_as_reference": candidate.save_as_reference,
+                            "encoded_bytes": candidate.encoded_bytes,
+                            "encoded_frames": candidate.encoded_frames,
+                            "trial_pixels": candidate.trial_pixels,
+                            "elapsed_seconds": candidate.elapsed.as_secs_f64(),
+                        })
+                    })
+                    .collect();
+                let pruned: Vec<_> = frame
+                    .pruned
+                    .iter()
+                    .map(|candidate| {
+                        json!({
+                            "strategy": format!("{:?}", candidate.strategy),
+                            "tile_size": candidate.tile_size,
+                            "reference_index": candidate.reference_index,
+                            "source": candidate.source,
+                            "save_as_reference": candidate.save_as_reference,
+                            "lower_bound": candidate.lower_bound,
+                            "encoded_frames": candidate.encoded_frames,
+                            "planned_frames": candidate.planned_frames,
+                            "trial_pixels": candidate.trial_pixels,
+                            "elapsed_seconds": candidate.elapsed.as_secs_f64(),
+                        })
+                    })
+                    .collect();
+                let differences: Vec<_> = frame.differences.iter().map(|diff| json!({
+                "reference": diff.reference,
+                "source": diff.source,
+                "changed_pixels": diff.changed_pixels,
+                "bounds": diff.bounds.map(|rect| json!({
+                    "x": rect.x, "y": rect.y, "width": rect.width, "height": rect.height,
+                })),
+            })).collect();
+                json!({
+                    "index": index,
+                    "winner_index": frame.winner_index,
+                    "retained_reference": frame.retained_reference,
+                    "reference_lookahead": frame.reference_lookahead,
+                    "lookahead_comparisons": frame.lookahead_comparisons,
+                    "reused_payloads": frame.reused_payloads,
+                    "reused_payload_pixels": frame.reused_payload_pixels,
+                    "references_before": frame.references_before,
+                    "references_after": frame.references_after,
+                    "analysis_elapsed_seconds": frame.analysis_elapsed.as_secs_f64(),
+                    "candidates": candidates,
+                    "pruned": pruned,
+                    "differences": differences,
+                })
+            })
+            .collect();
+    serde_json::to_writer(
+        &mut output,
+        &json!({
+            "operation": "encode_frames",
+            "inputs": result.frames.len(),
+            "output_bytes": result.bytes.len(),
+            "frames": frames,
+        }),
+    )?;
+    writeln!(output)?;
+    Ok(())
+}
+
 pub(crate) fn run(args: EncodeFramesArgs) -> Result<()> {
     let _total = rs_jxl::profile::scope("cli.total");
+    args.validate_options()?;
     args.check_paths()?;
     let durations = args.frame_durations()?;
     let mut options = EncodeOptions {
@@ -395,7 +524,11 @@ pub(crate) fn run(args: EncodeFramesArgs) -> Result<()> {
         let mut encoder = Encoder::new(options.threads)?;
         encoder.encode_auto(&images, &durations, &options, &args.auto_options())?
     };
-    write_report(std::io::stderr().lock(), &result)?;
+    if args.report_json {
+        write_json_report(std::io::stderr().lock(), &result)?;
+    } else {
+        write_report(std::io::stderr().lock(), &result)?;
+    }
     // Protect every source again before the existing transactional publisher.
     args.check_paths()?;
     io::write_output(&args.inputs[0], &args.output, args.force, &result.bytes)
@@ -436,6 +569,13 @@ mod tests {
         assert_eq!(args.threads, 1);
         let auto = args.auto_options();
         assert_eq!(auto.reference, Reference::SmallestCrop);
+        assert!(!auto.retained_reference && !args.report_json);
+        assert!(!auto.reference_lookahead);
+        assert_eq!(
+            auto.reference_lookahead,
+            AutoOptions::default().reference_lookahead
+        );
+        args.validate_options().unwrap();
         assert!(auto.allow_mask && auto.allow_multi_rect);
         assert_eq!(auto.prune, AutoOptions::default().prune);
         assert_eq!(
@@ -443,10 +583,100 @@ mod tests {
             AutoOptions::default().adaptive_rectangles
         );
         assert_eq!(auto.tile_size, AutoOptions::default().tile_size);
+        assert_eq!(
+            auto.extra_tile_sizes,
+            AutoOptions::default().extra_tile_sizes
+        );
         assert_eq!(auto.max_rectangles, AutoOptions::default().max_rectangles);
         assert_eq!(auto.max_frames, usize::MAX);
         assert_eq!(auto.max_total_trials, usize::MAX);
         assert_eq!(auto.max_trial_pixels, u64::MAX);
+    }
+
+    #[test]
+    fn retained_reference_is_opt_in_and_requires_automatic_reference_selection() {
+        for extra in [
+            vec!["--retained-reference"],
+            vec![
+                "--retained-reference",
+                "--reference",
+                "auto",
+                "--report-json",
+            ],
+        ] {
+            let args = parse(&extra);
+            args.validate_options().unwrap();
+            assert!(args.auto_options().retained_reference);
+        }
+        assert!(parse(&["--report-json"]).report_json);
+        for reference in ["previous", "first", "full"] {
+            parse(&["--reference", reference])
+                .validate_options()
+                .unwrap();
+            let args = parse(&["--reference", reference, "--retained-reference"]);
+            assert!(
+                args.validate_options()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("--reference auto")
+            );
+            // Options must fail before nonexistent input files are accessed.
+            assert!(
+                run(args)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("--reference auto")
+            );
+        }
+    }
+
+    #[test]
+    fn reference_lookahead_requires_retained_reference_before_io() {
+        let error = Cli::try_parse_from([
+            "rs-jxl",
+            "encode-frames",
+            "missing.png",
+            "-o",
+            "out.jxl",
+            "--reference-lookahead",
+        ])
+        .unwrap_err();
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
+        assert!(error.to_string().contains("--retained-reference"));
+        let args = parse(&["--retained-reference", "--reference-lookahead"]);
+        args.validate_options().unwrap();
+        assert!(args.auto_options().reference_lookahead);
+        assert!(args.auto_options().retained_reference);
+        assert!(
+            !parse(&["--retained-reference"])
+                .auto_options()
+                .reference_lookahead
+        );
+        for reference in ["previous", "first", "full"] {
+            let args = parse(&[
+                "--retained-reference",
+                "--reference-lookahead",
+                "--reference",
+                reference,
+            ]);
+            assert!(
+                run(args)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("--reference auto")
+            );
+        }
+        let mut args = parse(&[]);
+        args.reference_lookahead = true;
+        assert!(
+            run(args)
+                .unwrap_err()
+                .to_string()
+                .contains("--retained-reference")
+        );
     }
 
     #[test]
@@ -474,6 +704,12 @@ mod tests {
 
     #[test]
     fn explicit_timing_and_strategy_options_are_forwarded() {
+        assert_eq!(
+            parse(&["--extra-tile-sizes", "8,16,64"])
+                .auto_options()
+                .extra_tile_sizes,
+            [8, 16, 64]
+        );
         let args = parse(&[
             "--durations",
             "0,17",
@@ -713,16 +949,31 @@ mod tests {
             bytes: vec![0; 123],
             frames: vec![AutoFrameReport {
                 winner_index: 1,
+                retained_reference: true,
+                reference_lookahead: true,
+                lookahead_comparisons: 3,
+                reused_payloads: 2,
+                reused_payload_pixels: 25,
+                references_before: [None, Some(0), Some(1), None],
+                references_after: [None, Some(0), Some(1), None],
                 candidates: vec![
                     AutoCandidateReport {
                         strategy: Strategy::Full,
+                        tile_size: None,
+                        reference_index: None,
+                        source: 0,
+                        save_as_reference: 0,
                         encoded_bytes: 100,
                         encoded_frames: 1,
                         trial_pixels: 100,
                         elapsed: Duration::from_secs(1),
                     },
                     AutoCandidateReport {
-                        strategy: Strategy::CropPrevious,
+                        strategy: Strategy::CropRetained,
+                        tile_size: None,
+                        reference_index: Some(1),
+                        source: 2,
+                        save_as_reference: 0,
                         encoded_bytes: 70,
                         encoded_frames: 2,
                         trial_pixels: 50,
@@ -730,7 +981,11 @@ mod tests {
                     },
                 ],
                 pruned: vec![AutoPrunedReport {
-                    strategy: Strategy::MergedPrevious,
+                    strategy: Strategy::MergedRetained,
+                    tile_size: Some(16),
+                    reference_index: Some(1),
+                    source: 2,
+                    save_as_reference: 0,
                     lower_bound: 80,
                     encoded_frames: 1,
                     planned_frames: 3,
@@ -739,7 +994,8 @@ mod tests {
                 }],
                 analysis_elapsed: Duration::from_millis(250),
                 differences: vec![AutoDiffReport {
-                    reference: 0,
+                    reference: 1,
+                    source: 2,
                     changed_pixels: 0,
                     bounds: None,
                 }],
@@ -749,12 +1005,13 @@ mod tests {
         write_report(&mut report, &result).unwrap();
         let report = String::from_utf8(report).unwrap();
         assert!(report.contains("frame 1: winner=1 candidates=2 pruned=1 analysis_elapsed=250ms"));
-        assert!(report.contains("difference reference=0 changed_pixels=0 bounds=None"));
+        assert!(report.contains("retained_reference=true reference_lookahead=true lookahead_comparisons=3 reused_payloads=2 reused_payload_pixels=25 references_before=[None, Some(0), Some(1), None] references_after=[None, Some(0), Some(1), None]"));
+        assert!(report.contains("difference reference=1 source=2 changed_pixels=0 bounds=None"));
         assert!(report.contains(
-            "strategy=Full encoded_bytes=100 encoded_frames=1 trial_pixels=100 elapsed=1s\n"
+            "strategy=Full reference_index=None source=0 save_as_reference=0 encoded_bytes=100 encoded_frames=1 trial_pixels=100 elapsed=1s\n"
         ));
         assert!(report.contains(
-            "strategy=CropPrevious encoded_bytes=70 encoded_frames=2 trial_pixels=50 elapsed=3s winner\n"
+            "strategy=CropRetained reference_index=Some(1) source=2 save_as_reference=0 encoded_bytes=70 encoded_frames=2 trial_pixels=50 elapsed=3s winner\n"
         ));
         let pruned = report
             .lines()
@@ -762,10 +1019,44 @@ mod tests {
             .unwrap();
         assert_eq!(
             pruned,
-            "  pruned=0 strategy=MergedPrevious lower_bound=80 encoded_frames=1 planned_frames=3 trial_pixels=40 elapsed=500ms"
+            "  pruned=0 strategy=MergedRetained reference_index=Some(1) source=2 save_as_reference=0 lower_bound=80 encoded_frames=1 planned_frames=3 trial_pixels=40 elapsed=500ms"
         );
         assert!(!pruned.contains("encoded_bytes=") && !pruned.contains("winner"));
         assert!(report.contains("sequence: inputs=1 output_bytes=123"));
+        let mut json = Vec::new();
+        write_json_report(&mut json, &result).unwrap();
+        assert_eq!(json.iter().filter(|&&byte| byte == b'\n').count(), 1);
+        let json: serde_json::Value = serde_json::from_slice(&json).unwrap();
+        assert_eq!(json["operation"], "encode_frames");
+        assert_eq!(json["output_bytes"], 123);
+        let frame = &json["frames"][0];
+        assert_eq!(frame["index"], 0);
+        assert_eq!(frame["winner_index"], 1);
+        assert_eq!(frame["retained_reference"], true);
+        assert_eq!(frame["reference_lookahead"], true);
+        assert_eq!(frame["lookahead_comparisons"], 3);
+        assert_eq!(frame["reused_payloads"], 2);
+        assert_eq!(frame["reused_payload_pixels"], 25);
+        assert_eq!(
+            frame["references_before"],
+            serde_json::json!([null, 0, 1, null])
+        );
+        assert_eq!(frame["references_before"], frame["references_after"]);
+        assert_eq!(frame["analysis_elapsed_seconds"], 0.25);
+        assert_eq!(frame["differences"][0]["source"], 2);
+        assert!(frame["differences"][0]["bounds"].is_null());
+        assert!(frame["candidates"][0]["reference_index"].is_null());
+        assert_eq!(frame["candidates"][1]["strategy"], "CropRetained");
+        assert_eq!(frame["candidates"][1]["reference_index"], 1);
+        assert_eq!(frame["candidates"][1]["source"], 2);
+        assert_eq!(frame["candidates"][1]["save_as_reference"], 0);
+        assert_eq!(frame["candidates"][1]["elapsed_seconds"], 3.0);
+        assert_eq!(frame["pruned"][0]["strategy"], "MergedRetained");
+        assert_eq!(frame["pruned"][0]["reference_index"], 1);
+        assert_eq!(frame["pruned"][0]["source"], 2);
+        assert_eq!(frame["pruned"][0]["save_as_reference"], 0);
+        assert_eq!(frame["pruned"][0]["lower_bound"], 80);
+        assert!(frame["pruned"][0].get("encoded_bytes").is_none());
     }
 
     struct TestDir(PathBuf);
@@ -810,6 +1101,46 @@ mod tests {
         let mut writer = encoder.write_header().unwrap();
         writer.write_image_data(data).unwrap();
         writer.finish().unwrap();
+    }
+
+    #[test]
+    fn lookahead_png_sequence_roundtrips_with_mixed_zero_durations() {
+        let dir = TestDir::new();
+        let samples = [
+            [17, 23, 31, 0, 42, 53, 64, 255],
+            [91, 82, 73, 0, 64, 55, 46, 255],
+            [92, 82, 73, 0, 64, 55, 46, 255],
+            [18, 23, 31, 0, 42, 53, 64, 255],
+        ];
+        let inputs: Vec<_> = (0..samples.len())
+            .map(|index| dir.0.join(format!("{index}.png")))
+            .collect();
+        for (path, data) in inputs.iter().zip(&samples) {
+            write_png(path, png::BitDepth::Eight, data);
+        }
+        let output = dir.0.join("lookahead.jxl");
+        run(file_args(
+            &inputs,
+            &output,
+            &[
+                "--retained-reference",
+                "--reference-lookahead",
+                "--report-json",
+                "--durations",
+                "0,3,0,5",
+                "--threads",
+                "2",
+            ],
+        ))
+        .unwrap();
+        let decoded =
+            rs_jxl::decode::decode(&fs::read(&output).unwrap(), &Default::default()).unwrap();
+        assert!(decoded.complete);
+        assert_eq!(decoded.frames.len(), 2);
+        for ((frame, index), duration) in decoded.frames.iter().zip([1, 3]).zip([3, 5]) {
+            assert_eq!(frame.pixels, PixelData::U8(samples[index].to_vec()));
+            assert_eq!(frame.duration_ticks, duration);
+        }
     }
 
     #[test]

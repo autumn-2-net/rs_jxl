@@ -60,14 +60,49 @@ def args(legacy=False):
 
 
 class BenchmarkTests(unittest.TestCase):
+    def test_multiscale_mode_is_opt_in_and_unknown_input_time_is_not_zero(self):
+        parsed = bench.parse_args(["one", "--modes", "auto-multiscale", "--out", "report.json"])
+        self.assertEqual(parsed.modes, ["auto-multiscale"])
+        self.assertNotIn("auto-multiscale", bench.DEFAULT_MODES)
+        codec = FakeCodec()
+        bench.measure(codec, dataset(), "auto-multiscale", args())
+        self.assertEqual(codec.calls[0][2]["auto_options"]["extra_tile_sizes"], [8, 16, 64])
+        report = {"status": "passed", "native": "fixture", "effort": 9, "threads": 4,
+                  "reference": "auto", "legacy": False,
+                  "datasets": [{"folder": "subset", "width": 5, "height": 3,
+                                "frames": 2, "input_seconds": None, "results": []}]}
+        self.assertIn("input read/decode: not measured", bench.markdown(report))
+
     def test_cli_folders_defaults_and_legacy_modes(self):
         parsed = bench.parse_args(["one", "--folders", "two", "three", "--folders", "four",
                                    "--out", "report.md"])
         self.assertEqual(parsed.folders, list(map(Path, ["one", "two", "three", "four"])))
         self.assertEqual((parsed.effort, parsed.threads), (9, 4))
-        self.assertEqual(parsed.modes, list(bench.MODES))
+        self.assertEqual(parsed.modes, list(bench.DEFAULT_MODES))
         parsed = bench.parse_args(["one", "--legacy", "--modes", "crop,auto", "--out", "report.json"])
         self.assertEqual(parsed.modes, ["crop", "auto-legacy"])
+
+    def test_retained_reference_is_explicit_and_not_an_old_library_mode(self):
+        parsed = bench.parse_args(["one", "--modes", "auto-retained", "--out", "report.json"])
+        self.assertEqual(parsed.modes, ["auto-retained"])
+        for extra in (["--legacy"], ["--reference", "first"]):
+            with self.assertRaises(SystemExit):
+                bench.parse_args(["one", "--modes", "auto-retained", "--out", "report.json", *extra])
+        codec = FakeCodec()
+        row = bench.measure(codec, dataset(), "auto-retained", args())
+        self.assertEqual(row["status"], "passed")
+        self.assertTrue(codec.calls[0][2]["auto_options"]["retained_reference"])
+
+    def test_lookahead_mode_forwards_native_option(self):
+        parsed = bench.parse_args(["one", "--modes", "auto-lookahead", "--out", "report.json"])
+        self.assertEqual(parsed.modes, ["auto-lookahead"])
+        self.assertNotIn("auto-lookahead", bench.DEFAULT_MODES)
+        codec = FakeCodec()
+        bench.measure(codec, dataset(), "auto-lookahead", args())
+        self.assertTrue(codec.calls[0][2]["auto_options"]["reference_lookahead"])
+        for extra in (["--legacy"], ["--reference", "previous"]):
+            with self.assertRaises(SystemExit):
+                bench.parse_args(["one", "--modes", "auto-lookahead", "--out", "report.json", *extra])
 
     def test_natural_filename_order(self):
         paths = list(map(Path, ["frame10.png", "frame2.png", "frame1.png"]))
@@ -152,7 +187,8 @@ class BenchmarkTests(unittest.TestCase):
         stats = bench.search_statistics(info, require_new=True)
         self.assertEqual(stats, {"candidates_completed": 1, "candidates_pruned": 1,
                                  "trial_pixels": 22, "candidate_seconds": 0.75,
-                                 "analysis_seconds": 0.125})
+                                 "analysis_seconds": 0.125, "lookahead_comparisons": None,
+                                 "reused_payloads": None, "reused_payload_pixels": None})
         old = {"frames": [{"candidates": [{"encoded_bytes": 123}]}]}
         self.assertIsNone(bench.search_statistics(old)["candidates_pruned"])
         self.assertIsNone(bench.search_statistics(old)["analysis_seconds"])

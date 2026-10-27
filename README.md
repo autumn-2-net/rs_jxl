@@ -55,10 +55,13 @@ diagnostics, not a requirement to reproduce C++ arithmetic bit for bit.
 - Full-frame difference planning against the previous or first frame, including
   hidden RGB and extra planes. Crop area is a heuristic, not an encoded-size claim.
 - Native [multiframe analysis](docs/MULTIFRAME_ANALYSIS.md) reports exact changed
-  pixels, reference-policy geometry, mask eligibility and rectangle proposals
+  pixels, reference-policy geometry, optional historical matches, mask eligibility,
+  rectangle proposals and candidate/repeated-payload work
   without encoding; reusable Rust contexts and Python share the same planner.
 - Separate byte-selected automatic multiframe encoding compares full/crop,
   eligible binary masks and multiple REPLACE layers, retaining actual winners.
+  Optional retained-reference lookahead and multiscale grids expand reuse;
+  extra grids remain disabled by default due to their measured search costs.
   See [automatic frames](docs/MULTIFRAME_AUTO.md) and
   [encode-frames CLI](docs/MULTIFRAME_AUTO_CLI.md).
 - Typed `codec::EncodeJob` dispatch and reusable `codec::Encoder` workers,
@@ -203,8 +206,10 @@ layers on a shared canvas; `rs_jxl.decode_layer(data, layer=i)` retrieves one
 without canvas padding or compositing. Layout, depth, color and extra-channel
 metadata must agree. See [heterogeneous layers](docs/HETEROGENEOUS_LAYERS.md) for
 placement, timing, reference semantics and the distinction from automatic diff
-encoding. [Stronger temporal reuse](docs/MULTIFRAME_REUSE_ROADMAP.md) is a future
-encoder-search direction using standard JXL references and patches.
+encoding. [Stronger temporal reuse](docs/MULTIFRAME_REUSE_ROADMAP.md) tracks
+implemented retained-reference policies and future displaced patch matching.
+See [multiscale measurements](docs/MULTIFRAME_MULTISCALE_BENCHMARK.md) for the
+current compression gains and substantial search-cost tradeoffs.
 
 ## Build and Run
 
@@ -354,6 +359,8 @@ must repeat the relevant checks; historical binding validation remains separate.
 
 ## Documentation
 
+- [Encoding parameters: defaults, search, JPEG and multiframe (Chinese)](docs/ENCODING_PARAMETERS.md)
+- [Multiframe analysis: interpreting reports and search tradeoffs (Chinese)](docs/MULTIFRAME_ANALYSIS_GUIDE.md)
 - [Coverage and acceptance gates](docs/PIXEL_LOSSLESS_PORT_STATUS.md)
 - [Verification checkpoints and profiling](docs/PORT_VERIFICATION.md)
 - [Source map and migration order](docs/MIGRATION.md)

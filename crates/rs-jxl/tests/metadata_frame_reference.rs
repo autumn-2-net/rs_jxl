@@ -961,28 +961,131 @@ fn overwritten_reference_stage_is_not_stale() {
 
 #[test]
 fn zero_duration_slot_zero_is_saved_but_timed_slot_zero_is_not() {
-    let (full, crop) = reference_images(true);
     for duration in [0, 1] {
-        let frames = [
-            Frame {
-                image: &full,
-                options: FrameOptions {
-                    duration,
-                    ..Default::default()
-                },
+        let (bytes, expected) = slot_zero_sequence(duration);
+        let decoded = rs_jxl::decode::decode(
+            &bytes,
+            &rs_jxl::decode::DecodeOptions {
+                include_extra_channels: true,
+                ..Default::default()
             },
-            Frame {
-                image: &crop,
+        )
+        .unwrap();
+        assert_eq!(decoded.frames.len(), expected.len());
+        for (actual, expected) in decoded.frames.iter().zip(&expected) {
+            assert_eq!(&actual.pixels, expected.pixels(), "duration={duration}");
+            let PixelData::U8(pixels) = expected.pixels() else {
+                panic!("expected U8 fixture");
+            };
+            assert_eq!(actual.extra_planes.len(), 2);
+            assert_eq!(
+                actual.extra_planes[0],
+                PixelData::U8(pixels.chunks_exact(4).map(|pixel| pixel[3]).collect()),
+                "duration={duration}: interleaved alpha is also exposed as an extra plane"
+            );
+            assert_eq!(
+                &actual.extra_planes[1..],
+                expected.extra_planes(),
+                "duration={duration}"
+            );
+        }
+    }
+}
+
+fn slot_zero_sequence(duration: u32) -> (Vec<u8>, Vec<Image>) {
+    let (full, crop) = reference_images(true);
+    let frames = [
+        Frame {
+            image: &full,
+            options: FrameOptions {
+                duration,
+                ..Default::default()
+            },
+        },
+        Frame {
+            image: &crop,
+            options: FrameOptions {
+                duration: 1,
+                ..Default::default()
+            },
+        },
+    ];
+    let bytes = rs_jxl::encode_frames(&full, &frames, &options()).unwrap();
+    // A timed frame does not save slot zero. Reading that empty slot is legal
+    // and supplies zeros, rather than the preceding visible frame's pixels.
+    let composite = |background: &PixelData, replacement: &PixelData| {
+        let (PixelData::U8(background), PixelData::U8(replacement)) = (background, replacement)
+        else {
+            panic!("expected U8 fixture");
+        };
+        let mut values = if duration == 0 {
+            background.clone()
+        } else {
+            vec![0; background.len()]
+        };
+        values[..replacement.len()].copy_from_slice(replacement);
+        PixelData::U8(values)
+    };
+    let expected = Image::new(
+        full.width(),
+        full.height(),
+        full.layout(),
+        composite(full.pixels(), crop.pixels()),
+    )
+    .unwrap()
+    .with_metadata(
+        full.metadata().clone(),
+        full.extra_planes()
+            .iter()
+            .zip(crop.extra_planes())
+            .map(|(background, replacement)| composite(background, replacement))
+            .collect(),
+    )
+    .unwrap();
+    let expected = if duration == 0 {
+        vec![expected]
+    } else {
+        vec![full, expected]
+    };
+    (bytes, expected)
+}
+
+#[test]
+#[ignore = "requires RS_JXL_DJXL; saved versus empty slot-zero background"]
+fn slot_zero_background_matches_official_decoders() {
+    let decoders = decoder_paths();
+    let scratch = ScratchDir::new();
+    for duration in [0, 1] {
+        let (bytes, expected) = slot_zero_sequence(duration);
+        let frames: Vec<_> = expected
+            .iter()
+            .map(|image| Frame {
+                image,
                 options: FrameOptions {
                     duration: 1,
                     ..Default::default()
                 },
-            },
-        ];
-        if duration == 0 {
-            assert!(rs_jxl::encode_frames(&full, &frames, &options()).is_ok());
-        } else {
-            assert_invalid_reference(&full, &frames);
+            })
+            .collect();
+        let baseline = rs_jxl::encode_frames(&expected[0], &frames, &options()).unwrap();
+        let actual_path = scratch.0.join("slot-zero.jxl");
+        let expected_path = scratch.0.join("slot-zero-full-frames.jxl");
+        fs::write(&actual_path, bytes).unwrap();
+        fs::write(&expected_path, baseline).unwrap();
+        for decoder in &decoders {
+            let label = format!(
+                "slot zero duration={duration}, decoder={}",
+                decoder.display()
+            );
+            let actual = decode(decoder, &actual_path, &scratch, &label);
+            let baseline = decode(decoder, &expected_path, &scratch, &label);
+            assert_original_colors(
+                &actual,
+                &expected,
+                &(0..expected.len()).collect::<Vec<_>>(),
+                &label,
+            );
+            assert_decoded_equal(&actual, &baseline, &label);
         }
     }
 }

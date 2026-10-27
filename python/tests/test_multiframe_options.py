@@ -14,6 +14,19 @@ from rs_jxl import multiframe
 
 
 class MultiframeOptionAdapters(unittest.TestCase):
+    def test_extra_grids_forward_without_mutating_input_and_validate_early(self):
+        grids = [np.uint32(8), 16, 32, 8, 64]
+        request = self.request(strategy="auto", auto_options={"extra_tile_sizes": grids})
+        self.assertEqual(request["auto_options"]["extra_tile_sizes"], grids)
+        self.assertIsNot(request["auto_options"]["extra_tile_sizes"], grids)
+        json.dumps(request)
+        for value in (None, True, "8,16", 8, [True], [1.5], ["8"]):
+            with self.subTest(value=value), self.assertRaises(TypeError):
+                self.request(strategy="auto", auto_options={"extra_tile_sizes": value})
+        for value in ([0], [-1], [1 << 32]):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                self.request(strategy="auto", auto_options={"extra_tile_sizes": value})
+
     def setUp(self):
         self.frames = [np.zeros((2, 3, 4), dtype=np.uint8)]
 
@@ -164,11 +177,11 @@ class NativeMultiframeOptions(unittest.TestCase):
                             self.assertGreaterEqual(candidate["elapsed_seconds"], 0)
                             self.assertGreaterEqual(candidate["trial_pixels"], 0)
                     self.assertEqual(report["frames"][1]["differences"], [{
-                        "reference": 0, "changed_pixels": 1,
+                        "reference": 0, "source": 1, "changed_pixels": 1,
                         "bounds": {"x": 3, "y": 2, "width": 1, "height": 1},
                     }])
                     self.assertEqual(report["frames"][2]["differences"], [{
-                        "reference": 1, "changed_pixels": 0, "bounds": None,
+                        "reference": 1, "source": 2, "changed_pixels": 0, "bounds": None,
                     }])
 
     def test_zero_budgets_fail_explicitly_in_native_code(self):

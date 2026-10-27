@@ -3,9 +3,10 @@
 Source inspection: 2026-10-27, `rs_jxl` base HEAD
 `59c66f8338d711730c181e31cfcf0ad30f27b4ce`; read-only optimized C++ reference:
 `b866b3defec13494bfbaf705db93581cda118e37`.
-This is a future-reuse investigation, not an implementation of temporal patch
-search. The implemented [heterogeneous-size layer API](HETEROGENEOUS_LAYERS.md)
-is a separate feature.
+The historical-reference policy below is now available as the opt-in
+`AutoOptions.retained_reference` in [automatic frames](MULTIFRAME_AUTO.md).
+Displaced temporal patch search remains future work. The implemented
+[heterogeneous-size layer API](HETEROGENEOUS_LAYERS.md) is a separate feature.
 
 **Yes, stronger reuse is possible without extending the JXL bitstream.**
 The useful next steps are bounded selection of older saved states, then exact
@@ -16,10 +17,10 @@ reuse, arbitrary access to past frames, or general video motion compensation.
 
 | Area | Current source behavior |
 | --- | --- |
-| Automatic references | `Reference` and `plan` in [multiframe.rs](../crates/rs-jxl/src/multiframe.rs), and `reference_indices` in [auto.rs](../crates/rs-jxl/src/multiframe/auto.rs), choose previous, first, both, or full-only. No older-anchor selection or displaced cross-frame search. |
+| Automatic references | Default `Reference` modes and geometry-only planning choose previous, first, both, or full-only. Opt-in `AutoOptions.retained_reference` in [auto.rs](../crates/rs-jxl/src/multiframe/auto.rs) uses [references.rs](../crates/rs-jxl/src/multiframe/references.rs) to retain the winning background and rotate the other slot. Displaced cross-frame search remains unimplemented. |
 | Difference geometry | [diff.rs](../crates/rs-jxl/src/multiframe/diff.rs) `DiffMap::between`, `regions.rs::tiles_from_map` and `partition.rs::propose` compare the same canvas coordinates. Tiled/tightened and adaptive merged rectangles transmit changed current samples; they do not copy a displaced old rectangle. |
 | Selection | `auto::encode_inner` measures complete candidate layer bytes, including generated patch-reference frames. Full REPLACE remains a candidate; `plan` instead uses bounding-box area. Neither proves a global optimum. |
-| Reference allocation | Automatic encoding saves the first reconstructed canvas in slot 1 and subsequent/intermediate reconstructed canvases in slot 2. Slot 3 is reserved when current patch tools are enabled. These are encoder policies, not fixed meanings of the standard slots. |
+| Reference allocation | Defaults pin the first canvas in slot 1 and subsequent/intermediate canvases in slot 2. Retained-reference mode rotates slots 1/2; slot 3 remains reserved for patch tools. These are encoder policies, not fixed meanings of the standard slots. |
 | Explicit layers | [frame.rs](../crates/rs-jxl/src/frame.rs) `FrameOptions` and [encode.rs](../crates/rs-jxl/src/encode.rs) `encode_frames` already expose origins, blending, reference-only frames and save stage. Explicit legal slot selection is broader than automatic first/previous selection, but does not discover matches. |
 | Existing patches | `encode_logical_frame_impl` calls [patch_frame.rs](../crates/rs-jxl/src/patch_frame.rs) `prepare`/`prepare_source` on the current image and emits a new pre-transform atlas into slot 3. This is intra-frame repetition reuse, not a persistent temporal dictionary. |
 
@@ -134,13 +135,26 @@ establish arbitrary 17..31-bit integer equality.
 
 ## Practical Priority
 
-1. **Retain one older anchor for aligned reuse.** Extend the existing exact diff
-   candidates to an explicitly retained post-transform keyframe, initially by
-   optionally rotating slot 1 instead of permanently retaining frame zero.
-   Keep slot 2 for previous/intermediate state and slot 3 for current patch tools.
-   This offers recurrence reuse with little new pixel machinery. Define the
-   save/eviction schedule first; scanning old input images that are not saved in
-   the codestream is not sufficient. This is proposed, not implemented.
+The native analyzer now reports optional historical-input comparisons, minimum
+multi-rectangle area and prospective candidate/repeated-payload workload. The
+encoder can also test `extra_tile_sizes` without replacing the original grid.
+The [e9 multiscale experiment](MULTIFRAME_MULTISCALE_BENCHMARK.md) found gains
+for dispersed tiny changes, but modest/no real-image gains with much more search.
+It remains opt-in; expanding the candidate count is not a replacement for
+better temporal tools or better search guidance.
+
+1. **Retain one older anchor for aligned reuse: initial policy implemented.**
+   The opt-in native policy rotates slots 1/2, retains a winning delta's source,
+   and places the new reconstructed state in the other slot. Full winners retain
+   the previous state. Slot 3 stays available for patch tools. Reports expose
+   actual logical-index/slot mappings. This avoids hidden extra reference-copy
+   encodes but can evict a useful first image; benchmark the whole sequence.
+   Optional `reference_lookahead` now preserves a strictly more useful old canvas
+   for the next input using exact geometry and reuses those difference maps.
+   It does not encode speculative future candidates or guarantee a global win.
+   Repeated non-mask rectangles within one input also reuse complete Modular
+   payloads while rebuilding candidate-specific headers. Wider-horizon eviction
+   and displaced temporal patches remain future work.
 2. **Bounded local crop matching with standard REPLACE patches.** For scrolling
    content or translated repeated regions, search a limited displacement window
    against one retained pre-transform source; verify proposed matches exactly.

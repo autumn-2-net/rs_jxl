@@ -27,7 +27,8 @@ bytes in memory. Files/writers can consume those bytes using their own I/O polic
 ## Candidates
 
 Every logical frame tests a full-frame REPLACE candidate. Subsequent frames can
-also test the following, against the previous image and/or the first image:
+also test the following, against the previous image and/or the first image by
+default, or the currently retained states when the new option is enabled:
 
 - Crop REPLACE: the exact bounding rectangle of all changed samples.
 - Binary alpha mask: changed pixels retain their current values; unchanged
@@ -50,10 +51,139 @@ implement the candidate/pruning algorithms.
 
 All color and extra samples participate, including invisible RGB and floating
 sample words. Identical frames use a 1x1 exact replacement, not an illegal empty
-layer. A permanent first-image reference uses slot 1; the previous reconstructed
+layer. By default a permanent first-image reference uses slot 1; the previous reconstructed
 state and intermediate rectangle states use slot 2. Slot 3 stays available for
 the existing intra-frame patch encoder. References store reconstructed full
 states, not residual rectangles. Decoders perform reconstruction normally.
+
+## Optional Multiscale Partitions
+
+`extra_tile_sizes` defaults to an empty list. For example, `[8, 16, 64]` adds
+three alternative grids to the default `tile_size=32`. Both ordinary tile and
+adaptive merged proposals use the already computed exact difference map; input
+samples are not rescanned for each grid. Repeated grids and identical ordered
+rectangle plans for the same reference are skipped. The original candidates
+remain ahead of additional proposals in canonical equal-byte ties. Full/crop/
+mask candidates are not repeated per grid.
+
+```python
+data, report = rs_jxl.encode_multiframe(
+    images, strategy="auto", effort=9, threads=4, return_info=True,
+    auto_options={"extra_tile_sizes": [8, 16, 64]},
+)
+```
+
+Finer grids can isolate separate changes hidden inside a single coarse tile;
+coarser grids can avoid excessive independent coding overhead. Neither is
+universally better. All proposals compete using actual encoded bytes, with
+the existing finalized-byte pruning and repeated-rectangle payload cache.
+Reports identify the proposing `tile_size` (null for full/crop/mask).
+`max_rectangles` applies to each candidate; explicit trial/pixel budgets still
+apply to all submitted work. Extra grids have no effect when multi-rectangle
+planning is disabled. Positive integer values are required even in that case.
+
+This is an opt-in compression search expansion, not a guaranteed speedup. For
+identical available reference states and options the old local candidates are
+retained; rotating-reference policies can change future states and therefore
+do not imply a whole-sequence no-regression guarantee. Use analysis to inspect
+candidate area, layer count and prospective repeated work, then measure full
+encoded sequences before enabling more grids by default.
+The [e9 measurements](MULTIFRAME_MULTISCALE_BENCHMARK.md) show a useful sparse
+fixture but poor real-input cost/size tradeoffs; extra grids remain disabled
+by default. They are not a recommended blanket archive setting.
+
+## Retained Historical Reference
+
+`AutoOptions.retained_reference=true` opts into dynamic allocation of those same
+two post-transform slots. It requires `Reference::SmallestCrop` (Python
+`reference="auto"`) and real byte-selected automatic encoding. Default behavior
+remains unchanged. No synthetic reference-copy layer or private bitstream is
+added, and patch slot 3 is never borrowed or disabled.
+
+```python
+data, report = rs_jxl.encode_multiframe(
+    images, strategy="auto", reference="auto", effort=9, threads=4,
+    auto_options={"retained_reference": True}, return_info=True,
+)
+```
+
+The previous state and one retained state are eligible backgrounds. For each
+delta candidate, the candidate retains the source slot and saves the completed
+current state into the other slot. A full-frame winner retains the previous
+state and replaces the older slot. Only the winning bytes and slot state are
+committed. This allows a sequence `X, A, B, A'` to reuse `A` after it is neither
+the first nor the previous frame. If a repeatedly useful older state keeps
+winning, it remains retained. Intermediate crop rectangles save to the chosen
+destination and subsequent rectangles read that same destination; they never
+overwrite the retained background. The final stream frame is not saved.
+
+There are at most two reference comparisons per logical frame. Existing crop,
+mask, tiled and merged rectangle tools and proven-byte pruning are reused;
+the policy does not enumerate arbitrary history or encode every previous image.
+`CropRetained`, `MaskRetained`, `TilesRetained` and `MergedRetained` identify a
+reference that is neither first nor previous. First/previous labels retain
+their ordinary meanings even when those states move between slots.
+
+This is a local, feedback-based policy, not a globally optimal cache. It may
+evict the original first frame and make a later return to it more expensive.
+The option remains explicit for that reason. Compare full sequence sizes and
+encode/decode costs on actual workloads; no no-regression guarantee is implied.
+Geometry-only `analyze_multiframe` still analyzes first/previous references:
+it cannot predict a retained-state history determined by encoded-byte winners.
+This option does not add different-size automatic differences or translated
+block matching; use `encode_layers` for explicit heterogeneous rectangles.
+
+### Optional Next-Input Lookahead
+
+`reference_lookahead=true` additionally requires `retained_reference=true`.
+Before choosing the current frame's destination slot, Rust compares the next
+input against the current input and each saved full canvas. It preserves an
+older canvas only when its exact difference bbox area (then changed-pixel
+count) is strictly better than both the current image and the other old canvas.
+Ties and cases without a strictly useful old canvas retain the existing policy.
+This is geometric eviction guidance, not a predicted compressed-byte result.
+
+At most three next-input difference maps are computed. Maps for the committed
+saved states are reused at the next iteration; unrelated future inputs are not
+searched or encoded. The final input needs no lookahead. Subsampled-extra paths
+continue using full frames and do not scan speculative crop differences.
+Statistics include all lookahead work in native analysis time.
+
+This addresses `X, A, B, X2`: the simple retained policy can evict X while
+encoding B, whereas the lookahead can keep X for the following X2. It may save
+the current result into the same slot read by the first crop; blending reads
+the old canvas before saving the reconstructed result. Further rectangles use
+that destination's intermediate state. Only the winning candidate commits.
+The policy still sees only one next input and does not guarantee a globally
+smaller stream. It remains opt-in and does not change default reference policy.
+
+### Repeated Candidate Payloads
+
+Within one logical input, non-mask candidates can crop exactly the same rectangle
+against different references. Their encoded Modular sections are reusable even
+though their source/save slots and timing headers differ. Native Rust now
+encodes those sections once when a complete reusable result is available and
+rebuilds the complete header/TOC for each use. No compressed bitstream patching,
+pixel hashing, approximate sample comparison or decoder changes are involved.
+
+Only rectangles appearing more than once in the candidate set allocate cache
+entries. An entry is released after its final submitted use; pruned candidate
+tails also release their unvisited uses instead of pinning completed payloads.
+There is no sequence-wide payload cache or new hard codec cap. Peak cached
+memory depends on complete repeated candidate payloads in that input; this is
+not a fixed-RSS guarantee. Mask candidates and actual generated patch atlases
+stay on their original encoder paths, so their distinct samples/atlas state
+cannot be reused accidentally. Merely enabling patch detection does not disable
+reuse: if detection finds no dictionary, the regular payload can be cached.
+Actual patch plans are passed straight to the existing encoder, without running
+detection a second time. Canceled sections are never cached as complete payloads.
+
+Selection continues using each candidate's actual header plus payload size,
+canonical ties and proven bounds. `trial_pixels` and its explicit work budget
+still count submitted rectangle area, including cached submissions. Native
+`reused_payloads` and `reused_payload_pixels` separately expose successful cache
+lookups (also if their complete size proves a candidate cannot win). Timings
+include lookup, header generation, validation and copying; a hit is not free.
 
 Mask eligibility is deliberately strict: existing opaque integer GA/RGBA,
 8/16-bit storage, only its primary alpha extra channel, and no premultiplied
@@ -84,6 +214,19 @@ always considered. Each `AutoFrameReport` contains:
   exact `changed_pixels`, and `bounds: Option<Rect>`. No change has zero pixels
   and `None` bounds; no analyzed references gives an empty list. A reference
   index is not a JXL reference-slot number.
+- Every completed/pruned candidate also reports `reference_index` (None/null
+  for a full replacement), `source` (the first rectangle's reference slot),
+  and `save_as_reference` (the final rectangle's intended save slot, 0 on the
+  last stream frame). Difference entries include their actual `source` slot.
+- `retained_reference` records the active policy. `references_before` and
+  `references_after` map the four slots to complete logical input indices.
+  None/null means no complete input state is advertised there, including a
+  partial intermediate rectangle and the private patch scratch slot. These
+  are committed winner states, never the side effects of losing/pruned trials.
+- `reference_lookahead` records whether one-input lookahead is enabled;
+  `lookahead_comparisons` counts newly computed future difference maps.
+- `reused_payloads` and `reused_payload_pixels` count completed-payload cache
+  hits and the rectangle area whose backend encoding was avoided.
 
 `trial_pixels` counts areas actually submitted to trial encoding, including an
 interrupted layer, not analysis scans. Time fields are native `Duration`s; the
@@ -97,6 +240,15 @@ candidate. Reports are restored to canonical order afterward. Disabling pruning
 with `prune=false` completes all eligible trials or fails explicitly on an error.
 For the same candidate set and sufficient budgets, pruning preserves selection;
 it does not change eligibility or the preference among equal-byte candidates.
+
+Execution ordering estimates submitted area and per-layer work. Masks retain a
+sparse-content discount, but also pay a bbox scan term: changed pixels plus
+one eighth of submitted area (rounded up), then the same layer term as other
+candidates. This is a heuristic work weight, not a measured speed ratio or a
+compressed-byte bound. It neither removes masks nor expands the candidate set;
+canonical equal-byte tie-breaking remains independent of execution order.
+See the [ordering experiment](MULTIFRAME_ORDER_BENCHMARK.md), including the
+rejected full-area ordering and timing controls, for the measured scope.
 
 Selection is the smallest measured byte count; equal sizes keep the earlier
 full/crop candidate. Time is measured, not used as a hidden lossless-effort
@@ -152,6 +304,49 @@ separately when that mapping is needed. This API is for complete image states;
 use `encode_frames` for caller-defined layer names, blend instructions or timecodes.
 
 ## Verification
+
+### 2026-10-27 Lookahead And Payload Reuse
+
+One-input lookahead and patch-aware crop-payload reuse are validated with the
+release DLL and CLI. All 169 Python tests passed, including independent official
+djxl 0.12/0.13 compatibility fixtures. Native lookahead, same-slot multirectangle,
+actual patch-atlas coexistence, cached payload/header, resource-limit and pruning
+cache-release tests passed. Strict all-target Clippy and workspace formatting
+passed. This is targeted acceptance, not a full-corpus performance guarantee.
+
+At e9/four threads, t2 becomes 3.82% smaller with lookahead, but encoding rises
+from 39.51 s without lookahead in the new build to 41.31 s with it. t1 is equal
+in size. A synthetic repeated-crop fixture keeps its size while going from
+5.50 s in the previous build to 3.10 s; these are single-pass observations.
+See [MULTIFRAME_LOOKAHEAD_BENCHMARK.md](MULTIFRAME_LOOKAHEAD_BENCHMARK.md) for
+before/after bpp, encode/decode throughput, cache counters and limits.
+
+### 2026-10-27 Retained-Reference Update
+
+The release CLI and FFI DLL built successfully on Windows x86-64. Reference
+allocation lives in `multiframe/references.rs`; the adapters only validate and
+forward options and serialize native reports.
+
+- 10 new integration tests passed across `multiframe_retained` and
+  `multiframe_retained_patches`. They cover real older-state reuse, hidden RGB,
+  8/16-bit storage, extra-only changes, floating sample words, mixed/zero
+  durations, pruning and trial isolation, context recovery, raw reference
+  headers, a completed multi-rectangle canvas reused later, and coexistence
+  with actual private patch atlases.
+- 36 existing multiframe/analysis/pruning/context integration tests, 45 FFI
+  tests and 16 focused CLI tests passed.
+- All 159 Python tests passed with official djxl 0.12/0.13 and CUDA-transfer
+  checks enabled; all 11 benchmark-harness tests passed. These counts describe
+  this checkout and should not be added to historical suite totals below.
+- Strict all-target Clippy passed for the core, FFI and CLI.
+- Real t1/t2 and a synthetic recurrence sequence passed e9 exact native-sample
+  checks, including durations and alpha planes where present. The recurrence
+  sequence became 24.96% smaller than the default auto policy; t1/t2 were equal
+  in size. These results do not establish a universal size or speed improvement.
+
+Full measurements, independent-image sums, bpp, encode/decode throughput and
+reproduction details are in
+[MULTIFRAME_RETAINED_BENCHMARK.md](MULTIFRAME_RETAINED_BENCHMARK.md).
 
 ### 2026-10-27 Native Update
 

@@ -37,6 +37,8 @@ fn analysis_options_use_native_defaults_and_forward_all_overrides() {
     assert_eq!(actual.allow_multi_rect, default.allow_multi_rect);
     assert_eq!(actual.adaptive_rectangles, default.adaptive_rectangles);
     assert_eq!(actual.tile_size, default.tile_size);
+    assert_eq!(actual.extra_tile_sizes, default.extra_tile_sizes);
+    assert_eq!(actual.history_window, default.history_window);
     assert_eq!(actual.max_rectangles, default.max_rectangles);
     assert_eq!(
         actual.rectangle_bytes_per_pixel,
@@ -56,6 +58,8 @@ fn analysis_options_use_native_defaults_and_forward_all_overrides() {
             "allow_multi_rect": false,
             "adaptive_rectangles": false,
             "tile_size": 8,
+            "extra_tile_sizes": [16, 64],
+            "history_window": 4,
             "max_rectangles": 17,
             "rectangle_bytes_per_pixel": 0.0,
         }));
@@ -65,6 +69,8 @@ fn analysis_options_use_native_defaults_and_forward_all_overrides() {
         assert_eq!(actual.reference, reference);
         assert!(!actual.allow_mask && !actual.allow_multi_rect && !actual.adaptive_rectangles);
         assert_eq!((actual.tile_size, actual.max_rectangles), (8, 17));
+        assert_eq!(actual.extra_tile_sizes, [16, 64]);
+        assert_eq!(actual.history_window, 4);
         assert_eq!(actual.rectangle_bytes_per_pixel, 0.0);
         assert_eq!(actual.threads, 3);
     }
@@ -97,6 +103,7 @@ fn analysis_options_reject_other_operations_and_invalid_geometry() {
     }
     for options in [
         json!({"tile_size": 0, "allow_multi_rect": false}),
+        json!({"extra_tile_sizes": [0]}),
         json!({"max_rectangles": 0, "adaptive_rectangles": false}),
         json!({"rectangle_bytes_per_pixel": -0.1}),
     ] {

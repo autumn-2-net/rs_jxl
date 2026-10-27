@@ -140,6 +140,10 @@ fn auto_frame_report(index: usize, frame: &multiframe::AutoFrameReport) -> Value
         .map(|candidate| {
             json!({
                 "strategy": format!("{:?}", candidate.strategy),
+                "tile_size": candidate.tile_size,
+                "reference_index": candidate.reference_index,
+                "source": candidate.source,
+                "save_as_reference": candidate.save_as_reference,
                 "encoded_bytes": candidate.encoded_bytes,
                 "encoded_frames": candidate.encoded_frames,
                 "trial_pixels": candidate.trial_pixels,
@@ -153,6 +157,10 @@ fn auto_frame_report(index: usize, frame: &multiframe::AutoFrameReport) -> Value
         .map(|candidate| {
             json!({
                 "strategy": format!("{:?}", candidate.strategy),
+                "tile_size": candidate.tile_size,
+                "reference_index": candidate.reference_index,
+                "source": candidate.source,
+                "save_as_reference": candidate.save_as_reference,
                 "lower_bound": candidate.lower_bound,
                 "encoded_frames": candidate.encoded_frames,
                 "planned_frames": candidate.planned_frames,
@@ -167,6 +175,7 @@ fn auto_frame_report(index: usize, frame: &multiframe::AutoFrameReport) -> Value
         .map(|difference| {
             json!({
                 "reference": difference.reference,
+                "source": difference.source,
                 "changed_pixels": difference.changed_pixels,
                 "bounds": rect(difference.bounds),
             })
@@ -175,6 +184,13 @@ fn auto_frame_report(index: usize, frame: &multiframe::AutoFrameReport) -> Value
     json!({
         "index": index,
         "winner_index": frame.winner_index,
+        "retained_reference": frame.retained_reference,
+        "reference_lookahead": frame.reference_lookahead,
+        "lookahead_comparisons": frame.lookahead_comparisons,
+        "reused_payloads": frame.reused_payloads,
+        "reused_payload_pixels": frame.reused_payload_pixels,
+        "references_before": frame.references_before,
+        "references_after": frame.references_after,
         "candidates": candidates,
         "pruned": pruned,
         "analysis_seconds": frame.analysis_elapsed.as_secs_f64(),
@@ -368,15 +384,30 @@ mod tests {
     fn auto_report_keeps_native_statistics_and_separates_pruned_bounds() {
         let frame = AutoFrameReport {
             winner_index: 0,
+            retained_reference: true,
+            reference_lookahead: true,
+            lookahead_comparisons: 3,
+            reused_payloads: 2,
+            reused_payload_pixels: 25,
+            references_before: [None, Some(0), Some(1), None],
+            references_after: [None, Some(2), Some(1), None],
             candidates: vec![AutoCandidateReport {
                 strategy: Strategy::Full,
+                tile_size: None,
+                reference_index: None,
+                source: 0,
+                save_as_reference: 1,
                 encoded_bytes: 80,
                 encoded_frames: 1,
                 trial_pixels: 100,
                 elapsed: Duration::from_millis(125),
             }],
             pruned: vec![AutoPrunedReport {
-                strategy: Strategy::MergedFirst,
+                strategy: Strategy::MergedRetained,
+                tile_size: Some(16),
+                reference_index: Some(1),
+                source: 2,
+                save_as_reference: 1,
                 lower_bound: 90,
                 encoded_frames: 1,
                 planned_frames: 3,
@@ -387,11 +418,13 @@ mod tests {
             differences: vec![
                 AutoDiffReport {
                     reference: 0,
+                    source: 1,
                     changed_pixels: 0,
                     bounds: None,
                 },
                 AutoDiffReport {
                     reference: 1,
+                    source: 2,
                     changed_pixels: 2,
                     bounds: Some(multiframe::Rect {
                         x: 3,
@@ -407,19 +440,30 @@ mod tests {
             json!({
                 "index": 2,
                 "winner_index": 0,
+                "retained_reference": true,
+                "reference_lookahead": true,
+                "lookahead_comparisons": 3,
+                "reused_payloads": 2,
+                "reused_payload_pixels": 25,
+                "references_before": [null, 0, 1, null],
+                "references_after": [null, 2, 1, null],
                 "candidates": [{
                     "strategy": "Full", "encoded_bytes": 80, "encoded_frames": 1,
+                    "tile_size": null,
+                    "reference_index": null, "source": 0, "save_as_reference": 1,
                     "trial_pixels": 100, "elapsed_seconds": 0.125,
                 }],
                 "pruned": [{
-                    "strategy": "MergedFirst", "lower_bound": 90,
+                    "strategy": "MergedRetained", "lower_bound": 90,
+                    "tile_size": 16,
+                    "reference_index": 1, "source": 2, "save_as_reference": 1,
                     "encoded_frames": 1, "planned_frames": 3,
                     "trial_pixels": 30, "elapsed_seconds": 0.25,
                 }],
                 "analysis_seconds": 0.5,
                 "differences": [
-                    {"reference": 0, "changed_pixels": 0, "bounds": null},
-                    {"reference": 1, "changed_pixels": 2,
+                    {"reference": 0, "source": 1, "changed_pixels": 0, "bounds": null},
+                    {"reference": 1, "source": 2, "changed_pixels": 2,
                      "bounds": {"x": 3, "y": 4, "width": 5, "height": 6}},
                 ],
             })

@@ -257,9 +257,12 @@ search defaults or perform difference analysis, planning or selection.
 | `allow_mask` | bool | true |
 | `allow_multi_rect` | bool | true |
 | `tile_size` | positive u32 integer | 32 |
+| `extra_tile_sizes` | list/tuple of positive u32 integers | [] |
 | `max_rectangles` | positive native usize integer | 32 |
 | `prune` | bool | true |
 | `adaptive_rectangles` | bool | true |
+| `retained_reference` | bool; true requires `reference="auto"` | false |
+| `reference_lookahead` | bool; true requires `retained_reference=True` | false |
 | `max_frames` | nonnegative native usize integer | usize::MAX |
 | `max_total_trials` | nonnegative native usize integer | usize::MAX |
 | `max_trial_pixels` | nonnegative u64 integer | u64::MAX |
@@ -278,14 +281,35 @@ Automatic frame reports distinguish completed work from pruning:
 
 - `candidates` contains only completed trials in canonical order. Entries have
   `strategy`, actual `encoded_bytes`, `encoded_frames`, `trial_pixels` and
-  `elapsed_seconds`. `winner_index` indexes this list, not execution order.
+  `elapsed_seconds`, plus `reference_index`, `source` and `save_as_reference`.
+  `winner_index` indexes this list, not execution order.
 - `pruned` contains `strategy`, proven `lower_bound`, fully finished
-  `encoded_frames`, `planned_frames`, `trial_pixels` and `elapsed_seconds`.
+  `encoded_frames`, `planned_frames`, `trial_pixels` and `elapsed_seconds`, plus
+  `reference_index`, `source` and `save_as_reference` for the proposed candidate.
   These entries do not have `encoded_bytes`; a lower bound is not an actual size.
 - `analysis_seconds` is native difference/planning time. `differences` contains
-  native `{reference, changed_pixels, bounds}` records, with zero-based input
-  reference indices and null bounds for no changes. An empty list means no
+  native `{reference, source, changed_pixels, bounds}` records, with zero-based
+  input reference indices, JXL source slot IDs and null bounds for no changes.
+  An empty list means no
   reference analysis was needed.
+- `retained_reference` reports whether the opt-in policy is active for this
+  sequence. `references_before` and `references_after` are four-element arrays
+  mapping JXL slots 0..3 to complete logical input frame indices. JSON null means
+  blank/unknown, partial intermediate state, or scratch data, not a complete
+  input frame. Slot 3 is reserved for patch scratch data and reported as null.
+- `reference_lookahead` is a boolean indicating the opt-in next-input policy.
+  `lookahead_comparisons` is a nonnegative native `usize` count of newly computed
+  exact future `DiffMap`s during this logical frame, at most 3. It is zero when
+  disabled or there is no next input. Ordinary current-input/static analysis and
+  reads of previously cached maps do not count as lookahead computations.
+- `reused_payloads` (native `usize`) and `reused_payload_pixels` (u64) count cached
+  unmasked crop payload hits and the sum of their rectangle areas. Reuse is
+  automatic for equivalent frame payloads for repeated identical rectangles
+  within the same logical input; there is no reuse option. It does not cross
+  logical inputs or calls, reuse masked payloads, or require unsafe patch-mode
+  reuse. Patch mode may conservatively bypass the cache. `trial_pixels` still
+  counts every submitted rectangle's area, including cache hits; reuse counters
+  do not measure skipped analysis scans or encoded-byte savings.
 
 Timing values are native elapsed seconds, not Python measurements. Trial pixels
 are areas submitted to the encoder, including interrupted layers, not analysis
@@ -302,6 +326,82 @@ frame's measured bytes per pixel only to propose geometry. Disable them with
 `adaptive_rectangles=False`; `allow_multi_rect=False` disables both tile and merged
 proposals. No performance or compression improvement is claimed yet.
 
+### Retained Reference Mode
+
+```python
+data, report = rs_jxl.encode_multiframe(
+    [scene_x, scene_a, scene_b, scene_a_updated],
+    strategy="auto", reference="auto", effort=9,
+    auto_options={"retained_reference": True}, return_info=True,
+)
+frame = report["frames"][3]
+winner = frame["candidates"][frame["winner_index"]]
+reference_index = winner["reference_index"]  # logical input index, or None for Full
+source_slot = winner["source"]             # JXL slot, not an input index
+```
+
+This policy is opt-in and operates entirely in native Rust. It requires both
+`strategy="auto"` and `reference="auto"`; conflicting choices are rejected before
+Python consumes the image iterable. Explicit false keeps the existing policy.
+It also works through `Encoder.encode_multiframe`; reference images are retained
+only within one call, never between context calls.
+
+Two saved canvas slots (1 and 2) rotate. With `reference_lookahead=False` (the
+default), when a delta wins, its source reference
+is retained and the current complete state is stored in the other slot. When a
+full frame wins, the previous input is retained and the older slot is evicted.
+Thus an older recurring state can remain useful beyond the immediately preceding
+frame. The policy can evict the original first frame; it is not an unlimited
+history or a guarantee of a smaller whole file. Default
+`retained_reference=False` continues comparing the original first/previous
+references as before.
+
+To opt into one-input lookahead, use
+`auto_options={"retained_reference": True, "reference_lookahead": True}`.
+`reference_lookahead` requires a Python `bool`; true without retained references
+is rejected before consuming frames. Retained references still require
+`strategy="auto", reference="auto"`. Omission or false leaves the prior
+retention policy unchanged.
+
+Native Rust compares the currently saved complete states against the **next**
+input using exact full-pixel `DiffMap`s, ranking smaller bounding-box area first,
+then fewer changed pixels. It changes which old state survives only when
+strictly better than the old policy's choice; ties keep that choice. The current
+input is also compared with the next input so its map is ready after saving.
+At most one future input is examined, with at most three newly computed future
+maps. Maps for the states actually retained are cached for the next iteration,
+which reuses at most two retained-map reads. No future input is trial-encoded.
+All channels, invisible RGB, extra planes and exact floating-point sample words
+participate; metadata compatibility rules are unchanged.
+
+This can retain A across `A, B, B2, A2` even when B2 is encoded from B: B's slot
+may be overwritten only after blending. A multi-rectangle candidate reads the
+original source for its first rectangle, then its destination's intermediate
+composite for subsequent rectangles. The heuristic is opt-in because better
+next-input geometry does not guarantee a smaller next encode or whole sequence.
+Reports expose the policy and computation counters above, not predicted savings.
+
+Older-reference trials report `CropRetained`, `MaskRetained`, `TilesRetained` or
+`MergedRetained`; strategy alone does not identify the source. Use
+`reference_index` and `source`, and consult `references_before` to see committed
+state. Completed losing candidates and pruned candidates do not change the live
+slots. `save_as_reference` is the candidate's final layer save slot, zero for the
+last stream frame. Multi-part candidates can save intermediate layers even when
+that final value is zero. Such a partial canvas is null in `references_after`,
+not advertised as the completed input. These arrays report actual committed
+complete states, not hypothetical trial saves.
+
+The mode reuses existing standard JXL reference and blending mechanisms. It
+does not introduce a private bitstream extension or displaced-block/temporal
+patch search. Crop/mask/tile/merged trials retain their existing eligibility
+rules, including exact hidden RGB handling and mask restrictions.
+`analyze_multiframe` remains a static first/previous geometry analyzer: it does
+not run encodes or know which candidates will win and which slots will survive,
+so it accepts neither `retained_reference` nor `reference_lookahead` and does not
+predict this dynamic policy.
+
+### Multiframe Sample Semantics
+
 All channels including hidden RGB participate in differences. durations is a
 tick count or list, default 1; tps=(1000,1), loops=0. Zero is a true layer, not
 a fabricated display duration; visible-frame count can differ from layer count.
@@ -316,6 +416,39 @@ JPEG frame input remains pixel-lossless relative to the input decoder, not
 byte-reversible; use `transcode_jpeg`/`reconstruct_jpeg` for original JPEG bytes.
 
 ### Geometry-Only Analysis
+
+Multiscale partitions are opt-in with
+`analysis_options={"extra_tile_sizes": [8, 16, 64]}` (and the same key in
+`auto_options` for encoding). The base grid remains eligible. Duplicate grids
+and equivalent ordered rectangle plans per reference are skipped in native
+code. Additional candidates may improve size but increase encoding work.
+The `tile_size` candidate field records the proposing grid or None for
+full/crop/mask. Geometry minima do not imply minimum encoded size.
+
+`history_window=8` inspects preceding input positions within distance 8, excluding
+already compared first/previous inputs. It defaults to 0 (disabled). The report's
+`frames[i]["history"]` entries describe potential older references; they do not
+claim those inputs occupy available JXL reference slots. `improves_static_bbox`
+only indicates a strictly smaller bbox than both static references, and is false
+when cropping is unsupported. Large windows add exact pixel comparison work.
+
+`frames[i]["geometry"]` includes `best_area_candidate_index`, `candidate_count`,
+`trial_pixels`, `trial_layers`, and `unmasked_rectangles`. These are prospective
+unpruned work counts, not performed encodes. The latter reports total/unique/
+repeated rectangle work; `unique_pixels` sums distinct rectangle areas, not their
+geometric union. Repeated payload work is an opportunity, not guaranteed cache
+hits (patches and pruning can bypass reuse). The top-level `geometry` aggregates
+each frame's best-area candidate, total layers and workload. Existing
+`reference_modes` remains single-bbox-only for backward compatibility.
+
+```python
+analysis = rs_jxl.analyze_multiframe(
+    images, threads=4,
+    analysis_options={"extra_tile_sizes": [8, 16, 64], "history_window": 8},
+)
+frame = analysis["frames"][1]
+best_geometry = frame["candidates"][frame["geometry"]["best_area_candidate_index"]]
+```
 
 ```python
 analysis = rs_jxl.analyze_multiframe(
@@ -367,6 +500,8 @@ options. These controls affect candidate proposals, not exact pair statistics.
 | `allow_multi_rect` | bool | true |
 | `adaptive_rectangles` | bool | true |
 | `tile_size` | positive u32 integer | 32 |
+| `extra_tile_sizes` | list/tuple of positive u32 integers | [] |
+| `history_window` | nonnegative native usize integer | 0 |
 | `max_rectangles` | positive native usize integer | 32 |
 | `rectangle_bytes_per_pixel` | finite nonnegative real number, not bool | 1.0 |
 
@@ -401,7 +536,7 @@ Each `frames` entry contains:
   indexes input frames, or is `None` for a full replacement; `source` is the JXL
   reference slot (0 full, 1 first, 2 previous). An identical crop has `changed=None`
   but a 1x1 placeholder region and one submitted pixel, not a zero-area layer.
-- `candidates`: geometry proposals with `strategy`, `reference_index`, `source`,
+- `candidates`: geometry proposals with `strategy`, `tile_size`, `reference_index`, `source`,
   `rectangles`, `layer_pixels`, `layer_area_ratio` and `layer_count`. These are not
   encode trials: there are no encoded byte sizes or winner indices. Layer pixels
   sum submitted rectangle areas, including the entire bbox for a mask proposal.
@@ -654,7 +789,18 @@ tests on those systems, not just a matching wheel platform tag.
 
 ### Current Verification
 
-The native automatic-option/report update on 2026-10-27 passed all 173 Python
+The final multiframe stability check on 2026-10-27 passed 260 tests across
+`python/tests` and the multiframe benchmark harness, with official djxl 0.12/0.13
+and CUDA checks enabled. The built Windows wheel was installed into an isolated
+directory; all 174 API tests passed with `RS_JXL_NATIVE_LIB` unset, after asserting
+that both the Python package and native DLL came from that installation.
+These are overlapping test sets, not 434 independent cases. Two existing
+packaging/toolchain warnings remained non-fatal. The source distribution was
+also checked for the new Rust modules, tests, documentation and C header.
+See the [stability checkpoint](MULTIFRAME_STABILITY_20261027.md) for native
+regressions, the corrected reference-slot test and validation limitations.
+
+The earlier native automatic-option/report update on 2026-10-27 passed 173 Python
 tests against the rebuilt release DLL, with official djxl interoperability and
 CUDA transfer checks enabled. Two existing packaging warnings remained non-fatal.
 Difference analysis, candidate generation, pruning and timing are native Rust;

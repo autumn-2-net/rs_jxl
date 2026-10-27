@@ -9,8 +9,10 @@ use crate::{
 use std::io::Write;
 
 pub(crate) mod budget;
+pub(crate) mod reusable;
 pub(crate) mod session;
 use budget::{SectionBudget, TrialEncode, complete_or_return};
+pub(crate) use reusable::{LogicalFrameCache, encode_logical_frame_cached_trial};
 
 #[derive(Clone, Debug)]
 pub struct EncodeOptions {
@@ -391,6 +393,20 @@ fn encode_logical_frame_impl(
     budget: Option<&SectionBudget>,
     generated_reference: Option<&mut bool>,
 ) -> Result<TrialEncode<Vec<u8>>> {
+    validate_logical_frame(canvas, frame, options, last)?;
+    let plan = prepare_patch_plan(frame.image, options)?;
+    if let Some(generated) = generated_reference {
+        *generated = plan.is_some();
+    }
+    encode_logical_frame_from_plan(canvas, frame, options, last, budget, plan)
+}
+
+fn validate_logical_frame(
+    canvas: FrameCanvas<'_>,
+    frame: &crate::frame::Frame<'_>,
+    options: &EncodeOptions,
+    last: bool,
+) -> Result<()> {
     validate(frame.image, options)?;
     frame
         .options
@@ -408,20 +424,31 @@ fn encode_logical_frame_impl(
             "patches reserve reference slot 3".into(),
         ));
     }
-    let plan = {
-        let _patches = crate::profile::scope("encode.patch_analysis");
-        if let Some(config) = &options.source_patches {
-            crate::patch_frame::prepare_source(frame.image, config)?
-        } else if let Some(patches) = &options.patches {
-            crate::patch_frame::prepare(frame.image, patches)?
-        } else {
-            None
-        }
-    };
-    let mut stream = Vec::new();
-    if let Some(generated) = generated_reference {
-        *generated = plan.is_some();
+    Ok(())
+}
+
+type PreparedPatchPlan = (Image, Image, crate::tools::patches::PatchDictionary);
+
+fn prepare_patch_plan(image: &Image, options: &EncodeOptions) -> Result<Option<PreparedPatchPlan>> {
+    let _patches = crate::profile::scope("encode.patch_analysis");
+    if let Some(config) = &options.source_patches {
+        crate::patch_frame::prepare_source(image, config)
+    } else if let Some(patches) = &options.patches {
+        crate::patch_frame::prepare(image, patches)
+    } else {
+        Ok(None)
     }
+}
+
+fn encode_logical_frame_from_plan(
+    canvas: FrameCanvas<'_>,
+    frame: &crate::frame::Frame<'_>,
+    options: &EncodeOptions,
+    last: bool,
+    budget: Option<&SectionBudget>,
+    plan: Option<PreparedPatchPlan>,
+) -> Result<TrialEncode<Vec<u8>>> {
+    let mut stream = Vec::new();
     if let Some((reference, residual, dictionary)) = plan {
         let reference_options = crate::frame::FrameOptions {
             reference_only: true,
@@ -507,8 +534,32 @@ fn encode_frame_trial(
     budget: Option<&SectionBudget>,
 ) -> Result<TrialEncode<Vec<u8>>> {
     let _frame = crate::profile::scope("encode.frame");
-    let modular_options = options.modular.for_pixel_metadata(image.metadata());
     let credited_before = budget.map_or(0, SectionBudget::section_bytes);
+    let sections = complete_or_return!(encode_frame_sections_trial(
+        image, options, frame, patches, budget,
+    ));
+    let output = assemble_frame_sections(canvas, image, options, frame, last, patches, &sections)?;
+    if let Some(budget) = budget {
+        // Final section bytes were already charged at their producing tasks.
+        // Add only the frame header, or the whole uninstrumented small/legacy
+        // frame, to the resource tally. Never count assembly as new evidence.
+        let credited = budget.section_bytes() - credited_before;
+        let overhead = output.len().checked_sub(credited).ok_or_else(|| {
+            Error::Encoding("finalized sections exceed the assembled frame".into())
+        })?;
+        budget.retain_overhead(overhead)?;
+    }
+    Ok(TrialEncode::Complete(output))
+}
+
+fn encode_frame_sections_trial(
+    image: &Image,
+    options: &EncodeOptions,
+    frame: &crate::frame::FrameOptions,
+    patches: Option<&crate::tools::patches::PatchDictionary>,
+    budget: Option<&SectionBudget>,
+) -> Result<TrialEncode<Vec<Vec<u8>>>> {
+    let modular_options = options.modular.for_pixel_metadata(image.metadata());
     let reference_passes = crate::modular::layout::Passes::default();
     let passes = if frame.reference_only {
         &reference_passes
@@ -623,6 +674,25 @@ fn encode_frame_trial(
         sections.extend(encoded);
         sections
     };
+    Ok(TrialEncode::Complete(sections))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn assemble_frame_sections(
+    canvas: FrameCanvas<'_>,
+    image: &Image,
+    options: &EncodeOptions,
+    frame: &crate::frame::FrameOptions,
+    last: bool,
+    patches: Option<&crate::tools::patches::PatchDictionary>,
+    sections: &[Vec<u8>],
+) -> Result<Vec<u8>> {
+    let reference_passes = crate::modular::layout::Passes::default();
+    let passes = if frame.reference_only {
+        &reference_passes
+    } else {
+        &options.passes
+    };
     let sizes: Vec<_> = sections.iter().map(Vec::len).collect();
     let header = match canvas {
         FrameCanvas::Image(canvas) => codestream::frame_header(
@@ -673,19 +743,9 @@ fn encode_frame_trial(
         .map_err(|_| Error::Limit("encoded output allocation"))?;
     output.extend_from_slice(&header);
     for section in sections {
-        output.extend_from_slice(&section);
+        output.extend_from_slice(section);
     }
-    if let Some(budget) = budget {
-        // Final section bytes were already charged at their producing tasks.
-        // Add only the frame header, or the whole uninstrumented small/legacy
-        // frame, to the resource tally. Never count assembly as new evidence.
-        let credited = budget.section_bytes() - credited_before;
-        let overhead = output.len().checked_sub(credited).ok_or_else(|| {
-            Error::Encoding("finalized sections exceed the assembled frame".into())
-        })?;
-        budget.retain_overhead(overhead)?;
-    }
-    Ok(TrialEncode::Complete(output))
+    Ok(output)
 }
 
 /// Buffers a complete encoding, then writes it. No partial output on codec error.
