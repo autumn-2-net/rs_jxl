@@ -35,7 +35,7 @@ def main():
                            cwd=work, env=env, check=True)
 
         run("-m", "pip", "install", "--disable-pip-version-check", str(wheels[0]),
-            "pillow", "pytest", "packaging", "setuptools>=68", "wheel>=0.38")
+            "pillow", "pytest", "packaging", "setuptools>=68", "wheel>=0.38", "tomlkit>=0.12,<1")
         run(ROOT / "scripts/smoke_ci.py", "--cli", cli)
         run("-m", "pytest", "--import-mode=prepend", "-p", "no:cacheprovider",
             ROOT / "python/tests", "-q")

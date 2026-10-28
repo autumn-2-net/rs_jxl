@@ -98,7 +98,10 @@ source archives are not pre-versioned wheels or binary archives.
 3. Build the wheel using the native library from that build, without a second
    implicit Cargo build or a different dependency resolution.
 4. Test version synchronization, invalid input rejection, archive assembly,
-   required notices, executable permissions and checksums.
+   required notices, executable permissions and checksums. Packaging roundtrips
+   compare wheel/sdist metadata and wheel filenames against the fixture's input
+   `pyproject.toml`, covering both the current project version and explicit
+   non-default versions. They must not assume a particular project version.
 5. Create a fresh temporary virtual environment, install the built wheel and
    test dependencies, and clear `PYTHONPATH`, `PYTHONHOME` and native-library
    overrides. Python runs with `-I` outside the checkout. Smoke checks verify
@@ -121,6 +124,9 @@ Use an existing Python 3.10+ environment and Rust toolchain. The wheel test
 helper creates and removes only its own temporary virtual environment and
 downloads its Python dependencies with pip. It never installs into your base
 Python environment or starts WSL.
+
+The isolated test environment also installs `tomlkit` to read and vary temporary
+packaging manifests. This is a test dependency, not a wheel runtime dependency.
 
 ```powershell
 cargo fetch --locked
@@ -162,3 +168,11 @@ release-assembly tests passed on Windows, including symlink rejection and Linux
 multi-tag wheel filename fixtures. Actionlint 1.7.12 accepted the updated workflow
 with shellcheck/pyflakes disabled. No GitHub Release was created and no hosted
 workflow was triggered during this local verification.
+
+On 2026-10-28 the packaging test's fixed `0.1.0` expectation was replaced with
+the input manifest's version. All 75 packaging tests passed, including wheel/
+sdist roundtrips at the project version, `1.0.0` and `2.7.3`, plus mismatched
+version rejection. The fresh-venv CI runner using the existing Windows Release
+wheel/CLI passed its smoke checks and 237 Python tests (12 optional skips, two
+tooling warnings); all 27 CI helper tests also passed. Native binaries were not
+rebuilt, and hosted Linux/Windows runs still require manual dispatch.

@@ -15,7 +15,10 @@ from types import SimpleNamespace
 import zipfile
 
 from packaging.requirements import Requirement
+from packaging.utils import parse_wheel_filename
+from packaging.version import Version
 import pytest
+import tomlkit
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -154,11 +157,16 @@ def test_cross_tag_environment_rejected(packaging, monkeypatch, name):
         packaging._build_target()
 
 
-def fixture_project(tmp_path, packaging):
+def fixture_project(tmp_path, packaging, version=None):
     root = tmp_path / "project with spaces"
     root.mkdir()
     for name in ("setup.py", "pyproject.toml", "MANIFEST.in"):
         shutil.copy2(ROOT / name, root / name)
+    if version is not None:
+        manifest = root / "pyproject.toml"
+        project = tomlkit.parse(manifest.read_text(encoding="utf-8"))
+        project["project"]["version"] = version
+        manifest.write_text(tomlkit.dumps(project), encoding="utf-8")
     for name in packaging.REQUIRED_SOURCES:
         if not (root / name).exists():
             write(root / name, "# Packaging fixture\n" if not name.endswith(".rs") else "// Fixture\n")
@@ -327,7 +335,7 @@ def inspect_notices(archive, root, packaging):
     assert b"Retained Upstream License" in archive.read(f"{info}/licenses/docs/PORTING_KERNELS.md")
 
 
-def inspect_wheel(path, native, root, packaging):
+def inspect_wheel(path, native, root, packaging, expected_version):
     assert "-py3-none-" in path.name
     assert not path.name.endswith("-any.whl")
     with zipfile.ZipFile(path) as archive:
@@ -341,15 +349,19 @@ def inspect_wheel(path, native, root, packaging):
         assert "Tag: py3-none-" in wheel
         metadata = email.message_from_bytes(archive.read(next(name for name in names if name.endswith("/METADATA"))))
         assert metadata["Name"] == "rs-jxl"
-        assert metadata["Version"] == "0.1.0"
+        assert metadata["Version"] == expected_version, "Wheel metadata version differs from the build input"
+        assert parse_wheel_filename(path.name)[1] == Version(expected_version)
         assert metadata["Requires-Python"] == ">=3.10"
         assert {str(Requirement(value)) for value in metadata.get_all("Requires-Dist")} == {"cffi>=1.15", "numpy>=1.22"}
         assert metadata.get_all("Provides-Extra", []) == []
         inspect_notices(archive, root, packaging)
 
 
-def test_real_wheel_and_sdist_roundtrip_without_cargo(packaging, tmp_path):
-    root = fixture_project(tmp_path, packaging)
+@pytest.mark.parametrize("version", [None, "1.0.0", "2.7.3"],
+                         ids=["project-version", "release-1.0.0", "release-2.7.3"])
+def test_real_wheel_and_sdist_roundtrip_without_cargo(packaging, tmp_path, version):
+    root = fixture_project(tmp_path, packaging, version)
+    expected_version = tomlkit.parse((root / "pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]
     native = write(tmp_path / "prebuilt" / packaging._native_name(), native_header(sys.platform))
     required_extra = ["crates/rs-jxl/src/nested/module.rs", "vendor/libsais-rs/src/libsais64.rs",
                       "vendor/jxl-rs/jxl/src/nested/module.rs", "python/tests/test_fixture.py",
@@ -378,15 +390,20 @@ def test_real_wheel_and_sdist_roundtrip_without_cargo(packaging, tmp_path):
         assert set(required_extra).issubset(names)
         assert not set(excluded).intersection(names)
         prefix = archive.getmembers()[0].name.split("/")[0]
+        metadata = email.message_from_bytes(archive.extractfile(f"{prefix}/PKG-INFO").read())
+        assert metadata["Version"] == expected_version
         for name in packaging.LICENSE_FILES + EMBEDDED_ASSETS:
             assert archive.extractfile(f"{prefix}/{name}").read() == (root / name).read_bytes()
         # This archive was just produced from the test's own temporary fixture.
         archive.extractall(extracted)
     wheel = run_backend(root, "build_wheel", native)
-    inspect_wheel(wheel, native, root, packaging)
+    inspect_wheel(wheel, native, root, packaging, expected_version)
+    # The check must still reject a stale or otherwise mismatched wheel version.
+    with pytest.raises(AssertionError, match="Wheel metadata version"):
+        inspect_wheel(wheel, native, root, packaging, expected_version + ".post1")
     unpacked = next(extracted.iterdir())
     rebuilt = run_backend(unpacked, "build_wheel", native)
-    inspect_wheel(rebuilt, native, unpacked, packaging)
+    inspect_wheel(rebuilt, native, unpacked, packaging, expected_version)
     assert hashlib.sha256(wheel.read_bytes()).digest() == hashlib.sha256(rebuilt.read_bytes()).digest()
 
 
