@@ -203,5 +203,4 @@ fn merge_dense<const WIDTH: usize>(dense: &[usize; WIDTH], sparse: &mut BTreeMap
 }
 
 #[cfg(test)]
-#[path = "lz77_source_histograms_tests.rs"]
 mod tests;

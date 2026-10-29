@@ -21,7 +21,6 @@ use super::{
 };
 use crate::{Error, Result};
 
-#[path = "lz77_source_seed_profile.rs"]
 mod seed_profile;
 
 pub(super) fn hash(values: &[u32], position: usize) -> u32 {
@@ -1011,11 +1010,9 @@ impl<'a> Optimal<'a> {
 }
 
 #[cfg(test)]
-#[path = "lz77_source_fast_tests.rs"]
 mod fast_tests;
 
 #[cfg(test)]
-#[path = "lz77_source_short_tests.rs"]
 mod short_tests;
 
 #[cfg(test)]

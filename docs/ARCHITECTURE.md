@@ -4,6 +4,27 @@ This is a responsibility map and review guide, not a claim of complete source
 parity, format coverage, portability, or performance. Start with the
 [documentation index](README.md) for API contracts and separate status reports.
 The repository's [contribution rules](../AGENTS.md) still apply.
+The [2026-10-29 maintenance record](MAINTENANCE_20261029.md) contains the latest
+organization-only changes and their validation evidence.
+
+## Repository Layout
+
+| Directory | Ownership |
+| --- | --- |
+| `crates/` | The codec, pixel-input readers, CLI and C ABI. Dependencies flow toward the codec; the codec does not depend on an adapter. |
+| `python/rs_jxl/` | Installed Python API, buffer/stream handling and CFFI transport. No codec policy or build-time code. |
+| `python/tests/` | Python API and packaging regression tests. Packaging fixtures must work at the requested build version, not a fixed project version. |
+| `build_support/` | Internal setuptools support: native artifact validation/discovery, source manifests and build commands. Included in sdists, never in runtime wheels. |
+| `scripts/` | Stable build/release/smoke entry points and the native multiframe benchmark commands. Existing command paths remain supported. |
+| `tools/` | Development-only corpus, profiling, comparison and benchmark tools, with their own harness tests. Not a runtime codec dependency. |
+| `docs/` | Current API/module guides, port ledgers and explicitly dated experiments; see the documentation index. |
+| `vendor/` | Separately maintained upstream code, licenses and provenance. A local cleanup must not rewrite upstream history. |
+| `out/`, `target/`, `build/`, `dist/` | Ignored local results and generated artifacts, not source. Do not delete datasets or benchmark evidence as part of a source cleanup. |
+
+Module directories express ownership, not necessarily public namespaces. Keep
+public reexports and existing command entry points stable when implementation
+files move. Colocate private implementation and tests with their owning module;
+avoid adding another long family of prefixed files to a shared directory.
 
 ## Entry Points and Dependencies
 
@@ -92,6 +113,11 @@ The adapters have their own narrow boundaries:
   [encode/multiframe.rs](../crates/rs-jxl-ffi/src/encode/multiframe.rs) handles
   sequence preparation and report conversion; still-image and byte-reversible
   JPEG dispatch remain in `encode.rs`. Analysis keeps its separate serializer.
+- FFI [request.rs](../crates/rs-jxl-ffi/src/request.rs) keeps the operation envelope,
+  typed request views and cross-field validation. `request/deserialize.rs` owns
+  duplicate/presence/null parsing; `image.rs` owns payload descriptors; `options.rs`
+  owns option and resource-limit schemas. Reexports keep existing adapter imports
+  stable. Splitting files does not change validation order or the JSON/C ABI.
 - CLI encoding JSON uses `analysis_elapsed_seconds`; FFI encoding JSON uses
   `analysis_seconds`. Encoding strategy labels use their existing Debug spelling,
   while analysis has its own wire labels. These are existing adapter contracts,
@@ -215,9 +241,13 @@ These are physical file boundaries, not new public API namespaces:
 
 - [ma_train_options.rs](../crates/rs-jxl/src/modular/ma_train_options.rs)
   holds `TrainOptions`, `HistogramOptions`, `MaBudgetMode`, defaults and
-  validation. `ma_train.rs` reexports the public types and retains the learner
-  and histogram-cache orchestration. Internal methods retain their original
-  visibility scope; constraint validation stays private to the options module.
+  validation. `ma_train.rs` reexports the public types and retains entry-point
+  validation, sample constraints and constants. Private helpers under
+  [ma_train/](../crates/rs-jxl/src/modular/ma_train/) separate preparation,
+  parent histograms, cache leases, scratch ownership, split scoring, split-search
+  policy and learner orchestration. These are implementation boundaries, not
+  new public options or a different MA algorithm. Constraint validation stays
+  private to the options module.
 - [ma_train_tests.rs](../crates/rs-jxl/src/modular/ma_train_tests.rs)
   remains the `modular::ma_train::tests` module through `#[path]`. Other focused
   MA test modules retain their own names.
@@ -226,9 +256,17 @@ These are physical file boundaries, not new public API namespaces:
   and [ma_simd_count_x86.rs](../crates/rs-jxl/src/tools/ma_simd_count_x86.rs)
   isolate architecture-specific kernels. [ma_simd_tests.rs](../crates/rs-jxl/src/tools/ma_simd_tests.rs)
   remains `tools::ma_simd::tests`; optional AVX512/reciprocal tests are separate.
-- [lz77_source_tests.rs](../crates/rs-jxl/src/tools/lz77_source_tests.rs)
-  remains `tools::lz77_source::tests`. Matching, indexing, parsing and execution
-  helpers stay in the existing `lz77_source_*` implementation modules.
+- [lz77/source/tests.rs](../crates/rs-jxl/src/tools/lz77/source/tests.rs)
+  remains `tools::lz77::source::tests`. The implementation now follows its Rust
+  module tree under `tools/lz77/`: `policy.rs`, `dp.rs` and `source.rs`, with
+  matching/indexing/parsing/execution helpers and tests under their actual owners.
+  The former `lz77_source_*` file prefix is no longer needed. Public paths such
+  as `tools::lz77::SourceConfig` and `tools::lz77::policy` are unchanged.
+- [training/tests.rs](../crates/rs-jxl/src/modular/training/tests.rs) and
+  [scheduler/adapter/](../crates/rs-jxl/src/scheduler/adapter/) separate the large
+  test bodies from sample gathering and candidate projection. The original
+  `training::tests`, `adapter::tectonic_tests`, `adapter::direct_input_tests` and
+  `adapter::responsive_tests` filters still select the same tests.
 - CLI still-image arguments and dispatch live in
   [encode.rs](../crates/rs-jxl-cli/src/encode.rs), shared parsers in
   [validators.rs](../crates/rs-jxl-cli/src/validators.rs), and the extracted
@@ -236,6 +274,23 @@ These are physical file boundaries, not new public API namespaces:
 
 Follow the declaring `mod`/`#[path]` and reexports when changing visibility or
 test filters. A sibling filename alone does not establish a Rust module path.
+
+### Build Support
+
+`setup.py` only registers setuptools commands. The internal `build_support`
+package separates three concerns:
+
+- `native.py`: host/target checks, PE/ELF/Mach-O header inspection and locked,
+  offline Cargo artifact discovery. A prebuilt library is validated, not executed.
+- `sources.py`: required source files, attribution and complete-sdist checks.
+- `commands.py`: wheel/editable/sdist hooks and native-library publication.
+
+This package is source-build infrastructure, not part of `python/rs_jxl` or a
+wheel. `MANIFEST.in` and required-source validation include its files in sdists.
+Packaging tests use copied support modules and rebuild from extracted sdists;
+missing modules must fail rather than fall back to a checkout or stale artifact.
+The separate CI version/release helpers retain their command paths and
+manual-only trigger. See [CI](CI.md) for build versions and publication policy.
 
 ## Invariants to Preserve
 
@@ -306,7 +361,7 @@ historical checkpoints remain separate.
 | Change Surface | Coverage to Select | Review Focus |
 | --- | --- | --- |
 | File/module extraction | Original inline tests through their retained qualified module names; relevant focused sibling tests. | Compare moved bodies and defaults, public paths, minimal visibility, `cfg`/target gates, macros, imports and source notices. Format only owned Rust files with `skip_children=true` during shared work. |
-| MA/SIMD/LZ77 | `ma_train_tests.rs`, cache/budget/pruning/handoff tests, `ma_simd*_tests.rs`, `lz77_source*_tests.rs`. | Boundary populations, tails, saturation, error ordering, scalar/native arithmetic and enabled/disabled experiments. Do not equate approximate scoring profiles merely because both encode losslessly. |
+| MA/SIMD/LZ77 | `ma_train_tests.rs`, cache/budget/pruning/handoff tests, `ma_simd*_tests.rs`, colocated tests under `tools/lz77/`. | Boundary populations, tails, saturation, error ordering, scalar/native arithmetic and enabled/disabled experiments. Do not equate approximate scoring profiles merely because both encode losslessly. |
 | Pixel API and sample types | [pixel_acceptance.rs](../crates/rs-jxl/tests/pixel_acceptance.rs), [decode_lossless_edges.rs](../crates/rs-jxl/tests/decode_lossless_edges.rs), [decode_wide_integer.rs](../crates/rs-jxl/tests/decode_wide_integer.rs), explicit float/oracle targets. | Invisible RGB, exact integer values, float words where supported, extra channels, metadata and writer failures. An f32 NPY projection cannot prove arbitrary U31 equality. |
 | Frames and streams | [multiframe_auto.rs](../crates/rs-jxl/tests/multiframe_auto.rs), [decode_streaming.rs](../crates/rs-jxl/tests/decode_streaming.rs), sequence/metadata reference tests. | Zero-duration layers, visible-frame indexing, crop/blend/reference state, timing, fragmented input, EOF, trailing metadata and partial outputs. |
 | JPEG archival | [transcode_reference_tests.rs](../crates/rs-jxl/src/jpeg/transcode_reference_tests.rs), [decode_jpeg.rs](../crates/rs-jxl/tests/decode_jpeg.rs), coefficient/reconstruction tests. | Compare every reconstructed JPEG byte. Parser or coefficient-to-JPEG helper tests alone do not cover an entire JPEG-to-JXL round trip. |

@@ -348,7 +348,6 @@ struct Step {
     distance: u32,
 }
 
-#[path = "lz77_source_compact_dp.rs"]
 mod compact_steps;
 use compact_steps::Steps;
 

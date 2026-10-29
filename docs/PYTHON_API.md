@@ -22,7 +22,10 @@ Set `RS_JXL_NATIVE_LIB` to a prebuilt `rs_jxl_ffi.dll` (Windows),
 `librs_jxl_ffi.so` (Linux), or `librs_jxl_ffi.dylib` (macOS) to skip compilation.
 The packager checks native format/architecture, not by executing the library.
 Wheels are py3-none-platform, never pure-any. Foreign cross-builds are rejected;
-Linux manylinux repair remains release work. macOS runtime is out of scope.
+Linux manylinux repair is performed by the [manual CI build](CI.md).
+macOS runtime is out of scope. The internal `build_support/` package is included
+in source distributions for building, not in installed runtime wheels; see
+[build ownership](ARCHITECTURE.md#build-support).
 Development/editable imports use PYTHONPATH=python and target/release, honoring
 CARGO_TARGET_DIR/CARGO_BUILD_TARGET. Wheels use their bundled library; explicit
 RS_JXL_NATIVE_LIB overrides either lookup and fails on an invalid path/ABI.

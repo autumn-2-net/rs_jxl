@@ -61,43 +61,29 @@ use super::{
 };
 use crate::{Error, Result};
 
-#[path = "lz77_source_matchers.rs"]
 mod matchers;
 use matchers::{Chain, Fast, Optimal};
-#[path = "lz77_source_range.rs"]
 mod range;
 use range::Parser;
 pub use range::{SourceBlockDyadic, SourceBlockEnvelope};
-#[path = "lz77_source_workers.rs"]
 mod workers;
 use workers::Schedule;
 pub use workers::SourceParallelism;
-#[path = "lz77_source_index.rs"]
 mod index;
 use index::StaticIndex;
 pub use index::{SourceDeepPrefix, SourceIndexMode, SourceIndexTags, SourceRunKeys};
-#[path = "lz77_source_replay.rs"]
 mod replay;
 use replay::Classes;
-#[path = "lz77_source_blocks.rs"]
 mod blocks;
 pub use blocks::{SourceBlockMode, SourceSeedBlocks, SourceSeedGuided};
-#[path = "lz77_source_suffix.rs"]
 mod suffix;
 pub use suffix::SourceSuffixMode;
-#[path = "lz77_source_chain_batch.rs"]
 mod chain_batch;
-#[path = "lz77_source_distances.rs"]
 mod distances;
-#[path = "lz77_source_histograms.rs"]
 mod histograms;
-#[path = "lz77_source_prices.rs"]
 mod prices;
-#[path = "lz77_source_profile.rs"]
 mod profile;
-#[path = "lz77_source_sais.rs"]
 mod sais;
-#[path = "lz77_source_search.rs"]
 mod search;
 
 /// enc_lz77.cc's JXL_LOSSLESS_LZ77_MATCH_COST modes 0..7.
@@ -1860,13 +1846,10 @@ pub fn parse_source_rle_streams_with_state(
 }
 
 #[cfg(test)]
-#[path = "lz77_source_controls_tests.rs"]
 mod controls_tests;
 
 #[cfg(test)]
-#[path = "lz77_source_alias_tests.rs"]
 mod alias_tests;
 
 #[cfg(test)]
-#[path = "lz77_source_tests.rs"]
 mod tests;

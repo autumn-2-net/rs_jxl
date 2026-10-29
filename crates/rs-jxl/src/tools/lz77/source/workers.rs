@@ -274,7 +274,6 @@ impl Schedule {
 }
 
 #[cfg(test)]
-#[path = "lz77_source_arena_tests.rs"]
 mod arena_tests;
 
 #[cfg(test)]

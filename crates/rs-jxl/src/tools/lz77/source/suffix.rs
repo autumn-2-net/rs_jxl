@@ -3,7 +3,7 @@
 // see docs/PORTING_KERNELS.md. The external Rust utility is Apache-2.0.
 
 //! enc_lz77_suffix.h / enc_lz77_lcp.h at b866b3d. The source's external
-//! libsais_int uses the bounded serial adapter in lz77_source_sais.rs and the
+//! libsais_int uses the bounded serial adapter in sais.rs and the
 //! vendored pure-Rust translation, not a substitute suffix-order algorithm.
 //! Source neighbor nominations and strict sliding-window semantics are kept.
 

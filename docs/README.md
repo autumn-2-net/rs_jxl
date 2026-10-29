@@ -50,7 +50,11 @@ platform certifications.
 
 ## Acceptance and Validation
 
-The latest [multiframe maintenance checkpoint](ARCHITECTURE.md#multiframe-maintenance-checkpoint)
+The [2026-10-29 organization checkpoint](MAINTENANCE_20261029.md) records the
+MA/LZ77 module layout, FFI schema boundaries, extracted build-support package
+and the exact verification scope. Public interfaces and codec policy are retained.
+
+The earlier [multiframe maintenance checkpoint](ARCHITECTURE.md#multiframe-maintenance-checkpoint)
 records the behavior-preserving module cleanup: 2,503 Rust tests, 260 Python and
 harness tests, 174 overlapping installed-wheel API tests and 11 official-decoder
 checks passed. It records ignored cases, packaging checks and validation limits.

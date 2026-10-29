@@ -38,7 +38,7 @@
 //! SourceConfig now also routes history/wide buckets, baseline static indexes,
 //! match-cost 4..7 and bounded stream workers. These do not repair this legacy
 //! projection: callers must opt into parse_source_streams[_with_state]. Remaining
-//! executable-route experiments are listed in lz77_source.rs, not erased here.
+//! executable-route experiments are listed in source.rs, not erased here.
 //! This module never changes Lz77Options::default(), reads environment settings,
 //! or changes a caller's entropy serializer. SourceLz77Method deliberately has
 //! no None: the scheduler must bypass parse entirely for disabled LZ77.

@@ -209,7 +209,6 @@ impl<'a> Prices<'a> {
 }
 
 #[cfg(test)]
-#[path = "lz77_source_penalty_tests.rs"]
 mod penalty_tests;
 
 #[cfg(test)]

@@ -13,7 +13,6 @@ use super::matchers::filled;
 use super::{Command, Literal, SourceBlockMode, SourceConfig, reserved};
 use crate::{Error, Result};
 
-#[path = "lz77_source_relax.rs"]
 mod vector;
 use vector::{Update, VectorSteps};
 
@@ -742,7 +741,6 @@ impl Parser {
 }
 
 #[cfg(test)]
-#[path = "lz77_source_range_tests.rs"]
 mod variant_tests;
 
 #[cfg(test)]

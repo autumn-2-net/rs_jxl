@@ -360,5 +360,4 @@ impl Drop for Batch<'_> {
 }
 
 #[cfg(test)]
-#[path = "lz77_source_chain_batch_tests.rs"]
 mod tests;

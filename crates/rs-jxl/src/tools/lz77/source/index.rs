@@ -19,15 +19,11 @@ use super::{
 use crate::tools::lz77_prefix::fingerprint_mask;
 use crate::{Error, Result, execution};
 
-#[path = "lz77_source_deep.rs"]
 mod deep;
 use deep::DeepChain;
-#[path = "lz77_source_index_batch.rs"]
 mod batch;
-#[path = "lz77_source_index_parallel.rs"]
 mod parallel;
 pub(super) use batch::Batch;
-#[path = "lz77_source_values.rs"]
 mod values;
 use values::Values;
 
@@ -1187,5 +1183,4 @@ pub(super) mod tests {
 }
 
 #[cfg(test)]
-#[path = "lz77_source_compact_tests.rs"]
 mod compact_tests;

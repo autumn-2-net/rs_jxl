@@ -1,4 +1,5 @@
 include pyproject.toml setup.py MANIFEST.in README.md AGENTS.md Cargo.toml Cargo.lock
+recursive-include build_support *.py
 recursive-include docs *.md
 recursive-include python/rs_jxl *.py *.pyi py.typed *.h
 recursive-include python/tests *.py

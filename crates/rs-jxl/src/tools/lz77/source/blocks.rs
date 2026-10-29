@@ -778,19 +778,15 @@ fn parse_lazy(
 }
 
 #[cfg(test)]
-#[path = "lz77_source_block_guided_tests.rs"]
 mod guided_tests;
 
 #[cfg(test)]
-#[path = "lz77_source_block_pruning_tests.rs"]
 mod pruning_tests;
 
 #[cfg(test)]
-#[path = "lz77_source_block_dp_tests.rs"]
 mod dp_tests;
 
 #[cfg(test)]
-#[path = "lz77_source_block_count_tests.rs"]
 mod count_tests;
 
 #[cfg(test)]
