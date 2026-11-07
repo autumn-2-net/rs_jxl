@@ -5,6 +5,7 @@
 
 use std::ops::Range;
 
+use super::gradient;
 use crate::bit_reader::BitReader;
 use crate::entropy_coding::decode::{Histograms, SymbolReader, unpack_signed};
 use crate::error::Result;
@@ -290,24 +291,51 @@ impl<'a, R: Reader> ModularChannelDecoder for WpOnly<'a, R> {
 const GRADIENT_PROPERTY: u8 = 9;
 const WEIGHTED_PROPERTY: u8 = 15;
 
-struct GradientOnly<'a, R> {
-    lut: &'a [u8; LUT_TABLE_SIZE],
+enum GradientLookup<'a> {
+    Lut(&'a [u8; LUT_TABLE_SIZE]),
+    Tree(&'a [TreeNode]),
+}
+
+struct GradientOnly<'a, R, const WIDE: bool> {
+    lookup: GradientLookup<'a>,
     reader: R,
 }
 
-impl<'a, R: Reader> GradientOnly<'a, R> {
+impl<'a, R: Reader, const WIDE: bool> GradientOnly<'a, R, WIDE> {
     fn new(
-        tree: &[TreeNode],
+        tree: &'a [TreeNode],
         reader: R,
         lut: &'a mut [u8; LUT_TABLE_SIZE],
         lut_stack: &mut Vec<RangeAndNode>,
     ) -> Option<Self> {
-        let lut = make_lut(tree, lut, lut_stack)?;
-        Some(Self { lut, reader })
+        let lookup = match make_lut(tree, lut, lut_stack) {
+            Some(lut) => GradientLookup::Lut(lut),
+            // Eligibility was checked independently against the C++ bounds.
+            None if WIDE => GradientLookup::Tree(tree),
+            None => return None,
+        };
+        Some(Self { lookup, reader })
+    }
+
+    #[inline(always)]
+    fn cluster(&self, data: PredictionData) -> usize {
+        let prop9 = if WIDE {
+            gradient::property(data)
+        } else {
+            data.left.wrapping_add(data.top).wrapping_sub(data.topleft)
+        };
+        match self.lookup {
+            GradientLookup::Lut(lut) => {
+                let index = (prop9 as i64 - LUT_MIN_SPLITVAL as i64)
+                    .clamp(0, LUT_TABLE_SIZE as i64 - 1) as usize;
+                lut[index] as usize
+            }
+            GradientLookup::Tree(tree) => gradient::context(tree, prop9) as usize,
+        }
     }
 }
 
-impl<'a, R: Reader> ModularChannelDecoder for GradientOnly<'a, R> {
+impl<R: Reader, const WIDE: bool> ModularChannelDecoder for GradientOnly<'_, R, WIDE> {
     #[inline(always)]
     fn needs_toptop(&self) -> bool {
         false
@@ -322,14 +350,7 @@ impl<'a, R: Reader> ModularChannelDecoder for GradientOnly<'a, R> {
         br: &mut BitReader,
         histograms: &Histograms,
     ) -> i32 {
-        let prop9 = prediction_data
-            .left
-            .wrapping_add(prediction_data.top)
-            .wrapping_sub(prediction_data.topleft);
-
-        let index =
-            (prop9 as i64 - LUT_MIN_SPLITVAL as i64).clamp(0, LUT_TABLE_SIZE as i64 - 1) as usize;
-        let cluster = self.lut[index];
+        let cluster = self.cluster(prediction_data);
 
         let pred = clamped_gradient(
             prediction_data.left as i64,
@@ -337,7 +358,7 @@ impl<'a, R: Reader> ModularChannelDecoder for GradientOnly<'a, R> {
             prediction_data.topleft as i64,
         );
 
-        let dec = self.reader.read(reader, histograms, br, cluster as usize);
+        let dec = self.reader.read(reader, histograms, br, cluster);
         dec.wrapping_add(pred as i32)
     }
 }
@@ -453,6 +474,7 @@ pub(super) fn run_on_specialized_tree<F: FnOnce(&mut dyn ModularChannelDecoder) 
     storage: ModularStorage,
     lut_scratch: &mut [u8; LUT_TABLE_SIZE],
     tree_scratch: &mut TreeScratch,
+    wide_gradient: bool,
     run: F,
 ) -> Result<()> {
     // TODO(veluca): consider skipping the pruning if header.uses_global_tree is true.
@@ -616,14 +638,34 @@ pub(super) fn run_on_specialized_tree<F: FnOnce(&mut dyn ModularChannelDecoder) 
     }
 
     if !uses_non_gradient {
+        if wide_gradient {
+            // WIDE always has a traversal fallback when the small LUT cannot
+            // represent a semantically eligible C++ gradient tree.
+            if !uses_non420 {
+                return run(&mut GradientOnly::<_, true>::new(
+                    pruned_tree,
+                    Reader420NoLz,
+                    lut_scratch,
+                    lut_stack,
+                )
+                .unwrap());
+            }
+            return run(&mut GradientOnly::<_, true>::new(
+                pruned_tree,
+                ReaderGeneric,
+                lut_scratch,
+                lut_stack,
+            )
+            .unwrap());
+        }
         if !uses_non420 {
             if let Some(mut grad) =
-                GradientOnly::new(pruned_tree, Reader420NoLz, lut_scratch, lut_stack)
+                GradientOnly::<_, false>::new(pruned_tree, Reader420NoLz, lut_scratch, lut_stack)
             {
                 return run(&mut grad);
             }
         } else if let Some(mut grad) =
-            GradientOnly::new(pruned_tree, ReaderGeneric, lut_scratch, lut_stack)
+            GradientOnly::<_, false>::new(pruned_tree, ReaderGeneric, lut_scratch, lut_stack)
         {
             return run(&mut grad);
         }
@@ -669,3 +711,7 @@ pub(super) fn run_on_specialized_tree<F: FnOnce(&mut dyn ModularChannelDecoder) 
     }
     run(&mut FlatTree::new(inner, ReaderGeneric, wp_state))
 }
+
+#[cfg(test)]
+#[path = "gradient_tests.rs"]
+mod gradient_tests;

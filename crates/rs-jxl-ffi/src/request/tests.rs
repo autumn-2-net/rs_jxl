@@ -2,6 +2,91 @@ use super::*;
 use rs_jxl::multiframe::Reference;
 use serde_json::json;
 
+#[test]
+fn legacy_gradient_is_explicit_and_projects_to_native_decode_options() {
+    for operation in ["decode", "decode_to_png"] {
+        for (wire, expected) in [
+            (json!({}), false),
+            (json!({"legacy_gradient": false}), false),
+            (json!({"legacy_gradient": true}), true),
+        ] {
+            let request: Request = serde_json::from_value(json!({
+                "operation": operation, "options": wire,
+            }))
+            .unwrap();
+            request.validate_typed().unwrap();
+            assert_eq!(
+                crate::decode::options(&request.options)
+                    .unwrap()
+                    .legacy_gradient,
+                expected
+            );
+        }
+    }
+}
+
+#[test]
+fn legacy_gradient_rejects_wrong_types_null_and_duplicates() {
+    for value in [
+        json!(null),
+        json!(0),
+        json!(1),
+        json!(1.0),
+        json!("true"),
+        json!("false"),
+        json!([]),
+        json!({}),
+    ] {
+        assert!(
+            serde_json::from_value::<Request>(json!({
+                "operation": "decode", "options": {"legacy_gradient": value},
+            }))
+            .is_err(),
+            "{value}"
+        );
+    }
+    assert!(
+        serde_json::from_str::<Request>(
+            r#"{"operation":"decode","options":{"legacy_gradient":true,"legacy_gradient":false}}"#
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn legacy_gradient_is_rejected_by_nondecode_operations_even_when_false() {
+    for operation in [
+        "encode",
+        "encode_multiframe",
+        "encode_layers",
+        "analyze_multiframe",
+        "transcode_jpeg",
+        "reconstruct_jpeg",
+        "info",
+        "read_image",
+    ] {
+        for value in [false, true] {
+            let mut wire = json!({
+                "operation": operation, "options": {"legacy_gradient": value},
+            });
+            if matches!(
+                operation,
+                "encode" | "encode_multiframe" | "encode_layers" | "analyze_multiframe"
+            ) {
+                wire["images"] = json!([{"length": 0}]);
+            }
+            let request: Request = serde_json::from_value(wire).unwrap();
+            let error = request.validate().unwrap_err();
+            assert!(
+                error
+                    .message
+                    .starts_with("option legacy_gradient is unsupported"),
+                "{operation}: {error}"
+            );
+        }
+    }
+}
+
 fn automatic(options: serde_json::Value) -> Request {
     serde_json::from_value(json!({
         "operation": "encode_multiframe",

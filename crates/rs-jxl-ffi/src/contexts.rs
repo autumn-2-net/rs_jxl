@@ -201,3 +201,36 @@ pub unsafe extern "C" fn rs_jxl_context_free(context: *mut RsJxlContext) {
         mem::forget(payload);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_gradient_is_per_call_even_after_decode_errors() {
+        let mut context = RsJxlContext {
+            resources: Resources::Decoder(Decoder::new(DecodeOptions::default()).unwrap()),
+            threads: 1,
+            poisoned: false,
+        };
+        for operation in ["decode", "decode_to_png"] {
+            for (options, expected) in [
+                (json!({"legacy_gradient": true}), true),
+                (json!({}), false),
+                (json!({"legacy_gradient": true}), true),
+                (json!({"legacy_gradient": false}), false),
+            ] {
+                let request = serde_json::to_vec(&json!({
+                    "operation": operation, "options": options,
+                }))
+                .unwrap();
+                assert!(context.execute(&request, &[]).is_err());
+                assert!(!context.poisoned);
+                let Resources::Decoder(decoder) = &context.resources else {
+                    panic!("expected decoder");
+                };
+                assert_eq!(decoder.options().legacy_gradient, expected);
+            }
+        }
+    }
+}

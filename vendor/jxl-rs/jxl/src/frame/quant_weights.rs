@@ -237,6 +237,7 @@ impl QuantEncoding {
                         lf_global.modular_global.recycler(),
                         lf_global.modular_global.storage(),
                         lf_global.modular_global.level5_limits,
+                        lf_global.modular_global.legacy_gradient,
                     )?,
                     qtable_den,
                 })

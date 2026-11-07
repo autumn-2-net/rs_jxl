@@ -47,6 +47,10 @@ pub struct JxlDecoderOptions {
     /// Does not affect floating-point output, native integer output, JPEG
     /// reconstruction, or Modular smooth-squeeze reconstruction.
     pub dither: DitherMode,
+    /// Recover pre-fix Rust files using the original wrapping gradient property
+    /// and small-LUT eligibility. Default false matches libjxl's wide, clamped
+    /// property for eligible gradient-only MA trees. No automatic fallback.
+    pub legacy_gradient: bool,
     /// If true, only parse frame headers/TOC and skip every frame's sections,
     /// including hidden reference/LF frames. No pixel or reference data is decoded.
     ///
@@ -131,6 +135,7 @@ impl Default for JxlDecoderOptions {
             high_precision: false,
             alpha_mode: AlphaMode::AsIs,
             dither: DitherMode::JxlRs,
+            legacy_gradient: false,
             scan_frames_only: false,
             max_downsampling: 1,
             request_aux_boxes: Vec::new(),

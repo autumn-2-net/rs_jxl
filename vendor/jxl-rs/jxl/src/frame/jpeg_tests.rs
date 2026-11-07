@@ -821,6 +821,7 @@ fn jpeg_groups_accumulate_without_a_pixel_pipeline_or_idct_scratch() {
             None,
             ModularStorage::I32,
             true,
+            false,
         )
         .unwrap();
         let block_context_map =

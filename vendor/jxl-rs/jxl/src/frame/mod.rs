@@ -132,6 +132,7 @@ pub struct DecoderState {
     pub high_precision: bool,
     pub alpha_mode: AlphaMode,
     pub dither: DitherMode,
+    pub legacy_gradient: bool,
     pub adjust_orientation: bool,
     pub level5_limits: bool,
     pub sample_limit: Option<usize>,
@@ -181,6 +182,7 @@ impl DecoderState {
             high_precision: options.high_precision,
             alpha_mode: options.alpha_mode,
             dither: options.dither,
+            legacy_gradient: options.legacy_gradient,
             adjust_orientation: options.adjust_orientation,
             level5_limits,
             sample_limit: options.sample_limit,
@@ -208,6 +210,27 @@ impl DecoderState {
 
     pub fn extra_channel_info(&self) -> &Vec<ExtraChannelInfo> {
         &self.file_header.image_metadata.extra_channel_info
+    }
+}
+
+#[cfg(test)]
+mod gradient_option_tests {
+    use super::*;
+    use crate::bit_reader::BitReader;
+    use crate::headers::JxlHeader;
+
+    #[test]
+    fn decoder_state_keeps_explicit_gradient_mode() {
+        assert!(!JxlDecoderOptions::default().legacy_gradient);
+        for legacy_gradient in [false, true, false] {
+            let file = FileHeader::read(&mut BitReader::new(&[0xff, 0x0a, 0x41, 0x06])).unwrap();
+            let options = JxlDecoderOptions {
+                legacy_gradient,
+                ..Default::default()
+            };
+            let state = DecoderState::new(file, &options, true);
+            assert_eq!(state.legacy_gradient, legacy_gradient);
+        }
     }
 }
 

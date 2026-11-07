@@ -38,6 +38,9 @@ use rs_jxl::modular::tree::{Node, Tree};
 use rs_jxl::modular::{GroupwiseDecision, groupwise_decision};
 use rs_jxl::{EncodeOptions, Image, ModularOptions, PixelData, PixelLayout, encode};
 
+#[path = "float_reference/gradient.rs"]
+mod gradient;
+
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 static TEMP_ID: AtomicU64 = AtomicU64::new(0);
 

@@ -37,6 +37,7 @@ platform certifications.
 | Rust pixel encoding, images and tools | [Pixel API](PIXEL_API.md), [integer and float paths](INTEGER_AND_FLOAT_PATHS.md), [intrinsic dimensions](INTRINSIC_DIMENSIONS.md) |
 | Shared PNG/JPEG pixel input | [rs-jxl-image](../crates/rs-jxl-image/src/lib.rs), [CLI encode adapter](../crates/rs-jxl-cli/src/encode.rs); use the JPEG API below when original file bytes must be recoverable |
 | Runtime JXL decoding and output semantics | [Maintained decoder API/status](DECODER_STATUS.md), [exact native integer decoding](NATIVE_INTEGER_DECODE.md) |
+| Float32 gradient interoperability and old-file recovery | [Arithmetic fix and compatibility mode](FLOAT32_GRADIENT_INTEROP.md) |
 | Incremental decoding | [Rust/CLI streaming input](STREAMING_INPUT.md); full Python incremental streaming is not implemented |
 | Byte-reversible JPEG | [JPEG API](JPEG_API.md), [compatibility and supported-domain distinctions](JPEG_COMPATIBILITY.md) |
 | Frame planning, layers and animation | [Automatic frames](MULTIFRAME_AUTO.md), [multiframe CLI](MULTIFRAME_AUTO_CLI.md), [frame-aware search](MULTIFRAME_SEARCH.md) |
@@ -49,6 +50,11 @@ platform certifications.
 | Search/probe integration and execution | [Probe API](SCHEDULER_PROBE_API.md), [cooperative execution](PARALLEL_EXECUTION.md), [progressive group scheduler](PROGRESSIVE_GROUP_SCHEDULER.md), [scheduler default routes](../crates/rs-jxl/src/scheduler/DEFAULT_ROUTES.md) |
 
 ## Acceptance and Validation
+
+The [2026-11-07 float32 gradient fix](FLOAT32_GRADIENT_INTEROP.md) records the
+two-sided official interoperability failure, corrected arithmetic and explicit
+old-file recovery. It includes the 114-output archive replay, full native
+regression results and the limits of local Python/CLI validation.
 
 The [2026-10-29 organization checkpoint](MAINTENANCE_20261029.md) records the
 MA/LZ77 module layout, FFI schema boundaries, extracted build-support package

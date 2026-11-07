@@ -107,7 +107,7 @@ fn channel(
         plan.weighted,
         previous_channels.min(plan.previous_channels),
         stream_id,
-        |_, pos, _n, wp_pred, props, value| {
+        |_, pos, neighbors, wp_pred, props, value| {
             let x = pos % channel.width;
             if x == 0 {
                 for &predictor in &plan.predictors {
@@ -124,7 +124,7 @@ fn channel(
                     .map_err(|e| Error::Encoding(e.to_string()))?;
                 }
             }
-            let leaf = plan.lookup(props)?;
+            let leaf = plan.lookup_pixel(props, neighbors)?;
             let (context, predictor, offset, multiplier) =
                 (leaf.context, leaf.predictor, leaf.offset, leaf.multiplier);
             let residual = if predictor == Predictor::Weighted {

@@ -469,6 +469,7 @@ impl Frame {
                 self.decoder_state.sample_limit,
                 self.decoder_state.modular_storage(),
                 self.decoder_state.level5_limits,
+                self.decoder_state.legacy_gradient,
             )?;
 
             // Ensure that, if we call this function again, we resume from just after
@@ -542,6 +543,7 @@ impl Frame {
                 decoder_state.modular_storage(),
                 lf_global.modular_global.recycler(),
                 decoder_state.level5_limits,
+                decoder_state.legacy_gradient,
                 decoder_state.jpeg_capture.as_deref(),
             )?;
         }
@@ -573,6 +575,7 @@ impl Frame {
                 decoder_state.modular_storage(),
                 lf_global.modular_global.recycler(),
                 decoder_state.level5_limits,
+                decoder_state.legacy_gradient,
             )?;
         }
         Ok(())

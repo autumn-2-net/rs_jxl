@@ -6,6 +6,7 @@
 use super::common::{
     References, init_properties_and_references, make_pixel, precompute_references,
 };
+use super::gradient;
 use crate::bit_reader::BitReader;
 use crate::entropy_coding::decode::{Histograms, SymbolReader};
 use crate::error::Result;
@@ -327,6 +328,7 @@ pub(super) fn decode_modular_channel(
     br: &mut BitReader,
     storage: ModularStorage,
     scratch_space: &mut ScratchSpace,
+    legacy_gradient: bool,
 ) -> Result<()> {
     debug!("reading channel");
     let size = buffers[chan].size(storage);
@@ -336,7 +338,16 @@ pub(super) fn decode_modular_channel(
         tree_scratch,
         ..
     } = scratch_space;
-    if size.0 * size.1 <= SMALL_CHANNEL_THRESHOLD {
+    let wide_gradient = !legacy_gradient
+        && gradient::eligible(
+            &tree.nodes,
+            chan,
+            stream_id,
+            &mut tree_scratch.pruned_tree_queue,
+        )?;
+    // The channel-size optimization must not choose the property semantics.
+    // Legacy mode retains the original FullTree shortcut for small channels.
+    if !wide_gradient && size.0 * size.1 <= SMALL_CHANNEL_THRESHOLD {
         let mut decoder = FullTree::new(
             tree,
             &header.wp_header,
@@ -369,6 +380,7 @@ pub(super) fn decode_modular_channel(
         storage,
         tree_lut_scratch,
         tree_scratch,
+        wide_gradient,
         |t| {
             decode_modular_channel_impl(
                 t,

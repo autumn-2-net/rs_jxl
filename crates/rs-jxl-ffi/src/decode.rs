@@ -12,6 +12,7 @@ pub(super) fn options(o: &Options) -> Result<DecodeOptions> {
     let mut options = DecodeOptions {
         threads: o.threads.unwrap_or(1),
         coalescing: o.coalescing.unwrap_or(true),
+        legacy_gradient: o.legacy_gradient.unwrap_or(false),
         adjust_orientation: o.adjust_orientation.unwrap_or(true),
         include_extra_channels: o.include_extra_channels.unwrap_or(true),
         // Returning native planes must not apply spot-color compositing to RGB.

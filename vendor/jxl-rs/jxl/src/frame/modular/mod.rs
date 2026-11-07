@@ -291,6 +291,7 @@ pub struct FullModularImage {
     recycler: Arc<BufferRecycler>,
     storage: ModularStorage,
     pub(super) level5_limits: bool,
+    pub(super) legacy_gradient: bool,
 }
 
 fn max_modular_transforms(level5_limits: bool) -> usize {
@@ -335,6 +336,7 @@ impl FullModularImage {
         sample_limit: Option<usize>,
         storage: ModularStorage,
         level5_limits: bool,
+        legacy_gradient: bool,
     ) -> Result<Self> {
         let mut channels = vec![];
         for c in 0..modular_color_channels {
@@ -396,6 +398,7 @@ impl FullModularImage {
                 recycler,
                 storage,
                 level5_limits,
+                legacy_gradient,
             });
         }
 
@@ -593,6 +596,7 @@ impl FullModularImage {
             recycler,
             storage,
             level5_limits,
+            legacy_gradient,
         })
     }
 
@@ -625,6 +629,7 @@ impl FullModularImage {
                     &mut scratch,
                     &self.recycler,
                     self.level5_limits,
+                    self.legacy_gradient,
                 )
             },
         );
@@ -719,6 +724,7 @@ impl FullModularImage {
                     &mut scratch,
                     &self.recycler,
                     self.level5_limits,
+                    self.legacy_gradient,
                 )?;
                 Ok(())
             },
@@ -1124,6 +1130,7 @@ pub(super) fn decode_vardct_lf(
     storage: ModularStorage,
     recycler: &BufferRecycler,
     level5_limits: bool,
+    legacy_gradient: bool,
     jpeg_capture: Option<&crate::frame::jpeg::JpegCapture>,
 ) -> Result<()> {
     let extra_precision = br.read(2)?;
@@ -1173,6 +1180,7 @@ pub(super) fn decode_vardct_lf(
         &mut scratch_space,
         recycler,
         level5_limits,
+        legacy_gradient,
     )?;
     drop(scratch_space);
     if let Some(capture) = jpeg_capture {
@@ -1223,6 +1231,7 @@ pub(super) fn decode_hf_metadata(
     storage: ModularStorage,
     recycler: &BufferRecycler,
     level5_limits: bool,
+    legacy_gradient: bool,
 ) -> Result<()> {
     let stream_id = ModularStreamId::LFMeta(group).get_id(frame_header);
     debug!(?stream_id);
@@ -1266,6 +1275,7 @@ pub(super) fn decode_hf_metadata(
         &mut scratch_space,
         recycler,
         level5_limits,
+        legacy_gradient,
     )?;
     drop(scratch_space);
     if storage == ModularStorage::I16 {
@@ -1371,6 +1381,7 @@ pub(super) fn decode_quant_table(
     recycler: &BufferRecycler,
     storage: ModularStorage,
     level5_limits: bool,
+    legacy_gradient: bool,
 ) -> Result<Vec<i32>> {
     let bit_depth = BitDepth::integer_samples(8);
     let mut image = [
@@ -1406,6 +1417,7 @@ pub(super) fn decode_quant_table(
         &mut scratch_space,
         recycler,
         level5_limits,
+        legacy_gradient,
     )?;
     drop(scratch_space);
     let mut qtable = Vec::with_capacity(required_size_x * required_size_y * 3);

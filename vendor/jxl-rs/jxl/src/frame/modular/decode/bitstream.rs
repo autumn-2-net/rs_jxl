@@ -207,6 +207,7 @@ pub(in crate::frame::modular) fn decode_modular_subbitstream(
     scratch_space: &mut ScratchSpace,
     recycler: &BufferRecycler,
     level5_limits: bool,
+    legacy_gradient: bool,
 ) -> Result<()> {
     #[cfg(feature = "decoder-profile")]
     let _profile = crate::decoder_profile::scope("modular.substream");
@@ -312,6 +313,7 @@ pub(in crate::frame::modular) fn decode_modular_subbitstream(
                 br,
                 storage,
                 scratch_space,
+                legacy_gradient,
             ) {
                 reader.reclaim_lz77_scratch(&mut scratch_space.lz77_window);
                 if let Some(p) = partial_decoded_buffers {

@@ -11,6 +11,12 @@ def threads(value) -> int:
     return min(256, os.cpu_count() or 1) if value == 0 else value
 
 
+def boolean(value, name) -> bool:
+    if not isinstance(value, bool):
+        raise TypeError(f"{name} must be a boolean")
+    return value
+
+
 def lossless_only(lossless, distance) -> None:
     if lossless is not None and lossless is not True:
         raise ValueError("rs_jxl only provides lossless encoding")
@@ -27,6 +33,8 @@ def encoder(effort, count, source_search, encoder_options, overrides) -> dict:
         if encoder_options.keys() & (result.keys() | {"strip_metadata"}):
             raise ValueError("effort, threads, source_search and strip_metadata must use their explicit arguments")
         result.update(encoder_options)
+    if "legacy_gradient" in result or "legacy_gradient" in overrides:
+        raise ValueError("legacy_gradient is a decode-only recovery option")
     aliases = {"modular_group_size": "group_size_shift", "modular_colorspace": "rct",
                "modular_predictor": "predictor", "modular_palette_colors": "palette_colors"}
     for name, value in overrides.items():

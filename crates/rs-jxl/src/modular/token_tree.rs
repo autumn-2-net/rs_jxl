@@ -1,8 +1,12 @@
 // Copyright (c) the JPEG XL Project Authors. All rights reserved.
 // BSD-3-Clause; retained notice in docs/PORTING_KERNELS.md.
 //! Specialize static channel/group properties without renumbering wire contexts.
-use super::{Node, Predictor, Tree};
+use super::{Neighbors, Node, Predictor, Tree};
 use crate::{Error, Result};
+
+// libjxl encoding.h::TreeToLookupTable uses this range after static filtering.
+const GRADIENT_MIN: i32 = -8192;
+const GRADIENT_MAX: i32 = 8191;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Leaf {
@@ -11,6 +15,10 @@ pub(crate) struct Leaf {
     pub offset: i32,
     pub multiplier: u32,
 }
+
+#[cfg(test)]
+#[path = "token_tree/gradient_tests.rs"]
+mod gradient_tests;
 
 // Tree::new bounds nodes to 2^22 and properties to 255. Keep the hot walk
 // compact; leaf payloads are touched only after the decisions are finished.
@@ -28,6 +36,7 @@ pub(crate) struct ChannelTree {
     pub predictors: Vec<Predictor>,
     pub weighted: bool,
     pub previous_channels: usize,
+    gradient_lut: bool,
 }
 
 impl ChannelTree {
@@ -38,6 +47,7 @@ impl ChannelTree {
             predictors: Vec::new(),
             weighted: false,
             previous_channels: 0,
+            gradient_lut: true,
         };
         let mut pending = vec![(0, 0)];
         while let Some((mut source, destination)) = pending.pop() {
@@ -64,6 +74,8 @@ impl ChannelTree {
                     offset,
                     multiplier,
                 } => {
+                    result.gradient_lut &=
+                        predictor == Predictor::Gradient && offset == 0 && multiplier == 1;
                     result.weighted |= predictor == Predictor::Weighted;
                     if !predictor.has_weighted() && !result.predictors.contains(&predictor) {
                         result.predictors.push(predictor);
@@ -87,6 +99,8 @@ impl ChannelTree {
                     greater,
                     less_equal,
                 } => {
+                    result.gradient_lut &=
+                        property == 9 && (GRADIENT_MIN - 1..GRADIENT_MAX).contains(&threshold);
                     result.weighted |= property == 15;
                     if property >= 16 {
                         result.previous_channels =
@@ -128,6 +142,29 @@ impl ChannelTree {
                 .get(node.property as usize)
                 .ok_or_else(|| Error::Encoding("missing MA property".into()))?;
             index = if value > node.threshold {
+                node.greater
+            } else {
+                node.less_equal
+            } as usize;
+        }
+    }
+
+    pub fn lookup_pixel(&self, properties: &[i32], neighbors: Neighbors) -> Result<Leaf> {
+        if !self.gradient_lut {
+            return self.lookup(properties);
+        }
+        // Generic property storage wraps to i32; libjxl's gradient LUT instead
+        // clamps a wide intermediate. Mirror that distinction only at emission.
+        let gradient = (i64::from(neighbors.left) + i64::from(neighbors.top)
+            - i64::from(neighbors.topleft))
+        .clamp(i64::from(GRADIENT_MIN), i64::from(GRADIENT_MAX)) as i32;
+        let mut index = 0;
+        loop {
+            let node = self.nodes[index];
+            if node.property == u32::MAX {
+                return Ok(self.leaves[node.greater as usize]);
+            }
+            index = if gradient > node.threshold {
                 node.greater
             } else {
                 node.less_equal

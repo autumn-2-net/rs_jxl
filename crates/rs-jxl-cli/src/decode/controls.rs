@@ -99,6 +99,12 @@ pub(crate) struct DecodeArgs {
     /// Floating-to-U8 output pattern; does not affect JPEG reconstruction or native integers
     #[arg(long, value_enum, default_value = "jxl-rs")]
     pub(super) dither: DitherControl,
+    /// Force old wrapping grad-only property-9 arithmetic for older Rust float32 recovery
+    #[arg(
+        long,
+        long_help = "Force old wrapping grad-only property-9 arithmetic to recover older Rust float32 streams. Default decoding uses C++-compatible wide arithmetic. This is not auto-detection or an encoding option; verify recovered samples before re-encoding. It does not guarantee all old streams are recoverable or all other streams are safe."
+    )]
+    pub(super) legacy_gradient: bool,
     #[arg(long, alias = "keep_orientation")]
     pub(super) keep_orientation: bool,
     #[arg(long)]
@@ -232,6 +238,15 @@ impl DecodeArgs {
         if self.reconstruct_jpeg && format != OutputFormat::Jpg {
             return Err("--reconstruct-jpeg requires JPEG output".into());
         }
+        if self.legacy_gradient
+            && !self.disable_output
+            && self.output.is_none()
+            && self.preview_out.is_none()
+        {
+            return Err(
+                "--legacy-gradient requires pixel output, --preview-out or --disable-output".into(),
+            );
+        }
         if (format == OutputFormat::Jpg || format.metadata())
             && (self.color_space.is_some()
                 || self.color_profile.is_some()
@@ -253,6 +268,7 @@ impl DecodeArgs {
                 || self.allow_partial_files
                 || self.downsampling != 1
                 || self.keep_orientation
+                || self.legacy_gradient
                 || self.norender_spotcolors
                 || self.preview_out.is_some())
         {
@@ -264,6 +280,7 @@ impl DecodeArgs {
                 || self.output_frames
                 || self.output_extra_channels
                 || self.bits.is_some()
+                || self.legacy_gradient
                 || self.allow_partial_files
                 || self.downsampling != 1
                 || self.no_coalescing)
@@ -310,6 +327,7 @@ impl DecodeArgs {
             render_spot_colors: !self.norender_spotcolors && format != OutputFormat::Npy,
             include_extra_channels: true,
             coalescing: !self.no_coalescing,
+            legacy_gradient: self.legacy_gradient,
             include_preview: self.preview_out.is_some(),
             allow_partial: self.allow_partial_files,
             downsampling: self.downsampling,

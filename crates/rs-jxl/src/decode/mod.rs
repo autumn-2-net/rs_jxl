@@ -94,6 +94,10 @@ pub struct DecodeOptions {
     /// Floating output, native integer output and JPEG reconstruction ignore it.
     /// Explicit color postprocessing retains its existing nondithered quantizer.
     pub dither: DitherMode,
+    /// Recover pre-fix Rust files using wrapping gradient-property semantics.
+    /// Default false matches libjxl for eligible gradient-only MA trees.
+    /// This is an explicit compatibility mode, never an automatic fallback.
+    pub legacy_gradient: bool,
     /// Allow legacy Main10 complexity without a jxll box; budgets still apply.
     pub allow_implicit_main10: bool,
     pub adjust_orientation: bool,
@@ -117,6 +121,7 @@ impl Default for DecodeOptions {
             threads: 1,
             format: SampleFormat::Native,
             dither: DitherMode::JxlRs,
+            legacy_gradient: false,
             allow_implicit_main10: false,
             adjust_orientation: true,
             render_spot_colors: true,
@@ -336,6 +341,7 @@ fn backend_options_from_validated(options: &DecodeOptions) -> JxlDecoderOptions 
     backend.skip_preview = !options.include_preview;
     backend.alpha_mode = options.alpha_mode;
     backend.dither = options.dither;
+    backend.legacy_gradient = options.legacy_gradient;
     backend.max_downsampling = usize::from(options.downsampling);
     backend.sample_limit = Some(options.limits.max_samples);
     backend.max_profile_level = ProfileLevel::Main10;
@@ -359,6 +365,35 @@ mod dither_tests {
                 ..DecodeOptions::default()
             };
             assert_eq!(backend_options_from_validated(&options).dither, dither);
+        }
+    }
+}
+
+#[cfg(test)]
+mod gradient_option_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_gradient_defaults_and_backend_options() {
+        assert!(!DecodeOptions::default().legacy_gradient);
+        assert!(!JxlDecoderOptions::default().legacy_gradient);
+        let mut decoder = Decoder::new(DecodeOptions::default()).unwrap();
+        for legacy_gradient in [true, false, true, false] {
+            let options = DecodeOptions {
+                legacy_gradient,
+                ..DecodeOptions::default()
+            };
+            assert_eq!(
+                backend_options(&[], &options).unwrap().legacy_gradient,
+                legacy_gradient
+            );
+            decoder.set_options(options.clone()).unwrap();
+            assert_eq!(decoder.options().legacy_gradient, legacy_gradient);
+            assert_eq!(
+                backend_options_from_validated(decoder.options()).legacy_gradient,
+                legacy_gradient
+            );
+            assert_eq!(options.clone().legacy_gradient, legacy_gradient);
         }
     }
 }

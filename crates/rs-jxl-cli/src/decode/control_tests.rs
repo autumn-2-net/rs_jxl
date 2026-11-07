@@ -33,6 +33,65 @@ fn args(tail: &[&str]) -> DecodeArgs {
 }
 
 #[test]
+fn legacy_gradient_is_an_explicit_decode_only_recovery_flag() {
+    let default = args(&["in.jxl", "out.npy"]);
+    assert!(!default.options(OutputFormat::Npy).legacy_gradient);
+    for tail in [
+        vec!["in.jxl", "out.npy", "--legacy-gradient"],
+        vec!["in.jxl", "out.png", "--legacy-gradient"],
+        vec!["in.jxl", "out.npy", "--legacy-gradient", "--frame", "0"],
+        vec!["in.jxl", "out.npy", "--legacy-gradient", "--stream-input"],
+        vec![
+            "in.jxl",
+            "--legacy-gradient",
+            "--disable-output",
+            "--no-coalescing",
+        ],
+        vec![
+            "in.jxl",
+            "--legacy-gradient",
+            "--preview-out",
+            "preview.npy",
+        ],
+    ] {
+        let a = args(&tail);
+        assert!(a.options(a.output_format().unwrap()).legacy_gradient);
+    }
+    for tail in [
+        vec!["in.jxl", "out.jpg", "--legacy-gradient"],
+        vec!["in.jxl", "out.xmp", "--legacy-gradient"],
+        vec!["in.jxl", "--legacy-gradient", "--disable-output", "-J"],
+        vec!["in.jxl", "--legacy-gradient", "--metadata-out", "info.json"],
+    ] {
+        assert!(args(&tail).output_format().is_err());
+    }
+    for value in ["true", "false", "1", "auto"] {
+        assert!(
+            crate::Cli::try_parse_from([
+                "rs-jxl",
+                "decode",
+                "in.jxl",
+                "out.npy",
+                &format!("--legacy-gradient={value}"),
+            ])
+            .is_err()
+        );
+    }
+    for command in ["encode", "encode-frames", "transcode-jpeg"] {
+        assert!(
+            crate::Cli::try_parse_from([
+                "rs-jxl",
+                command,
+                "in.png",
+                "out.jxl",
+                "--legacy-gradient",
+            ])
+            .is_err()
+        );
+    }
+}
+
+#[test]
 fn dither_defaults_and_exact_mode_names_parse() {
     use rs_jxl::decode::DitherMode;
 

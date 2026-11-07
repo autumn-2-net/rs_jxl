@@ -211,3 +211,45 @@ Parent decoder unit tests cover large headers and declared ICC stream lengths
 without large allocations, exact small sample caps, and the wrapper's metadata,
 streaming and reconstruction budget plumbing. Central build/test validation is
 required; this change was not locally tested with Cargo.
+
+## Explicit Gradient Property Compatibility
+
+The 2026-11-07 decoder correction follows libjxl
+`lib/jxl/modular/encoding/encoding.h` (`TreeToLookupTable`, `kPropRangeFast`)
+and `encoding.cc` (`FilterTree`, `DecodeModularChannelMAANS`). After pruning
+channel/stream decisions, default decoding selects wide gradient-property
+semantics only when every remaining split is property 9 with a threshold in
+`[-8193, 8190]` and every leaf uses Gradient, offset 0, multiplier 1. Compute
+`W + N - NW` in i64 and clamp to `[-8192, 8191]` before choosing the context.
+The threshold bounds deliberately include empty/redundant LUT intervals;
+eligibility is not the old Rust LUT's stricter range-subdivision test.
+
+`frame/modular/decode/gradient.rs` performs this semantic classification and
+wide property calculation. `specialized_trees.rs` still uses the original
+2048-entry LUT where representable, with tree traversal otherwise. The <=64
+sample channel shortcut is retained only where it cannot change default
+gradient semantics. Generic properties (including non-unit leaves and mixed
+properties/predictors), weighted prediction, weighted LUT selection and the
+single-leaf gradient predictor arithmetic are unchanged.
+
+`JxlDecoderOptions::legacy_gradient` is an explicit per-decoder bool, default
+false. True preserves pre-fix wrapping property-9 arithmetic, the original
+`[-1024, 1023]` LUT domain and exact `make_lut` acceptance/rejection, including
+generic fallback for redundant thresholds and the original small-channel
+shortcut. There is no detection, retry or automatic fallback. The parent
+`DecodeOptions::legacy_gradient` forwards this value through its common backend
+option adapter. `DecoderState` and `FullModularImage` retain it for frames,
+incremental input, global/local LF/HF groups, parallel tasks, VarDCT LF data,
+HF metadata and Modular quantization tables. No global mode or environment
+variable is introduced.
+
+Unit coverage in `decode/gradient.rs` and `decode/gradient_tests.rs` checks exact
+eligibility boundaries, static pruning, empty intervals, non-unit/mixed trees,
+positive/negative i32 overflow, clamping before traversal and unchanged legacy
+LUT rejection. Adapter/state tests cover false defaults and explicit option
+propagation. The motivating words are W=N=`0x40000000`, NW=0; the minimized
+source repeats `[0,0,0,0,0,0,0,2,1e-10]` as F32 for 528 samples (16x11 RGB).
+Evidence is in `D:/cpp_pj/jxl_python/out/float-interop-20261107`. The parent owns
+the encoder correction and frozen official/legacy integration fixtures.
+Builds and tests are reserved for central parent validation; no local Cargo
+verification is claimed.

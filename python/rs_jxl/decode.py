@@ -19,13 +19,15 @@ def _frame(data, descriptor, out, device, extras, include_alpha):
 
 
 def _input(src, *, frame, coalesced, return_extra_channels, threads,
-           format, dither, adjust_orientation, limits, max_pixels,
+           format, dither, adjust_orientation, legacy_gradient, limits, max_pixels,
            max_output_bytes, strip_metadata):
+    legacy_gradient = _options.boolean(legacy_gradient, "legacy_gradient")
     frame = None if frame is None else integer(frame, "frame", 0)
     threads = _options.threads(threads)
     data = read_bytes(src)
     if is_jxl(data):
         options = {"threads": threads, "coalescing": coalesced,
+                   "legacy_gradient": legacy_gradient,
                    "frame_index": frame, "format": format, "dither": dither,
                    "include_extra_channels": return_extra_channels,
                    "adjust_orientation": adjust_orientation,
@@ -37,7 +39,8 @@ def _input(src, *, frame, coalesced, return_extra_channels, threads,
             raise IndexError("PNG/JPEG pixel input contains only frame 0")
         if limits is not None or max_pixels is not None or max_output_bytes is not None:
             raise ValueError("resource limits on PNG/JPEG pixel decoding are not exposed yet")
-        if format != "native" or not adjust_orientation or not coalesced or dither != "jxl-rs":
+        if (format != "native" or not adjust_orientation or not coalesced
+                or dither != "jxl-rs" or legacy_gradient):
             raise ValueError("JXL-specific decode options cannot be applied to PNG/JPEG input")
         request = {"operation": "read_image", "options": {"strip_metadata": strip_metadata}}
     return request, data
@@ -46,14 +49,19 @@ def _input(src, *, frame, coalesced, return_extra_channels, threads,
 def decode(src, *, frame=0, out="numpy", coalesced=True, return_info=False,
            return_extra_channels=False, include_alpha_extra=False, threads=1,
            format="native", dither="jxl-rs", adjust_orientation=True, device=None,
+           legacy_gradient: bool = False,
            limits=None, max_pixels=None, max_output_bytes=None, strip_metadata=False,
            _context=None):
-    """Decode owned HWC arrays/tensors, or packed bytes; no borrowed output escapes."""
+    """Decode owned HWC arrays/tensors, or packed bytes; no borrowed output escapes.
+
+    legacy_gradient explicitly recovers older Rust streams; it is not auto-detection.
+    """
     if out not in ("numpy", "torch", "bytes") or (device is not None and out != "torch"):
         raise ValueError("out must be numpy/torch/bytes; device is Torch-only")
     request, data = _input(src, frame=frame, coalesced=coalesced,
                           return_extra_channels=return_extra_channels, threads=threads,
                           format=format, dither=dither, adjust_orientation=adjust_orientation,
+                          legacy_gradient=legacy_gradient,
                           limits=limits, max_pixels=max_pixels, max_output_bytes=max_output_bytes,
                           strip_metadata=strip_metadata)
     with execute_buffer(request, data, context=_context) as (raw, meta):
@@ -72,6 +80,7 @@ def decode(src, *, frame=0, out="numpy", coalesced=True, return_info=False,
 
 def decode_into(src, destination, *, frame=0, coalesced=True, threads=1,
                 format="native", dither="jxl-rs", adjust_orientation=True,
+                legacy_gradient: bool = False,
                 limits=None, max_pixels=None, max_output_bytes=None,
                 strip_metadata=False, return_info=False, _context=None):
     """Copy one decoded frame into an exact-shape/dtype writable NumPy buffer.
@@ -83,6 +92,7 @@ def decode_into(src, destination, *, frame=0, coalesced=True, threads=1,
     request, data = _input(src, frame=frame, coalesced=coalesced,
                           return_extra_channels=False, threads=threads, format=format,
                           dither=dither, adjust_orientation=adjust_orientation,
+                          legacy_gradient=legacy_gradient,
                           limits=limits, max_pixels=max_pixels, max_output_bytes=max_output_bytes,
                           strip_metadata=strip_metadata)
     with execute_buffer(request, data, context=_context) as (raw, meta):
@@ -94,19 +104,21 @@ def decode_into(src, destination, *, frame=0, coalesced=True, threads=1,
     return (destination, details) if return_info else destination
 
 
-def decode_layer(src, *, layer=0, return_info=True, **options):
+def decode_layer(src, *, layer=0, return_info=True, legacy_gradient: bool = False, **options):
     if "frame" in options or "coalesced" in options:
         raise ValueError("use layer= for raw layer decoding")
-    return decode(src, frame=layer, coalesced=False, return_info=return_info, **options)
+    return decode(src, frame=layer, coalesced=False, return_info=return_info,
+                  legacy_gradient=legacy_gradient, **options)
 
 
-def decode_extra_channel(src, channel=0, *, frame=0, out="numpy", **options):
+def decode_extra_channel(src, channel=0, *, frame=0, out="numpy",
+                         legacy_gradient: bool = False, **options):
     channel = integer(channel, "channel", 0)
     frame = integer(frame, "frame", 0)
     if "return_extra_channels" in options or "include_alpha_extra" in options:
         raise ValueError("decode_extra_channel always includes all native extra channels")
     _, metadata = decode(src, frame=frame, out=out, return_extra_channels=True,
-                         include_alpha_extra=True, **options)
+                         include_alpha_extra=True, legacy_gradient=legacy_gradient, **options)
     extras = metadata["extra_channels"]
     if channel >= len(extras):
         raise IndexError("extra channel index out of range")
@@ -133,9 +145,11 @@ def reconstruct_jpeg(src, output=None, *, threads=1, limits=None, _context=None)
     return write_or_return(data, output)
 
 
-def decode_to_png(src, output=None, *, frame=0, threads=1, coalesced=True, limits=None, _context=None):
+def decode_to_png(src, output=None, *, frame=0, threads=1, coalesced=True,
+                  legacy_gradient: bool = False, limits=None, _context=None):
     """Export an exact native 8/16-bit JXL frame as PNG, without Pillow narrowing."""
     data, _ = execute({"operation": "decode_to_png", "options": {
+        "legacy_gradient": _options.boolean(legacy_gradient, "legacy_gradient"),
         "threads": _options.threads(threads), "frame_index": integer(frame, "frame", 0),
         "coalescing": coalesced, "limits": _options.limits(limits),
     }}, read_bytes(src), context=_context)

@@ -19,6 +19,8 @@ pub struct Options {
     pub ma_max_leaves: Option<usize>,
     pub frame_index: Option<usize>,
     pub coalescing: Option<bool>,
+    #[serde(deserialize_with = "present_bool")]
+    pub legacy_gradient: Option<bool>,
     pub format: Option<String>,
     pub include_extra_channels: Option<bool>,
     pub adjust_orientation: Option<bool>,
@@ -27,6 +29,13 @@ pub struct Options {
     pub brotli_quality: Option<u8>,
     pub no_cfl: Option<bool>,
     pub order: Option<String>,
+}
+
+// Keep omission distinct from false without treating an explicit null as omission.
+fn present_bool<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<bool>, D::Error> {
+    bool::deserialize(deserializer).map(Some)
 }
 
 #[derive(Debug, Default, Deserialize)]

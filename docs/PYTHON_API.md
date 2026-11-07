@@ -175,7 +175,7 @@ and return values match the corresponding module-level functions.
 
 Thread counts are fixed for a context. Methods inherit that count, and an
 explicit `threads` value must normalize to the same count. All other options
-are per-call; effort, limits, frame selection and output format from one call do
+are per-call; effort, limits, frame selection, `legacy_gradient` and output format from one call do
 not become defaults for the next. Contexts reuse workers, not input buffers,
 parser state, decoded frames, reference slots or candidate caches. One thread
 does not create a pool. `info` and PNG/JPEG pixel reading are stateless and do
@@ -696,7 +696,7 @@ Use `transcode_jpeg` and `reconstruct_jpeg` for byte-reversible JPEG storage.
 ## Decoding and Safety
 
 decode defaults to frame=0, coalesced native samples, orientation adjustment,
-dither="jxl-rs". frame=None retains all frames; targeted selection uses native
+dither="jxl-rs", legacy_gradient=False. frame=None retains all frames; targeted selection uses native
 target-frame decoding. dither="libjxl" affects floating-to-U8 only, not exact
 integers/JPEG bytes. format=u8/u16/f32 explicitly requests sample conversion.
 info reads JXL headers/metadata. decode_to_png exports representable native
@@ -704,6 +704,49 @@ info reads JXL headers/metadata. decode_to_png exports representable native
 Selected-frame decoding does not validate later data. Use frame=None when
 whole-input decoding is required; a selected frame's `complete` flag is not
 whole-file validation.
+
+### Explicit Legacy Recovery
+
+`legacy_gradient: bool = False` is a decode-only recovery control on `decode`,
+`decode_into`, `decode_layer`, `decode_extra_channel`, `decode_to_png`, and their
+`Decoder` methods. Default decoding uses C++-compatible wide arithmetic for
+grad-only MA property 9. `True` explicitly forces the old wrapping interpretation
+used by older Rust float32 streams. There is no auto-detection, fallback retry,
+or new encoding toggle. A reusable decoder resets to `False` on the next call
+unless that call explicitly requests recovery again.
+
+Python accepts only actual `bool` values; `None`, integers, strings and NumPy
+booleans raise `TypeError`. The JSON option likewise accepts only `true`/`false`,
+not `null`. Encoding, JPEG transcoding/reconstruction and `info` do not accept
+this option, even when explicitly false. PNG/JPEG pixel input rejects
+`legacy_gradient=True`. PNG export still requires representable native 8/16-bit
+samples; recovery does not make float32 PNG export lossless or supported.
+
+For a known affected older Rust stream, recover the native samples explicitly,
+check them against the original samples when available, then re-encode with the
+corrected encoder's ordinary settings. Keep the old file until verification is
+complete. For a simple still image:
+
+```python
+recovered = rs_jxl.decode("older-rust.jxl", legacy_gradient=True)
+# Verify recovered sample words against the original before publishing a replacement.
+rs_jxl.encode(recovered, "reencoded.jxl")
+```
+
+This array-only example does not preserve metadata, extra planes or animation;
+carry those through the appropriate encode APIs when present. The CLI equivalent
+is `rs-jxl decode older-rust.jxl recovered.npy --legacy-gradient`; NPY preserves
+native float32 samples. The flag is unavailable on encode commands and rejected
+for JPEG reconstruction or metadata-only output.
+
+The motivating minimal float pattern failed interoperability at efforts 1 and 2:
+old Rust-generated streams decoded only with the old Rust interpretation, while
+official-generated streams of the same pattern were rejected by that decoder.
+The corrected default handles the official interpretation; explicit legacy mode
+is for recovering the old bytes. This is not a global safety or compatibility
+guarantee for other efforts, inputs, or old files. Successful decoding alone
+does not establish that the selected interpretation recovered the right samples;
+using legacy mode on unrelated streams may fail or produce incorrect samples.
 
 ### Preallocated Output
 

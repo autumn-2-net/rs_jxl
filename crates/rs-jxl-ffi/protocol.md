@@ -130,7 +130,8 @@ any results.
 
 Unknown, duplicate and inapplicable fields fail. Optional fields may be omitted
 or null, except `options`, `analysis_options`, and `layer_options` must be objects
-when supplied. Supplied members of `auto_options`/`analysis_options` must have
+when supplied, and `options.legacy_gradient` must be a boolean (never null).
+Supplied members of `auto_options`/`analysis_options` must have
 their declared types (not null); layer field types are specified below.
 Top-level keys: operation (required), options (default {}), images (default []),
 durations, reference, timebase, loops, auto, auto_options, analysis_options,
@@ -414,7 +415,7 @@ fails if unsupported by encoder. spot_color is four floats, cfa_channel integer.
   see Multiframe Analysis Results below.
 - decode/decode_to_png: threads=1, frame_index=null, coalescing=true,
   format=native (native/u8/u16/f32), include_extra_channels=true,
-  adjust_orientation=true,dither=jxl-rs (jxl-rs/libjxl),limits={}.
+  adjust_orientation=true,dither=jxl-rs (jxl-rs/libjxl),legacy_gradient=false,limits={}.
   decode_to_png defaults frame_index=0; emits PNG, not packed pixels; refuses
   float/wide integer output, non-alpha extras, or inexact alpha/depth conversion.
 - info: threads=1,coalescing=true,adjust_orientation=true,limits={}.
@@ -422,6 +423,15 @@ fails if unsupported by encoder. spot_color is four floats, cfa_channel integer.
 - reconstruct_jpeg: threads=1,limits={}; byte-exact only, no pixel fallback.
 - transcode_jpeg: threads=1,effort=7,source_search=false,brotli_quality=null,
   no_cfl=false,order=source (source/default/adaptive),limits={}.
+
+`legacy_gradient` is accepted only for `decode`/`decode_to_png`, including decoder
+context calls. Omission defaults to false on every call; explicit true forces the
+old wrapping grad-only property-9 interpretation to recover older Rust float32
+streams instead of the default C++-compatible wide arithmetic. This is not
+auto-detection, automatic retry or an encoder toggle. Other operations reject it
+even when false; null and nonboolean values fail deserialization. Verify recovered
+samples before re-encoding with the corrected encoder. Recovery does not relax
+PNG output restrictions or provide a global safety/compatibility guarantee.
 
 Limits are NESTED options.limits, never flattened. Decode/info/reconstruct:
 max_input_bytes,max_output_bytes,max_metadata_bytes,max_pixels,max_samples,
