@@ -147,7 +147,13 @@ def reconstruct_jpeg(src, output=None, *, threads=1, limits=None, _context=None)
 
 def decode_to_png(src, output=None, *, frame=0, threads=1, coalesced=True,
                   legacy_gradient: bool = False, limits=None, _context=None):
-    """Export an exact native 8/16-bit JXL frame as PNG, without Pillow narrowing."""
+    """Export a native 8/16-bit frame, preserving output ICC without narrowing.
+
+    Scan complete container metadata before decoding the selected pixels.
+    Ancillary boxes (including Exif/XMP) raise CodecError rather than being
+    silently discarded. Use info() or decode(frame=None) to retrieve them.
+    Validation failures leave output paths and streams untouched.
+    """
     data, _ = execute({"operation": "decode_to_png", "options": {
         "legacy_gradient": _options.boolean(legacy_gradient, "legacy_gradient"),
         "threads": _options.threads(threads), "frame_index": integer(frame, "frame", 0),

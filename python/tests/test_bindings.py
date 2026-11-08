@@ -258,6 +258,14 @@ class BindingsTests(PixelAssertions, unittest.TestCase):
                 self.assertIsNone(rs_jxl.decode_to_png(encoded, stream, threads=1))
                 self.assertPixels(rs_jxl.decode(io.BytesIO(stream.getvalue()), threads=1), source)
 
+    def test_png_export_does_not_silently_drop_jpeg_reconstruction_data(self):
+        original = _tiny_jpeg()
+        encoded = rs_jxl.transcode_jpeg(original, effort=2)
+        self.assertIn("jbrd", [box["type"] for box in rs_jxl.info(encoded)["boxes"]])
+        with self.assertRaisesRegex(rs_jxl.CodecError, "ancillary JXL boxes"):
+            rs_jxl.decode_to_png(encoded)
+        self.assertEqual(rs_jxl.reconstruct_jpeg(encoded), original)
+
     def test_invalid_input_frames_and_decode_limits(self):
         for data in (b"", b"not an image", b"\xff\x0a\x00"):
             with self.subTest(data=data):

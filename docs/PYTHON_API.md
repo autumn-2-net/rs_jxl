@@ -705,6 +705,20 @@ Selected-frame decoding does not validate later data. Use frame=None when
 whole-input decoding is required; a selected frame's `complete` flag is not
 whole-file validation.
 
+`decode_to_png` and `Decoder.decode_to_png` first scan the complete container's
+headers and metadata, without decoding later pixel frames. Unlike ordinary
+selected-frame `decode`, this requires complete container/frame structure and
+applies metadata and frame-count limits to the whole input. The PNG keeps the
+output ICC profile. Decoder-exposed ancillary boxes (`Exif`, `xml ` XMP, `jumb`,
+`jhgm`, `jbrd`) raise `CodecError`: this API does not serialize those boxes into
+PNG. This includes boxes before, between or after codestream chunks and
+Brotli-compressed boxes; none may silently bypass the export guard. Unrequested
+unknown box types remain outside the decoder's metadata API.
+Use `info(src)["boxes"]` or `decode(src, frame=None, return_info=True)` to retrieve
+supported metadata separately. When validation fails, no output bytes are
+returned and the requested file or stream is not modified. Ordinary target-frame
+decoding still stops early; its empty `boxes` is not proof of absent metadata.
+
 ### Explicit Legacy Recovery
 
 `legacy_gradient: bool = False` is a decode-only recovery control on `decode`,

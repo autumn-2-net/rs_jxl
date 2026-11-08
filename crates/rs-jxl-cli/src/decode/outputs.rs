@@ -340,10 +340,32 @@ pub(super) fn preview(
         .preview
         .as_ref()
         .ok_or("input contains no decoded preview")?;
+    let boxes = if format == OutputFormat::Png {
+        for metadata in &image.boxes {
+            if !matches!(&metadata.kind, b"Exif" | b"xml ") {
+                args.diagnostic(format!(
+                    "warning: PNG preview cannot preserve box {:?} ({} bytes).",
+                    String::from_utf8_lossy(&metadata.kind),
+                    metadata.data.len()
+                ));
+            }
+        }
+        if image.boxes.iter().any(|b| &b.kind == b"xml ")
+            && (image.info.preview_size != Some(image.info.size)
+                || (!args.keep_orientation && image.info.orientation as u16 != 1))
+        {
+            args.diagnostic(
+                "warning: retained preview XMP may describe the original image dimensions/orientation.",
+            );
+        }
+        image.boxes.as_slice()
+    } else {
+        &[]
+    };
     let view = Raster {
         frames: std::slice::from_ref(frame),
         alpha_mode: options.alpha_mode,
-        boxes: &[],
+        boxes,
         ..Raster::from(image)
     };
     let bytes = serialize_raster(

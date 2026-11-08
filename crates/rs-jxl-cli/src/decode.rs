@@ -18,6 +18,9 @@ use controls::OutputFormat;
 const MAX_OUTPUT_BYTES: usize = usize::MAX;
 
 #[cfg(test)]
+#[path = "decode/selected_metadata_tests.rs"]
+mod selected_metadata_tests;
+#[cfg(test)]
 #[path = "decode_tests.rs"]
 mod tests;
 #[cfg(test)]
@@ -72,7 +75,7 @@ pub(crate) fn run(args: DecodeArgs) -> Result<()> {
             None => decoder.decode(&bytes)?,
         });
     }
-    let image = decoded.ok_or("no decoding repetitions")?;
+    let mut image = decoded.ok_or("no decoding repetitions")?;
     if args.frame.is_none()
         && !image.complete
         && !(args.allow_partial_files || args.downsampling > 1)
@@ -92,17 +95,40 @@ pub(crate) fn run(args: DecodeArgs) -> Result<()> {
     if args.disable_output {
         return Ok(());
     }
+    let selected_png_preview = args.frame.is_some()
+        && args
+            .preview_out
+            .as_deref()
+            .filter(|path| *path != Path::new("-"))
+            .map(OutputFormat::from_path)
+            .transpose()?
+            == Some(OutputFormat::Png);
+    let inspected = if args.frame.is_some()
+        && ((args.output.is_some() && format == OutputFormat::Png)
+            || selected_png_preview
+            || args.metadata_out.is_some()
+            || args.orig_icc_out.is_some())
+    {
+        // Frame selection stops before metadata is collected. Scan headers/boxes,
+        // not later pixels; retain the selected output's profile and pixel status.
+        let mut inspected = decode::inspect(&bytes, &options)?;
+        image.boxes = std::mem::take(&mut inspected.boxes);
+        Some(inspected)
+    } else {
+        None
+    };
     diagnostics(&args, &image, format);
     let mut batch = outputs::Batch::new(&args);
     outputs::pixels(&mut batch, &image, format, &options)?;
     outputs::preview(&mut batch, &image, &options)?;
-    if args.frame.is_some() && (args.metadata_out.is_some() || args.orig_icc_out.is_some()) {
-        let inspected = decode::inspect(&bytes, &options)?;
+    if let Some(inspected) = &inspected {
         let metadata = metadata::Metadata {
             output_profile: image.output_profile.as_ref(),
             output_intensity_target: image.output_intensity_target,
+            boxes: &image.boxes,
+            bytes_read: image.bytes_read,
             complete: image.complete,
-            ..metadata::Metadata::from(&inspected)
+            ..metadata::Metadata::from(inspected)
         };
         batch.sidecars(&metadata)?;
     } else {

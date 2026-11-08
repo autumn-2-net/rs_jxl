@@ -252,6 +252,22 @@ Raw-layer output requires `--metadata-out` to keep crop/blending/reference data.
 PNG background compositing is explicitly requested with `--alpha-blend`; the
 original alpha can still be exported with `--output-extra-channels`.
 
+Selected-frame PNG export also scans complete container headers and metadata
+before publication. It preserves Exif/XMP that appear before, between or after
+codestream chunks (including `brob`), using the existing PNG writer. The scan
+does not decode later pixel frames and does not change the selected image's
+`complete=false` or pixel decoder `bytes_read`. Sidecars reuse the same inspection
+while retaining the actual output color profile and intensity target. A malformed
+metadata tail fails before image or sidecar publication.
+PNG previews likewise retain available Exif/XMP for full, selected and streamed
+decoding. Exif orientation follows the output orientation; retained preview XMP
+can still describe original dimensions/orientation, so the CLI warns rather than
+rewriting arbitrary XML. Other unsupported box kinds produce diagnostics, not
+invented PNG mappings. Plain selected NPY output without metadata sidecars keeps
+its early-stop path. Python/C ABI `decode_to_png` has a stricter contract: it
+rejects decoder-exposed ancillary boxes instead of embedding them; see
+`PYTHON_API.md` and `crates/rs-jxl-ffi/protocol.md`.
+
 Metadata-only `.exif`, `.xmp`/`.xml`, `.jumb`/`.jumbf` outputs use header/box scans,
 not full pixel decoding. `--icc-out`, `--orig-icc-out` and `--metadata-out` expose
 output profile, source profile and JSON frame/channel metadata independently.

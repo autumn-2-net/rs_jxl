@@ -625,3 +625,12 @@ PNG export keeps the output ICC and unapplied orientation, rejects premultiplied
 or mismatched-depth alpha, and rejects ancillary JXL boxes instead of dropping
 metadata. Native PNG export requires exactly 8- or 16-bit integer depth. Explicit
 decode format conversion is caller opt-in; no native depth is implicitly narrowed.
+`decode_to_png` first performs a complete header/metadata inspection, independent
+of `frame_index` or reusable decoder state. Exif, XMP (`xml `), JUMBF (`jumb`),
+HDR gain maps (`jhgm`) and JPEG reconstruction data (`jbrd`) are rejected even
+after the selected frame or inside `brob`; unknown unrequested boxes are not
+exposed by the decoder. Metadata limits apply cumulatively to expanded payloads.
+Malformed/truncated trailing container data fails before PNG output is produced.
+Only the selected frame and its dependencies are pixel-decoded; later compressed
+pixels are not validated by inspection. Ordinary targeted `decode` remains an
+early-stop operation, with `complete=false` and no whole-file metadata claim.

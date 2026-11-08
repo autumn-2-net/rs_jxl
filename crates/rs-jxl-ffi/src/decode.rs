@@ -101,6 +101,10 @@ pub fn execute_with_context(
         return Ok((result, Vec::new()));
     }
     let target = if request.operation == Operation::DecodeToPng {
+        // Targeted pixel decoding stops before container completion, so its
+        // empty boxes cannot establish that PNG export would lose no metadata.
+        let inspection = decode::inspect(input, &options).map_err(message)?;
+        png::check_metadata(&inspection.boxes)?;
         Some(request.options.frame_index.unwrap_or(0))
     } else {
         request.options.frame_index

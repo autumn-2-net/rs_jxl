@@ -1,7 +1,7 @@
 use crate::{Result, message, pixels};
 use rs_jxl::{
     PixelData, PixelLayout,
-    decode::{DecodeOptions, DecodedImage, ExtraChannel, SampleFormat},
+    decode::{DecodeOptions, DecodedBox, DecodedImage, ExtraChannel, SampleFormat},
 };
 use std::{
     borrow::Cow,
@@ -30,6 +30,13 @@ impl Write for Output {
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
+}
+
+pub(super) fn check_metadata(boxes: &[DecodedBox]) -> Result<()> {
+    if !boxes.is_empty() {
+        return Err("PNG export cannot preserve ancillary JXL boxes; use info or decode(frame=None) to retrieve metadata separately".into());
+    }
+    Ok(())
 }
 
 pub(super) fn encode(image: &DecodedImage, options: &DecodeOptions) -> Result<Vec<u8>> {
@@ -107,11 +114,9 @@ pub(super) fn encode(image: &DecodedImage, options: &DecodeOptions) -> Result<Ve
         return Err("PNG output ICC color space disagrees with pixels".into());
     }
     info.icc_profile = Some(Cow::Borrowed(icc.as_slice()));
-    // Ancillary metadata cannot be silently discarded or copied with a stale
-    // EXIF orientation. The packed decode API preserves all boxes in JSON.
-    if !image.boxes.is_empty() {
-        return Err("PNG export cannot preserve ancillary JXL boxes; use decode to retrieve metadata separately".into());
-    }
+    // Also guard full-image callers; targeted callers must inspect the complete
+    // container first. Copying EXIF without updating orientation is not safe.
+    check_metadata(&image.boxes)?;
     if !options.adjust_orientation && image.info.orientation as u16 != 1 {
         let orientation = image.info.orientation as u16;
         let mut exif = vec![

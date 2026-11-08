@@ -2,6 +2,9 @@ use rs_jxl_ffi::*;
 use serde_json::{Value, json};
 use std::{mem, ptr, slice};
 
+#[path = "abi/png_metadata.rs"]
+mod png_metadata;
+
 struct Owned(*mut RsJxlResult);
 impl Drop for Owned {
     fn drop(&mut self) {
