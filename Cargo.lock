@@ -591,6 +591,7 @@ dependencies = [
 name = "rs-jxl-ffi"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
  "png",
  "rs-jxl",
  "rs-jxl-image",

@@ -215,23 +215,23 @@ pub fn append(
         .filter(|n| *n <= isize::MAX as usize)
         .ok_or("output exceeds isize::MAX")?;
     data.try_reserve(length).map_err(message)?;
+    macro_rules! append_words {
+        ($values:expr) => {{
+            // The wire format is little-endian. A byte view keeps every float
+            // bit intact and needs no aligned destination or numeric conversion.
+            #[cfg(target_endian = "little")]
+            data.extend_from_slice(bytemuck::cast_slice($values));
+            #[cfg(target_endian = "big")]
+            for n in $values {
+                data.extend_from_slice(&n.to_le_bytes());
+            }
+        }};
+    }
     match pixels {
         PixelData::U8(v) => data.extend_from_slice(v),
-        PixelData::U16(v) | PixelData::F16(v) => {
-            for n in v {
-                data.extend_from_slice(&n.to_le_bytes());
-            }
-        }
-        PixelData::U32(v) => {
-            for n in v {
-                data.extend_from_slice(&n.to_le_bytes());
-            }
-        }
-        PixelData::F32(v) => {
-            for n in v {
-                data.extend_from_slice(&n.to_le_bytes());
-            }
-        }
+        PixelData::U16(v) | PixelData::F16(v) => append_words!(v),
+        PixelData::U32(v) => append_words!(v),
+        PixelData::F32(v) => append_words!(v),
     }
     Ok(
         json!({"width":width,"height":height,"channels":channels,"dtype":dtype,"offset":offset,"length":length}),
@@ -317,5 +317,103 @@ mod tests {
         assert_eq!(image.channel_dimensions(1), (2, 2));
         assert_eq!(image.extra_planes()[0].len(), 4);
         assert!(region(&[0], usize::MAX, 2).is_err());
+    }
+
+    #[test]
+    fn packed_planes_preserve_word_bits_offsets_and_odd_alignment() {
+        let u16_values: Vec<_> = (0..65_536).map(|n| n as u16).collect();
+        let words = [
+            0,
+            1,
+            0x8000_0000,
+            0x7fff_ffff,
+            0x7f80_0000,
+            0xff80_0000,
+            0x7fc1_2345,
+            0x7f80_0001,
+            0xffff_ffff,
+        ];
+        let cases = [
+            (PixelData::U8(vec![0, 1, 127, 255]), vec![0, 1, 127, 255]),
+            (
+                PixelData::U16(u16_values.clone()),
+                u16_values.iter().flat_map(|n| n.to_le_bytes()).collect(),
+            ),
+            (
+                PixelData::F16(u16_values.clone()),
+                u16_values.iter().flat_map(|n| n.to_le_bytes()).collect(),
+            ),
+            (
+                PixelData::U32(words.to_vec()),
+                words.iter().flat_map(|n| n.to_le_bytes()).collect(),
+            ),
+            (
+                PixelData::F32(words.map(f32::from_bits).to_vec()),
+                words.iter().flat_map(|n| n.to_le_bytes()).collect(),
+            ),
+        ];
+        let mut packed = vec![0xa5];
+        let mut expected = packed.clone();
+        for (pixels, bytes) in cases {
+            let offset = packed.len();
+            let descriptor = append(&mut packed, &pixels, pixels.len(), 1, 1).unwrap();
+            assert_eq!(descriptor["offset"], offset);
+            assert_eq!(descriptor["length"], bytes.len());
+            expected.extend_from_slice(&bytes);
+            assert_eq!(packed, expected);
+        }
+        let before = packed.clone();
+        assert!(append(&mut packed, &PixelData::U16(vec![1, 2]), 1, 1, 1).is_err());
+        assert_eq!(packed, before);
+    }
+
+    #[test]
+    #[ignore = "manual release-profile FFI packing benchmark; no timing assertion"]
+    fn benchmark_output_packing() {
+        use std::hint::black_box;
+        use std::time::Instant;
+        let count = 1024 * 1024;
+        let cases = [
+            ("u8", PixelData::U8((0..count).map(|n| n as u8).collect())),
+            (
+                "u16",
+                PixelData::U16((0..count).map(|n| n as u16).collect()),
+            ),
+            (
+                "u32",
+                PixelData::U32((0..count).map(|n| n as u32).collect()),
+            ),
+            (
+                "f32",
+                PixelData::F32(
+                    (0..count)
+                        .map(|n| f32::from_bits(n as u32 ^ 0x8000_0000))
+                        .collect(),
+                ),
+            ),
+        ];
+        for (label, pixels) in cases {
+            let mut output = Vec::new();
+            for _ in 0..4 {
+                output.clear();
+                black_box(append(&mut output, &pixels, 1024, 1024, 1).unwrap());
+            }
+            let mut times = Vec::new();
+            for _ in 0..5 {
+                let start = Instant::now();
+                for _ in 0..64 {
+                    output.clear();
+                    black_box(append(&mut output, black_box(&pixels), 1024, 1024, 1).unwrap());
+                    black_box(&output);
+                }
+                times.push(start.elapsed().as_secs_f64() / 64.0);
+            }
+            times.sort_by(f64::total_cmp);
+            eprintln!(
+                "pack {label}: median_seconds={:.9} GiB/s={:.3} rounds={times:?}",
+                times[2],
+                output.len() as f64 / times[2] / 1_073_741_824.0
+            );
+        }
     }
 }

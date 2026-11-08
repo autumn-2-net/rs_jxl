@@ -51,6 +51,16 @@ platform certifications.
 
 ## Acceptance and Validation
 
+The [2026-11-08 decode recovery and FFI packing follow-up](DECODE_RECOVERY_AND_PACKING_20261108.md)
+records malformed-input/state checks and the output-copy change. It separates
+the clear packing-only gains from noisy complete-API timings, including a
+slower F32 measurement; it does not claim a general decoder speedup.
+
+The [2026-11-08 lossless correctness audit](LOSSLESS_CORRECTNESS_AUDIT_20261108.md)
+records the e1..e10 bidirectional official matrix and exact frame/extra-channel
+combination checks. It separates 12 official floating-point encoding rejections
+from successful decoding and includes the reusable harness and coverage limits.
+
 The [2026-11-07 float32 gradient fix](FLOAT32_GRADIENT_INTEROP.md) records the
 two-sided official interoperability failure, corrected arithmetic and explicit
 old-file recovery. It includes the 114-output archive replay, full native

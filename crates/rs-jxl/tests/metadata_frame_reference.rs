@@ -27,6 +27,9 @@ use rs_jxl::modular::predictor::Predictor;
 use rs_jxl::multiframe::{self, PlannedFrame, Rect, Reference};
 use rs_jxl::{EncodeOptions, Error, Image, ModularOptions, PixelData, PixelLayout};
 
+#[path = "metadata_frame_reference/combinations.rs"]
+mod combinations;
+
 const FRAME_COUNT: usize = 5;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const REFERENCES: [Reference; 4] = [

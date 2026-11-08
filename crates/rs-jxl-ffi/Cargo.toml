@@ -14,6 +14,7 @@ rs-jxl-image = { path = "../rs-jxl-image" }
 serde = { version = "1", features = ["derive"] }
 png.workspace = true
 serde_json.workspace = true
+bytemuck = "=1.25.2"
 
 [lints]
 workspace = true
