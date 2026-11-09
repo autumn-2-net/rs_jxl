@@ -4,6 +4,7 @@ fn fixture(records: usize, predictors: usize, wide: bool) -> TreeSamples {
     let bins = if wide { 513 } else { 256 };
     let values: Vec<u32> = (0..records).map(|i| ((i * 37) % bins) as u32).collect();
     TreeSamples {
+        global_max_symbols: 0,
         properties: vec![if wide {
             PropertyColumn::Wide(values)
         } else {

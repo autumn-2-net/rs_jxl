@@ -114,7 +114,7 @@ pub(super) fn leaf(predictor: Predictor) -> Node {
     scaled_leaf(predictor, 1)
 }
 
-fn scaled_leaf(predictor: Predictor, multiplier: u32) -> Node {
+pub(super) fn scaled_leaf(predictor: Predictor, multiplier: u32) -> Node {
     Node::Leaf {
         predictor,
         offset: 0,
@@ -343,6 +343,14 @@ pub(super) fn train_nodes_with_scratch(
     stats: &TrainingStats,
     scratch_pool: &ScratchPool,
 ) -> Result<Vec<Node>> {
+    if options.tree_learning.enabled()
+        && let Some(receipt) = &options.tree_learning_receipt
+    {
+        receipt.learners.fetch_add(1, Ordering::Relaxed);
+        receipt
+            .records
+            .fetch_add(samples.counts.len(), Ordering::Relaxed);
+    }
     // Resolve once, at the invocation root. Descendant learners receive local
     // allowances from this budget; they must not reset to the global ceiling.
     let resolved;
@@ -516,10 +524,33 @@ pub(super) fn train_pending_in_frontier<const REORDER: bool>(
         let Some(split) = state.decision.flatten() else {
             continue;
         };
-        if leaves == options.max_leaves {
-            return Err(Error::Limit(
-                "MA leaf budget exhausted with beneficial splits remaining",
-            ));
+        let additional = if split.symmetric.is_some() { 2 } else { 1 };
+        if options.max_leaves - leaves < additional {
+            if options.complete_search() {
+                return Err(Error::Limit(
+                    "MA leaf budget exhausted with beneficial splits remaining",
+                ));
+            }
+            // A two-sided proposal is atomic: do not leave an unfitted half split.
+            continue;
+        }
+        if split.symmetric.is_some() {
+            let children = super::symmetric::commit::<REORDER>(
+                samples, options, stats, indices, &mut nodes, state, split,
+            )?;
+            leaves += 2;
+            if let Some(receipt) = &options.tree_learning_receipt {
+                receipt.symmetric_splits.fetch_add(1, Ordering::Relaxed);
+            }
+            // The PR processes low, then middle, then high; each remains an
+            // ordinary pending subtree eligible for existing parallel dispatch.
+            pending.extend(children.into_iter().rev());
+            continue;
+        }
+        if options.tree_learning.enabled()
+            && let Some(receipt) = &options.tree_learning_receipt
+        {
+            receipt.cost_splits.fetch_add(1, Ordering::Relaxed);
         }
         let cut = begin + split.below_count;
         partition_node::<REORDER>(

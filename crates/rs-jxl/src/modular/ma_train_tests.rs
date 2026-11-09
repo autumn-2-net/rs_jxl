@@ -744,11 +744,15 @@ fn histogram_fixture(records: usize, predictors: usize) -> (TreeSamples, TrainOp
             .collect(),
         counts: (0..records).map(|i| 1 + (i % 13) as u16).collect(),
         thresholds: vec![vec![0, 1], (0..16).collect(), (0..4).collect(), vec![0]],
+        global_max_symbols: 256,
     };
     (samples, options)
 }
 
-fn assert_same_candidates(actual: Candidates, expected: Candidates) {
+fn assert_same_candidates<const N: usize>(
+    actual: [Option<Split>; N],
+    expected: [Option<Split>; N],
+) {
     for (actual, expected) in actual.into_iter().zip(expected) {
         match (actual, expected) {
             (None, None) => {}
@@ -758,6 +762,13 @@ fn assert_same_candidates(actual: Candidates, expected: Candidates) {
                 assert_eq!(a.below_count, b.below_count);
                 assert_eq!(a.below_predictor, b.below_predictor);
                 assert_eq!(a.above_predictor, b.above_predictor);
+                assert_eq!(a.split_cost, b.split_cost);
+                assert_eq!(
+                    a.symmetric
+                        .map(|s| (s.low_bin, s.low_count, s.middle_predictor)),
+                    b.symmetric
+                        .map(|s| (s.low_bin, s.low_count, s.middle_predictor))
+                );
                 assert_eq!(a.bits.to_bits(), b.bits.to_bits());
             }
             mismatch => panic!("different split candidates: {mismatch:?}"),
@@ -2753,7 +2764,7 @@ fn small_node_compaction_keeps_decisions_and_raw_parent_histograms() {
     let total = samples.counts.iter().map(|&n| u32::from(n)).sum();
     let base = DefaultScorer::new().estimate_bits(&raw[0].counts, total) + raw[0].extra_bits as f32;
     assert!(compact_parent_histograms(&raw, DefaultScorer::new().lanes()).is_some());
-    let mut winners = [None; 4];
+    let mut winners = [None; 6];
     for property in 0..options.properties.len() {
         let candidates =
             evaluate_property(&samples, &indices, &options, &raw, 0, total, property).unwrap();
@@ -3919,6 +3930,8 @@ fn predictor_penalties_and_static_constant_preference_follow_source() {
         Some(Split {
             property,
             bits,
+            split_cost: 0.0,
+            symmetric: None,
             bin: 0,
             below_count: 1,
             below_predictor: 0,
@@ -3930,7 +3943,14 @@ fn predictor_penalties_and_static_constant_preference_follow_source() {
         ..TrainOptions::default()
     };
     let chosen = choose_split(
-        [split(0, 80.0), None, split(15, 5.0), split(6, 6.0)],
+        [
+            split(0, 80.0),
+            None,
+            split(15, 5.0),
+            split(6, 6.0),
+            None,
+            None,
+        ],
         100.0,
         &options,
     )
@@ -3986,10 +4006,26 @@ fn split_threshold_uses_f32_rounding_and_strict_improvement() {
         below_predictor: 0,
         above_predictor: 0,
         bits: 16_777_216.0,
+        split_cost: 0.0,
+        symmetric: None,
     };
     // 2^24 + 1 rounds back to 2^24. Adding in f64 would reject this split.
-    assert!(choose_split([None, None, Some(split), None], 16_777_218.0, &options).is_some());
-    assert!(choose_split([None, None, Some(split), None], split.bits, &options).is_none());
+    assert!(
+        choose_split(
+            [None, None, Some(split), None, None, None],
+            16_777_218.0,
+            &options
+        )
+        .is_some()
+    );
+    assert!(
+        choose_split(
+            [None, None, Some(split), None, None, None],
+            split.bits,
+            &options
+        )
+        .is_none()
+    );
     options.split_threshold = f64::MAX;
     assert!(options.validate().is_err());
 }
@@ -4103,7 +4139,7 @@ fn fused_split_costs_match_all_thresholds_full_histogram_oracle() {
     for property in 0..options.properties.len() {
         let actual =
             evaluate_property(&samples, &indices, &options, &parents, 0, total, property).unwrap();
-        let mut expected = [None; 4];
+        let mut expected = [None; 6];
         for bin in 0..samples.thresholds[property].len() {
             if !indices
                 .iter()
@@ -4161,6 +4197,8 @@ fn fused_split_costs_match_all_thresholds_full_histogram_oracle() {
                     below_predictor: below.predictor,
                     above_predictor: above.predictor,
                     bits: below.bits + above.bits,
+                    split_cost: 0.0,
+                    symmetric: None,
                 },
             );
         }

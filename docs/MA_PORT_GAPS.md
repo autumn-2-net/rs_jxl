@@ -922,3 +922,10 @@ Central regression coverage includes `modular::ma_train`, `tools::ma_simd`,
 `tools::ma_entropy`, and `modular::training`; focused end-to-end pixel results
 are recorded above. Future changes still require fresh central validation.
 No whole-pipeline performance result or complete-migration acceptance is claimed.
+
+## PR5007 Experiment
+
+The default-off split-cost and symmetric-interval learner port is tracked in
+[MA_TREE_LEARNING_PR5007_20261109.md](MA_TREE_LEARNING_PR5007_20261109.md).
+Its controls, upstream pin, compatibility checks and paired measurements are
+separate from the baseline migration claims above.

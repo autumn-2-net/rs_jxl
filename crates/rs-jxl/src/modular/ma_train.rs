@@ -156,7 +156,10 @@ pub use ma_parallel::ParallelOptions;
 
 #[path = "ma_train_options.rs"]
 mod train_options;
-pub use train_options::{HistogramOptions, MaBudgetMode, TrainOptions};
+pub use train_options::{HistogramOptions, MaBudgetMode, TrainOptions, TreeLearning};
+
+mod learning_receipt;
+pub use learning_receipt::{TreeLearningReceipt, TreeLearningSnapshot};
 
 #[path = "ma_frontier.rs"]
 mod ma_frontier;
@@ -218,6 +221,9 @@ use split_search::{
 
 mod learner;
 mod seed;
+mod symmetric;
+#[cfg(test)]
+mod symmetric_tests;
 use learner::{
     PendingNode, TrainingNode, leaf, partition_node, train_nodes, train_pending_in_frontier,
     train_roots_with_layout,

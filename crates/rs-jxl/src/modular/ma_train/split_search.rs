@@ -7,6 +7,7 @@
 
 #[cfg(test)]
 use super::InitialCacheStage;
+use super::split_scoring::pr5007;
 use super::{
     Arc, Candidates, DefaultScorer, DenseHistogram, HistogramBudget, HistogramCache, Mutex,
     OnceLock, Ordering, ParentHistogram, PredictorPlan, PropertyColumn, PropertyHistogram,
@@ -74,6 +75,12 @@ pub(super) fn duplicate_property<T: PropertyValue>(
     seen: &mut Vec<SeenProperty>,
     remap: &mut Vec<usize>,
 ) -> bool {
+    // Equal partitions can have different signed threshold representation costs
+    // and different two-sided boundary opportunities. Keep only constant proofs
+    // in PR modes; legacy partition proofs retain their original behavior.
+    if options.tree_learning.enabled() {
+        return false;
+    }
     // Search experiments may select thresholds by their original bin index.
     // Only a complete sweep permits ignoring strictly monotone bin relabeling.
     let relabel = options.search == SearchOptions::default();
@@ -182,6 +189,7 @@ pub(super) fn find_best_split_with_properties(
     redundant_properties: &mut Vec<u8>,
 ) -> Result<Option<Split>> {
     let _scope = crate::profile::scope("ma.find_best_split");
+    pr5007::validate_options(options)?;
     let _node_scope = node_profile_scope(indices.len(), options.predictors.len());
     debug_assert!(removed.is_empty() || cache.is_some());
     if indices.len() < 2 {
@@ -205,7 +213,7 @@ pub(super) fn find_best_split_with_properties(
             .scoring
             .description
             .cost(&scorer, &parent.counts, total);
-    if base_bits <= options.split_threshold as f32 {
+    if base_bits <= pr5007::threshold(options) {
         *cache = None;
         return Ok(None);
     }
@@ -347,7 +355,7 @@ pub(super) fn find_best_split_with_properties(
             }
         }
     }
-    let mut winners = [None; 4];
+    let mut winners = [None; 6];
     let candidates: Vec<Result<(Candidates, bool)>> = {
         let cache_stride = working_cache.as_ref().and_then(|cache| cache.stride);
         let collection_stride = histogram_stride(
@@ -366,10 +374,10 @@ pub(super) fn find_best_split_with_properties(
                         seen: Option<&mut Vec<SeenProperty>>| {
             if options.property_dedup && working_redundant[property] != 0 {
                 stats.inherited_properties.fetch_add(1, Ordering::Relaxed);
-                return Ok(([None; 4], true));
+                return Ok(([None; 6], true));
             }
             if !race.keep.is_empty() && race.keep[property] == 0 {
-                return Ok(([None; 4], false));
+                return Ok(([None; 6], false));
             }
             with_property_values!(&samples.properties[property], |values| {
                 let mut histogram = property_jobs
@@ -407,7 +415,7 @@ pub(super) fn find_best_split_with_properties(
                         .map_or(scratch.used.as_slice(), |h| h.used.as_slice());
                     if used.iter().filter(|&&n| n != 0).take(2).count() < 2 {
                         stats.constant_properties.fetch_add(1, Ordering::Relaxed);
-                        return Ok(([None; 4], true));
+                        return Ok(([None; 6], true));
                     }
                     if indices.len() >= 64
                         && let Some(seen) = seen
@@ -428,7 +436,7 @@ pub(super) fn find_best_split_with_properties(
                             histogram.valid = false;
                         }
                         stats.duplicate_properties.fetch_add(1, Ordering::Relaxed);
-                        return Ok(([None; 4], true));
+                        return Ok(([None; 6], true));
                     }
                     if let Some(histogram) = histogram.as_mut() {
                         if cached_property {

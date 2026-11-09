@@ -343,6 +343,7 @@ mod tests {
             .collect();
         (
             TreeSamples {
+                global_max_symbols: 0,
                 properties,
                 residuals: vec![residuals.clone(), residuals],
                 counts: (0..records).map(|i| 1 + ((i / 64) % 3) as u16).collect(),

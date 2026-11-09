@@ -316,6 +316,7 @@ mod tests {
         }
         for records in [0, 1, 2, 17, 255, 256] {
             let samples = TreeSamples {
+                global_max_symbols: 0,
                 properties: Vec::new(),
                 thresholds: Vec::new(),
                 residuals: Vec::new(),
@@ -526,6 +527,7 @@ mod tests {
                 })
                 .collect();
             let samples = TreeSamples {
+                global_max_symbols: 0,
                 properties: Vec::new(),
                 thresholds: Vec::new(),
                 residuals: Vec::new(),

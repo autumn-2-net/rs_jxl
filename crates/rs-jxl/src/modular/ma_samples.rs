@@ -251,6 +251,7 @@ mod tests {
 
     fn empty_samples(properties: &[usize], predictors: usize) -> TreeSamples {
         TreeSamples {
+            global_max_symbols: 0,
             properties: properties
                 .iter()
                 .map(|&p| PropertyColumn::new(p, 255))

@@ -472,6 +472,7 @@ mod tests {
     fn fixture(records: &[usize], ybins: usize) -> (TreeSamples, TrainOptions) {
         let total: usize = records.iter().sum();
         let mut samples = TreeSamples {
+            global_max_symbols: 0,
             properties: vec![
                 PropertyColumn::Wide(Vec::with_capacity(total)),
                 PropertyColumn::Wide(Vec::with_capacity(total)),

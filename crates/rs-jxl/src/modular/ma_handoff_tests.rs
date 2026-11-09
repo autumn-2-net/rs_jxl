@@ -3,6 +3,7 @@ use super::*;
 
 fn fixture(records: usize, predictors: usize) -> TreeSamples {
     TreeSamples {
+        global_max_symbols: 0,
         properties: vec![
             PropertyColumn::Packed((0..records).map(|i| (i % 7) as u8).collect()),
             PropertyColumn::Wide((0..records).map(|i| ((i * 31) % 259) as u32).collect()),
@@ -390,6 +391,8 @@ fn handoff_history_preserves_unevaluated_terminal_and_ready_decisions() {
     let options = options(3);
     let stats = TrainingStats::default();
     let split = Split {
+        split_cost: 0.0,
+        symmetric: None,
         property: 0,
         bin: 2,
         below_count: indices

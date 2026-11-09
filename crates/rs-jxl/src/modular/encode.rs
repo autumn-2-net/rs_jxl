@@ -51,6 +51,9 @@ pub struct ModularOptions {
     /// apply; this cannot increase an existing ceiling or limit fixed trees.
     pub ma_max_leaves: Option<usize>,
     pub split_threshold: f64,
+    /// PR5007 MA learning experiment, independent of effort and default off.
+    pub tree_learning: ma_train::TreeLearning,
+    pub tree_learning_receipt: Option<std::sync::Arc<ma_train::TreeLearningReceipt>>,
     pub entropy: Coding,
     /// Explicit post-training experiments; never enabled by effort alone.
     pub refinement: super::refinement::Options,
@@ -139,6 +142,8 @@ impl Default for ModularOptions {
             ma_budget_mode: None,
             ma_max_leaves: None,
             split_threshold: 48.0,
+            tree_learning: Default::default(),
+            tree_learning_receipt: None,
             entropy: Coding::Auto,
             refinement: Default::default(),
             lz77: true,
@@ -227,6 +232,18 @@ impl ModularOptions {
         }
         self.entropy_options.validate()?;
         self.source_ma_parallel.workers.validate()?;
+        if self.tree_learning.enabled()
+            && (self.source_ma_seed.is_some()
+                || self.source_ma_search != Default::default()
+                || self.source_ma_scoring != Default::default()
+                || self.fast_context.is_some()
+                || self.custom_tree.is_some()
+                || self.fixed_tree.is_some())
+        {
+            return Err(Error::InvalidInput(
+                "PR5007 tree learning conflicts with fixed/seed trees or alternative split scoring/search".into(),
+            ));
+        }
         if let Some(seed) = &self.source_ma_seed {
             seed.validate()?;
             if self.source_ma_search.histogram_bins != 0 {
@@ -659,6 +676,8 @@ pub(super) fn train_options(options: &ModularOptions) -> ma_train::TrainOptions 
             .map(|_| options.tree_leaf_limit()),
         budget_mode: options.ma_budget_mode,
         split_threshold: options.split_threshold,
+        tree_learning: options.tree_learning,
+        tree_learning_receipt: options.tree_learning_receipt.clone(),
         seed: options.source_ma_seed.clone(),
         ..Default::default()
     };

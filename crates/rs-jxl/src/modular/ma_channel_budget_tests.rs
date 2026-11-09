@@ -33,6 +33,7 @@ fn fixture(channels: usize, bits: usize, records: usize) -> (TreeSamples, TrainO
     thresholds.extend((0..bits).map(|_| vec![0]));
     (
         TreeSamples {
+            global_max_symbols: 0,
             properties,
             residuals: vec![residuals.clone(), residuals],
             counts: vec![1; records],

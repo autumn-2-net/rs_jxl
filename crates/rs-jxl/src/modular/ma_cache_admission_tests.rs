@@ -11,6 +11,7 @@ fn fixture(records: usize, predictors: usize) -> (TreeSamples, TrainOptions) {
     options.parallel = false;
     options.split_threshold = 0.0;
     let samples = TreeSamples {
+        global_max_symbols: 0,
         properties: vec![PropertyColumn::Packed(
             (0..records).map(|i| (i % 8) as u8).collect(),
         )],
@@ -271,6 +272,8 @@ fn early_cache_14_inheritance_keeps_unbalanced_and_record_boundaries() {
         assert!(pending.cache.is_some());
         pending.parents = Some(parents);
         pending.decision = Some(Some(Split {
+            split_cost: 0.0,
+            symmetric: None,
             property: 0,
             bin: 0,
             below_count: low,

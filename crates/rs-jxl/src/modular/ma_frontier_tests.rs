@@ -44,6 +44,7 @@ fn fixture(low_records: usize, wide: bool) -> (TreeSamples, TrainOptions) {
         .collect();
     (
         TreeSamples {
+            global_max_symbols: 0,
             properties,
             residuals,
             counts: order.iter().map(|&i| 1 + ((i / 16) % 3) as u16).collect(),

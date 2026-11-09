@@ -13,6 +13,27 @@ use super::{
 };
 use crate::{Error, Result};
 
+/// Opt-in encoder-only experiments from libjxl PR #5007. Wire syntax is unchanged.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum TreeLearning {
+    #[default]
+    Legacy,
+    /// Account for split-value syntax and residual alphabet size.
+    Cost,
+    /// Also evaluate near-zero intervals as two ordinary binary splits.
+    Symmetric,
+}
+
+impl TreeLearning {
+    pub fn enabled(self) -> bool {
+        self != Self::Legacy
+    }
+
+    pub fn symmetric(self) -> bool {
+        self == Self::Symmetric
+    }
+}
+
 /// Behavior when an MA learner runs out of leaf capacity. Required multiplier,
 /// channel and constant partitions must fit in either mode.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -77,6 +98,9 @@ pub struct TrainOptions {
     /// Required improvement in sampled bits; equality does not split.
     /// Scoring rounds this to f32, matching the source's default decision path.
     pub split_threshold: f64,
+    pub tree_learning: TreeLearning,
+    /// Optional invocation-owned evidence; never affects learned decisions.
+    pub tree_learning_receipt: Option<std::sync::Arc<super::TreeLearningReceipt>>,
     /// 2..=256 quantile/coordinate bins; WP retains its source preset bins.
     pub max_property_values: usize,
     /// Source preference for static/non-WP splits; finite and at least 1.
@@ -152,6 +176,8 @@ impl Default for TrainOptions {
             require_complete_search: false,
             budget_mode: None,
             split_threshold: 16.0,
+            tree_learning: TreeLearning::Legacy,
+            tree_learning_receipt: None,
             max_property_values: 256,
             fast_decode_multiplier: 1.0,
             parallel: true,
@@ -228,6 +254,15 @@ impl TrainOptions {
 
     pub(super) fn validate(&self) -> Result<()> {
         self.parallel_tools.workers.validate()?;
+        if self.tree_learning.enabled()
+            && (self.seed.is_some()
+                || self.search != SearchOptions::default()
+                || self.scoring != ScoringOptions::default())
+        {
+            return Err(Error::InvalidInput(
+                "PR5007 tree learning requires default split search/scoring and no seed".into(),
+            ));
+        }
         if let Some(seed) = &self.seed {
             seed.validate()?;
             if self.channel_tree != ChannelTreeMode::Disabled || self.search.histogram_bins != 0 {

@@ -147,6 +147,9 @@ struct Args {
     /// Refit sampled MA leaf predictors on all pixels; retain smaller output.
     #[arg(long, conflicts_with_all = ["search", "scan_only", "fast_context"])]
     refine_leaves: bool,
+    /// Opt-in PR5007 split costs or split costs plus near-zero interval search.
+    #[arg(long, value_parser = ["cost", "symmetric"], conflicts_with_all = ["search", "scan_only", "fast_context", "ma_seed"])]
+    tree_learning: Option<String>,
     /// Experimental earlier cache construction for 14-predictor MA searches.
     #[arg(long)]
     early_cache_14: bool,
@@ -423,6 +426,15 @@ fn run(args: Args) -> Result<()> {
         ..Default::default()
     };
     args.ma_budget.apply(&mut base.modular);
+    if let Some(mode) = &args.tree_learning {
+        use rs_jxl::modular::ma_train::TreeLearning;
+        base.modular.tree_learning = match mode.as_str() {
+            "cost" => TreeLearning::Cost,
+            "symmetric" => TreeLearning::Symmetric,
+            _ => unreachable!("validated tree learning mode"),
+        };
+        base.modular.tree_learning_receipt = Some(std::sync::Arc::new(Default::default()));
+    }
     if args.refine_entropy || args.refine_leaves {
         base.modular.refinement = rs_jxl::modular::refinement::Options {
             entropy: args.refine_entropy,
@@ -610,6 +622,7 @@ fn run(args: Args) -> Result<()> {
         .as_ref()
         .and_then(|config| config.match_extension_receipt.clone());
     let refinement_receipt = base.modular.refinement.receipt.clone();
+    let tree_learning_receipt = base.modular.tree_learning_receipt.clone();
     let start = Instant::now();
     let encoded = if args.search {
         let mut driver = DriverOptions::scout();
@@ -749,6 +762,13 @@ fn run(args: Args) -> Result<()> {
         result.bytes
     };
     let pixels = f64::from(image.width()) * f64::from(image.height());
+    let tree_learning_work = tree_learning_receipt.map(|receipt| {
+        let stats = receipt.snapshot();
+        serde_json::json!({
+            "learners": stats.learners, "records": stats.records,
+            "cost_splits": stats.cost_splits, "symmetric_splits": stats.symmetric_splits,
+        })
+    });
     let refinement = refinement_receipt.map(|receipt| {
         let stats = receipt.snapshot();
         serde_json::json!({
@@ -784,6 +804,8 @@ fn run(args: Args) -> Result<()> {
             "ma_seed": ma_seed,
             "match_extension": match_extension,
             "refinement": refinement,
+            "tree_learning": args.tree_learning.as_deref().unwrap_or("legacy"),
+            "tree_learning_work": tree_learning_work,
         })
     );
     if let Some(path) = args.output {
@@ -827,6 +849,30 @@ fn refinement_flags_are_opt_in_and_cannot_hide_inside_outer_search() {
     ])
     .unwrap();
     assert!(both.refine_entropy && both.refine_leaves);
+}
+
+#[test]
+fn tree_learning_is_explicit_and_excludes_other_tree_experiments() {
+    let defaults = Args::try_parse_from(["encoder_lab", "image.png"]).unwrap();
+    assert!(defaults.tree_learning.is_none());
+    for mode in ["cost", "symmetric"] {
+        let args =
+            Args::try_parse_from(["encoder_lab", "image.png", "--tree-learning", mode]).unwrap();
+        assert_eq!(args.tree_learning.as_deref(), Some(mode));
+        for extra in [
+            vec!["--search"],
+            vec!["--scan-only"],
+            vec!["--ma-seed", "refine"],
+            vec!["--fast-context", "auto12"],
+        ] {
+            let mut argv = vec!["encoder_lab", "image.png", "--tree-learning", mode];
+            argv.extend(extra);
+            assert!(Args::try_parse_from(argv).is_err());
+        }
+    }
+    assert!(
+        Args::try_parse_from(["encoder_lab", "image.png", "--tree-learning", "unknown"]).is_err()
+    );
 }
 
 #[cfg(test)]

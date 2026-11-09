@@ -178,7 +178,7 @@ impl Work<'_> {
         if indices.len() >= self.options.histogram_cache_thresholds().0 {
             state.cache = HistogramCache::reserve_with_stride(samples, parents, &self.budget, None);
         }
-        let mut winners = [None; 4];
+        let mut winners = [None; 6];
         let mut scratch = self.scratch.acquire();
         for (property, &id) in self.options.properties.iter().enumerate() {
             if ![0, 10, 11].contains(&id) {

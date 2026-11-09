@@ -16,6 +16,9 @@ use super::{
 };
 use crate::{Error, Result};
 
+#[path = "pr5007.rs"]
+pub(super) mod pr5007;
+
 // Per-predictor timers can dominate small sweeps. RS_JXL_PROFILE=1 keeps
 // broad/cache timings; these detail scopes additionally require
 // RS_JXL_PROFILE_DETAIL=1, read once before the first detail scope.
@@ -61,6 +64,7 @@ pub(super) fn predictor_penalty(predictor: Predictor, parent: Predictor, thresho
 /// enc_ma.cc::FindBestSplitImpl representative/penalty construction. This proof
 /// belongs to one node, not to retained worker scratch or an inherited cache.
 pub(super) struct PredictorPlan {
+    pub(super) parent_predictor: usize,
     pub(super) representative: [usize; 14],
     pub(super) penalty: [f32; 14],
     pub(super) active: [usize; 14],
@@ -71,6 +75,7 @@ impl PredictorPlan {
     pub(super) fn identity(predictors: usize) -> Self {
         debug_assert!(predictors <= 14);
         Self {
+            parent_predictor: 0,
             representative: std::array::from_fn(|i| i),
             penalty: [0.0; 14],
             active: std::array::from_fn(|i| i),
@@ -87,12 +92,13 @@ impl PredictorPlan {
     ) -> Self {
         let predictors = parents.len();
         let mut plan = Self::identity(predictors);
+        plan.parent_predictor = parent_predictor;
         plan.active_count = 0;
         for predictor in 0..predictors {
             let penalty = predictor_penalty(
                 options.predictors[predictor],
                 options.predictors[parent_predictor],
-                options.split_threshold as f32,
+                pr5007::threshold(options),
             );
             plan.penalty[predictor] = penalty;
             if options.predictor_dedup && predictors > 2 {
@@ -151,6 +157,13 @@ impl PredictorPlan {
 }
 
 #[derive(Clone, Copy, Debug)]
+pub(super) struct SymmetricSplit {
+    pub(super) low_bin: usize,
+    pub(super) low_count: usize,
+    pub(super) middle_predictor: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
 pub(super) struct Split {
     pub(super) property: usize,
     pub(super) bin: usize,
@@ -158,12 +171,20 @@ pub(super) struct Split {
     pub(super) below_predictor: usize,
     pub(super) above_predictor: usize,
     pub(super) bits: f32,
+    pub(super) split_cost: f32,
+    pub(super) symmetric: Option<SymmetricSplit>,
 }
 
-pub(super) type Candidates = [Option<Split>; 4];
+impl Split {
+    pub(super) fn cost(self) -> f32 {
+        self.bits + self.split_cost
+    }
+}
+
+pub(super) type Candidates = [Option<Split>; 6];
 
 pub(super) fn keep_better(best: &mut Option<Split>, candidate: Split) {
-    if best.is_none_or(|old| candidate.bits < old.bits) {
+    if best.is_none_or(|old| candidate.cost() < old.cost()) {
         *best = Some(candidate);
     }
 }
@@ -186,6 +207,7 @@ pub(super) fn evaluate_property_values<T: PropertyValue>(
     mapping: Option<&[u8; 256]>,
     scratch: &mut PropertyScratch,
 ) -> Result<Candidates> {
+    pr5007::validate_options(options)?;
     debug_assert!(cached.is_none() || mapping.is_none());
     debug_assert!(cached.is_none_or(|histogram| histogram.valid));
     scratch.score_mask.clear();
@@ -218,8 +240,16 @@ pub(super) fn evaluate_property_values<T: PropertyValue>(
     let first = used.iter().position(|&n| n != 0).unwrap_or(0);
     let last = used.iter().rposition(|&n| n != 0).unwrap_or(0);
     if first == last {
-        return Ok([None; 4]);
+        return Ok([None; 6]);
     }
+    scratch.symmetric.prepare(
+        options,
+        property,
+        &samples.thresholds[property],
+        used,
+        weights,
+        samples.global_max_symbols,
+    );
     scratch.below.clear();
     scratch.below.resize(bins, Cost::default());
     scratch.above.clear();
@@ -240,7 +270,8 @@ pub(super) fn evaluate_property_values<T: PropertyValue>(
     };
     let coarsened = coarse_rows.is_some();
     let _binning_scope = coarsened.then(|| crate::profile::scope("ma.adaptive_histogram"));
-    if !coarsened
+    if !options.tree_learning.symmetric()
+        && !coarsened
         && ma_events::eligible(
             options,
             total,
@@ -269,6 +300,7 @@ pub(super) fn evaluate_property_values<T: PropertyValue>(
         #[cfg(test)]
         scratch.scored_predictors.extend_from_slice(plan.active());
         return Ok(property_candidates(
+            samples,
             options,
             property,
             used,
@@ -546,6 +578,7 @@ pub(super) fn evaluate_property_values<T: PropertyValue>(
             // table. This lower bound keeps the exact f32 extra-bit order;
             // it is local to this node and must not be inherited by children.
             if options.split_dominance
+                && !options.tree_learning.symmetric()
                 && total <= 256
                 && options.scoring == ScoringOptions::default()
                 && options.search == SearchOptions::default()
@@ -582,6 +615,18 @@ pub(super) fn evaluate_property_values<T: PropertyValue>(
                 .scoring
                 .reset(options.scoring, &parent.counts, total, indices.len())?;
             let penalty = plan.penalty[predictor];
+            scratch.symmetric.score_middle(
+                &scorer,
+                predictor,
+                penalty,
+                symbols,
+                increase,
+                extra,
+                stride,
+                used,
+                packed,
+                &scratch.property_bins,
+            );
             let mut extra_below = 0u64;
             let _score_scope = histogram_detail_scope("ma.histogram_score");
             if options.scoring == ScoringOptions::default()
@@ -682,14 +727,30 @@ pub(super) fn evaluate_property_values<T: PropertyValue>(
             }
         }
     }
-    Ok(property_candidates(
+    let mut result = property_candidates(
+        samples,
         options,
         property,
         used,
         (below_costs, above_costs),
         first..last,
         &scratch.score_mask,
-    ))
+    );
+    if scratch.symmetric.has_candidates() {
+        let parent = &parents[plan.parent_predictor];
+        scratch.symmetric.finish(
+            options,
+            property,
+            &samples.thresholds[property],
+            samples.global_max_symbols,
+            below_costs,
+            above_costs,
+            scorer.estimate_bits(&parent.counts, total) + parent.extra_bits as f32,
+            total,
+            &mut result,
+        );
+    }
+    Ok(result)
 }
 
 #[inline]
@@ -703,7 +764,9 @@ fn update_cost(best: &mut Cost, bits: f32, penalty: f32, predictor: usize) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn property_candidates(
+    samples: &Samples<impl SampleStorage>,
     options: &TrainOptions,
     property: usize,
     used: &[usize],
@@ -713,7 +776,8 @@ fn property_candidates(
 ) -> Candidates {
     let (below_costs, above_costs) = costs;
     let first = range.start;
-    let mut result = [None; 4];
+    let mut result = [None; 6];
+    let scorer = DefaultScorer::default();
     let mut below_count = 0;
     for bin in range {
         if used[bin] == 0 {
@@ -749,6 +813,13 @@ fn property_candidates(
                 below_predictor: below.predictor,
                 above_predictor: above.predictor,
                 bits: below.bits + above.bits,
+                split_cost: pr5007::one_sided_cost(
+                    samples.thresholds[property][bin],
+                    options,
+                    samples.global_max_symbols,
+                    &scorer,
+                ),
+                symmetric: None,
             },
         );
     }
@@ -824,6 +895,9 @@ pub(super) fn choose_split(
     base_bits: f32,
     options: &TrainOptions,
 ) -> Option<Split> {
+    if options.tree_learning.enabled() {
+        return choose_cost_split(candidates, base_bits, options);
+    }
     let threshold = options.split_threshold as f32;
     let mut best = candidates[2];
     for candidate in [candidates[3], candidates[1]].into_iter().flatten() {
@@ -840,4 +914,46 @@ pub(super) fn choose_split(
         best = Some(candidate);
     }
     best.filter(|candidate| candidate.bits + threshold < base_bits)
+}
+
+fn choose_cost_split(
+    candidates: Candidates,
+    base_bits: f32,
+    options: &TrainOptions,
+) -> Option<Split> {
+    let fast_decode_multiplier = options.fast_decode_multiplier as f32;
+    let mut best = candidates[2];
+    for candidate in [candidates[3], candidates[1]].into_iter().flatten() {
+        if candidate.cost() < base_bits
+            && candidate.bits <= fast_decode_multiplier * best.map_or(f32::INFINITY, |b| b.bits)
+        {
+            best = Some(candidate);
+        }
+    }
+    if let Some(candidate) = candidates[0]
+        && candidate.cost() < base_bits
+    {
+        best = Some(candidate);
+    }
+    if options.tree_learning.symmetric() {
+        let mut best_two_sided = candidates[4];
+        if let Some(candidate) = candidates[5]
+            && candidate.cost() < base_bits
+            && candidate.bits
+                <= fast_decode_multiplier * best_two_sided.map_or(f32::INFINITY, |b| b.bits)
+        {
+            best_two_sided = Some(candidate);
+        }
+        if let Some(candidate) = best_two_sided
+            && candidate.cost() < base_bits
+            && best.is_none_or(|one_sided| {
+                one_sided.cost() >= base_bits
+                    || base_bits - candidate.cost()
+                        >= pr5007::TWO_SIDED_EFFICIENCY_RATIO * (base_bits - one_sided.cost())
+            })
+        {
+            best = Some(candidate);
+        }
+    }
+    best.filter(|candidate| candidate.cost() < base_bits)
 }

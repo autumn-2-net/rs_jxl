@@ -5,6 +5,7 @@ fn fixture() -> (TreeSamples, TrainOptions) {
     options.properties = vec![0, 6, 15];
     let records = 384;
     let samples = TreeSamples {
+        global_max_symbols: 0,
         properties: vec![
             PropertyColumn::Packed((0..records).map(|i| (i % 3) as u8).collect()),
             PropertyColumn::Wide((0..records).map(|i| (i * 73 % 257 * 3) as u32).collect()),

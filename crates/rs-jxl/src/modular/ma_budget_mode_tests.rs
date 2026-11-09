@@ -24,6 +24,7 @@ fn fixture(channels: usize, records: usize) -> (TreeSamples, TrainOptions) {
     thresholds.extend((0..5).map(|_| vec![0]));
     (
         TreeSamples {
+            global_max_symbols: 0,
             properties,
             residuals: vec![residuals.clone(), residuals],
             counts: vec![1; records],

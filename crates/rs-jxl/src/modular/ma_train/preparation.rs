@@ -406,6 +406,7 @@ impl TreeSamples {
             residuals: vec![Vec::new(); options.predictors.len()],
             counts: Vec::new(),
             thresholds,
+            global_max_symbols: 0,
         };
         let config = HybridUintConfig::new(4, 1, 2).map_err(|e| Error::Encoding(e.to_string()))?;
         let capacity = sample_storage::split_record_capacity(samples.clone())?;
@@ -430,6 +431,15 @@ impl TreeSamples {
                 &config,
             );
             dedup.insert(&mut result, &key, sample.weight)?;
+        }
+        if options.tree_learning.enabled() {
+            result.global_max_symbols = result
+                .residuals
+                .iter()
+                .flatten()
+                .map(|r| usize::from(r.token) + 1)
+                .max()
+                .unwrap_or(0);
         }
         crate::profile::note(
             "ma.sample_counts",

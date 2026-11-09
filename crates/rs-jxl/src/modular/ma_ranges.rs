@@ -59,6 +59,8 @@ pub(super) struct Samples<S: SampleStorage> {
     pub(super) residuals: Vec<S::Residuals>,
     pub(super) counts: S::Counts,
     pub(super) thresholds: S::Thresholds,
+    /// Full learner population, retained unchanged by subtree column loans.
+    pub(super) global_max_symbols: usize,
 }
 pub(super) type TreeSamples = Samples<Owned>;
 pub(super) type SampleView<'a> = Samples<Borrowed<'a>>;
@@ -71,6 +73,7 @@ impl Clone for TreeSamples {
             residuals: self.residuals.clone(),
             counts: self.counts.clone(),
             thresholds: self.thresholds.clone(),
+            global_max_symbols: self.global_max_symbols,
         }
     }
 }
@@ -128,6 +131,7 @@ impl<S: SampleStorage> Samples<S> {
                     base: base + range.start,
                 },
                 thresholds: &self.thresholds[..],
+                global_max_symbols: self.global_max_symbols,
             });
         }
         for column in &mut self.properties {
@@ -173,6 +177,7 @@ mod tests {
             ],
             counts: (1..=12).collect(),
             thresholds: vec![(0..11).collect(), (0..11).collect()],
+            global_max_symbols: 12,
         }
     }
 
@@ -196,6 +201,7 @@ mod tests {
                     .all(|view| view.thresholds.as_ptr() == threshold_base)
             );
             assert_eq!((views[0].base(), views[1].base()), (1, 7));
+            assert!(views.iter().all(|view| view.global_max_symbols == 12));
             for view in &mut views {
                 let last = view.counts.len() - 1;
                 view.counts.swap(0, last);

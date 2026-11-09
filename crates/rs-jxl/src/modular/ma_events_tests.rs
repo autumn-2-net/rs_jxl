@@ -227,6 +227,7 @@ fn fixture(predictors: usize, total: u32) -> (TreeSamples, TrainOptions) {
     let rest: u32 = counts.iter().skip(1).map(|&n| u32::from(n)).sum();
     counts[0] = u16::try_from(total - rest).unwrap();
     let samples = TreeSamples {
+        global_max_symbols: 0,
         properties: vec![
             PropertyColumn::Wide((0..192).map(|i| (i / 3 * 11 + 3) as u32).collect()),
             PropertyColumn::Packed((0..192).map(|i| (i / 3 * 3 + 2) as u8).collect()),

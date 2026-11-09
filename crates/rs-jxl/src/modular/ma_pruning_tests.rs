@@ -9,6 +9,7 @@ fn fixture(records: usize, weight: u16) -> (TreeSamples, TrainOptions) {
         ..Default::default()
     };
     let samples = TreeSamples {
+        global_max_symbols: 0,
         properties: vec![
             PropertyColumn::Packed((0..records).map(|i| (i % 8) as u8).collect()),
             PropertyColumn::Wide((0..records).map(|i| (17 * (i % 8) + 3) as u32).collect()),

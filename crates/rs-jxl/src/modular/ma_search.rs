@@ -746,6 +746,7 @@ mod tests {
             residuals: vec![tokens.clone(), tokens],
             counts: vec![1; records],
             thresholds: vec![vec![0]; ids.len()],
+            global_max_symbols: 0,
         };
         let options = TrainOptions {
             properties: ids,
@@ -895,6 +896,7 @@ mod tests {
                 residuals: vec![tokens.clone(), tokens],
                 counts: (0..records).map(|i| (i % 9 + 1) as u16).collect(),
                 thresholds: vec![(0..255).collect()],
+                global_max_symbols: 32,
             };
             let mut options = TrainOptions {
                 properties: vec![6],

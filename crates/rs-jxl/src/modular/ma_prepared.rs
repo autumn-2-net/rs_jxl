@@ -151,11 +151,22 @@ impl PreparedInput {
             );
             residuals.push(converted);
         }
+        let global_max_symbols = if options.tree_learning.enabled() {
+            residuals
+                .iter()
+                .flatten()
+                .map(|r| usize::from(r.token) + 1)
+                .max()
+                .unwrap_or(0)
+        } else {
+            0
+        };
         Ok(TreeSamples {
             properties,
             residuals,
             counts: self.counts,
             thresholds: self.quantization.thresholds,
+            global_max_symbols,
         })
     }
 }
