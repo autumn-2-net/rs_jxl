@@ -3,6 +3,49 @@ use crate::metadata::{BitDepth, ExtraChannelInfo, ExtraChannelType};
 use crate::{PixelData, PixelLayout};
 
 #[test]
+fn explicit_tree_experiments_override_only_the_default_fixed_tree() {
+    let image = Image::new(
+        2,
+        1,
+        PixelLayout::Rgb,
+        PixelData::U8(vec![1, 2, 3, 4, 5, 6]),
+    )
+    .unwrap();
+    for effort in [2, 3, 5, 9] {
+        let params = CandidateParams::default().backend(effort).unwrap();
+        let plain = project_native(&params, &image, &EncodeOptions::default())
+            .unwrap()
+            .exact_options()
+            .unwrap();
+        if effort <= 3 {
+            assert!(plain.modular.fixed_tree.is_some());
+        }
+        for seed in [false, true] {
+            let mut base = EncodeOptions::default();
+            if seed {
+                base.modular.source_ma_seed = Some(Default::default());
+            } else {
+                base.modular.fast_context = Some(Default::default());
+            }
+            let options = project_native(&params, &image, &base)
+                .unwrap()
+                .exact_options()
+                .unwrap();
+            assert!(options.modular.fixed_tree.is_none());
+            assert_eq!(options.modular.source_ma_seed.is_some(), seed);
+            assert_eq!(options.modular.fast_context.is_some(), !seed);
+            let actual = options.modular.sampling.as_ref().unwrap();
+            let expected = plain.modular.sampling.as_ref().unwrap();
+            assert_eq!(actual.nb_repeats, expected.nb_repeats);
+            assert_eq!(actual.properties, expected.properties);
+            assert_eq!(actual.max_property_values, expected.max_property_values);
+            assert_eq!(actual.node_threshold, expected.node_threshold);
+            assert_eq!(options.modular.predictor, plain.modular.predictor);
+        }
+    }
+}
+
+#[test]
 fn explicit_candidates_accept_typed_depths_without_relaxing_search_gate() {
     let mut images = vec![
         Image::new(

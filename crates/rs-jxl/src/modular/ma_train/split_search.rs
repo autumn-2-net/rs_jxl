@@ -9,13 +9,41 @@
 use super::InitialCacheStage;
 use super::{
     Arc, Candidates, DefaultScorer, DenseHistogram, HistogramBudget, HistogramCache, Mutex,
-    Ordering, ParentHistogram, PredictorPlan, PropertyColumn, PropertyHistogram, PropertyScratch,
-    PropertyValue, SampleStorage, Samples, ScratchPool, SearchOptions, SparseHistogramPlan, Split,
-    TrainOptions, TrainingStats, WP_PROPERTY, choose_split, collect_property_marginals,
-    compact_parent_histograms_with_layout, evaluate_property_values, execution, histogram_stride,
-    keep_better, ma_partition_proofs, ma_search, parent_histogram,
+    OnceLock, Ordering, ParentHistogram, PredictorPlan, PropertyColumn, PropertyHistogram,
+    PropertyScratch, PropertyValue, SampleStorage, Samples, ScratchPool, SearchOptions,
+    SparseHistogramPlan, Split, TrainOptions, TrainingStats, WP_PROPERTY, choose_split,
+    collect_property_marginals, compact_parent_histograms_with_layout, evaluate_property_values,
+    execution, histogram_stride, keep_better, ma_partition_proofs, ma_search, parent_histogram,
 };
 use crate::Result;
+
+// Distinct records, not summed sample weights; predictors are configured, before
+// node-local pruning. Static names bound profiler storage to twelve entries/shard.
+fn node_profile_name(records: usize, predictors: usize) -> &'static str {
+    match (records, predictors <= 2) {
+        (0..=16, true) => "ma.find_best_split.records_le16.predictors_le2",
+        (0..=16, false) => "ma.find_best_split.records_le16.predictors_gt2",
+        (17..=64, true) => "ma.find_best_split.records_17_64.predictors_le2",
+        (17..=64, false) => "ma.find_best_split.records_17_64.predictors_gt2",
+        (65..=256, true) => "ma.find_best_split.records_65_256.predictors_le2",
+        (65..=256, false) => "ma.find_best_split.records_65_256.predictors_gt2",
+        (257..=1024, true) => "ma.find_best_split.records_257_1024.predictors_le2",
+        (257..=1024, false) => "ma.find_best_split.records_257_1024.predictors_gt2",
+        (1025..=4096, true) => "ma.find_best_split.records_1025_4096.predictors_le2",
+        (1025..=4096, false) => "ma.find_best_split.records_1025_4096.predictors_gt2",
+        (_, true) => "ma.find_best_split.records_gt4096.predictors_le2",
+        (_, false) => "ma.find_best_split.records_gt4096.predictors_gt2",
+    }
+}
+
+fn node_profile_scope(records: usize, predictors: usize) -> Option<crate::profile::Scope> {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    // No per-node environment access, timer or counter lock when disabled.
+    let enabled = *ENABLED.get_or_init(|| {
+        crate::profile::enabled() && std::env::var("RS_JXL_PROFILE_MA_NODES").as_deref() == Ok("1")
+    });
+    enabled.then(|| crate::profile::scope(node_profile_name(records, predictors)))
+}
 
 pub(super) struct SeenProperty {
     pub(super) signature: u64,
@@ -154,6 +182,7 @@ pub(super) fn find_best_split_with_properties(
     redundant_properties: &mut Vec<u8>,
 ) -> Result<Option<Split>> {
     let _scope = crate::profile::scope("ma.find_best_split");
+    let _node_scope = node_profile_scope(indices.len(), options.predictors.len());
     debug_assert!(removed.is_empty() || cache.is_some());
     if indices.len() < 2 {
         *cache = None;
@@ -573,4 +602,60 @@ pub(super) fn find_best_split_with_properties(
     *cache = working_cache;
     *redundant_properties = working_redundant;
     Ok(decision)
+}
+
+#[cfg(test)]
+mod node_profile_tests {
+    use super::node_profile_name;
+
+    #[test]
+    fn record_bucket_and_predictor_boundaries() {
+        for (first, last, few, many) in [
+            (
+                0,
+                16,
+                "ma.find_best_split.records_le16.predictors_le2",
+                "ma.find_best_split.records_le16.predictors_gt2",
+            ),
+            (
+                17,
+                64,
+                "ma.find_best_split.records_17_64.predictors_le2",
+                "ma.find_best_split.records_17_64.predictors_gt2",
+            ),
+            (
+                65,
+                256,
+                "ma.find_best_split.records_65_256.predictors_le2",
+                "ma.find_best_split.records_65_256.predictors_gt2",
+            ),
+            (
+                257,
+                1024,
+                "ma.find_best_split.records_257_1024.predictors_le2",
+                "ma.find_best_split.records_257_1024.predictors_gt2",
+            ),
+            (
+                1025,
+                4096,
+                "ma.find_best_split.records_1025_4096.predictors_le2",
+                "ma.find_best_split.records_1025_4096.predictors_gt2",
+            ),
+            (
+                4097,
+                usize::MAX,
+                "ma.find_best_split.records_gt4096.predictors_le2",
+                "ma.find_best_split.records_gt4096.predictors_gt2",
+            ),
+        ] {
+            for records in [first, last] {
+                for predictors in [0, 1, 2] {
+                    assert_eq!(node_profile_name(records, predictors), few);
+                }
+                for predictors in [3, usize::MAX] {
+                    assert_eq!(node_profile_name(records, predictors), many);
+                }
+            }
+        }
+    }
 }

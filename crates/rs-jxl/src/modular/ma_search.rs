@@ -20,6 +20,8 @@ pub enum QuantileSplits {
     SixtyFour,
     /// JXL_MA_QUANTILE_SPLITS=2.
     ThirtyTwo,
+    /// Experimental warm-start proposals, not a default effort setting.
+    Twelve,
 }
 
 /// Explicit source proposal heuristics. These can change the learned tree,
@@ -56,6 +58,7 @@ impl SearchOptions {
             QuantileSplits::Disabled => 0,
             QuantileSplits::SixtyFour => 64,
             QuantileSplits::ThirtyTwo => 32,
+            QuantileSplits::Twelve => 12,
         }
     }
 }

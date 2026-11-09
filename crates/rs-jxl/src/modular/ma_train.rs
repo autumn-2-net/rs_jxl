@@ -217,6 +217,7 @@ use split_search::{
 };
 
 mod learner;
+mod seed;
 use learner::{
     PendingNode, TrainingNode, leaf, partition_node, train_nodes, train_pending_in_frontier,
     train_roots_with_layout,
@@ -226,6 +227,7 @@ use learner::{
     partition_samples, train_nodes_with_layout, train_nodes_with_scratch, train_nodes_with_stats,
     train_pending_with_layout,
 };
+pub use seed::{SeedMode, SeedOptions, SeedReceipt, SeedSnapshot};
 
 const PROPERTY_RANGE: i32 = 511;
 const QUANTILE_RANGE: i32 = 512;

@@ -297,6 +297,11 @@ fn project_native_metadata(
         9 => Some(FixedTree::GradientLeaf),
         _ => None,
     };
+    // Explicit tree experiments replace the low-effort fixed tree, not the
+    // effort's transform, entropy, LZ77 or sampling settings.
+    if options.modular.fast_context.is_some() || options.modular.source_ma_seed.is_some() {
+        options.modular.fixed_tree = None;
+    }
     // training::learn enables require_complete_search whenever sampling is
     // Some. Budget exhaustion with beneficial splits errors, never truncates.
     options.modular.max_tree_leaves = resources.max_tree_leaves;

@@ -51,6 +51,15 @@ platform certifications.
 
 ## Acceptance and Validation
 
+The [2026-11-09 500-image MA strategy validation](MA_CORPUS500_20261109.md)
+records the frozen stratified sample, native timing and official pixel-check
+protocol, durable benchmark tooling and completion status.
+
+The [2026-11-09 shallow-plan and MA warm-start experiment](MA_WARM_START_EXPERIMENT_20261109.md)
+documents full standard-predictor statistics, shared prepared-sample refinement,
+explicit lab switches and same-effort pixel-verified comparisons. It does not
+enable these experimental strategies in production effort defaults.
+
 The [2026-11-08 decode recovery and FFI packing follow-up](DECODE_RECOVERY_AND_PACKING_20261108.md)
 records malformed-input/state checks and the output-copy change. It separates
 the clear packing-only gains from noisy complete-API timings, including a
@@ -177,6 +186,8 @@ rejected experiments and remaining limitations remain part of the record.
 - [Scheduler palette audit, 2026-10-26](SCHEDULER_PALETTE_AUDIT_20261026.md)
 - [MA small-histogram sweep kernels, 2026-10-26](MA_SWEEP_KERNELS_20261026.md)
 - [MA tree execution experiments, 2026-10-26](MA_TREE_EXPERIMENTS_20261026.md)
+- [MA model costs, reuse and small-node experiments, 2026-11-09](MA_STRATEGY_EXPERIMENTS_20261109.md)
+- [Shared MA prefix experiment, 2026-11-09](MA_SHARED_PREFIX_EXPERIMENT_20261109.md)
 
 ### Decoding and Reconstruction
 
@@ -189,6 +200,7 @@ rejected experiments and remaining limitations remain part of the record.
 - [JPEG-transcoded JXL pixel decoding, 2026-10-25](JPEG_PIXEL_DECODE_20261025.md)
 - [Progressive JPEG reconstruction follow-up, 2026-11-08](JPEG_RECONSTRUCTION_SPEED_20261108.md)
 - [Pixel-lossless encoder and decoder speed, 2026-11-09](PIXEL_CODEC_SPEED_20261109.md)
+- [Rejected MA/LZ77 work-reduction experiments, 2026-11-09](MA_LZ77_WORK_REDUCTION_20261109.md)
 
 Keep rendered pixel comparisons distinct from byte-exact JPEG reconstruction
 and native lossless sample checks when interpreting these reports. None of this

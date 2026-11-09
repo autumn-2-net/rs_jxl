@@ -19,7 +19,7 @@ use clap::{Parser, ValueEnum};
 use rs_jxl::{
     EncodeOptions,
     modular::{
-        ma_train::{DenseHistogram, HistogramOptions, PropertyBins},
+        ma_train::{DenseHistogram, DescriptionCost, HistogramOptions, PropertyBins},
         predictor::Predictor,
         sample::GatherOptions,
     },
@@ -58,6 +58,26 @@ enum Histograms {
     Bins,
     Dense,
     DenseBins,
+}
+
+#[derive(Clone, Copy, Debug, Default, ValueEnum)]
+enum Description {
+    #[default]
+    Off,
+    Quarter,
+    Half,
+    Full,
+}
+
+impl From<Description> for DescriptionCost {
+    fn from(value: Description) -> Self {
+        match value {
+            Description::Off => Self::Disabled,
+            Description::Quarter => Self::Quarter,
+            Description::Half => Self::Half,
+            Description::Full => Self::Full,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -181,6 +201,29 @@ struct Args {
     /// Experimental unclipped incremental Shannon scoring, not the source default.
     #[arg(long, conflicts_with = "clipped")]
     shannon: bool,
+    /// Experimental histogram model regularization; not final clustered wire bits.
+    #[arg(long, value_enum, default_value = "off")]
+    description_cost: Description,
+    /// Measure emitted tree/model bits for one direct candidate, not search probes.
+    #[arg(long, conflicts_with_all = ["search", "scan_only"])]
+    model_costs: bool,
+    /// Experimental complete shallow MA plan; no exhaustive suffix learning.
+    #[arg(long, value_parser = ["leaf", "gradient12", "directional12", "auto12"], conflicts_with_all = ["search", "scan_only"])]
+    fast_context: Option<String>,
+    /// Encoder-only static offset fitting, with an optional causal bias proposal.
+    #[arg(long, value_parser = ["off", "static", "adaptive"], requires = "fast_context")]
+    context_bias: Option<String>,
+    #[arg(long, value_parser = ["auto", "scalar", "avx2", "avx512"], requires = "fast_context")]
+    context_scan: Option<String>,
+    /// Score Basic4 or all fourteen standard predictors, including native WP.
+    #[arg(long, value_parser = ["basic", "full"], requires = "fast_context")]
+    context_predictors: Option<String>,
+    /// Shared-preparation shallow seed, optionally refined or re-evaluated.
+    #[arg(long, value_parser = ["only", "refine", "repair"], conflicts_with_all = ["fast_context", "search", "scan_only", "ma_histogram_bins"])]
+    ma_seed: Option<String>,
+    /// Initial depth only; refinement retains the normal final tree budget.
+    #[arg(long, requires = "ma_seed", value_parser = clap::value_parser!(u8).range(1..=8))]
+    ma_seed_depth: Option<u8>,
     /// Score coarse MA split quantiles, then refine their strongest valleys.
     #[arg(long)]
     refine_quantiles: bool,
@@ -461,6 +504,57 @@ fn run(args: Args) -> Result<()> {
             rs_jxl::modular::ma_train::ClippedEntropyMode::SlidingAtLeast2048;
     }
     base.modular.source_ma_scoring.fast_entropy = args.shannon;
+    base.modular.source_ma_scoring.description = args.description_cost.into();
+    if let Some(mode) = &args.fast_context {
+        use rs_jxl::modular::fast_context::{Bias, Mode, Options, PredictorSet, Receipt, Scan};
+        base.modular.fast_context = Some(Options {
+            mode: match mode.as_str() {
+                "leaf" => Mode::Leaf,
+                "gradient12" => Mode::Gradient12,
+                "directional12" => Mode::Directional12,
+                "auto12" => Mode::Auto12,
+                _ => unreachable!("validated mode"),
+            },
+            bias: match args.context_bias.as_deref().unwrap_or("off") {
+                "off" => Bias::Off,
+                "static" => Bias::Static,
+                "adaptive" => Bias::Adaptive,
+                _ => unreachable!("validated bias"),
+            },
+            scan: match args.context_scan.as_deref().unwrap_or("auto") {
+                "auto" => Scan::Auto,
+                "scalar" => Scan::Scalar,
+                "avx2" => Scan::Avx2,
+                "avx512" => Scan::Avx512,
+                _ => unreachable!("validated scan"),
+            },
+            receipt: Some(std::sync::Arc::new(Receipt::default())),
+            predictors: match args.context_predictors.as_deref().unwrap_or("basic") {
+                "basic" => PredictorSet::Basic,
+                "full" => PredictorSet::Full,
+                _ => unreachable!("validated predictors"),
+            },
+        });
+    }
+    if let Some(mode) = &args.ma_seed {
+        use rs_jxl::modular::ma_train::{SeedMode, SeedOptions, SeedReceipt};
+        base.modular.source_ma_seed = Some(SeedOptions {
+            mode: match mode.as_str() {
+                "only" => SeedMode::Only,
+                "refine" => SeedMode::Refine,
+                "repair" => SeedMode::Repair,
+                _ => unreachable!("validated seed"),
+            },
+            depth: args.ma_seed_depth.unwrap_or(3),
+            receipt: Some(std::sync::Arc::new(SeedReceipt::default())),
+            ..Default::default()
+        });
+    }
+    if args.model_costs {
+        base.modular.model_cost_receipt = Some(std::sync::Arc::new(
+            rs_jxl::modular::encode::receipt_cost::ModelCostReceipt::default(),
+        ));
+    }
     base.modular.source_ma_search.refine_quantiles = args.refine_quantiles;
     base.modular.source_ma_search.histogram_bins = args.ma_histogram_bins.unwrap_or(0);
     base.modular.source_ma_search.quantile_splits = match args.quantile_splits {
@@ -471,6 +565,9 @@ fn run(args: Args) -> Result<()> {
     };
     let seconds;
     let mut search_report = serde_json::Value::Null;
+    let mut model_costs = serde_json::Value::Null;
+    let mut fast_context = serde_json::Value::Null;
+    let mut ma_seed = serde_json::Value::Null;
     let start = Instant::now();
     let encoded = if args.search {
         let mut driver = DriverOptions::scout();
@@ -570,6 +667,42 @@ fn run(args: Args) -> Result<()> {
             },
         )?;
         seconds = start.elapsed().as_secs_f64();
+        if let Some(receipt) = &result.artifact.options.modular.model_cost_receipt {
+            model_costs = serde_json::json!({
+                "tree_bits": receipt.tree_bits(),
+                "entropy_header_bits": receipt.entropy_header_bits(),
+                "total_bits": receipt.bits(),
+            });
+        }
+        if let Some(options) = &result.artifact.options.modular.fast_context {
+            let receipt = options
+                .receipt
+                .as_ref()
+                .expect("requested receipt")
+                .snapshot();
+            fast_context = serde_json::json!({
+                "mode": args.fast_context, "bias": args.context_bias.as_deref().unwrap_or("off"),
+                "scan": args.context_scan.as_deref().unwrap_or("auto"),
+                "predictors": args.context_predictors.as_deref().unwrap_or("basic"),
+                "trees": receipt.trees, "leaves": receipt.leaves, "pixels": receipt.pixels,
+                "offset_leaves": receipt.offset_leaves, "horizontal": receipt.horizontal,
+                "vertical": receipt.vertical, "single": receipt.single,
+            });
+        }
+        if let Some(options) = &result.artifact.options.modular.source_ma_seed {
+            let receipt = options
+                .receipt
+                .as_ref()
+                .expect("requested seed receipt")
+                .snapshot();
+            ma_seed = serde_json::json!({
+                "mode": args.ma_seed, "depth": options.depth,
+                "learners": receipt.learners, "prepared_records": receipt.prepared_records,
+                "seed_splits": receipt.seed_splits, "refined_leaves": receipt.refined_leaves,
+                "repaired_branches": receipt.repaired_branches, "merged_branches": receipt.merged_branches,
+                "predictor_changes": receipt.predictor_changes, "histogram_reuses": receipt.histogram_reuses,
+            });
+        }
         eprintln!("candidate={params:?}");
         result.bytes
     };
@@ -583,6 +716,10 @@ fn run(args: Args) -> Result<()> {
             "matcher": format!("{matcher:?}"), "search_policy": args.search_policy(),
             "search": args.search, "timing": "encoder call only; input decode and output IO excluded",
             "search_report": search_report,
+            "description_cost": format!("{:?}", args.description_cost),
+            "model_costs": model_costs,
+            "fast_context": fast_context,
+            "ma_seed": ma_seed,
         })
     );
     if let Some(path) = args.output {
@@ -611,6 +748,104 @@ fn main() -> std::process::ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn seed_and_full_predictor_experiments_are_explicit() {
+        let defaults = Args::try_parse_from(["encoder_lab", "input.png"]).unwrap();
+        assert!(defaults.ma_seed.is_none() && defaults.ma_seed_depth.is_none());
+        assert!(defaults.context_predictors.is_none());
+        for mode in ["only", "refine", "repair"] {
+            for depth in ["1", "3", "8"] {
+                assert!(
+                    Args::try_parse_from([
+                        "encoder_lab",
+                        "input.png",
+                        "--ma-seed",
+                        mode,
+                        "--ma-seed-depth",
+                        depth
+                    ])
+                    .is_ok()
+                );
+            }
+            for flag in ["--search", "--scan-only"] {
+                assert!(
+                    Args::try_parse_from(["encoder_lab", "input.png", "--ma-seed", mode, flag])
+                        .is_err()
+                );
+            }
+            assert!(
+                Args::try_parse_from([
+                    "encoder_lab",
+                    "input.png",
+                    "--ma-seed",
+                    mode,
+                    "--fast-context",
+                    "auto12"
+                ])
+                .is_err()
+            );
+        }
+        for args in [
+            vec!["--ma-seed-depth", "3"],
+            vec!["--ma-seed", "only", "--ma-seed-depth", "0"],
+            vec!["--ma-seed", "only", "--ma-seed-depth", "9"],
+            vec!["--context-predictors", "full"],
+        ] {
+            let mut argv = vec!["encoder_lab", "input.png"];
+            argv.extend(args);
+            assert!(Args::try_parse_from(argv).is_err());
+        }
+        for predictors in ["basic", "full"] {
+            assert!(
+                Args::try_parse_from([
+                    "encoder_lab",
+                    "input.png",
+                    "--fast-context",
+                    "auto12",
+                    "--context-predictors",
+                    predictors
+                ])
+                .is_ok()
+            );
+        }
+    }
+
+    #[test]
+    fn model_cost_experiments_are_explicit_and_direct_only() {
+        let defaults = Args::try_parse_from(["encoder_lab", "input.png"]).unwrap();
+        assert_eq!(
+            DescriptionCost::from(defaults.description_cost),
+            DescriptionCost::Disabled
+        );
+        assert!(!defaults.model_costs);
+        for (name, expected) in [
+            ("off", DescriptionCost::Disabled),
+            ("quarter", DescriptionCost::Quarter),
+            ("half", DescriptionCost::Half),
+            ("full", DescriptionCost::Full),
+        ] {
+            let args = Args::try_parse_from([
+                "encoder_lab",
+                "input.png",
+                "--description-cost",
+                name,
+                "--model-costs",
+            ])
+            .unwrap();
+            assert_eq!(DescriptionCost::from(args.description_cost), expected);
+            assert!(args.model_costs);
+        }
+        for flag in ["--search", "--scan-only"] {
+            assert!(
+                Args::try_parse_from(["encoder_lab", "input.png", "--model-costs", flag,]).is_err()
+            );
+        }
+        assert!(
+            Args::try_parse_from(["encoder_lab", "input.png", "--description-cost", "unknown",])
+                .is_err()
+        );
+    }
 
     #[test]
     fn subtree_experiments_are_independent_opt_ins() {
@@ -1001,5 +1236,38 @@ mod tests {
         let args = Args::try_parse_from(["encoder_lab", "input.png", "--search", "--pilot-first"])
             .unwrap();
         assert_eq!(args.search_policy(), "pilot-first");
+    }
+}
+#[test]
+fn fast_context_modes_are_explicit_and_require_their_primary_switch() {
+    let defaults = Args::try_parse_from(["encoder_lab", "input.png"]).unwrap();
+    assert!(defaults.fast_context.is_none());
+    assert!(defaults.context_bias.is_none());
+    assert!(defaults.context_scan.is_none());
+    for mode in ["leaf", "gradient12", "directional12", "auto12"] {
+        for bias in ["off", "static", "adaptive"] {
+            let args = Args::try_parse_from([
+                "encoder_lab",
+                "input.png",
+                "--fast-context",
+                mode,
+                "--context-bias",
+                bias,
+                "--context-scan",
+                "scalar",
+            ])
+            .unwrap();
+            assert_eq!(args.fast_context.as_deref(), Some(mode));
+            assert_eq!(args.context_bias.as_deref(), Some(bias));
+        }
+    }
+    for (flag, value) in [("--context-bias", "static"), ("--context-scan", "avx2")] {
+        assert!(Args::try_parse_from(["encoder_lab", "input.png", flag, value]).is_err());
+    }
+    for flag in ["--search", "--scan-only"] {
+        assert!(
+            Args::try_parse_from(["encoder_lab", "input.png", "--fast-context", "auto12", flag])
+                .is_err()
+        );
     }
 }

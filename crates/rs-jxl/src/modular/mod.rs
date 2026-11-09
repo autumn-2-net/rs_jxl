@@ -8,6 +8,7 @@ pub(crate) mod auxiliary;
 pub mod candidate_cache;
 pub mod cost;
 pub mod encode;
+pub mod fast_context;
 pub mod fixed;
 pub(crate) mod frame;
 pub(crate) mod global;

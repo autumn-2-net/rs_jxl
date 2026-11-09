@@ -102,6 +102,10 @@ pub struct ModularOptions {
     pub fixed_tree: Option<FixedTree>,
     /// Explicit validated MA tree, corresponding to source custom_fixed_tree.
     pub custom_tree: Option<Tree>,
+    /// Experimental complete shallow MA plans; never enabled by effort alone.
+    pub fast_context: Option<super::fast_context::Options>,
+    /// Shared-preparation MA warm start, disabled independently of effort.
+    pub source_ma_seed: Option<ma_train::SeedOptions>,
     /// Independent source MA learners, merged using actual stream-ID splits.
     pub tree_groups: Option<super::tree_groups::TreeGroupOptions>,
     /// Empty means one initial domain; otherwise inclusive starts plus final end.
@@ -160,6 +164,8 @@ impl Default for ModularOptions {
             parallel_weighted: false,
             fixed_tree: None,
             custom_tree: None,
+            fast_context: None,
+            source_ma_seed: None,
             tree_groups: None,
             tree_group_splits: Vec::new(),
             palette_policy: None,
@@ -218,6 +224,33 @@ impl ModularOptions {
         }
         self.entropy_options.validate()?;
         self.source_ma_parallel.workers.validate()?;
+        if let Some(seed) = &self.source_ma_seed {
+            seed.validate()?;
+            if self.source_ma_search.histogram_bins != 0 {
+                return Err(Error::InvalidInput(
+                    "MA seed cannot combine with histogram binning".into(),
+                ));
+            }
+            if self.fast_context.is_some()
+                || self.fixed_tree.is_some()
+                || self.custom_tree.is_some()
+                || self.candidate_cache.is_some()
+                || self.source_channel_tree != ma_train::ChannelTreeMode::Disabled
+            {
+                return Err(Error::InvalidInput(
+                    "MA seed conflicts with other tree/preparation experiments".into(),
+                ));
+            }
+        }
+        if let Some(fast) = &self.fast_context {
+            fast.validate()?;
+            if self.custom_tree.is_some()
+                || self.fixed_tree.is_some()
+                || self.candidate_cache.is_some()
+            {
+                return Err(Error::InvalidInput("fast_context conflicts with fixed/custom trees and candidate preparation reuse".into()));
+            }
+        }
         if let Some(groups) = &self.tree_groups {
             groups.validate()?;
         }
@@ -623,6 +656,7 @@ pub(super) fn train_options(options: &ModularOptions) -> ma_train::TrainOptions 
             .map(|_| options.tree_leaf_limit()),
         budget_mode: options.ma_budget_mode,
         split_threshold: options.split_threshold,
+        seed: options.source_ma_seed.clone(),
         ..Default::default()
     };
     options.source_ma_histograms.apply(&mut train);

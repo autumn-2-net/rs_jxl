@@ -217,6 +217,32 @@ pub(super) fn learn_with_budget_and_gather(
         }
     }
 
+    if let Some(fast) = &options.fast_context {
+        let samples = views.iter().try_fold(0usize, |n, v| {
+            n.checked_add(v.width * v.height)
+                .ok_or(Error::Limit("fast-context population overflow"))
+        })?;
+        if options.sample_limit.is_some_and(|limit| samples > limit) {
+            return Err(Error::Limit(
+                "fast-context full-scan sample budget exceeded",
+            ));
+        }
+        if let Some(budget) = budget {
+            budget.consume(samples)?;
+        }
+        return super::fast_context::learn(
+            &views,
+            max_channels,
+            options.tree_leaf_limit(),
+            options.ma_budget_mode == Some(ma_train::MaBudgetMode::Strict),
+            &ordered
+                .iter()
+                .map(|stream| (stream.stream_id as u32, stream.wp))
+                .collect::<Vec<_>>(),
+            fast,
+        );
+    }
+
     let mut train = encode::train_options(options);
     train.parallel = parallel_search;
     let policy = options.sampling.as_ref();

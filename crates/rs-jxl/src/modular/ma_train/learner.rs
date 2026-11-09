@@ -6,11 +6,11 @@
 //! This layer owns node/leaf budgets, child commit order and histogram handoff scheduling.
 
 use super::{
-    Arc, HistogramBudget, HistogramCache, Intersection, Node, Ordering, ParentHistogram, Predictor,
-    PropertyColumn, PropertyValue, SampleStorage, Samples, ScratchPool, Split, StaticPropRange,
-    TrainOptions, TrainingStats, box_intersects, execution, find_best_split_with_properties,
-    ma_channel, ma_frontier, ma_parallel, parent_histograms, subtract_parent_histograms,
-    swap_column,
+    Arc, HistogramBudget, HistogramCache, Intersection, Node, OnceLock, Ordering, ParentHistogram,
+    Predictor, PropertyColumn, PropertyValue, SampleStorage, Samples, ScratchPool, Split,
+    StaticPropRange, TrainOptions, TrainingStats, box_intersects, execution,
+    find_best_split_with_properties, ma_channel, ma_frontier, ma_parallel, parent_histograms,
+    subtract_parent_histograms, swap_column,
 };
 use crate::{Error, Result};
 
@@ -153,6 +153,7 @@ impl PendingNode {
             redundant_properties: Vec::new(),
         }
     }
+
     pub(super) fn evaluate(
         &mut self,
         samples: &Samples<impl SampleStorage>,
@@ -182,9 +183,47 @@ impl PendingNode {
     }
 }
 
+fn ready_frontier_profile_name(current: &PendingNode, pending: &[PendingNode]) -> &'static str {
+    let width = std::iter::once(current)
+        .chain(pending.iter())
+        .filter(|state| {
+            state.decision.is_none() && (1..=256).contains(&(state.job.end - state.job.begin))
+        })
+        .take(8)
+        .count();
+    match width {
+        0 => "ma.ready_frontier.records_le256.width_0",
+        1 => "ma.ready_frontier.records_le256.width_1",
+        2..=3 => "ma.ready_frontier.records_le256.width_2_3",
+        4..=7 => "ma.ready_frontier.records_le256.width_4_7",
+        _ => "ma.ready_frontier.records_le256.width_ge8",
+    }
+}
+
+// One snapshot per nonempty, non-detached DFS pop reaching evaluate, even when
+// the current decision is cached. Include current + pending disjoint ranges
+// only if unsearched with 1..=256 distinct records (not summed sample weights).
+// Exclude cached decisions, empty ranges, detached/in-flight jobs and other
+// learners. Repeated snapshots can observe the same pending node; this is local
+// availability, not a unique-node count or a guarantee of cache/scratch budget.
+fn profile_ready_frontier(current: &PendingNode, pending: &[PendingNode]) {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    if !*ENABLED.get_or_init(|| {
+        crate::profile::enabled() && std::env::var("RS_JXL_PROFILE_MA_NODES").as_deref() == Ok("1")
+    }) {
+        return;
+    }
+    // Only calls are meaningful: durations are marker overhead, not search time.
+    // Drop the marker before any search/partition.
+    // The disabled path never scans the queue, allocates or reads the clock.
+    drop(crate::profile::scope(ready_frontier_profile_name(
+        current, pending,
+    )));
+}
+
 /// Source forced splits, isolated from discretionary splits to guarantee that
 /// the finite leaf budget cannot silently drop a multiplier on a pending node.
-fn multiplier_skeleton<const REORDER: bool>(
+pub(super) fn multiplier_skeleton<const REORDER: bool>(
     samples: &mut Samples<impl SampleStorage>,
     options: &TrainOptions,
     indices: &mut [usize],
@@ -317,6 +356,9 @@ pub(super) fn train_nodes_with_scratch(
     } else {
         options
     };
+    if options.seed.is_some() {
+        return super::seed::train(samples, options, stats, scratch_pool);
+    }
     if let Some(nodes) = ma_channel::train(samples, options, stats, scratch_pool)? {
         return Ok(nodes);
     }
@@ -469,6 +511,7 @@ pub(super) fn train_pending_in_frontier<const REORDER: bool>(
             // any disjoint task starts physically swapping its own columns.
             continue;
         }
+        profile_ready_frontier(&state, &pending);
         state.evaluate(samples, indices, options, budget, stats, scratch_pool)?;
         let Some(split) = state.decision.flatten() else {
             continue;
@@ -672,4 +715,69 @@ pub(super) fn train_pending_in_frontier<const REORDER: bool>(
         ),
     );
     Ok(nodes)
+}
+
+#[cfg(test)]
+mod ready_frontier_profile_tests {
+    use super::{PendingNode, TrainingNode, ready_frontier_profile_name};
+
+    fn node(records: usize, decided: bool) -> PendingNode {
+        let mut state = PendingNode::new(TrainingNode {
+            node: 0,
+            begin: 257,
+            end: 257 + records,
+            predictor: 0,
+            multiplier: 1,
+        });
+        if decided {
+            state.decision = Some(None);
+        }
+        state
+    }
+
+    #[test]
+    fn width_bucket_boundaries_include_current() {
+        for (width, expected) in [
+            (0usize, "ma.ready_frontier.records_le256.width_0"),
+            (1, "ma.ready_frontier.records_le256.width_1"),
+            (2, "ma.ready_frontier.records_le256.width_2_3"),
+            (3, "ma.ready_frontier.records_le256.width_2_3"),
+            (4, "ma.ready_frontier.records_le256.width_4_7"),
+            (7, "ma.ready_frontier.records_le256.width_4_7"),
+            (8, "ma.ready_frontier.records_le256.width_ge8"),
+            (9, "ma.ready_frontier.records_le256.width_ge8"),
+            (16, "ma.ready_frontier.records_le256.width_ge8"),
+        ] {
+            let current = node(if width == 0 { 257 } else { 256 }, false);
+            let pending: Vec<_> = (0..width.saturating_sub(1))
+                .map(|_| node(1, false))
+                .collect();
+            assert_eq!(ready_frontier_profile_name(&current, &pending), expected);
+        }
+    }
+
+    #[test]
+    fn only_live_small_unsearched_nodes_are_counted() {
+        let mut current = node(256, false);
+        let mut pending = [
+            node(0, false),
+            node(257, false),
+            node(256, true),
+            node(1, false),
+        ];
+        assert_eq!(
+            ready_frontier_profile_name(&current, &pending),
+            "ma.ready_frontier.records_le256.width_2_3"
+        );
+        current.decision = Some(None);
+        assert_eq!(
+            ready_frontier_profile_name(&current, &pending),
+            "ma.ready_frontier.records_le256.width_1"
+        );
+        pending[3].decision = Some(None);
+        assert_eq!(
+            ready_frontier_profile_name(&current, &pending),
+            "ma.ready_frontier.records_le256.width_0"
+        );
+    }
 }

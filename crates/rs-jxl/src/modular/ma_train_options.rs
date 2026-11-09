@@ -113,6 +113,8 @@ pub struct TrainOptions {
     pub scoring: ScoringOptions,
     /// Default-off source property race and weighted split proposals.
     pub search: SearchOptions,
+    /// Explicit shared-preparation shallow seed and optional refinement.
+    pub seed: Option<super::SeedOptions>,
     /// Resolved JXL_MA_CHANNEL_TREE mode. Caller disables ineligible metadata,
     /// JPEG, probe or effort routes before training; learner gates still apply.
     pub channel_tree: ChannelTreeMode,
@@ -166,6 +168,7 @@ impl Default for TrainOptions {
             histogram_events: false,
             scoring: ScoringOptions::default(),
             search: SearchOptions::default(),
+            seed: None,
             channel_tree: ChannelTreeMode::Disabled,
             parallel_tools: ParallelOptions::default(),
             histogram_cache_bytes: 32 * 1024 * 1024,
@@ -225,6 +228,15 @@ impl TrainOptions {
 
     pub(super) fn validate(&self) -> Result<()> {
         self.parallel_tools.workers.validate()?;
+        if let Some(seed) = &self.seed {
+            seed.validate()?;
+            if self.channel_tree != ChannelTreeMode::Disabled || self.search.histogram_bins != 0 {
+                return Err(Error::InvalidInput(
+                    "MA seed cannot combine with channel-tree or histogram-binning experiments"
+                        .into(),
+                ));
+            }
+        }
         if self.search.histogram_bins != 0
             && (!(2..=256).contains(&self.search.histogram_bins)
                 || self.search.refine_quantiles
