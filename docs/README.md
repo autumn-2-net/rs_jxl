@@ -188,6 +188,7 @@ rejected experiments and remaining limitations remain part of the record.
 - [MA tree execution experiments, 2026-10-26](MA_TREE_EXPERIMENTS_20261026.md)
 - [MA model costs, reuse and small-node experiments, 2026-11-09](MA_STRATEGY_EXPERIMENTS_20261109.md)
 - [Shared MA prefix experiment, 2026-11-09](MA_SHARED_PREFIX_EXPERIMENT_20261109.md)
+- [Exact tile patch experiment, 2026-11-09](TILE_PATCH_EXPERIMENT_20261109.md)
 
 ### Decoding and Reconstruction
 

@@ -211,6 +211,30 @@ official decoder's floating arithmetic, including overlapping patches.
 They are mutually exclusive. Both reserve reference slot 3 and may decline a
 fixture when no profitable supported component is found. They are intra-frame
 tools, not automatic inter-frame prediction. Their overhead can exceed savings.
+
+`tile_patches: Option<tools::patches::TilePatchOptions>` is a separate opt-in
+experiment for exact repeated grid tiles (default 16x16, at least three copies).
+It is mutually exclusive with both older detectors and also reserves slot 3.
+It compares every eligible full-resolution 1..16-bit integer channel, including
+alpha and hidden RGB. Other extra planes pass through unchanged with None
+blending; floating or >16-bit main color declines discovery. Constant tiles and
+partial boundary tiles remain in the normal pixel stream. This is not a
+superset of the unaligned component detector, nor inter-frame prediction.
+
+Default tile admission rejects weak estimated gains before reference/residual
+allocation or MA/backend work. It charges a stronger hurdle when patches would
+leave the frame-area route. `TilePatchOptions.force=true` bypasses this screen
+for experiments. Rejection encodes only the ordinary original-image route;
+admission is a heuristic, not a guarantee about final bytes.
+
+Use it with direct `encode`/frame APIs after any source-policy projection.
+Projection intentionally resolves its own source patch policy and clears this
+independent experiment. The default scheduler, installed CLI and Python ABI do
+not enable or expose it. Admitted/forced tile encoding may be larger; the development
+`patch_lab --mode guarded` compares complete off/tile encodes and counts both
+times. See [the tile patch experiment](TILE_PATCH_EXPERIMENT_20261109.md) for
+controls, explicit retained-dictionary limits, compatibility tests and results.
+
 Malformed patch limits are rejected before applicability checks, including on
 depths that cannot use the selected tool. A valid but ineligible heuristic
 request may produce no patch dictionary; that is not acceptance of bad options.

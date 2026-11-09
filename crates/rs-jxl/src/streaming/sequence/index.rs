@@ -56,7 +56,7 @@ impl IndexState {
         selected: bool,
         offset: u64,
     ) -> Result<IndexUpdate> {
-        if options.patches.is_some() || options.source_patches.is_some() {
+        if options.has_patches() {
             return Err(Error::InvalidInput(
                 "indexed output does not support generated patch reference frames".into(),
             ));

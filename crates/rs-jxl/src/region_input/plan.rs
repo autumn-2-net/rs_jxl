@@ -49,7 +49,7 @@ impl FrameAreaPlan {
             options.group_size_shift,
             &options.passes,
             options.responsive,
-            options.patches.is_some() || options.source_patches.is_some(),
+            options.has_patches(),
         )?;
         if decision != orchestration::GroupwiseDecision::FrameAreas {
             return Err(Error::InvalidInput(format!(

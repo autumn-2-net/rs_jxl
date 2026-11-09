@@ -26,6 +26,9 @@ pub struct EncodeOptions {
     pub shared_tree: bool,
     /// Explicit lossless repeated-component patches; atlas overhead may exceed savings.
     pub patches: Option<crate::tools::patches::PatchOptions>,
+    /// Opt-in exact grid tiles. Independent of source/component detection;
+    /// cheap admission rejects weak candidates. Estimates are not size bounds.
+    pub tile_patches: Option<crate::tools::patches::TilePatchOptions>,
     /// Background-relative source Add patches, retaining signed residuals.
     pub source_patches: Option<crate::tools::patches::SourcePatchConfig>,
     /// Resolve source atlas parameters after its dimensions are known.
@@ -47,12 +50,19 @@ impl Default for EncodeOptions {
             group_size_shift: 1,
             shared_tree: false,
             patches: None,
+            tile_patches: None,
             source_patches: None,
             source_patch_reference: None,
             global_palette: false,
             responsive: false,
             passes: Default::default(),
         }
+    }
+}
+
+impl EncodeOptions {
+    pub(crate) fn has_patches(&self) -> bool {
+        self.patches.is_some() || self.source_patches.is_some() || self.tile_patches.is_some()
     }
 }
 
@@ -152,9 +162,16 @@ pub(crate) fn validate_geometry(
     if let Some(patches) = &options.source_patches {
         patches.validate()?;
     }
-    if options.patches.is_some() && options.source_patches.is_some() {
+    if let Some(patches) = &options.tile_patches {
+        patches.validate()?;
+    }
+    if usize::from(options.patches.is_some())
+        + usize::from(options.source_patches.is_some())
+        + usize::from(options.tile_patches.is_some())
+        > 1
+    {
         return Err(Error::InvalidInput(
-            "select either Replace patches or source Add patches".into(),
+            "select only one of component Replace, tile Replace, or source Add patches".into(),
         ));
     }
     options.passes.validate()?;
@@ -257,7 +274,7 @@ pub(crate) fn validate_frame_references(
     mut available: [Option<bool>; 4],
 ) -> Result<[Option<bool>; 4]> {
     settings.validate_geometry(canvas, image, last)?;
-    let patches = options.patches.is_some() || options.source_patches.is_some();
+    let patches = options.has_patches();
     if !settings.reference_only {
         for blend in std::iter::once(settings.blend)
             .chain((0..canvas.metadata.extra_channels.len()).map(|e| settings.extra(e)))
@@ -411,7 +428,7 @@ fn validate_logical_frame(
     frame
         .options
         .validate_geometry(canvas.geometry(), frame.image.into(), last)?;
-    if (options.patches.is_some() || options.source_patches.is_some())
+    if options.has_patches()
         && (frame.options.save_as_reference == 3
             || std::iter::once(frame.options.blend)
                 .chain(
@@ -435,6 +452,23 @@ fn prepare_patch_plan(image: &Image, options: &EncodeOptions) -> Result<Option<P
         crate::patch_frame::prepare_source(image, config)
     } else if let Some(patches) = &options.patches {
         crate::patch_frame::prepare(image, patches)
+    } else if let Some(tiles) = &options.tile_patches {
+        let mut tiles = tiles.clone();
+        if !tiles.force
+            && crate::modular::orchestration::groupwise_decision(
+                image,
+                &options.modular,
+                options.group_size_shift,
+                &options.passes,
+                options.responsive,
+                false,
+            )? == crate::modular::orchestration::GroupwiseDecision::FrameAreas
+        {
+            tiles.min_estimated_savings = tiles
+                .min_estimated_savings
+                .max(tiles.full_frame_min_estimated_savings);
+        }
+        crate::patch_frame::prepare_tiles(image, &tiles)
     } else {
         Ok(None)
     }
@@ -471,6 +505,7 @@ fn encode_logical_frame_from_plan(
             }
         }
         atlas_options.patches = None;
+        atlas_options.tile_patches = None;
         atlas_options.source_patches = None;
         atlas_options.source_patch_reference = None;
         stream.extend(complete_or_return!(encode_frame_trial(

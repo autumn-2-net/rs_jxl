@@ -15,10 +15,11 @@
 //! extras with color; other extras pass through with None and native sampling.
 //! No int8 quantization, float tolerances, background-relative Add patches,
 //! alpha blending, alpha cleanup, or omission of invisible RGB is performed.
-//! This finds repeated component rectangles, not arbitrary tiled textures.
+//! discover() finds component rectangles. The independent discover_tiles()
+//! experiment finds exact non-overlapping grid tiles; see patch_tiles.rs.
 //! Lossy/XYB discovery, approximate grouping, dots, general blend arithmetic,
-//! parallel detection, encoder reference-frame serialization, and frame-size
-//! cost trials remain unported. A discovered plan is not a size-win guarantee.
+//! and parallel detection are outside this detector. Reference-frame writing
+//! lives in patch_frame/encode. A discovered plan is not a size-win guarantee.
 //!
 //! The source's JXL_LOSSLESS_PATCH_FAST path is used unconditionally: no-seed
 //! early exit, bulk seed marking, 3x3 interior-seed pruning, boundary-only BFS,
@@ -70,6 +71,10 @@ use std::collections::{BTreeMap, VecDeque};
 
 use super::lz77::Literal;
 use crate::{Error, Result};
+
+#[path = "patch_tiles.rs"]
+mod tiles;
+pub use tiles::{TilePatchOptions, TilePatchReceipt, TilePatchStats, discover_tiles};
 
 #[path = "patch_source.rs"]
 mod source;
@@ -873,6 +878,14 @@ pub fn discover(image: ImageView<'_>, options: &PatchOptions) -> Result<Option<P
     let Some((width, height, atlas_positions)) = pack(&info, options.max_reference_pixels)? else {
         return Ok(None);
     };
+    build_plan(image, &info, (width, height, atlas_positions)).map(Some)
+}
+
+fn build_plan(
+    image: ImageView<'_>,
+    info: &[PatchInfo],
+    (width, height, atlas_positions): AtlasPacking,
+) -> Result<PatchPlan> {
     let mut reference = ReferenceImage {
         width,
         height,
@@ -923,11 +936,11 @@ pub fn discover(image: ImageView<'_>, options: &PatchOptions) -> Result<Option<P
         }
     }
     let residual = subtract(image, reference.view(), &dictionary)?;
-    Ok(Some(PatchPlan {
+    Ok(PatchPlan {
         reference,
         dictionary,
         residual,
-    }))
+    })
 }
 
 #[cfg(test)]

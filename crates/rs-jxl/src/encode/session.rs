@@ -32,13 +32,7 @@ impl<'a> PixelSession<'a> {
         }
         // A configured detector is not a dictionary. Only a real patch plan
         // requires the existing reference-frame encoder; never disable patches.
-        let patches = if let Some(config) = &options.source_patches {
-            crate::patch_frame::prepare_source(image, config)?
-        } else if let Some(config) = &options.patches {
-            crate::patch_frame::prepare(image, config)?
-        } else {
-            None
-        };
+        let patches = prepare_patch_plan(image, options)?;
         if patches.is_some() {
             return Ok(None);
         }

@@ -286,7 +286,7 @@ impl<W: Write + Seek> FrameEncoder<W> {
             bounded.group_size_shift,
             &bounded.passes,
             bounded.responsive,
-            bounded.patches.is_some() || bounded.source_patches.is_some(),
+            bounded.has_patches(),
         )?;
         let area = if decision == GroupwiseDecision::FrameAreas {
             Some(AreaFrame::new(

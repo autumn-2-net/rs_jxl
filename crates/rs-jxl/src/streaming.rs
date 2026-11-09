@@ -42,7 +42,7 @@ pub fn encode_indexed_frames_streaming_to(
     output: impl Write,
 ) -> Result<()> {
     crate::encode::validate_frames(canvas, frames, options)?;
-    if options.patches.is_some() || options.source_patches.is_some() {
+    if options.has_patches() {
         return Err(Error::InvalidInput(
             "indexed output does not support generated patch reference frames".into(),
         ));

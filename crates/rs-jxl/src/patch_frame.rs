@@ -21,6 +21,31 @@ pub(crate) fn prepare(
     options: &patches::PatchOptions,
 ) -> Result<Option<(Image, Image, patches::PatchDictionary)>> {
     options.validate()?;
+    prepare_replace(image, |view| patches::discover(view, options))
+}
+
+pub(crate) fn prepare_tiles(
+    image: &Image,
+    options: &patches::TilePatchOptions,
+) -> Result<Option<(Image, Image, patches::PatchDictionary)>> {
+    options.validate()?;
+    let mut options = options.clone();
+    options.max_positions = options.position_budget(
+        (image.width() as usize)
+            .checked_mul(image.height() as usize)
+            .ok_or(crate::Error::Limit("tile patch image pixels"))?,
+        image.metadata().extra_channels.len(),
+    )?;
+    if options.max_positions < options.min_occurrences {
+        return Ok(None);
+    }
+    prepare_replace(image, |view| patches::discover_tiles(view, &options))
+}
+
+fn prepare_replace(
+    image: &Image,
+    discover: impl FnOnce(patches::ImageView<'_>) -> Result<Option<patches::PatchPlan>>,
+) -> Result<Option<(Image, Image, patches::PatchDictionary)>> {
     if image.metadata().bit_depth.is_float() || !(1..=16).contains(&image.bits()) {
         return Ok(None);
     }
@@ -45,16 +70,13 @@ pub(crate) fn prepare(
         .map(|&c| image.channel_depth(c).bits_per_sample)
         .max()
         .expect("nonempty color channels");
-    let Some(plan) = patches::discover(
-        patches::ImageView {
-            width: image.width() as usize,
-            height: image.height() as usize,
-            bit_depth: u32::from(bit_depth),
-            color_channels,
-            planes: &planes,
-        },
-        options,
-    )?
+    let Some(plan) = discover(patches::ImageView {
+        width: image.width() as usize,
+        height: image.height() as usize,
+        bit_depth: u32::from(bit_depth),
+        color_channels,
+        planes: &planes,
+    })?
     else {
         return Ok(None);
     };

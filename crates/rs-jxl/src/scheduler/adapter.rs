@@ -414,6 +414,7 @@ fn project_native_metadata(
     // The source non-XYB fast detector's On/Default routes both require seeds.
     // Legacy Replace patches are never a substitute for source Add patches.
     options.patches = None;
+    options.tile_patches = None;
     options.source_patches = None;
     if params.patches != Override::Off
         && crate::tools::patches::source_enabled(
