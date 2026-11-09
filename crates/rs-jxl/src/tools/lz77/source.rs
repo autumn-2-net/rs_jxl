@@ -80,6 +80,7 @@ mod suffix;
 pub use suffix::SourceSuffixMode;
 mod chain_batch;
 mod distances;
+pub(super) mod extension_receipt;
 mod histograms;
 mod prices;
 mod profile;
@@ -270,6 +271,12 @@ pub enum SourceFastPrefix {
 #[derive(Clone, Debug)]
 pub struct SourceConfig {
     pub method: SourceLz77Method,
+    /// Opt-in exact extension kernel; does not change candidates or wire semantics.
+    pub match_extension: super::MatchExtension,
+    /// Compare independent fast-ring/spatial candidates four at a time.
+    pub batch_fast_matches: bool,
+    /// Optional counters, aggregated when each matcher is dropped.
+    pub match_extension_receipt: Option<std::sync::Arc<extension_receipt::MatchExtensionReceipt>>,
     /// Only Optc256 uses the source's nominated short32/long8 bucket override.
     pub bucket_matcher: bool,
     /// Optc256-only override. Range modes use chains regardless of this setting.
@@ -510,6 +517,23 @@ impl SourceConfig {
             .unwrap_or(if self.force_huffman { 512 } else { 224 })
     }
     fn validate(&self) -> Result<()> {
+        self.match_extension.validate()?;
+        if self.batch_fast_matches && self.match_extension == super::MatchExtension::Legacy {
+            return Err(Error::InvalidInput(
+                "batched matches require an explicit extension kernel".into(),
+            ));
+        }
+        if self.match_extension != super::MatchExtension::Legacy
+            && (self.bucket_route().enabled
+                || self.index_mode != SourceIndexMode::Disabled
+                || self.suffix_mode != SourceSuffixMode::Disabled
+                || self.chain_batch
+                || self.shared_index)
+        {
+            return Err(Error::InvalidInput(
+                "match extension experiment supports fast rings and mutable chains only".into(),
+            ));
+        }
         if !(1..=8).contains(&self.block_grain)
             || matches!(self.seed_blocks, SourceSeedBlocks::Warm { history } if history == 0 || history > 1 << 20)
         {
@@ -548,6 +572,9 @@ impl Default for SourceConfig {
     fn default() -> Self {
         Self {
             method: SourceLz77Method::Lz77b3w3t,
+            match_extension: super::MatchExtension::Legacy,
+            batch_fast_matches: false,
+            match_extension_receipt: None,
             bucket_matcher: false,
             bucket_mode: SourceBucketMode::Default,
             bucket_selection: None,
@@ -909,6 +936,8 @@ fn careful_stream(
     let _profile = crate::profile::scope("lz77.source.careful_seed");
     let init_profile = crate::profile::scope("lz77.source.seed_matcher_init");
     let mut matcher = Chain::new(values, width, 256, config.max_match_length)?;
+    #[cfg(feature = "experimental-lz77")]
+    matcher.configure_extension(config)?;
     drop(init_profile);
     let mut output = reserved(input.len())?;
     let mut position = 0;

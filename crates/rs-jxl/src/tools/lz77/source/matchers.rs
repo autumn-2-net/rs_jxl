@@ -21,6 +21,8 @@ use super::{
 };
 use crate::{Error, Result};
 
+#[cfg(any(feature = "experimental-lz77", test))]
+mod fast_extension;
 mod seed_profile;
 
 pub(super) fn hash(values: &[u32], position: usize) -> u32 {
@@ -159,6 +161,8 @@ pub(super) struct Fast<'a, const N: usize> {
     ranges: bool,
     fast_ranges: SourceFastRanges,
     diagnostics: seed_profile::Profile,
+    #[cfg(feature = "experimental-lz77")]
+    extension: Option<fast_extension::FastExtension>,
 }
 
 impl<'a, const N: usize> Fast<'a, N> {
@@ -215,6 +219,8 @@ impl<'a, const N: usize> Fast<'a, N> {
             ranges: config.range_search,
             fast_ranges: config.fast_ranges,
             diagnostics: seed_profile::Profile::new(values.len(), width, N),
+            #[cfg(feature = "experimental-lz77")]
+            extension: fast_extension::FastExtension::new(config)?,
         })
     }
 
@@ -302,23 +308,25 @@ impl<'a, const N: usize> Fast<'a, N> {
             self.diagnostics.spatial_filter(&mut clock);
         }
         let limit = self.maximum.min(self.values.len() - position);
-        for &(distance, symbol) in &candidates[..count] {
-            consider_fast_match(
+        #[cfg(feature = "experimental-lz77")]
+        let spatial_extended = if let Some(extension) = &mut self.extension {
+            extension.find(
                 self.values,
                 position,
                 limit,
-                distance,
-                self.fast_ranges,
                 &mut best,
-                || symbol,
+                candidates[..count]
+                    .iter()
+                    .map(|&(distance, symbol)| (distance, move || symbol)),
             );
-        }
-        if SAMPLE {
-            self.diagnostics.spatial_matches(&mut clock);
-        }
-        for &previous in &ring.positions[..ring.size as usize] {
-            let distance = position - previous as usize;
-            if distance <= WINDOW_SIZE {
+            true
+        } else {
+            false
+        };
+        #[cfg(not(feature = "experimental-lz77"))]
+        let spatial_extended = false;
+        if !spatial_extended {
+            for &(distance, symbol) in &candidates[..count] {
                 consider_fast_match(
                     self.values,
                     position,
@@ -326,8 +334,42 @@ impl<'a, const N: usize> Fast<'a, N> {
                     distance,
                     self.fast_ranges,
                     &mut best,
-                    || self.codes.symbol(distance),
+                    || symbol,
                 );
+            }
+        }
+        if SAMPLE {
+            self.diagnostics.spatial_matches(&mut clock);
+        }
+        #[cfg(feature = "experimental-lz77")]
+        let ring_extended = if let Some(extension) = &mut self.extension {
+            let codes = &self.codes;
+            let candidates = ring.positions[..ring.size as usize]
+                .iter()
+                .map(|&previous| position - previous as usize)
+                .filter(|&distance| distance <= WINDOW_SIZE)
+                .map(|distance| (distance, move || codes.symbol(distance)));
+            extension.find(self.values, position, limit, &mut best, candidates);
+            true
+        } else {
+            false
+        };
+        #[cfg(not(feature = "experimental-lz77"))]
+        let ring_extended = false;
+        if !ring_extended {
+            for &previous in &ring.positions[..ring.size as usize] {
+                let distance = position - previous as usize;
+                if distance <= WINDOW_SIZE {
+                    consider_fast_match(
+                        self.values,
+                        position,
+                        limit,
+                        distance,
+                        self.fast_ranges,
+                        &mut best,
+                        || self.codes.symbol(distance),
+                    );
+                }
             }
         }
         if SAMPLE {
@@ -388,6 +430,11 @@ pub(super) struct Chain<'a> {
 }
 
 impl<'a> Chain<'a> {
+    #[cfg(feature = "experimental-lz77")]
+    pub(super) fn configure_extension(&mut self, config: &SourceConfig) -> Result<()> {
+        self.cache.configure_extension(config)
+    }
+
     pub(super) fn new(
         values: &'a [u32],
         width: usize,
@@ -964,6 +1011,8 @@ impl<'a> Optimal<'a> {
             if !config.match_cost.range() && cached {
                 chain.cache = MatchCache::new(chain.window)?;
             }
+            #[cfg(feature = "experimental-lz77")]
+            chain.configure_extension(config)?;
             Ok(Self::Chain(chain))
         }
     }

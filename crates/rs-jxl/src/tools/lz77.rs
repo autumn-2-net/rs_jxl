@@ -63,10 +63,13 @@ use super::lz77_prefix::{
 };
 
 mod dp;
+mod extension;
 pub mod policy;
 mod source;
 
+pub use extension::MatchExtension;
 pub use policy::{SourceLz77Method, source_config, source_options};
+pub use source::extension_receipt::{MatchExtensionReceipt, MatchExtensionSnapshot};
 pub use source::{
     SourceBlockDyadic, SourceBlockEnvelope, SourceBlockMode, SourceBucketMode,
     SourceBucketSelection, SourceChainCache, SourceConfig, SourceDeepPrefix, SourceFastPrefix,

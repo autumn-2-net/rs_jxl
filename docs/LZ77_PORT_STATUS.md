@@ -1,5 +1,8 @@
 # Pixel-Lossless LZ77 Port Status
 
+Latest opt-in kernel experiment:
+[Exact LZ77 extension (2026-11-09)](LZ77_EXTENSION_EXPERIMENT_20261109.md).
+
 Source-file references below follow the 2026-10-29 `tools/lz77/` layout (paths
 are relative to `crates/rs-jxl/src/tools/`). This path update does not rerun or
 change the dated experimental results.

@@ -45,6 +45,90 @@ fn replay(input: &[Literal], commands: &[Command], width: usize) {
 }
 
 #[test]
+#[cfg(feature = "experimental-lz77")]
+fn explicit_extension_routes_replay_original_tokens() {
+    use super::super::{MatchExtension, MatchExtensionReceipt};
+    let mut values = Vec::new();
+    for block in 0..40u32 {
+        values.extend((0..23).map(|n| (n * n + block % 3) % 29));
+        values.extend(std::iter::repeat_n(65535, 9 + block as usize % 31));
+    }
+    let input = tokens(&values);
+    for mode in [
+        MatchExtension::Scalar,
+        MatchExtension::Avx2,
+        MatchExtension::Avx512,
+    ] {
+        if super::super::extension::Extension::new(mode).is_err() {
+            continue;
+        }
+        for method in [
+            SourceLz77Method::Lz77b3w3t,
+            SourceLz77Method::Lz77b15w3t,
+            SourceLz77Method::Optc8,
+            SourceLz77Method::Optc256,
+        ] {
+            for batch in [false, true] {
+                let receipt = std::sync::Arc::new(MatchExtensionReceipt::default());
+                let config = SourceConfig {
+                    method,
+                    match_extension: mode,
+                    batch_fast_matches: batch,
+                    match_extension_receipt: Some(receipt.clone()),
+                    require_global_savings: false,
+                    ..Default::default()
+                };
+                let result = parse_source_with_state(&input, 23, &config).unwrap();
+                replay(&input, &result.commands, 23);
+                let snapshot = receipt.snapshot();
+                assert!(snapshot.extensions > 0, "{mode:?} {method:?}");
+                assert!(snapshot.fast_matchers + snapshot.chain_matchers > 0);
+                if !batch {
+                    assert_eq!(snapshot.batch_groups, 0);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn extension_experiment_rejects_inactive_route_combinations() {
+    use super::super::MatchExtension;
+    let config = SourceConfig {
+        match_extension: MatchExtension::Scalar,
+        ..Default::default()
+    };
+    for invalid in [
+        SourceConfig {
+            chain_batch: true,
+            ..config.clone()
+        },
+        SourceConfig {
+            bucket_matcher: true,
+            ..config.clone()
+        },
+        SourceConfig {
+            index_mode: SourceIndexMode::All,
+            ..config.clone()
+        },
+        SourceConfig {
+            suffix_mode: SourceSuffixMode::SlidingLcp,
+            ..config.clone()
+        },
+        SourceConfig {
+            shared_index: true,
+            ..config.clone()
+        },
+        SourceConfig {
+            batch_fast_matches: true,
+            ..Default::default()
+        },
+    ] {
+        assert!(parse_source(&[], 0, &invalid).is_err());
+    }
+}
+
+#[test]
 fn source_state_rejection_and_compatibility_wrappers() {
     for method in [
         SourceLz77Method::Lz77b1w3t,

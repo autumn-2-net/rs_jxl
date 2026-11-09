@@ -6,6 +6,7 @@ rust-version.workspace = true
 publish.workspace = true
 
 [features]
+experimental-lz77 = []
 decoder-avx512 = ["jxl-decoder/avx512"]
 decoder-profile = ["jxl-decoder/decoder-profile"]
 

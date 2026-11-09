@@ -1,0 +1,282 @@
+use super::*;
+use crate::modular::predictor::Predictor;
+use crate::modular::tree::Node;
+use std::cell::Cell;
+
+fn tree() -> Tree {
+    Tree::new(vec![Node::Leaf {
+        predictor: Predictor::Gradient,
+        offset: 0,
+        multiplier: 1,
+    }])
+    .unwrap()
+}
+
+#[test]
+fn exact_entropy_trial_reuses_tokens_and_only_charges_winning_header() {
+    for values in [
+        vec![0; 2000],
+        (0..3000).map(|i| (i * 73 % 39) as u32).collect(),
+    ] {
+        let streams = vec![values.into_iter().map(|v| Token::literal(0, v)).collect()];
+        let calls = Cell::new(0);
+        let receipt = Arc::new(Receipt::default());
+        let costs = Arc::new(encode::receipt_cost::ModelCostReceipt::default());
+        let options = encode::ModularOptions {
+            entropy: Coding::Source,
+            lz77: false,
+            refinement: Options {
+                entropy: true,
+                receipt: Some(receipt.clone()),
+                ..Default::default()
+            },
+            model_cost_receipt: Some(costs.clone()),
+            ..Default::default()
+        };
+        let serialize = |tree: &Tree,
+                         model: &Model,
+                         streams: &[Vec<Token>],
+                         options: &encode::ModularOptions| {
+            let mut writer = BitWriter::new(1 << 20);
+            encode::write_tree_and_model(tree, model, &mut writer, options)?;
+            model.write_stream(&streams[0], &mut writer)?;
+            Ok((
+                writer.bits_written(),
+                (writer.bits_written(), model.uses_ans()),
+            ))
+        };
+        let (bits, ans) = choose(
+            &tree(),
+            &[],
+            &options,
+            |_| {
+                calls.set(calls.get() + 1);
+                Ok((streams.clone(), false))
+            },
+            serialize,
+        )
+        .unwrap();
+        let mut raw_options = options.clone();
+        raw_options.model_cost_receipt = None;
+        let source =
+            Model::build_with_options(&streams, 1, false, Coding::Source, &options.entropy_options)
+                .unwrap();
+        let alternate = Model::build_with_options(
+            &streams,
+            1,
+            false,
+            if source.uses_ans() {
+                Coding::Prefix
+            } else {
+                Coding::Ans
+            },
+            &options.entropy_options,
+        )
+        .unwrap();
+        let original = serialize(&tree(), &source, &streams, &raw_options)
+            .unwrap()
+            .0;
+        let other = serialize(&tree(), &alternate, &streams, &raw_options)
+            .unwrap()
+            .0;
+        assert_eq!(bits, original.min(other));
+        assert_eq!(calls.get(), 1);
+        assert_eq!(receipt.snapshot().models, 2);
+        assert_eq!(receipt.snapshot().saved_bits, original - bits);
+        let selected = if ans == source.uses_ans() {
+            source
+        } else {
+            alternate
+        };
+        let mut header = BitWriter::new(1 << 20);
+        encode::write_tree_and_model(&tree(), &selected, &mut header, &raw_options).unwrap();
+        assert_eq!(costs.bits(), header.bits_written());
+    }
+}
+
+#[test]
+fn ties_retain_baseline_and_do_not_claim_a_win() {
+    let receipt = Arc::new(Receipt::default());
+    let options = encode::ModularOptions {
+        refinement: Options {
+            entropy: true,
+            receipt: Some(receipt.clone()),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let streams = vec![vec![Token::literal(0, 0); 1000]];
+    let base = Model::build_with_options(
+        &streams,
+        1,
+        false,
+        options.entropy,
+        &options.entropy_options,
+    )
+    .unwrap();
+    let selected = choose(
+        &tree(),
+        &[],
+        &options,
+        |_| Ok((streams.clone(), false)),
+        |_, model, _, _| Ok((100, model.uses_ans())),
+    )
+    .unwrap();
+    assert_eq!(selected, base.uses_ans());
+    assert_eq!(receipt.snapshot().entropy_wins, 0);
+    assert_eq!(receipt.snapshot().saved_bits, 0);
+}
+
+#[test]
+fn oversized_optional_output_keeps_baseline_but_allocation_errors_propagate() {
+    use crate::bit_writer::BitWriterError;
+    for error in [BitWriterError::SizeLimit, BitWriterError::Allocation] {
+        let options = encode::ModularOptions {
+            refinement: Options {
+                entropy: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let calls = Cell::new(0);
+        let result = choose(
+            &tree(),
+            &[],
+            &options,
+            |_| Ok((vec![vec![Token::literal(0, 0); 100]], false)),
+            |_, _, _, _| {
+                calls.set(calls.get() + 1);
+                if calls.get() == 1 {
+                    Ok((8, 19))
+                } else {
+                    Err(error.into())
+                }
+            },
+        );
+        if error == BitWriterError::SizeLimit {
+            assert_eq!(result.unwrap(), 19);
+        } else {
+            assert!(result.is_err());
+        }
+    }
+}
+
+#[test]
+fn refit_obeys_source_predictor_policy_and_rejects_larger_actual_output() {
+    use crate::modular::group::Channel;
+    use crate::modular::sample::{SamplingPolicy, SourcePolicy, TreeMode};
+    let planes = vec![Channel {
+        width: 64,
+        height: 32,
+        hshift: 0,
+        vshift: 0,
+        samples: (0..2048).map(|i| (i % 64) * 13 + (i / 64) * 7).collect(),
+    }];
+    let views = [training::TrainingStream {
+        channels: &planes,
+        wp: weighted::Header::default(),
+        stream_id: 0,
+    }];
+    let original = Tree::new(vec![Node::Leaf {
+        predictor: Predictor::Zero,
+        offset: 0,
+        multiplier: 1,
+    }])
+    .unwrap();
+    for (mode, permitted) in [
+        (TreeMode::WeightedOnly, Predictor::Weighted),
+        (TreeMode::NoWeighted, Predictor::Gradient),
+    ] {
+        for proposal_cost in [80, 120] {
+            let receipt = Arc::new(Receipt::default());
+            let options = encode::ModularOptions {
+                predictor: Predictor::Best,
+                sampling: Some(
+                    SamplingPolicy::from_source(&SourcePolicy {
+                        tree_mode: mode,
+                        ..Default::default()
+                    })
+                    .unwrap(),
+                ),
+                refinement: Options {
+                    leaves: true,
+                    receipt: Some(receipt.clone()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let selected = choose(
+                &original,
+                &views,
+                &options,
+                |_| Ok((vec![vec![Token::literal(0, 0); 100]], false)),
+                |tree, _, _, _| {
+                    let predictor = tree.predictors()[0];
+                    if predictor != Predictor::Zero {
+                        assert_eq!(predictor, permitted);
+                    }
+                    Ok((
+                        if predictor == Predictor::Zero {
+                            100
+                        } else {
+                            proposal_cost
+                        },
+                        predictor,
+                    ))
+                },
+            )
+            .unwrap();
+            assert_eq!(receipt.snapshot().refit_proposals, 1);
+            assert_eq!(
+                selected,
+                if proposal_cost < 100 {
+                    permitted
+                } else {
+                    Predictor::Zero
+                }
+            );
+            assert_eq!(
+                receipt.snapshot().refit_wins,
+                usize::from(proposal_cost < 100)
+            );
+        }
+    }
+}
+
+#[test]
+fn unaligned_local_trials_preserve_prefix_and_have_no_larger_payload() {
+    use crate::modular::group::Channel;
+    let planes = vec![Channel {
+        width: 32,
+        height: 16,
+        hshift: 0,
+        vshift: 0,
+        samples: (0..512).map(|i| i * 37 % 256).collect(),
+    }];
+    let wp = weighted::Header::default();
+    let mut options = encode::ModularOptions {
+        lz77: false,
+        ..Default::default()
+    };
+    let (tokens, lz77) = encode::group_stream(&planes, &tree(), &options, &wp, 0).unwrap();
+    let streams = [tokens];
+    let model =
+        Model::build_with_options(&streams, 1, lz77, options.entropy, &options.entropy_options)
+            .unwrap();
+    for prefix in 0..8 {
+        let mut base = BitWriter::new(1 << 20);
+        base.write(prefix, (1 << prefix) - 1).unwrap();
+        encode::write_tree_and_model(&tree(), &model, &mut base, &options).unwrap();
+        model.write_stream(&streams[0], &mut base).unwrap();
+        let mut refined = BitWriter::new(1 << 20);
+        refined.write(prefix, (1 << prefix) - 1).unwrap();
+        options.refinement.entropy = true;
+        write_local(&tree(), &planes, &wp, 0, &options, &mut refined).unwrap();
+        assert!(refined.bits_written() <= base.bits_written());
+        refined.zero_pad_to_byte().unwrap();
+        assert_eq!(
+            refined.bytes().unwrap()[0] & ((1 << prefix) - 1),
+            (1 << prefix) - 1
+        );
+    }
+}

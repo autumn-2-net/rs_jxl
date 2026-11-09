@@ -52,6 +52,8 @@ pub struct ModularOptions {
     pub ma_max_leaves: Option<usize>,
     pub split_threshold: f64,
     pub entropy: Coding,
+    /// Explicit post-training experiments; never enabled by effort alone.
+    pub refinement: super::refinement::Options,
     pub lz77: bool,
     pub lz77_mode: lz77::Lz77Mode,
     /// Exact palette limit; None disables palette analysis.
@@ -138,6 +140,7 @@ impl Default for ModularOptions {
             ma_max_leaves: None,
             split_threshold: 48.0,
             entropy: Coding::Auto,
+            refinement: Default::default(),
             lz77: true,
             lz77_mode: lz77::Lz77Mode::Lazy,
             palette_colors: None,
@@ -917,6 +920,10 @@ pub(crate) fn write_prepared_stream(
     // returns immediately after GroupHeader when every channel is empty.
     if planes.iter().any(|p| p.width != 0 && p.height != 0) {
         let tree = learn(planes, options, &wp, stream_id, bits)?;
+        if options.refinement.enabled() {
+            super::refinement::write_local(&tree, planes, &wp, stream_id, options, writer)?;
+            return Ok(());
+        }
         let (tokens, has_matches) = group_stream(planes, &tree, options, &wp, stream_id)?;
         let streams = [tokens];
         let model = Model::build_with_options(

@@ -32,7 +32,7 @@ impl ModelCostReceipt {
         self.entropy_header_bits.load(Ordering::Relaxed)
     }
 
-    pub(super) fn record(&self, tree_bits: usize, entropy_header_bits: usize) {
+    pub(in crate::modular) fn record(&self, tree_bits: usize, entropy_header_bits: usize) {
         self.tree_bits.fetch_add(tree_bits, Ordering::Relaxed);
         self.entropy_header_bits
             .fetch_add(entropy_header_bits, Ordering::Relaxed);

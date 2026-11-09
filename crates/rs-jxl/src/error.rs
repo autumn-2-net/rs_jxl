@@ -27,7 +27,8 @@ impl From<crate::bit_writer::BitWriterError> for Error {
     fn from(e: crate::bit_writer::BitWriterError) -> Self {
         use crate::bit_writer::BitWriterError as B;
         match e {
-            B::SizeLimit | B::Allocation => Self::Limit("encoded output allocation"),
+            B::SizeLimit => Self::Limit("encoded output size"),
+            B::Allocation => Self::Limit("encoded output allocation"),
             _ => Self::Encoding(e.to_string()),
         }
     }

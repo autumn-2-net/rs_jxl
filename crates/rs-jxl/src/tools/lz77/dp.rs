@@ -194,6 +194,10 @@ pub(super) struct MatchCache {
     // A verified interval at physical distance d stays valid at every later
     // origin inside that interval. Include the decoder's exact window limit.
     ends: Vec<usize>,
+    #[cfg(feature = "experimental-lz77")]
+    extension: Option<super::extension::Extension>,
+    #[cfg(feature = "experimental-lz77")]
+    receipt: super::source::extension_receipt::LocalReceipt,
     #[cfg(test)]
     compared_values: usize,
 }
@@ -202,6 +206,10 @@ impl MatchCache {
     pub(super) fn uncached() -> Self {
         Self {
             ends: Vec::new(),
+            #[cfg(feature = "experimental-lz77")]
+            extension: None,
+            #[cfg(feature = "experimental-lz77")]
+            receipt: Default::default(),
             #[cfg(test)]
             compared_values: 0,
         }
@@ -212,9 +220,25 @@ impl MatchCache {
         ends.resize(window + 1, 0);
         Ok(Self {
             ends,
+            #[cfg(feature = "experimental-lz77")]
+            extension: None,
+            #[cfg(feature = "experimental-lz77")]
+            receipt: Default::default(),
             #[cfg(test)]
             compared_values: 0,
         })
+    }
+
+    #[cfg(feature = "experimental-lz77")]
+    pub(super) fn configure_extension(&mut self, config: &super::SourceConfig) -> Result<()> {
+        self.extension = super::extension::Extension::new(config.match_extension)?;
+        if self.extension.is_some() {
+            self.receipt = super::source::extension_receipt::LocalReceipt::new(
+                config.match_extension_receipt.clone(),
+                true,
+            );
+        }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -249,6 +273,22 @@ impl MatchCache {
             .saturating_sub(position)
             .max(prefix)
             .min(limit);
+        #[cfg(feature = "experimental-lz77")]
+        if let Some(extension) = self.extension {
+            // A verified cache/prefix can already cover the whole request.
+            // Avoid entering an ISA-specific function for an empty suffix.
+            if length < limit {
+                self.receipt.extend(1, false);
+                length += extension.length_u32(
+                    &values[position + length..position + limit],
+                    &values[previous + length..previous + limit],
+                );
+            }
+            if let Some(end) = self.ends.get_mut(distance) {
+                *end = (*end).max(position + length);
+            }
+            return length;
+        }
         // LZ77MatchLength's eight-value block comparison, using safe slices.
         while limit - length >= 8 {
             #[cfg(test)]

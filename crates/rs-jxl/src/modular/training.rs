@@ -399,7 +399,10 @@ fn gather_legacy(
 
 /// TreeSamples::SetPredictor. GradientOnly by itself restricts properties;
 /// enc_modular.cc's decoding tier independently supplies predictor_override.
-fn source_predictors(mode: Predictor, policy: &SamplingPolicy) -> Result<Vec<Predictor>> {
+pub(super) fn source_predictors(
+    mode: Predictor,
+    policy: &SamplingPolicy,
+) -> Result<Vec<Predictor>> {
     if policy.tree_mode == TreeMode::WeightedOnly {
         return Ok(vec![Predictor::Weighted]);
     }

@@ -295,6 +295,12 @@ pub(crate) fn toc_size(sizes: &[usize]) -> Result<usize> {
     toc_size_with_first(first, rest)
 }
 
+/// Unpadded size-entry bits, so callers can compare a subset of sections
+/// without inventing alignment for unchanged entries elsewhere in the TOC.
+pub(crate) fn size_entry_bits(size: usize) -> Result<usize> {
+    Ok(SIZE_BITS[bucket(size)?])
+}
+
 fn toc_size_with_first(first: usize, rest: &[usize]) -> Result<usize> {
     let mut bits = SIZE_BITS[bucket(first)?];
     for &size in rest {

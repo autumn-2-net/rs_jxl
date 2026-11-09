@@ -95,6 +95,64 @@ pub(super) fn encode_prepared_shared_borrowed_trial(
     } else {
         training::learn(&views, options)?
     };
+    if options.refinement.enabled() {
+        let (global, encoded) = super::refinement::choose(
+            &tree,
+            &views,
+            options,
+            |tree| shared_streams(&prepared, tree, options),
+            |tree, model, streams, scratch| {
+                let output = write_shared(
+                    single, &prepared, tree, model, streams, scratch, limit, patches, None,
+                )?
+                .into_complete()?;
+                // Omitted/empty TOC entries are constant across trials. Compare
+                // unpadded entry bits so their final alignment cannot reverse
+                // a win. A collapsed frame has only one nonempty stream.
+                let cost = std::iter::once(&output.0).chain(&output.1).try_fold(
+                    0usize,
+                    |sum, bytes| {
+                        let entry = crate::streaming::size_entry_bits(bytes.len())?;
+                        bytes
+                            .len()
+                            .checked_mul(8)
+                            .and_then(|n| n.checked_add(entry))
+                            .and_then(|n| sum.checked_add(n))
+                            .ok_or(crate::Error::Limit("refinement section bits"))
+                    },
+                )?;
+                Ok((cost, output))
+            },
+        )?;
+        if single {
+            return Ok(TrialEncode::Complete((global, encoded)));
+        }
+        // Only the selected final sections charge the caller's pruning budget.
+        let global = complete_or_return!(budget::section(budget, || Ok(global)));
+        let mut selected = Vec::with_capacity(encoded.len());
+        for bytes in encoded {
+            selected.push(complete_or_return!(budget::section(budget, || Ok(bytes))));
+        }
+        return Ok(TrialEncode::Complete((global, selected)));
+    }
+    let (streams, lz77) = shared_streams(&prepared, &tree, options)?;
+    let model = Model::build_with_options(
+        &streams,
+        tree.leaves() + usize::from(lz77),
+        lz77,
+        options.entropy,
+        &options.entropy_options,
+    )?;
+    write_shared(
+        single, &prepared, &tree, &model, &streams, options, limit, patches, budget,
+    )
+}
+
+fn shared_streams(
+    prepared: &[&Prepared],
+    tree: &super::tree::Tree,
+    options: &ModularOptions,
+) -> Result<(Vec<Vec<crate::entropy::stream::Token>>, bool)> {
     let parallel_channels =
         super::tokens::shared_channel_parallel(prepared.iter().copied(), options.parallel_tokens)?;
     let streams = if options.lz77
@@ -103,7 +161,7 @@ pub(super) fn encode_prepared_shared_borrowed_trial(
         let tokenize = |g: &Prepared| {
             super::tokens::tokenize(
                 &g.planes,
-                &tree,
+                tree,
                 &g.wp,
                 options.previous_channels,
                 g.stream_id,
@@ -116,7 +174,7 @@ pub(super) fn encode_prepared_shared_borrowed_trial(
                 .map(|g| tokenize(g))
                 .collect::<Result<Vec<_>>>()?
         } else {
-            execution::try_map(&prepared, |_, g| tokenize(g))?
+            execution::try_map(prepared, |_, g| tokenize(g))?
         };
         let inputs: Vec<_> = raw.iter().map(Vec::as_slice).collect();
         let widths: Vec<_> = prepared
@@ -140,7 +198,7 @@ pub(super) fn encode_prepared_shared_borrowed_trial(
         let encode = |g: &Prepared| {
             encode::group_stream_with_channels(
                 &g.planes,
-                &tree,
+                tree,
                 options,
                 &g.wp,
                 g.stream_id,
@@ -153,24 +211,32 @@ pub(super) fn encode_prepared_shared_borrowed_trial(
                 .map(|g| encode(g))
                 .collect::<Result<Vec<_>>>()?
         } else {
-            execution::try_map(&prepared, |_, g| encode(g))?
+            execution::try_map(prepared, |_, g| encode(g))?
         }
     };
     let lz77 = streams.iter().any(|s| s.1);
     let streams: Vec<_> = streams.into_iter().map(|s| s.0).collect();
-    let model = Model::build_with_options(
-        &streams,
-        tree.leaves() + usize::from(lz77),
-        lz77,
-        options.entropy,
-        &options.entropy_options,
-    )?;
+    Ok((streams, lz77))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_shared(
+    single: bool,
+    prepared: &[&Prepared],
+    tree: &super::tree::Tree,
+    model: &Model,
+    streams: &[Vec<crate::entropy::stream::Token>],
+    options: &ModularOptions,
+    limit: usize,
+    patches: Option<&crate::tools::patches::PatchDictionary>,
+    budget: Option<&SectionBudget>,
+) -> Result<TrialEncode<EncodedShared>> {
     let global = complete_or_return!(budget::section(budget, || {
         let mut global = BitWriter::new(limit);
         crate::patch_frame::write_dictionary(&mut global, patches)?;
         global.write(1, 1)?;
         global.write(1, 1)?;
-        encode::write_tree_and_model(&tree, &model, &mut global, options)?;
+        encode::write_tree_and_model(tree, model, &mut global, options)?;
         group::write_header(&mut global, &prepared[0].transforms, &prepared[0].wp, true)?;
         if !streams[0].is_empty() {
             model.write_stream(&streams[0], &mut global)?;
@@ -237,6 +303,18 @@ pub(super) fn encode_prepared_independent(
                 options,
             )?
         };
+        if options.refinement.enabled() {
+            super::refinement::write_local(
+                &tree,
+                &g.planes,
+                &g.wp,
+                g.stream_id,
+                options,
+                &mut writer,
+            )?;
+            writer.zero_pad_to_byte()?;
+            return Ok(writer.into_bytes()?);
+        }
         let (tokens, has_matches) =
             encode::group_stream(&g.planes, &tree, options, &g.wp, g.stream_id)?;
         let streams = [tokens];
@@ -258,6 +336,69 @@ pub(super) fn encode_prepared_independent(
 mod tests {
     use super::super::{encode::FixedTree, group::Channel, predictor::Predictor};
     use super::*;
+
+    #[test]
+    fn refinement_credits_only_selected_sections_and_preserves_cutoff() {
+        use std::sync::{Arc, atomic::Ordering};
+        let groups: Vec<_> = (1..=2)
+            .map(|stream_id| Prepared {
+                planes: vec![Channel {
+                    width: 32,
+                    height: 16,
+                    hshift: 0,
+                    vshift: 0,
+                    samples: (0..512).map(|i| i * 17 % 256).collect(),
+                }],
+                transforms: Vec::new(),
+                wp: weighted::Header::default(),
+                stream_id,
+            })
+            .collect();
+        let receipt = Arc::new(super::super::refinement::Receipt::default());
+        let options = ModularOptions {
+            lz77: false,
+            refinement: super::super::refinement::Options {
+                entropy: true,
+                receipt: Some(receipt.clone()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let budget = SectionBudget::new(Some(1 << 19), 1 << 20).unwrap();
+        let (global, encoded) = encode_prepared_shared_borrowed_trial(
+            None,
+            &groups,
+            &options,
+            1 << 20,
+            None,
+            8,
+            Some(&budget),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+        assert_eq!(receipt.snapshot().models, 2);
+        assert_eq!(budget.sections_started.load(Ordering::Relaxed), 3);
+        assert_eq!(
+            budget.section_bytes(),
+            global.len() + encoded.iter().map(Vec::len).sum::<usize>()
+        );
+
+        let budget = SectionBudget::new(Some(1), 1 << 20).unwrap();
+        let bounded = encode_prepared_shared_borrowed_trial(
+            None,
+            &groups,
+            &options,
+            1 << 20,
+            None,
+            8,
+            Some(&budget),
+        )
+        .unwrap();
+        assert!(matches!(bounded, TrialEncode::Bounded { lower_bound: 1 }));
+        assert_eq!(budget.sections_started.load(Ordering::Relaxed), 1);
+        assert_eq!(budget.section_bytes(), global.len());
+    }
 
     #[test]
     fn independent_stream_keeps_prepared_wp_and_uses_selected_tree_writer() {

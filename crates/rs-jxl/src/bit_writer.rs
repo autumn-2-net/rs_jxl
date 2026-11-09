@@ -50,6 +50,10 @@ impl BitWriter {
         self.bits_written
     }
 
+    pub(crate) fn max_bytes(&self) -> usize {
+        self.max_bytes
+    }
+
     fn reserve(&mut self, additional_bits: usize) -> Result<()> {
         let end = self
             .bits_written

@@ -141,6 +141,12 @@ struct Args {
     lz: u8,
     #[arg(long, value_enum, default_value = "default")]
     histograms: Histograms,
+    /// Compare actual Prefix/ANS outputs while reusing learned trees and tokens.
+    #[arg(long, conflicts_with_all = ["search", "scan_only"])]
+    refine_entropy: bool,
+    /// Refit sampled MA leaf predictors on all pixels; retain smaller output.
+    #[arg(long, conflicts_with_all = ["search", "scan_only", "fast_context"])]
+    refine_leaves: bool,
     /// Experimental earlier cache construction for 14-predictor MA searches.
     #[arg(long)]
     early_cache_14: bool,
@@ -238,6 +244,12 @@ struct Args {
     reuse_preparation_mib: Option<u16>,
     #[arg(long)]
     chain_batch: bool,
+    /// Exact token match extension experiment, without changing candidate budgets.
+    #[arg(long, value_parser = ["scalar", "avx2", "avx512"], conflicts_with_all = ["search", "scan_only", "matcher", "chain_batch"])]
+    match_extension: Option<String>,
+    /// Interleave four independent fast-ring candidates (not chain traversal).
+    #[arg(long, requires = "match_extension")]
+    batch_matches: bool,
     #[arg(long, requires = "wide_probes", value_parser = clap::value_parser!(u16).range(1..=1024))]
     strip_rows: Option<u16>,
     #[arg(long, value_enum, default_value = "source")]
@@ -400,12 +412,24 @@ fn run(args: Args) -> Result<()> {
         };
     }
     params.validate()?;
+    if args.match_extension.is_some()
+        && params.lz_method() == rs_jxl::scheduler::params::LzMethod::None
+    {
+        return Err("selected candidate disables LZ77; match extension would not execute".into());
+    }
     let matcher = args.effective_matcher();
     let mut base = EncodeOptions {
         threads: usize::from(args.threads),
         ..Default::default()
     };
     args.ma_budget.apply(&mut base.modular);
+    if args.refine_entropy || args.refine_leaves {
+        base.modular.refinement = rs_jxl::modular::refinement::Options {
+            entropy: args.refine_entropy,
+            leaves: args.refine_leaves,
+            receipt: Some(std::sync::Arc::new(Default::default())),
+        };
+    }
     if args.palette_order.is_some() || args.force_palette {
         base.modular.palette_policy = Some(rs_jxl::modular::palette::PaletteOptions {
             force_palette: args.force_palette,
@@ -455,6 +479,18 @@ fn run(args: Args) -> Result<()> {
         ..Default::default()
     });
     let lz = base.modular.source_lz77.as_mut().unwrap();
+    if let Some(mode) = &args.match_extension {
+        use rs_jxl::tools::lz77::{MatchExtension, MatchExtensionReceipt};
+        lz.match_extension = match mode.as_str() {
+            "scalar" => MatchExtension::Scalar,
+            "avx2" => MatchExtension::Avx2,
+            "avx512" => MatchExtension::Avx512,
+            _ => unreachable!("validated match extension"),
+        };
+        lz.match_extension.validate()?;
+        lz.batch_fast_matches = args.batch_matches;
+        lz.match_extension_receipt = Some(std::sync::Arc::new(MatchExtensionReceipt::default()));
+    }
     if args.fast_ranges {
         lz.fast_ranges = rs_jxl::tools::lz77::SourceFastRanges::Both;
         lz.fast_prefix = Some(rs_jxl::tools::lz77::SourceFastPrefix::Simd);
@@ -568,6 +604,12 @@ fn run(args: Args) -> Result<()> {
     let mut model_costs = serde_json::Value::Null;
     let mut fast_context = serde_json::Value::Null;
     let mut ma_seed = serde_json::Value::Null;
+    let match_receipt = base
+        .modular
+        .source_lz77
+        .as_ref()
+        .and_then(|config| config.match_extension_receipt.clone());
+    let refinement_receipt = base.modular.refinement.receipt.clone();
     let start = Instant::now();
     let encoded = if args.search {
         let mut driver = DriverOptions::scout();
@@ -707,6 +749,26 @@ fn run(args: Args) -> Result<()> {
         result.bytes
     };
     let pixels = f64::from(image.width()) * f64::from(image.height());
+    let refinement = refinement_receipt.map(|receipt| {
+        let stats = receipt.snapshot();
+        serde_json::json!({
+            "entropy": args.refine_entropy, "leaves": args.refine_leaves,
+            "domains": stats.domains, "models": stats.models,
+            "refit_proposals": stats.refit_proposals, "refit_wins": stats.refit_wins,
+            "entropy_wins": stats.entropy_wins, "saved_bits": stats.saved_bits,
+            "refit_seconds": stats.refit_seconds, "model_seconds": stats.model_seconds,
+            "write_seconds": stats.write_seconds,
+        })
+    });
+    let match_extension = match_receipt.map(|receipt| {
+        let r = receipt.snapshot();
+        serde_json::json!({
+            "mode": args.match_extension, "batch": args.batch_matches,
+            "active": r.extensions != 0, "batch_active": r.batch_groups != 0,
+            "fast_matchers": r.fast_matchers, "chain_matchers": r.chain_matchers,
+            "extensions": r.extensions, "batch_groups": r.batch_groups,
+        })
+    });
     println!(
         "{}",
         serde_json::json!({
@@ -720,6 +782,8 @@ fn run(args: Args) -> Result<()> {
             "model_costs": model_costs,
             "fast_context": fast_context,
             "ma_seed": ma_seed,
+            "match_extension": match_extension,
+            "refinement": refinement,
         })
     );
     if let Some(path) = args.output {
@@ -745,9 +809,58 @@ fn main() -> std::process::ExitCode {
     }
 }
 
+#[test]
+fn refinement_flags_are_opt_in_and_cannot_hide_inside_outer_search() {
+    let defaults = Args::try_parse_from(["encoder_lab", "in.png"]).unwrap();
+    assert!(!defaults.refine_entropy && !defaults.refine_leaves);
+    for flag in ["--refine-entropy", "--refine-leaves"] {
+        assert!(Args::try_parse_from(["encoder_lab", "in.png", flag]).is_ok());
+        for conflict in ["--search", "--scan-only"] {
+            assert!(Args::try_parse_from(["encoder_lab", "in.png", flag, conflict]).is_err());
+        }
+    }
+    let both = Args::try_parse_from([
+        "encoder_lab",
+        "in.png",
+        "--refine-entropy",
+        "--refine-leaves",
+    ])
+    .unwrap();
+    assert!(both.refine_entropy && both.refine_leaves);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn match_extensions_are_explicit_and_route_checked() {
+        let defaults = Args::try_parse_from(["encoder_lab", "input.png"]).unwrap();
+        assert!(defaults.match_extension.is_none() && !defaults.batch_matches);
+        assert!(Args::try_parse_from(["encoder_lab", "input.png", "--batch-matches"]).is_err());
+        for mode in ["scalar", "avx2", "avx512"] {
+            assert!(
+                Args::try_parse_from([
+                    "encoder_lab",
+                    "input.png",
+                    "--match-extension",
+                    mode,
+                    "--batch-matches"
+                ])
+                .is_ok()
+            );
+            for other in [
+                vec!["--search"],
+                vec!["--scan-only"],
+                vec!["--chain-batch"],
+                vec!["--matcher", "indexed"],
+            ] {
+                let mut args = vec!["encoder_lab", "input.png", "--match-extension", mode];
+                args.extend(other);
+                assert!(Args::try_parse_from(args).is_err());
+            }
+        }
+    }
 
     #[test]
     fn seed_and_full_predictor_experiments_are_explicit() {

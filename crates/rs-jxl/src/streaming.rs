@@ -9,6 +9,7 @@ mod seek_output;
 mod seekable;
 mod sequence;
 mod toc;
+pub(crate) use toc::size_entry_bits;
 
 pub use seekable::encode_regions_seekable_to;
 pub use sequence::{
