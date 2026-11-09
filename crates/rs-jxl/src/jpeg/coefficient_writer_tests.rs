@@ -223,6 +223,353 @@ fn scalar_buffer_end_of_band(
     Ok(())
 }
 
+// Original scalar initial-pass walk, deliberately independent of mask
+// preparation, shifted_ac, speculative batches and the production fallback.
+#[allow(clippy::too_many_arguments)]
+fn scalar_initial(
+    writer: &mut EntropyBitWriter,
+    dc: Option<&HuffmanTable>,
+    ac: Option<&HuffmanTable>,
+    band: ScanBand,
+    extra: u32,
+    state: &mut DctCodingState,
+    previous: &mut i16,
+    block: &[i16; BLOCK_SIZE],
+) -> Result<(), CoefficientWriteError> {
+    state.healthy()?;
+    let result = (|| {
+        if band.start > band.end || band.end >= 64 || band.low_bit > 10 {
+            return Err(CoefficientWriteError::Invalid(
+                "spectral band or approximation level",
+            ));
+        }
+        if band.start == 0 && state.eob_run != 0 {
+            return Err(CoefficientWriteError::Invalid(
+                "pending AC state before DC block",
+            ));
+        }
+        let dc_value = i32::from(block[0]) >> band.low_bit;
+        let dc_bits = if band.start == 0 {
+            if dc.is_none() {
+                return Err(CoefficientWriteError::Invalid("missing DC table"));
+            }
+            let bits = magnitude_bits(dc_value - i32::from(*previous))?;
+            if bits.0 >= 12 {
+                return Err(CoefficientWriteError::Invalid(
+                    "DC difference exceeds 11 bits",
+                ));
+            }
+            Some(bits)
+        } else {
+            None
+        };
+        let mut values = [0i32; BLOCK_SIZE];
+        let mut trailing = 0usize;
+        if band.end != 0 {
+            if ac.is_none() {
+                return Err(CoefficientWriteError::Invalid("missing AC table"));
+            }
+            for k in usize::from(band.start.max(1))..=usize::from(band.end) {
+                let value = i32::from(block[NATURAL_ORDER[k]]);
+                if value.abs() >= 2048 {
+                    return Err(CoefficientWriteError::Invalid(
+                        "AC coefficient exceeds supported precision",
+                    ));
+                }
+                // Signed division truncates toward zero, unlike the DC shift.
+                values[k] = value / (1i32 << band.low_bit);
+                trailing = if values[k] == 0 { trailing + 1 } else { 0 };
+            }
+        }
+        if u64::from(extra) > trailing.div_ceil(16) as u64 {
+            return Err(CoefficientWriteError::Invalid(
+                "extra zero runs exceed trailing spectral band",
+            ));
+        }
+        if let Some((count, bits)) = dc_bits {
+            writer.write_symbol_bits(dc.unwrap(), count, u32::from(bits), count)?;
+            *previous = dc_value as i16;
+        }
+        if band.end == 0 {
+            return Ok(());
+        }
+        let ac = ac.unwrap();
+        let mut zeros = 0i32;
+        for &value in &values[usize::from(band.start.max(1))..=usize::from(band.end)] {
+            if value == 0 {
+                zeros += 1;
+                continue;
+            }
+            scalar_flush(state, writer)?;
+            while zeros > 15 {
+                writer.write_symbol(ac, 0xf0)?;
+                zeros -= 16;
+            }
+            let (count, bits) = magnitude_bits(value)?;
+            writer.write_symbol_bits(ac, ((zeros as u8) << 4) | count, u32::from(bits), count)?;
+            zeros = 0;
+        }
+        for _ in 0..extra {
+            scalar_flush(state, writer)?;
+            writer.write_symbol(ac, 0xf0)?;
+            zeros -= 16;
+        }
+        if zeros > 0 {
+            scalar_buffer_end_of_band(state, writer, ac, 0, 0)?;
+            if band.start == 0 {
+                scalar_flush(state, writer)?;
+            }
+        }
+        Ok(())
+    })();
+    state.finish_operation(result)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn assert_initial_matches_scalar(
+    writer: &EntropyBitWriter,
+    dc: Option<&HuffmanTable>,
+    ac: Option<&HuffmanTable>,
+    band: ScanBand,
+    extra: u32,
+    state: &DctCodingState,
+    previous: i16,
+    block: &[i16; BLOCK_SIZE],
+) {
+    let mut actual_writer = writer.clone();
+    let mut expected_writer = writer.clone();
+    let mut actual_state = state.clone();
+    let mut expected_state = state.clone();
+    let mut actual_previous = previous;
+    let mut expected_previous = previous;
+    let expected = scalar_initial(
+        &mut expected_writer,
+        dc,
+        ac,
+        band,
+        extra,
+        &mut expected_state,
+        &mut expected_previous,
+        block,
+    );
+    let actual = encode_initial_block(
+        &mut actual_writer,
+        dc,
+        ac,
+        band,
+        extra,
+        &mut actual_state,
+        &mut actual_previous,
+        block,
+    );
+    assert_eq!(
+        actual, expected,
+        "band={band:?}, extra={extra}, block={block:?}"
+    );
+    assert_eq!(actual_previous, expected_previous);
+    assert_eq!(actual_writer, expected_writer);
+    assert_eq!(actual_state, expected_state);
+    let expected_flush = if expected_state.failed {
+        Err(CoefficientWriteError::FailedState)
+    } else {
+        let result = scalar_flush(&mut expected_state, &mut expected_writer);
+        expected_state.finish_operation(result)
+    };
+    assert_eq!(actual_state.flush(&mut actual_writer), expected_flush);
+    assert_eq!(actual_state, expected_state);
+    assert_eq!(actual_writer, expected_writer);
+    let count = actual_writer.padding_bits_needed();
+    let mask = ((1u16 << count) - 1) as u8;
+    for pattern in [0, 0x55, 0xff] {
+        let mut actual = actual_writer.clone();
+        let mut expected = expected_writer.clone();
+        assert_eq!(
+            actual.align_with(pattern & mask, count),
+            expected.align_with(pattern & mask, count),
+        );
+        assert_eq!(actual, expected);
+    }
+}
+
+#[test]
+fn initial_mask_emission_matches_scalar_for_all_bands_and_bitplanes() {
+    let dc = dc_table();
+    let ac = ac_table();
+    for low_bit in 0..=13 {
+        for start in 0..64 {
+            for end in start..64 {
+                let band = ScanBand {
+                    start,
+                    end,
+                    low_bit,
+                };
+                for layout in 0..4 {
+                    // Out-of-band invalid values must not be validated.
+                    let mut block = [i16::MIN; BLOCK_SIZE];
+                    block[0] = -3;
+                    for k in usize::from(start.max(1))..=usize::from(end) {
+                        block[NATURAL_ORDER[k]] = match layout {
+                            0 => 0,
+                            1 => {
+                                if k % 17 == 0 || k == usize::from(end) {
+                                    -2047
+                                } else {
+                                    -1
+                                }
+                            }
+                            2 => {
+                                if k % 2 == 0 {
+                                    2047
+                                } else {
+                                    -2047
+                                }
+                            }
+                            _ => [0, 1, -1, 3, -3, 1023, -1023, 1024][k % 8],
+                        };
+                    }
+                    // Include the permitted final-ZRL overshoot for every band length.
+                    let extra = if layout == 0 {
+                        (usize::from(end) + 1 - usize::from(start.max(1))).div_ceil(16) as u32
+                    } else {
+                        0
+                    };
+                    let mut writer = EntropyBitWriter::new(1024);
+                    writer.write_bits(0x7f, 7).unwrap();
+                    assert_initial_matches_scalar(
+                        &writer,
+                        Some(&dc),
+                        Some(&ac),
+                        band,
+                        extra,
+                        &DctCodingState::new(0),
+                        0,
+                        &block,
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn initial_mask_preserves_scalar_errors_pending_runs_and_output_limits() {
+    let dc = dc_table();
+    let full = ac_table();
+    let incomplete = table(&[0, 1, 0x0b, 0xf0], 16);
+    let no_eob = table(&[1, 0xf0], 2);
+    for low_bit in [0, 3, 10, 11, 12, 13] {
+        for (start, end) in [(0, 0), (0, 63), (1, 63), (7, 39), (63, 63)] {
+            let band = ScanBand {
+                start,
+                end,
+                low_bit,
+            };
+            for ac in [Some(&full), Some(&incomplete), Some(&no_eob), None] {
+                for layout in 0..7 {
+                    let mut block = [0; BLOCK_SIZE];
+                    block[0] = -3;
+                    let first = usize::from(start.max(1));
+                    for k in first..=usize::from(end) {
+                        block[NATURAL_ORDER[k]] = match layout {
+                            0 => 0,
+                            1 => {
+                                if (k - first) % 19 == 0 {
+                                    -2047
+                                } else {
+                                    -1
+                                }
+                            }
+                            2 => {
+                                if k % 2 == 0 {
+                                    2047
+                                } else {
+                                    -2047
+                                }
+                            }
+                            3 => {
+                                if k == usize::from(end) {
+                                    2048
+                                } else {
+                                    0
+                                }
+                            }
+                            4 if k == first => i16::MIN,
+                            _ => 0,
+                        };
+                    }
+                    let extra = match layout {
+                        5 => 1,
+                        6 => u32::MAX,
+                        _ => 0,
+                    };
+                    for pending_run in [false, true] {
+                        let mut state = DctCodingState::new(126);
+                        if pending_run {
+                            // Corrections make pending-run flush failures observable.
+                            let mut seed_writer = EntropyBitWriter::new(1024);
+                            for _ in 0..2 {
+                                scalar_buffer_end_of_band(
+                                    &mut state,
+                                    &mut seed_writer,
+                                    &full,
+                                    u64::MAX >> 1,
+                                    63,
+                                )
+                                .unwrap();
+                            }
+                        }
+                        for pending in [0, 1, 7] {
+                            for limit in [0, 1, 2, 3, 8, 15, 16, 17, 31, 32, 63, 128, 512] {
+                                let mut writer = EntropyBitWriter::new(limit);
+                                writer.write_bits((1 << pending) - 1, pending).unwrap();
+                                assert_initial_matches_scalar(
+                                    &writer,
+                                    Some(&dc),
+                                    ac,
+                                    band,
+                                    extra,
+                                    &state,
+                                    0,
+                                    &block,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Missing DC table and invalid bands retain their original precedence.
+    for band in [
+        ScanBand {
+            start: 0,
+            end: 63,
+            low_bit: 0,
+        },
+        ScanBand {
+            start: 9,
+            end: 8,
+            low_bit: 0,
+        },
+        ScanBand {
+            start: 1,
+            end: 64,
+            low_bit: 0,
+        },
+    ] {
+        assert_initial_matches_scalar(
+            &EntropyBitWriter::new(0),
+            None,
+            None,
+            band,
+            u32::MAX,
+            &DctCodingState::new(0),
+            0,
+            &[i16::MIN; BLOCK_SIZE],
+        );
+    }
+}
+
 fn scalar_prepare_refinement_band(
     block: &[i16; BLOCK_SIZE],
     band: ScanBand,
@@ -378,7 +725,7 @@ fn initial_precision_bound_matches_category_validation_for_every_i16() {
                     "AC coefficient exceeds supported precision",
                 ))
             } else {
-                Ok(usize::from(shifted == 0))
+                Ok(u64::from(shifted != 0) << 23)
             };
             assert_eq!(validate_ac_band(&block, band), expected);
         }

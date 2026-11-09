@@ -264,26 +264,12 @@ fn shifted_ac(coefficient: i16, low_bit: u8) -> i32 {
 fn validate_ac_band(
     coefficients: &[i16; BLOCK_SIZE],
     band: ScanBand,
-) -> Result<usize, CoefficientWriteError> {
+) -> Result<u64, CoefficientWriteError> {
     #[cfg(feature = "decoder-profile")]
     let _profile = jxl_decoder::decoder_profile::sample_scope("sample.jpeg.validate_ac_band", 5);
-    let mut trailing_zeros = 0;
-    for &natural in &NATURAL_ORDER[usize::from(band.start.max(1))..=usize::from(band.end)] {
-        let magnitude = i32::from(coefficients[natural]).abs();
-        // For low_bit <= 10 the original category test is exactly this bound,
-        // including values that disappear under the point transform.
-        if magnitude >= 2048 {
-            return Err(CoefficientWriteError::Invalid(
-                "AC coefficient exceeds supported precision",
-            ));
-        }
-        trailing_zeros = if magnitude >> band.low_bit == 0 {
-            trailing_zeros + 1
-        } else {
-            0
-        };
-    }
-    Ok(trailing_zeros)
+    super::refinement::initial_nonzero(coefficients, band).ok_or(CoefficientWriteError::Invalid(
+        "AC coefficient exceeds supported precision",
+    ))
 }
 
 /// Emit a sequential block, including explicitly preserved trailing ZRLs.
@@ -390,33 +376,33 @@ pub fn encode_sequential_block(
 fn batch_initial_ac(
     batch: &mut EntropyBatch,
     ac: &HuffmanTable,
-    order: &[usize],
+    start: usize,
+    nonzero: u64,
     low_bit: u8,
     extra_zero_runs: u32,
     coefficients: &[i16; BLOCK_SIZE],
-) -> Option<i32> {
+) -> Option<()> {
     #[cfg(feature = "decoder-profile")]
     let _profile = jxl_decoder::decoder_profile::sample_scope("sample.jpeg.batch_initial_ac", 6);
-    let mut zeros = 0i32;
-    for &natural in order {
-        let value = shifted_ac(coefficients[natural], low_bit);
-        if value == 0 {
-            zeros += 1;
-            continue;
-        }
+    let mut remaining = nonzero;
+    let mut next = start;
+    while remaining != 0 {
+        let k = remaining.trailing_zeros() as usize;
+        let mut zeros = k - next;
         while zeros > 15 {
             batch.write_symbol(ac, 0xf0)?;
             zeros -= 16;
         }
-        let (count, bits) = magnitude_bits(value).ok()?;
+        let (count, bits) =
+            magnitude_bits(shifted_ac(coefficients[NATURAL_ORDER[k]], low_bit)).ok()?;
         batch.write_symbol_bits(ac, ((zeros as u8) << 4) | count, u32::from(bits), count)?;
-        zeros = 0;
+        next = k + 1;
+        remaining &= remaining - 1;
     }
     for _ in 0..extra_zero_runs {
         batch.write_symbol(ac, 0xf0)?;
-        zeros -= 16;
     }
-    Some(zeros)
+    Some(())
 }
 
 /// Emit a first progressive pass, or a sequential band. Negative DC uses an
@@ -457,7 +443,7 @@ pub fn encode_initial_block(
         } else {
             None
         };
-        let trailing = if band.end != 0 {
+        let nonzero = if band.end != 0 {
             if ac.is_none() {
                 return Err(CoefficientWriteError::Invalid("missing AC table"));
             }
@@ -465,6 +451,15 @@ pub fn encode_initial_block(
         } else {
             0
         };
+        let start = usize::from(band.start.max(1));
+        // Set bits are absolute spectral positions. With no set bits the
+        // entire AC band is trailing; DC-only bands have no AC positions.
+        let next = if nonzero == 0 {
+            start
+        } else {
+            64 - nonzero.leading_zeros() as usize
+        };
+        let trailing = usize::from(band.end) + 1 - next;
         // The frozen reader permits the last ZRL to pass the band end, but a
         // further ZRL could never have been consumed. Preserve that one overshoot.
         if u64::from(extra_zero_runs) > trailing.div_ceil(16) as u64 {
@@ -486,7 +481,7 @@ pub fn encode_initial_block(
         }
         let ac = ac.expect("validated AC table");
         let order = &NATURAL_ORDER[usize::from(band.start.max(1))..=usize::from(band.end)];
-        let has_symbols = trailing != order.len() || extra_zero_runs != 0;
+        let has_symbols = nonzero != 0 || extra_zero_runs != 0;
         if has_symbols {
             state.flush_inner(writer)?;
         }
@@ -496,7 +491,8 @@ pub fn encode_initial_block(
                     batch_initial_ac(
                         batch,
                         ac,
-                        order,
+                        start,
+                        nonzero,
                         band.low_bit,
                         extra_zero_runs,
                         coefficients,

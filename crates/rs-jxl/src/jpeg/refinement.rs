@@ -1,6 +1,6 @@
 // Copyright (c) the JPEG XL Project Authors. All rights reserved.
 // BSD-3-Clause; retained notice in docs/PORTING_KERNELS.md.
-//! Bit-plane classification for the JPEG refinement writer. Masks use zigzag
+//! Bit-plane classification for the JPEG coefficient writer. Masks use zigzag
 //! indices; no entropy state or coefficient values are changed here.
 
 use super::coefficients::ScanBand;
@@ -20,12 +20,30 @@ pub(super) fn classify(coefficients: &[i16; BLOCK_SIZE], band: ScanBand) -> Opti
     if std::is_x86_feature_detected!("avx2") {
         // SAFETY: runtime dispatch checks AVX2; the kernel only loads complete
         // chunks of its local 64-element array.
-        return unsafe { classify_avx2(coefficients, band) };
+        return unsafe { classify_avx2::<false>(coefficients, band) };
     }
-    classify_scalar(coefficients, band)
+    classify_scalar::<false>(coefficients, band)
 }
 
-fn classify_scalar(coefficients: &[i16; BLOCK_SIZE], band: ScanBand) -> Option<Masks> {
+/// Validated nonzero positions after the initial AC magnitude point transform.
+/// The caller validates the band; DC and out-of-band coefficients are ignored.
+pub(super) fn initial_nonzero(coefficients: &[i16; BLOCK_SIZE], band: ScanBand) -> Option<u64> {
+    debug_assert!(band.start <= band.end && band.end < 64 && band.low_bit <= 10);
+    #[cfg(target_arch = "x86_64")]
+    if usize::from(band.end) + 1 - usize::from(band.start.max(1)) >= 16
+        && std::is_x86_feature_detected!("avx2")
+    {
+        // SAFETY: AVX2 was checked; the kernel loads only complete chunks of
+        // its local 64-element array. Short bands avoid ordering that array.
+        return unsafe { classify_avx2::<true>(coefficients, band) }.map(|masks| masks.nonzero);
+    }
+    classify_scalar::<true>(coefficients, band).map(|masks| masks.nonzero)
+}
+
+fn classify_scalar<const INITIAL: bool>(
+    coefficients: &[i16; BLOCK_SIZE],
+    band: ScanBand,
+) -> Option<Masks> {
     let mut masks = Masks::default();
     for k in usize::from(band.start.max(1))..=usize::from(band.end) {
         let value = i32::from(coefficients[NATURAL_ORDER[k]]);
@@ -35,9 +53,11 @@ fn classify_scalar(coefficients: &[i16; BLOCK_SIZE], band: ScanBand) -> Option<M
         }
         let shifted = magnitude >> band.low_bit;
         masks.nonzero |= u64::from(shifted != 0) << k;
-        masks.newly_nonzero |= u64::from(shifted == 1) << k;
-        masks.correction |= ((shifted & 1) as u64) << k;
-        masks.positive |= u64::from(value > 0) << k;
+        if !INITIAL {
+            masks.newly_nonzero |= u64::from(shifted == 1) << k;
+            masks.correction |= ((shifted & 1) as u64) << k;
+            masks.positive |= u64::from(value > 0) << k;
+        }
     }
     Some(masks)
 }
@@ -82,13 +102,15 @@ fn mask_pair(a: std::arch::x86_64::__m256i, b: std::arch::x86_64::__m256i) -> u3
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn classify_avx2(coefficients: &[i16; BLOCK_SIZE], band: ScanBand) -> Option<Masks> {
+unsafe fn classify_avx2<const INITIAL: bool>(
+    coefficients: &[i16; BLOCK_SIZE],
+    band: ScanBand,
+) -> Option<Masks> {
     use std::arch::x86_64::*;
     // Constant indices allow LLVM to combine the gather into fixed shuffles.
     // Unlike a 32-bit gather on i16 input, this never reads past coefficient 63.
     let ordered: [i16; BLOCK_SIZE] = std::array::from_fn(|k| coefficients[NATURAL_ORDER[k]]);
     let zero = _mm256_setzero_si256();
-    let one = _mm256_set1_epi16(1);
     let high = _mm256_set1_epi16(-2048);
     let shift = _mm_cvtsi32_si128(i32::from(band.low_bit));
     let mut masks = Masks::default();
@@ -98,39 +120,179 @@ unsafe fn classify_avx2(coefficients: &[i16; BLOCK_SIZE], band: ScanBand) -> Opt
         let value = unsafe { _mm256_loadu_si256(ordered.as_ptr().add(offset).cast()) };
         let magnitude = _mm256_abs_epi16(value);
         let shifted = _mm256_srl_epi16(magnitude, shift);
-        let kinds = mask_pair(
-            _mm256_cmpgt_epi16(shifted, zero),
-            _mm256_cmpeq_epi16(shifted, one),
-        );
-        let bits = mask_pair(
-            _mm256_cmpeq_epi16(_mm256_and_si256(shifted, one), one),
-            _mm256_cmpgt_epi16(value, zero),
-        );
         // The high-bit test also rejects abs(i16::MIN), which remains 0x8000.
-        let in_range = mask_pair(
-            _mm256_cmpeq_epi16(_mm256_and_si256(magnitude, high), zero),
-            zero,
-        );
-        masks.nonzero |= u64::from(kinds & 0xffff) << offset;
-        masks.newly_nonzero |= u64::from(kinds >> 16) << offset;
-        masks.correction |= u64::from(bits & 0xffff) << offset;
-        masks.positive |= u64::from(bits >> 16) << offset;
-        valid |= u64::from(in_range & 0xffff) << offset;
+        let in_range = _mm256_cmpeq_epi16(_mm256_and_si256(magnitude, high), zero);
+        if INITIAL {
+            // Initial scans need only these two predicates, not refinement's
+            // newly-nonzero, correction or sign classifications.
+            let kinds = mask_pair(_mm256_cmpgt_epi16(shifted, zero), in_range);
+            masks.nonzero |= u64::from(kinds & 0xffff) << offset;
+            valid |= u64::from(kinds >> 16) << offset;
+        } else {
+            let one = _mm256_set1_epi16(1);
+            let kinds = mask_pair(
+                _mm256_cmpgt_epi16(shifted, zero),
+                _mm256_cmpeq_epi16(shifted, one),
+            );
+            let bits = mask_pair(
+                _mm256_cmpeq_epi16(_mm256_and_si256(shifted, one), one),
+                _mm256_cmpgt_epi16(value, zero),
+            );
+            let in_range = mask_pair(in_range, zero);
+            masks.nonzero |= u64::from(kinds & 0xffff) << offset;
+            masks.newly_nonzero |= u64::from(kinds >> 16) << offset;
+            masks.correction |= u64::from(bits & 0xffff) << offset;
+            masks.positive |= u64::from(bits >> 16) << offset;
+            valid |= u64::from(in_range & 0xffff) << offset;
+        }
     }
     let selected = (u64::MAX << band.start.max(1)) & (u64::MAX >> (63 - band.end));
     if valid & selected != selected {
         return None;
     }
     masks.nonzero &= selected;
-    masks.newly_nonzero &= selected;
-    masks.correction &= selected;
-    masks.positive &= selected;
+    if !INITIAL {
+        masks.newly_nonzero &= selected;
+        masks.correction &= selected;
+        masks.positive &= selected;
+    }
     Some(masks)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn scalar_initial_reference(coefficients: &[i16; BLOCK_SIZE], band: ScanBand) -> Option<u64> {
+        let mut nonzero = 0u64;
+        for k in usize::from(band.start.max(1))..=usize::from(band.end) {
+            let value = i32::from(coefficients[NATURAL_ORDER[k]]);
+            if !(-2047..=2047).contains(&value) {
+                return None;
+            }
+            // Signed division independently models AC truncation toward zero.
+            if value / (1i32 << band.low_bit) != 0 {
+                nonzero |= 1u64 << k;
+            }
+        }
+        Some(nonzero)
+    }
+
+    fn assert_initial_paths(coefficients: &[i16; BLOCK_SIZE], band: ScanBand) {
+        let expected = scalar_initial_reference(coefficients, band);
+        let expected_masks = expected.map(|nonzero| Masks {
+            nonzero,
+            ..Masks::default()
+        });
+        assert_eq!(
+            classify_scalar::<true>(coefficients, band),
+            expected_masks,
+            "scalar band={band:?}, coefficients={coefficients:?}",
+        );
+        assert_eq!(
+            initial_nonzero(coefficients, band),
+            expected,
+            "dispatch band={band:?}, coefficients={coefficients:?}",
+        );
+        #[cfg(target_arch = "x86_64")]
+        if std::is_x86_feature_detected!("avx2") {
+            // SAFETY: AVX2 was checked. The kernel only loads its complete
+            // local array, including when testing narrow or DC-only bands.
+            let actual = unsafe { classify_avx2::<true>(coefficients, band) };
+            assert_eq!(
+                actual, expected_masks,
+                "AVX2 band={band:?}, coefficients={coefficients:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn initial_nonzero_paths_match_for_all_bands_planes_and_boundaries() {
+        let boundaries = [
+            i16::MIN,
+            i16::MIN + 1,
+            -2049,
+            -2048,
+            -2047,
+            -1024,
+            -1,
+            0,
+            1,
+            1024,
+            2047,
+            2048,
+            2049,
+            i16::MAX - 1,
+            i16::MAX,
+        ];
+        let mut seed = 0x2143_6587u32;
+        for low_bit in 0..=10 {
+            let unit = 1i16 << low_bit;
+            for start in 0..64 {
+                for end in start..64 {
+                    let band = ScanBand {
+                        start,
+                        end,
+                        low_bit,
+                    };
+                    let first = usize::from(start.max(1));
+                    let end = usize::from(end);
+                    // Invalid DC/out-of-band values must never invalidate AC.
+                    let mut coefficients = [i16::MIN; BLOCK_SIZE];
+                    for k in first..=end {
+                        seed ^= seed << 13;
+                        seed ^= seed >> 17;
+                        seed ^= seed << 5;
+                        coefficients[NATURAL_ORDER[k]] = match k % 8 {
+                            0 => 0,
+                            1 => unit - 1,
+                            2 => -(unit - 1),
+                            3 => unit,
+                            4 => -unit,
+                            5 => 2047,
+                            6 => -2047,
+                            _ => (seed % 4095) as i16 - 2047,
+                        };
+                    }
+                    assert_initial_paths(&coefficients, band);
+                    if first > end {
+                        continue;
+                    }
+                    // Rotate boundary probes across the band's first, middle
+                    // and last positions, covering AVX2 chunk boundaries too.
+                    for (i, &value) in boundaries.iter().enumerate() {
+                        let k = [first, (first + end) / 2, end][i % 3];
+                        let natural = NATURAL_ORDER[k];
+                        let saved = coefficients[natural];
+                        coefficients[natural] = value;
+                        assert_initial_paths(&coefficients, band);
+                        coefficients[natural] = saved;
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn initial_nonzero_paths_match_every_i16_at_simd_chunk_edges() {
+        // A wide band exercises actual dispatch; direct SIMD tests above also
+        // include all narrow bands and the 15/16-position dispatch boundary.
+        for low_bit in 0..=10 {
+            let band = ScanBand {
+                start: 1,
+                end: 63,
+                low_bit,
+            };
+            let mut coefficients = [0; BLOCK_SIZE];
+            coefficients[0] = i16::MIN;
+            for value in i16::MIN..=i16::MAX {
+                let k = [1, 15, 16, 31, 32, 47, 48, 63][value as u16 as usize % 8];
+                coefficients[NATURAL_ORDER[k]] = value;
+                assert_initial_paths(&coefficients, band);
+                coefficients[NATURAL_ORDER[k]] = 0;
+            }
+        }
+    }
 
     #[test]
     fn dispatch_matches_scalar_for_all_planes_bands_and_invalid_values() {
@@ -152,7 +314,7 @@ mod tests {
                     }
                     assert_eq!(
                         classify(&coefficients, band),
-                        classify_scalar(&coefficients, band)
+                        classify_scalar::<false>(&coefficients, band)
                     );
                     for invalid in [i16::MIN, -2048, 2048, i16::MAX] {
                         coefficients[NATURAL_ORDER[end as usize]] = invalid;
