@@ -187,6 +187,8 @@ rejected experiments and remaining limitations remain part of the record.
 - [Decoder SIMD experiments, 2026-10-25](DECODER_SIMD_20261025.md)
 - [Decoder entropy experiments, 2026-10-25](DECODER_ENTROPY_20261025.md)
 - [JPEG-transcoded JXL pixel decoding, 2026-10-25](JPEG_PIXEL_DECODE_20261025.md)
+- [Progressive JPEG reconstruction follow-up, 2026-11-08](JPEG_RECONSTRUCTION_SPEED_20261108.md)
+- [Pixel-lossless encoder and decoder speed, 2026-11-09](PIXEL_CODEC_SPEED_20261109.md)
 
 Keep rendered pixel comparisons distinct from byte-exact JPEG reconstruction
 and native lossless sample checks when interpreting these reports. None of this

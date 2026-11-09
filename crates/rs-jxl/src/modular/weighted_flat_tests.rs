@@ -71,8 +71,8 @@ fn flat_shortcut_preserves_extremes_unsigned_history_and_row_boundaries() {
                     for pos in signed_positions(&initial, x, y).into_iter().flatten() {
                         initial.error[pos] = 0;
                     }
-                    for (i, errors) in initial.pred_errors.iter_mut().enumerate() {
-                        for (p, error) in errors.iter_mut().enumerate() {
+                    for (p, errors) in initial.pred_errors.iter_mut().enumerate() {
+                        for (i, error) in errors.iter_mut().enumerate() {
                             *error = [0, u32::MAX, u32::MAX - 1, 1, 1 << 31][(p + i) % 5];
                         }
                     }

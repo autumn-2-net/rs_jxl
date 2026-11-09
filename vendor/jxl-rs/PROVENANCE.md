@@ -253,3 +253,25 @@ Evidence is in `D:/cpp_pj/jxl_python/out/float-interop-20261107`. The parent own
 the encoder correction and frozen official/legacy integration fixtures.
 Builds and tests are reserved for central parent validation; no local Cargo
 verification is claimed.
+
+## Exact Flat Weighted Prediction (2026-11-09)
+
+`frame/modular/predict.rs` applies the same flat-neighborhood shortcut as the
+parent encoder's `modular::weighted::State`, derived from the optimized C++
+`PredictWeightedFlat` route. All five neighbors must match and the W/N/NW/NE
+signed prediction errors must be zero. Every sub-predictor then equals N, and
+the existing final clamp is [N, N], independent of unsigned error history.
+The decoder sets all four sub-predictions and the full-width scaled prediction;
+the normal per-pixel error update is retained even if the decoded sample differs.
+
+This skips the three unsigned-history loads, weight calculation and weighted
+average only in that proven case. It does not narrow samples, change stream
+semantics, skip state updates, or add an ISA requirement. The non-flat route
+retains its original equations and wrapping arithmetic.
+
+Parent `decoder_weighted_flat` covers original 8/16/31-bit RGBA samples,
+invisible RGB, widths 1/17, all five weighted presets, WP-only and mixed trees,
+and ANS/prefix streams. `decode_wide_integer`, `decode_lossless_edges` and
+`decoder_parallel_pixels` cover the surrounding integer, frame and group paths.
+Measured performance and independent official-stream checks are recorded in
+the parent's `docs/PIXEL_CODEC_SPEED_20261109.md`, not inferred from the shortcut.

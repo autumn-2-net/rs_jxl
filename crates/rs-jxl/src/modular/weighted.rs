@@ -172,7 +172,8 @@ pub struct State {
     stride: usize,
     prediction: [i64; NUM_PREDICTORS],
     pred: i64,
-    pred_errors: [Vec<u32>; NUM_PREDICTORS],
+    // Each raster step reads/updates all four predictor errors together.
+    pred_errors: Vec<[u32; NUM_PREDICTORS]>,
     error: Vec<i32>,
     next: Option<(usize, usize)>,
     pending: bool,
@@ -205,7 +206,7 @@ impl State {
             stride,
             prediction: [0; NUM_PREDICTORS],
             pred: 0,
-            pred_errors: [zeroed(len)?, zeroed(len)?, zeroed(len)?, zeroed(len)?],
+            pred_errors: zeroed(len)?,
             error: zeroed(len)?,
             next: Some((0, 0)),
             pending: false,
@@ -217,9 +218,7 @@ impl State {
     pub fn reset(&mut self) {
         self.prediction.fill(0);
         self.pred = 0;
-        for errors in &mut self.pred_errors {
-            errors.fill(0);
-        }
+        self.pred_errors.fill([0; NUM_PREDICTORS]);
         self.error.fill(0);
         self.next = Some((0, 0));
         self.pending = false;
@@ -342,13 +341,14 @@ impl State {
             self.prediction = [self.pred; NUM_PREDICTORS];
             return (n, 0);
         }
-        let mut errors = [0; NUM_PREDICTORS];
-        for (i, error) in errors.iter_mut().enumerate() {
-            let errors = &self.pred_errors[i];
-            *error = errors[pos_n]
-                .wrapping_add(errors[pos_ne])
-                .wrapping_add(errors[pos_nw]);
-        }
+        let north = self.pred_errors[pos_n];
+        let northeast = self.pred_errors[pos_ne];
+        let northwest = self.pred_errors[pos_nw];
+        let errors = std::array::from_fn(|i| {
+            north[i]
+                .wrapping_add(northeast[i])
+                .wrapping_add(northwest[i])
+        });
         let weights = weights(errors, self.header.w);
 
         let [n, w, ne, nw, nn] = [n, w, ne, nw, nn].map(|v| i64::from(v) << EXTRA_BITS);
@@ -392,11 +392,13 @@ impl State {
     fn update_at(&mut self, value: i32, x: usize, y: usize, (cur_row, prev_row): (usize, usize)) {
         let value = i64::from(value) << EXTRA_BITS;
         self.error[cur_row + x] = (self.pred - value) as i32;
+        let errors = self
+            .prediction
+            .map(|p| (((p - value).abs() + PREDICTION_ROUND) >> EXTRA_BITS) as u32);
+        self.pred_errors[cur_row + x] = errors;
+        let next = &mut self.pred_errors[prev_row + x + 1];
         for i in 0..NUM_PREDICTORS {
-            let err = ((self.prediction[i] - value).abs() + PREDICTION_ROUND) >> EXTRA_BITS;
-            self.pred_errors[i][cur_row + x] = err as u32;
-            self.pred_errors[i][prev_row + x + 1] =
-                self.pred_errors[i][prev_row + x + 1].wrapping_add(err as u32);
+            next[i] = next[i].wrapping_add(errors[i]);
         }
         self.pending = false;
         self.next = if x == self.width - 1 {
@@ -818,19 +820,11 @@ mod tests {
         state.predict(0, 0, 0, 0, 0, 0, 0).unwrap();
         state.pred = i64::from(i32::MAX) + 1;
         state.prediction = [4, -4, 12, (1i64 << 35) + 12];
-        for errors in &mut state.pred_errors {
-            errors[1] = u32::MAX;
-        }
+        state.pred_errors[1] = [u32::MAX; NUM_PREDICTORS];
         state.update(0, 0, 0).unwrap();
         assert_eq!(state.error[state.stride], i32::MIN);
-        assert_eq!(
-            state.pred_errors.each_ref().map(|p| p[state.stride]),
-            [0, 0, 1, 1]
-        );
-        assert_eq!(
-            state.pred_errors.each_ref().map(|p| p[1]),
-            [u32::MAX, u32::MAX, 0, 0]
-        );
+        assert_eq!(state.pred_errors[state.stride], [0, 0, 1, 1]);
+        assert_eq!(state.pred_errors[1], [u32::MAX, u32::MAX, 0, 0]);
         assert_eq!(error_weight(u32::MAX, 15), 4);
         assert_eq!(error_weight(0, 15), 4 + 15 * (1 << 24));
         for (i, &value) in DIV_LOOKUP.iter().enumerate() {

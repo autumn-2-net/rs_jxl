@@ -101,7 +101,7 @@ fn fused_rasters_match_pair_predictions_properties_and_entire_state() {
                 let mut actual = State::new(header, width).unwrap();
                 let mut reference = actual.clone();
                 let error_ptr = actual.error.as_ptr();
-                let pred_ptrs = actual.pred_errors.each_ref().map(|v| v.as_ptr());
+                let pred_ptr = actual.pred_errors.as_ptr();
                 for (p, &value) in samples.iter().enumerate() {
                     let (x, y) = (p % width, p / width);
                     compare_step(
@@ -113,7 +113,7 @@ fn fused_rasters_match_pair_predictions_properties_and_entire_state() {
                     );
                 }
                 assert_eq!(actual.error.as_ptr(), error_ptr);
-                assert_eq!(actual.pred_errors.each_ref().map(|v| v.as_ptr()), pred_ptrs);
+                assert_eq!(actual.pred_errors.as_ptr(), pred_ptr);
                 actual.reset();
                 reference.reset();
                 assert_eq!(actual, reference);
@@ -131,8 +131,8 @@ fn fused_wrapped_histories_and_flat_actual_mismatches_keep_every_field() {
                 for x in 0..width {
                     let mut initial = State::new(header, width).unwrap();
                     initial.next = Some((x, y));
-                    for (i, errors) in initial.pred_errors.iter_mut().enumerate() {
-                        for (p, error) in errors.iter_mut().enumerate() {
+                    for (p, errors) in initial.pred_errors.iter_mut().enumerate() {
+                        for (i, error) in errors.iter_mut().enumerate() {
                             *error = [0, u32::MAX, u32::MAX - 1, 1, 1 << 31][(i + p) % 5];
                         }
                     }
@@ -171,7 +171,7 @@ fn fused_returns_old_error_property_before_updating_histories() {
     let output = compare_step(&mut actual, &mut reference, 10000, (1, 1), [0; 5]);
     assert_eq!(output.1, -9, "N wins the equal-magnitude N/NW tie");
     assert_ne!(actual.error[cur + 1], output.1);
-    assert_ne!(actual.pred_errors[0][prev + 2], 0);
+    assert_ne!(actual.pred_errors[prev + 2][0], 0);
 }
 
 #[test]

@@ -334,32 +334,6 @@ impl<'a> WeightedPredictorState<'a> {
         // Safety note: guaranteed to be < self.xsize.
         let pos_nw = pos.0.saturating_sub(1);
 
-        debug_assert!(prev_row + pos.0 < self.pred_errors_buffer.len());
-        // SAFETY: prev_row <= xsize + 1, so the index is < 2*xsize + 1, which is in-bounds due to
-        // the safety invariant (`self.pred_error_buffers.len() == 2*(xsize+1)`).
-        let err_n = unsafe { self.pred_errors_buffer.get_unchecked(prev_row + pos.0) };
-        debug_assert!(prev_row + pos_ne < self.pred_errors_buffer.len());
-        // SAFETY: prev_row <= xsize + 1, so the index is < 2*xsize + 1, which is in-bounds due to
-        // the safety invariant (`self.pred_error_buffers.len() == 2*(xsize+1)`).
-        let err_ne = unsafe { self.pred_errors_buffer.get_unchecked(prev_row + pos_ne) };
-        debug_assert!(prev_row + pos_nw < self.pred_errors_buffer.len());
-        // SAFETY: prev_row <= xsize + 1, so the index is < 2*xsize + 1, which is in-bounds due to
-        // the safety invariant (`self.pred_error_buffers.len() == 2*(xsize+1)`).
-        let err_nw = unsafe { self.pred_errors_buffer.get_unchecked(prev_row + pos_nw) };
-
-        let err0 = err_n[0].wrapping_add(err_ne[0]).wrapping_add(err_nw[0]);
-        let err1 = err_n[1].wrapping_add(err_ne[1]).wrapping_add(err_nw[1]);
-        let err2 = err_n[2].wrapping_add(err_ne[2]).wrapping_add(err_nw[2]);
-        let err3 = err_n[3].wrapping_add(err_ne[3]).wrapping_add(err_nw[3]);
-
-        let [w0, w1, w2, w3] = weighted_weights::weights([err0, err1, err2, err3], self.w);
-        // Safety note: we know that w0, w1, w2, w3 >= 4 because u8 * DIVLOOKUP[i] + 4 never
-        // overflows.
-        debug_assert!(w0 >= 4);
-        debug_assert!(w1 >= 4);
-        debug_assert!(w2 >= 4);
-        debug_assert!(w3 >= 4);
-
         // Note: this might access what's morally equivalent to position -1,
         // but that value is guaranteed to be 0.
 
@@ -380,6 +354,43 @@ impl<'a> WeightedPredictorState<'a> {
         // SAFETY: prev_row <= xsize + 1, so the index is <= 2*xsize + 1, which is in-bounds due to
         // the safety invariant (`self.error.len() == 2*(xsize+1)`).
         let te_ne = unsafe { *self.error.get_unchecked(prev_row + 1 + pos_ne) as i64 };
+
+        if ((data.top ^ data.left)
+            | (data.top ^ data.topright)
+            | (data.top ^ data.topleft)
+            | (data.top ^ data.toptop))
+            == 0
+            && (te_w | te_n | te_nw | te_ne) == 0
+        {
+            // Every sub-predictor equals top and the final clamp is [top, top],
+            // regardless of unsigned error history. Keep all sub-predictions:
+            // update_errors must still run if the decoded pixel breaks the run.
+            self.pred = add_bits(data.top);
+            self.prediction = [self.pred; 4];
+            return (i64::from(data.top), 0);
+        }
+
+        debug_assert!(prev_row + pos.0 < self.pred_errors_buffer.len());
+        // SAFETY: each index is < 2*xsize + 1, within the 2*(xsize+1) buffer.
+        let err_n = unsafe { self.pred_errors_buffer.get_unchecked(prev_row + pos.0) };
+        debug_assert!(prev_row + pos_ne < self.pred_errors_buffer.len());
+        // SAFETY: pos_ne < xsize and prev_row <= xsize + 1.
+        let err_ne = unsafe { self.pred_errors_buffer.get_unchecked(prev_row + pos_ne) };
+        debug_assert!(prev_row + pos_nw < self.pred_errors_buffer.len());
+        // SAFETY: pos_nw < xsize and prev_row <= xsize + 1.
+        let err_nw = unsafe { self.pred_errors_buffer.get_unchecked(prev_row + pos_nw) };
+
+        let err0 = err_n[0].wrapping_add(err_ne[0]).wrapping_add(err_nw[0]);
+        let err1 = err_n[1].wrapping_add(err_ne[1]).wrapping_add(err_nw[1]);
+        let err2 = err_n[2].wrapping_add(err_ne[2]).wrapping_add(err_nw[2]);
+        let err3 = err_n[3].wrapping_add(err_ne[3]).wrapping_add(err_nw[3]);
+
+        let [w0, w1, w2, w3] = weighted_weights::weights([err0, err1, err2, err3], self.w);
+        // u8 * DIVLOOKUP[i] + 4 never overflows, so all weights are >= 4.
+        debug_assert!(w0 >= 4);
+        debug_assert!(w1 >= 4);
+        debug_assert!(w2 >= 4);
+        debug_assert!(w3 >= 4);
 
         let mut p = te_w;
         if te_n.abs() > p.abs() {
