@@ -17,14 +17,19 @@ from test_compare_cpp_port import fixture
 def measurement(args, mode="default", size=13, width=2, height=1, route="full_image", palettes=None):
     native, hot = bench.mode_config(mode)
     order = {"default": "Default", "frequency": "FrequencyLuma", "runs": "RunFrequency",
-             "screened": "ScreenedRuns"}.get(native)
+             "screened": "ScreenedRuns", "adjacency": "Adjacency"}.get(native)
+    rounds = None
     if hot is not None:
         order = f"HotRuns {{ hot_colors: {hot} }}"
+    if native in ("adjacency-minla", "ezeng", "ezeng-minla"):
+        rounds = 0 if native == "ezeng" else (4 if args.minla_rounds is None else args.minla_rounds)
+        variant = "AdjacencyMinLa" if native == "adjacency-minla" else "EzengMinLa"
+        order = f"{variant} {{ rounds: {rounds} }}"
     palettes = [] if palettes is None else palettes
     return dict(bytes=size, seconds=0.1, width=width, height=height, profile=None,
                 bpp=size * 8 / (width * height), mpix_per_second=width * height / 1e6 / 0.1,
                 mode=native, effort=args.effort, threads=args.threads, encode_calls=1, patches_cleared=True,
-                configured=dict(order=order, hot_colors=hot, groupwise=not args.full_frame,
+                configured=dict(order=order, hot_colors=hot, minla_rounds=rounds, groupwise=not args.full_frame,
                                 palette_colors=args.palette_colors if args.palette_colors is not None else 1024),
                 projected=dict(groupwise=True, palette_colors=1024),
                 overrides=dict(palette_colors=args.palette_colors, full_frame=args.full_frame),
@@ -53,12 +58,14 @@ class ArgumentsAndReceipts(unittest.TestCase):
         self.assertFalse(self.args.profile)
         self.assertTrue(bench.arguments(self.argv + ["--profile"]).profile)
         self.assertIsNone(self.args.palette_colors)
+        self.assertIsNone(self.args.minla_rounds)
         for mode in bench.MODES:
             cmd = bench.command(self.args, "in.png", "out.jxl", mode)
             native, hot = bench.mode_config(mode)
             self.assertEqual(cmd[:6], ["palette_lab.exe", "in.png", "--output", "out.jxl", "--mode", native])
             self.assertNotIn("--full-frame", cmd)
             self.assertNotIn("--palette-colors", cmd)
+            self.assertNotIn("--minla-rounds", cmd)
             if hot is not None:
                 self.assertEqual(cmd[-2:], ["--hot-colors", str(hot)])
             else:
@@ -69,6 +76,46 @@ class ArgumentsAndReceipts(unittest.TestCase):
             self.validate(measurement(args, mode), mode, args)
         with self.assertRaises(ValueError):
             bench.mode_config("searchbest")
+
+    def test_graph_modes_rounds_and_exact_debug_orders(self):
+        for rounds in (None, 0, 4, 40):
+            argv = self.argv + ["--modes", *bench.MODES]
+            if rounds is not None:
+                argv += ["--minla-rounds", str(rounds)]
+            args = bench.arguments(argv)
+            expected = {
+                "adjacency": ("Adjacency", None),
+                "adjacency-minla": (f"AdjacencyMinLa {{ rounds: {4 if rounds is None else rounds} }}",
+                                    4 if rounds is None else rounds),
+                "ezeng": ("EzengMinLa { rounds: 0 }", 0),
+                "ezeng-minla": (f"EzengMinLa {{ rounds: {4 if rounds is None else rounds} }}",
+                                4 if rounds is None else rounds),
+            }
+            for mode in bench.MODES:
+                with self.subTest(rounds=rounds, mode=mode):
+                    cmd = bench.command(args, "i", "o", mode)
+                    if rounds is not None and mode in bench.MINLA_MODES:
+                        self.assertEqual(cmd[-2:], ["--minla-rounds", str(rounds)])
+                    else:
+                        self.assertNotIn("--minla-rounds", cmd)
+                    m = measurement(args, mode)
+                    self.validate(m, mode, args)
+                    if mode not in expected:
+                        continue
+                    self.assertEqual(bench.mode_config(mode), (mode, None))
+                    order, count = expected[mode]
+                    self.assertEqual((m["configured"]["order"], m["configured"]["minla_rounds"]),
+                                     (order, count))
+                    for bad in ("Default", "AdjacencyMinla { rounds: 4 }", "EzengMinla { rounds: 0 }"):
+                        changed = deepcopy(m)
+                        changed["configured"]["order"] = bad
+                        with self.assertRaisesRegex(ValueError, "Configured order"):
+                            self.validate(changed, mode, args)
+                    for bad in (True, 0.0, -1, 41, "4"):
+                        changed = deepcopy(m)
+                        changed["configured"]["minla_rounds"] = bad
+                        with self.assertRaisesRegex(ValueError, "Configured MinLA rounds"):
+                            self.validate(changed, mode, args)
 
     def test_screened_order_and_nullable_profile(self):
         args = bench.arguments(self.argv + ["--modes", "default", "screened", "--profile"])
@@ -89,6 +136,12 @@ class ArgumentsAndReceipts(unittest.TestCase):
                       ["--palette-colors", "70912"], ["--modes", "runs"], ["--modes", "default", "default"]):
             with self.subTest(extra=extra), redirect_stderr(StringIO()), self.assertRaises(SystemExit):
                 bench.arguments(self.argv + extra)
+        for extra in (["--minla-rounds", "4"],
+                      ["--modes", "default", "adjacency", "ezeng", "--minla-rounds", "0"],
+                      ["--modes", "default", "adjacency-minla", "--minla-rounds", "-1"],
+                      ["--modes", "default", "ezeng-minla", "--minla-rounds", "41"]):
+            with self.subTest(extra=extra), redirect_stderr(StringIO()), self.assertRaises(SystemExit):
+                bench.arguments(self.argv + extra)
         with redirect_stderr(StringIO()), self.assertRaises(SystemExit):
             bench.arguments([a for a in self.argv if a != "--synthetic"])
         self.args.out.write_text("keep", encoding="utf-8")
@@ -106,6 +159,19 @@ class ArgumentsAndReceipts(unittest.TestCase):
             self.validate(measurement(self.args, mode, palettes=[palette]), mode)
             with self.assertRaises(ValueError):
                 self.validate(measurement(self.args, mode, route="groupwise", palettes=[palette]), mode)
+
+    def test_graph_configuration_does_not_claim_activation(self):
+        for mode in ("adjacency", "adjacency-minla", "ezeng", "ezeng-minla"):
+            for channels, colors, deltas in ((4, 48, 0), (3, 256, 0), (4, 257, 0),
+                                             (4, 300, 0), (2, 48, 0), (4, 0, 8)):
+                with self.subTest(mode=mode, channels=channels, colors=colors, deltas=deltas):
+                    palette = dict(input_channels=[0, channels], colors=colors,
+                                   deltas=deltas, predictor="Zero")
+                    m = measurement(self.args, mode, palettes=[palette])
+                    # Accepted tuples, including bypass cases, do not attest graph execution.
+                    self.validate(m, mode)
+                    self.assertIsNone(m["profile"])
+                    self.assertNotIn("graph_activated", m["palette_evidence"])
 
     def test_invalid_receipts(self):
         mutations = [lambda m: m.update(seconds=0), lambda m: m.update(seconds=float("nan")),
@@ -231,10 +297,16 @@ class Harness(unittest.TestCase):
                 encoder.write_bytes(b"encoder")
                 decoder.write_bytes(b"decoder")
                 argv = ["--encoder", str(encoder), "--decoder", str(decoder), "--case", str(source),
-                        "--out", str(root / "report.json"), "--repeats", "1", "--modes", "default", "screened"]
+                        "--out", str(root / "report.json"), "--repeats", "1", "--modes", "default", "screened",
+                        "adjacency-minla", "ezeng", "ezeng-minla"]
                 args = bench.arguments(argv + (["--profile"] if profile else []))
-                snapshot = "palette.order.screen | 2 | 0.250000 | 0.150000\n" if profile else None
-                notes = "[rs-jxl profile] palette decision: default" if profile else ""
+                snapshot = ("palette.order.graph | 1 | 0.040000 | 0.040000\n"
+                            "palette.order.graph.build | 1 | 0.010000 | 0.010000\n"
+                            "palette.order.graph.seed | 1 | 0.010000 | 0.010000\n"
+                            "palette.order.graph.refine | 1 | 0.020000 | 0.020000\n") if profile else None
+                notes = ("[rs-jxl profile] palette.graph.result seed=ezeng colors=48 samples=2 "
+                         "edges=1 rounds=4 moves=2 before=100 after=80\n"
+                         "[rs-jxl profile] palette.graph.bypass colors=300\n") if profile else ""
 
                 def run(cmd, env, timeout):
                     self.assertEqual(env.get("RS_JXL_PROFILE"), "1" if profile else None)
@@ -277,7 +349,7 @@ class Harness(unittest.TestCase):
                     argv = ["--encoder", str(encoder), "--decoder", str(decoder), "--case", str(source),
                             "--out", str(out), "--repeats", "2", "--warmups", "1", "--modes", *bench.MODES]
                     if diagnostic:
-                        argv += ["--full-frame", "--palette-colors", "10000"]
+                        argv += ["--full-frame", "--palette-colors", "10000", "--minla-rounds", "40"]
                     if profile:
                         argv += ["--profile"]
                     args = bench.arguments(argv)
@@ -298,6 +370,7 @@ class Harness(unittest.TestCase):
                             size = 12 + len(visits)
                             Path(cmd[cmd.index("--output") + 1]).write_bytes(bytes([len(visits)]) * size)
                             self.assertEqual("--full-frame" in cmd, diagnostic)
+                            self.assertEqual("--minla-rounds" in cmd, diagnostic and mode in bench.MINLA_MODES)
                             m = measurement(args, mode, size=size, route="full_image" if diagnostic else "groupwise")
                             if profile:
                                 # Inclusive totals can exceed the measured native wall duration.

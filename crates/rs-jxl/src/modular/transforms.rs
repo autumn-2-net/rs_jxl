@@ -296,6 +296,7 @@ pub fn palette_forward_with_options(
     tools: PaletteTools,
 ) -> Result<Option<PaletteOutput>> {
     let end = spatial_channel_range(planes, begin, num_channels, width, height)?;
+    tools.order.validate()?;
     if bit_depth == 0 || bit_depth > 32 {
         return Err(Error::InvalidInput("palette depth must be 1..=32".into()));
     }

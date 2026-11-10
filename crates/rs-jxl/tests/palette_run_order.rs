@@ -20,11 +20,15 @@ fn tools(order: PaletteOrder, mapping: PaletteMapping) -> PaletteTools {
     }
 }
 
-fn orders() -> [PaletteOrder; 3] {
+fn orders() -> [PaletteOrder; 7] {
     [
         PaletteOrder::RunFrequency,
         PaletteOrder::HotRuns { hot_colors: 2 },
         PaletteOrder::ScreenedRuns,
+        PaletteOrder::AdjacencyMinLa { rounds: 0 },
+        PaletteOrder::AdjacencyMinLa { rounds: 4 },
+        PaletteOrder::EzengMinLa { rounds: 0 },
+        PaletteOrder::EzengMinLa { rounds: 4 },
     ]
 }
 
@@ -116,6 +120,125 @@ fn source_modes_remain_zero_through_nine_only() {
     }
     for i in [10, 11, 255] {
         assert!(PaletteOrder::from_source_mode(i).is_err());
+    }
+}
+
+#[test]
+fn minla_zero_rounds_match_adjacency_and_large_tables_fall_back() {
+    for colors in [7, 257] {
+        let input: Vec<Vec<i32>> = (0..3)
+            .map(|c| {
+                (0..colors * 3)
+                    .map(|i| ((i * 13 % colors) * 73 + c * 19 + 7) as i32)
+                    .collect()
+            })
+            .collect();
+        let run = |order| {
+            transforms::palette_forward_with_options(
+                &input,
+                0,
+                3,
+                colors,
+                3,
+                512,
+                16,
+                true,
+                tools(order, PaletteMapping::Flat),
+            )
+            .unwrap()
+            .unwrap()
+        };
+        assert_eq!(
+            run(PaletteOrder::AdjacencyMinLa { rounds: 0 }),
+            run(PaletteOrder::Adjacency)
+        );
+        for order in [
+            PaletteOrder::AdjacencyMinLa { rounds: 4 },
+            PaletteOrder::EzengMinLa { rounds: 4 },
+        ] {
+            let result = run(order);
+            assert_expands(&result, &input, 16);
+            if colors > 256 {
+                let fallback = match order {
+                    PaletteOrder::AdjacencyMinLa { .. } => PaletteOrder::Adjacency,
+                    _ => PaletteOrder::Default,
+                };
+                assert_eq!(result, run(fallback));
+            }
+        }
+    }
+}
+
+#[test]
+fn minla_round_limits_are_validated_even_without_palette_work() {
+    for order in [
+        PaletteOrder::AdjacencyMinLa { rounds: 41 },
+        PaletteOrder::EzengMinLa { rounds: 255 },
+    ] {
+        assert!(
+            PaletteOptions {
+                tools: tools(order, PaletteMapping::Tree),
+                ..PaletteOptions::default()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            transforms::palette_forward_with_options(
+                &[vec![1, 2]],
+                0,
+                1,
+                2,
+                1,
+                0,
+                8,
+                false,
+                tools(order, PaletteMapping::Tree)
+            )
+            .is_err()
+        );
+    }
+}
+
+#[test]
+fn minla_unsupported_channels_use_fallback_even_with_ignored_geometry() {
+    let input = planes(&[[7, 13, 19, 0, -3], [29, 31, 37, 0, -7], [7, 13, 19, 0, -3]]);
+    for (order, fallback) in [
+        (
+            PaletteOrder::AdjacencyMinLa { rounds: 4 },
+            PaletteOrder::Adjacency,
+        ),
+        (
+            PaletteOrder::EzengMinLa { rounds: 4 },
+            PaletteOrder::Default,
+        ),
+    ] {
+        for geometry in [
+            PaletteGeometry::None,
+            PaletteGeometry::Principal,
+            PaletteGeometry::FrequencyBandsPrincipal,
+        ] {
+            let selected = PaletteTools {
+                order,
+                geometry,
+                ..PaletteTools::default()
+            };
+            let output = forward(&input, 3, 16, true, selected);
+            assert_eq!(
+                output,
+                forward(
+                    &input,
+                    3,
+                    16,
+                    true,
+                    PaletteTools {
+                        order: fallback,
+                        ..selected
+                    }
+                )
+            );
+            assert_expands(&output, &input, 16);
+        }
     }
 }
 

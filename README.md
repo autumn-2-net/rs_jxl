@@ -380,6 +380,7 @@ must repeat the relevant checks; historical binding validation remains separate.
 - [Experimental context-map-aware ANS clustering](docs/CONTEXT_MAP_REFINEMENT_20261110.md)
 - [Experimental LZ77 profitability scout and fast matchers](docs/LZ77_SCOUT_20261110.md)
 - [Cost-ranked sparse double-hash follow-up](docs/LZ77_COMBINED_20261110.md)
+- [Bounded palette MinLA and EZeng experiment](docs/PALETTE_MINLA_20261110.md)
 - [Progressive original-group scheduling](docs/PROGRESSIVE_GROUP_SCHEDULER.md)
 - [Incremental output and frame indexes](docs/STREAMING_OUTPUT.md)
 - [Fast lossless source port](docs/FJXL_PORT_STATUS.md)

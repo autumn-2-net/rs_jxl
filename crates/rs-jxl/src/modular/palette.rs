@@ -128,6 +128,7 @@ impl Default for PaletteOptions {
 impl PaletteOptions {
     pub fn validate(&self) -> Result<()> {
         self.mode.validate()?;
+        self.tools.order.validate()?;
         if !(-1..=9).contains(&self.speed_tier) || self.palette_colors.unsigned_abs() > 70911 {
             return Err(Error::InvalidInput(
                 "palette speed tier or color limit exceeds supported range".into(),
@@ -195,6 +196,7 @@ pub fn apply_palette_range_with_options(
     tools: PaletteTools,
 ) -> Result<Option<Transform>> {
     mode.validate()?;
+    tools.order.validate()?;
     if !(1..=32).contains(&bits) {
         return Err(Error::InvalidInput(
             "palette bit depth must be 1..32".into(),

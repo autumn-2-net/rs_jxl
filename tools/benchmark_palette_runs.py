@@ -3,6 +3,7 @@
 No builds, production-default changes, searchbest, or JXL identity comparisons.
 Timing is exactly one native encode, excluding process startup and file IO.
 Configured order is not activation evidence: receipts cover global tuples only.
+Graph execution needs a separate profile audit, not an eligible tuple count.
 """
 import argparse
 import json
@@ -20,8 +21,10 @@ from benchmark_tile_patches import add_comparisons as _comparisons, aggregate as
 import compare_cpp_port as port
 import corpus_inputs
 
-MODES = ("default", "frequency", "runs", "screened", "hot0", "hot32", "hot128", "hot512")
+MODES = ("default", "frequency", "runs", "screened", "hot0", "hot32", "hot128", "hot512",
+         "adjacency", "adjacency-minla", "ezeng", "ezeng-minla")
 DEFAULT_MODES = ("default", "runs", "hot0", "hot128")
+MINLA_MODES = ("adjacency-minla", "ezeng-minla")
 SCOPE = "global_tuple_only; excludes single-channel compaction and local/groupwise palettes"
 
 
@@ -53,6 +56,8 @@ def arguments(argv=None):
     p.add_argument("--modes", nargs="+", choices=MODES, default=list(DEFAULT_MODES))
     p.add_argument("--effort", type=int, choices=range(4, 11), default=9)
     p.add_argument("--threads", type=int, default=8)
+    p.add_argument("--minla-rounds", type=int, choices=range(41),
+                   help="Refinement rounds for MinLA modes only (native default: 4)")
     p.add_argument("--palette-colors", type=int)
     p.add_argument("--full-frame", action="store_true")
     p.add_argument("--profile", action="store_true", help="Collect inclusive native profile diagnostics")
@@ -67,6 +72,8 @@ def arguments(argv=None):
         p.error("Invalid threads/repeats/warmups/timeout/palette-colors")
     if len(set(a.modes)) != len(a.modes) or "default" not in a.modes:
         p.error("Use distinct modes including default")
+    if a.minla_rounds is not None and not any(mode in MINLA_MODES for mode in a.modes):
+        p.error("--minla-rounds requires adjacency-minla or ezeng-minla in --modes")
     if not a.case and a.manifest is None and not a.synthetic:
         p.error("Provide --case, --manifest or --synthetic")
     if a.out.exists():
@@ -86,6 +93,8 @@ def command(args, source, output, mode):
            "--effort", str(args.effort), "--threads", str(args.threads)]
     if hot is not None:
         cmd += ["--hot-colors", str(hot)]
+    if mode in MINLA_MODES and args.minla_rounds is not None:
+        cmd += ["--minla-rounds", str(args.minla_rounds)]
     if args.palette_colors is not None:
         cmd += ["--palette-colors", str(args.palette_colors)]
     if args.full_frame:
@@ -158,11 +167,19 @@ def validate_measurement(m, mode, size, width, height, args):
     if not isinstance(configured, dict) or not isinstance(projected, dict):
         raise ValueError("Missing configured/projected policy")
     expected_order = {"default": "Default", "frequency": "FrequencyLuma", "runs": "RunFrequency",
-                      "screened": "ScreenedRuns"}.get(native)
+                      "screened": "ScreenedRuns", "adjacency": "Adjacency"}.get(native)
+    rounds = None
     if hot is not None:
         expected_order = f"HotRuns {{ hot_colors: {hot} }}"
+    if native in MINLA_MODES or native == "ezeng":
+        rounds = 0 if native == "ezeng" else (4 if args.minla_rounds is None else args.minla_rounds)
+        variant = "AdjacencyMinLa" if native == "adjacency-minla" else "EzengMinLa"
+        expected_order = f"{variant} {{ rounds: {rounds} }}"
     if configured.get("order") != expected_order or configured.get("hot_colors") != hot:
         raise ValueError("Configured order mismatch")
+    actual_rounds = configured.get("minla_rounds")
+    if actual_rounds != rounds or (rounds is not None and type(actual_rounds) is not int):
+        raise ValueError("Configured MinLA rounds mismatch")
     for policy in (configured, projected):
         if (type(policy.get("groupwise")) is not bool or type(policy.get("palette_colors")) is not int
                 or not 0 <= policy["palette_colors"] <= 70911):
@@ -222,6 +239,7 @@ def benchmark(args):
                   correctness="Original 8/16-bit PNG samples including hidden RGB; official djxl",
                   official_decoder_provenance="Caller-attested; path and SHA256 recorded",
                   receipt_scope=SCOPE, ratio_contract="mode / default; sums of per-case medians",
+                  graph_evidence="Configured modes/accepted tuple counts are not execution evidence; separate profile audit required",
                   regression_policy="Size/time regressions reported, not failures")
     identities, temporary = [], None
     args.out.parent.mkdir(parents=True, exist_ok=True)

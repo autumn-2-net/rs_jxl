@@ -19,6 +19,10 @@ enum Mode {
     Runs,
     Screened,
     Hot,
+    Adjacency,
+    AdjacencyMinla,
+    Ezeng,
+    EzengMinla,
 }
 
 impl Mode {
@@ -29,15 +33,30 @@ impl Mode {
             Self::Runs => "runs",
             Self::Screened => "screened",
             Self::Hot => "hot",
+            Self::Adjacency => "adjacency",
+            Self::AdjacencyMinla => "adjacency-minla",
+            Self::Ezeng => "ezeng",
+            Self::EzengMinla => "ezeng-minla",
         }
     }
-    fn order(self, hot_colors: usize) -> PaletteOrder {
+    fn is_minla(self) -> bool {
+        matches!(self, Self::AdjacencyMinla | Self::EzengMinla)
+    }
+    fn order(self, hot_colors: usize, minla_rounds: u8) -> PaletteOrder {
         match self {
             Self::Default => PaletteOrder::Default,
             Self::Frequency => PaletteOrder::FrequencyLuma,
             Self::Runs => PaletteOrder::RunFrequency,
             Self::Screened => PaletteOrder::ScreenedRuns,
             Self::Hot => PaletteOrder::HotRuns { hot_colors },
+            Self::Adjacency => PaletteOrder::Adjacency,
+            Self::AdjacencyMinla => PaletteOrder::AdjacencyMinLa {
+                rounds: minla_rounds,
+            },
+            Self::Ezeng => PaletteOrder::EzengMinLa { rounds: 0 },
+            Self::EzengMinla => PaletteOrder::EzengMinLa {
+                rounds: minla_rounds,
+            },
         }
     }
 }
@@ -55,6 +74,9 @@ struct Args {
     mode: Mode,
     #[arg(long, default_value_t = 128)]
     hot_colors: usize,
+    /// Refinement rounds for adjacency-minla/ezeng-minla only (default: 4).
+    #[arg(long, value_parser = clap::value_parser!(u8).range(0..=40))]
+    minla_rounds: Option<u8>,
     /// Explicit experimental cap, equally applicable to every ordering mode.
     #[arg(long, value_parser = clap::value_parser!(i32).range(0..=70911))]
     palette_colors: Option<i32>,
@@ -63,7 +85,17 @@ struct Args {
     full_frame: bool,
 }
 
+impl Args {
+    fn validate(&self) -> Result<()> {
+        if self.minla_rounds.is_some() && !self.mode.is_minla() {
+            return Err("--minla-rounds requires --mode adjacency-minla or ezeng-minla".into());
+        }
+        Ok(())
+    }
+}
+
 fn run(args: Args) -> Result<()> {
+    args.validate()?;
     if args.output.exists() {
         return Err("benchmark output already exists".into());
     }
@@ -85,7 +117,9 @@ fn run(args: Args) -> Result<()> {
         .ok_or("projected native candidate has no palette policy")?;
     let projected_groupwise = policy.groupwise;
     let projected_palette_colors = policy.palette_colors;
-    policy.tools.order = args.mode.order(args.hot_colors);
+    policy.tools.order = args
+        .mode
+        .order(args.hot_colors, args.minla_rounds.unwrap_or(4));
     if let Some(colors) = args.palette_colors {
         policy.palette_colors = colors;
     }
@@ -95,6 +129,13 @@ fn run(args: Args) -> Result<()> {
     let configured = serde_json::json!({
         "order": format!("{:?}", policy.tools.order),
         "hot_colors": (args.mode == Mode::Hot).then_some(args.hot_colors),
+        "minla_rounds": if args.mode.is_minla() {
+            Some(args.minla_rounds.unwrap_or(4))
+        } else if args.mode == Mode::Ezeng {
+            Some(0)
+        } else {
+            None
+        },
         "palette_colors": policy.palette_colors, "groupwise": policy.groupwise,
     });
     let receipt = Arc::new(ReceiptCollector::default());
@@ -159,28 +200,83 @@ mod tests {
     use super::*;
     #[test]
     fn arguments_and_orders() {
-        let parse = |extra: &[&str]| {
-            Args::try_parse_from(
+        let parse = |extra: &[&str]| -> Result<Args> {
+            let args = Args::try_parse_from(
                 ["palette_lab", "in.png", "--output", "out.jxl"]
                     .into_iter()
                     .chain(extra.iter().copied()),
-            )
+            )?;
+            args.validate()?;
+            Ok(args)
         };
         let args = parse(&[]).unwrap();
         assert_eq!((args.effort, args.threads, args.hot_colors), (9, 8, 128));
         assert_eq!(args.mode, Mode::Default);
         assert!(!args.full_frame);
         assert_eq!(args.palette_colors, None);
-        assert_eq!(Mode::Runs.order(0), PaletteOrder::RunFrequency);
+        assert_eq!(args.minla_rounds, None);
+        assert_eq!(Mode::Runs.order(0, 4), PaletteOrder::RunFrequency);
         let screened = parse(&["--mode", "screened", "--hot-colors", "32"]).unwrap();
         assert_eq!(screened.mode, Mode::Screened);
         assert_eq!(screened.mode.name(), "screened");
         assert_eq!(
-            screened.mode.order(screened.hot_colors),
+            screened.mode.order(screened.hot_colors, 4),
             PaletteOrder::ScreenedRuns
         );
-        assert_eq!(Mode::Screened.order(0), PaletteOrder::ScreenedRuns);
-        assert_eq!(Mode::Hot.order(0), PaletteOrder::HotRuns { hot_colors: 0 });
+        assert_eq!(Mode::Screened.order(0, 4), PaletteOrder::ScreenedRuns);
+        assert_eq!(
+            Mode::Hot.order(0, 4),
+            PaletteOrder::HotRuns { hot_colors: 0 }
+        );
+        for (name, mode, order) in [
+            ("adjacency", Mode::Adjacency, PaletteOrder::Adjacency),
+            (
+                "adjacency-minla",
+                Mode::AdjacencyMinla,
+                PaletteOrder::AdjacencyMinLa { rounds: 4 },
+            ),
+            ("ezeng", Mode::Ezeng, PaletteOrder::EzengMinLa { rounds: 0 }),
+            (
+                "ezeng-minla",
+                Mode::EzengMinla,
+                PaletteOrder::EzengMinLa { rounds: 4 },
+            ),
+        ] {
+            let args = parse(&["--mode", name]).unwrap();
+            assert_eq!(args.mode, mode);
+            assert_eq!(mode.name(), name);
+            assert_eq!(
+                mode.order(args.hot_colors, args.minla_rounds.unwrap_or(4)),
+                order
+            );
+        }
+        for name in ["adjacency-minla", "ezeng-minla"] {
+            for rounds in ["0", "4", "40"] {
+                let args = parse(&["--mode", name, "--minla-rounds", rounds]).unwrap();
+                let rounds = rounds.parse().unwrap();
+                let order = if args.mode == Mode::AdjacencyMinla {
+                    PaletteOrder::AdjacencyMinLa { rounds }
+                } else {
+                    PaletteOrder::EzengMinLa { rounds }
+                };
+                assert_eq!(args.mode.order(128, args.minla_rounds.unwrap()), order);
+            }
+            for rounds in ["-1", "41", "256"] {
+                assert!(parse(&["--mode", name, "--minla-rounds", rounds]).is_err());
+            }
+        }
+        for name in [
+            "default",
+            "frequency",
+            "runs",
+            "screened",
+            "hot",
+            "adjacency",
+            "ezeng",
+        ] {
+            assert!(parse(&["--mode", name, "--minla-rounds", "4"]).is_err());
+        }
+        assert!(parse(&["--minla-rounds", "4"]).is_err());
         assert!(parse(&["--hot-colors", "0", "--palette-colors", "0", "--full-frame"]).is_ok());
         for extra in [
             ["--effort", "3"],

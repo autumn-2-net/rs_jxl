@@ -11,6 +11,8 @@ use std::collections::BTreeMap;
 
 use crate::{Error, Result};
 
+#[path = "palette_graph.rs"]
+mod graph;
 #[path = "palette_runs.rs"]
 mod runs;
 #[path = "palette_screen.rs"]
@@ -39,9 +41,29 @@ pub enum PaletteOrder {
     /// Experimental: keep default ordering unless sampled index residuals and
     /// the complete palette table support a run-aware or lexical alternative.
     ScreenedRuns,
+    /// Experimental: refine the existing adjacency seed on <=256 unique tuples.
+    /// Larger or aliased palettes retain ordinary adjacency ordering.
+    AdjacencyMinLa {
+        rounds: u8,
+    },
+    /// Experimental: insertion-based Zeng seed, optionally refined with MinLA.
+    /// Larger or aliased palettes retain default ordering. Zero rounds is EZeng.
+    EzengMinLa {
+        rounds: u8,
+    },
 }
 
 impl PaletteOrder {
+    pub fn validate(self) -> Result<()> {
+        if matches!(self, Self::AdjacencyMinLa { rounds } | Self::EzengMinLa { rounds } if rounds > 40)
+        {
+            return Err(Error::InvalidInput(
+                "palette MinLA rounds must be 0..40".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// JXL_LOSSLESS_PALETTE_ORDER, with zero denoting the ordinary luma order.
     pub fn from_source_mode(mode: u8) -> Result<Self> {
         match mode {
@@ -456,8 +478,9 @@ pub(super) fn reorder(
     planes: &[Vec<i32>],
     width: usize,
     height: usize,
-    tools: PaletteTools,
+    mut tools: PaletteTools,
 ) -> Result<()> {
+    tools.order.validate()?;
     let channels = planes.len();
     if channels < 3 {
         return Ok(());
@@ -467,7 +490,42 @@ pub(super) fn reorder(
         .map(|c| map.get(c).map(|e| e.count))
         .collect::<Result<_>>()?;
     let n = colors.len();
-    let order = if (channels > 4 || tools.geometry == PaletteGeometry::None)
+    let graph_order = if channels > 4 || tools.geometry == PaletteGeometry::None {
+        match tools.order {
+            PaletteOrder::AdjacencyMinLa { rounds } => {
+                tools.order = PaletteOrder::Adjacency;
+                graph::order(
+                    colors,
+                    &frequencies,
+                    map,
+                    planes,
+                    width,
+                    height,
+                    false,
+                    rounds,
+                )?
+            }
+            PaletteOrder::EzengMinLa { rounds } => {
+                tools.order = PaletteOrder::Default;
+                graph::order(
+                    colors,
+                    &frequencies,
+                    map,
+                    planes,
+                    width,
+                    height,
+                    true,
+                    rounds,
+                )?
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let order = if let Some(order) = graph_order {
+        order
+    } else if (channels > 4 || tools.geometry == PaletteGeometry::None)
         && tools.order == PaletteOrder::ScreenedRuns
     {
         screen::order(colors, &frequencies, map, planes, width, height)?
