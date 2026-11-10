@@ -260,6 +260,12 @@ struct Args {
     reuse_preparation_mib: Option<u16>,
     #[arg(long)]
     chain_batch: bool,
+    /// Sample JXL token profitability without changing or with routing the parse.
+    #[arg(long, value_parser = ["observe", "route"], conflicts_with_all = ["search", "scan_only"])]
+    lz_scout: Option<String>,
+    /// Explicit experimental seed finder; default uses the source matcher.
+    #[arg(long, value_parser = ["sparse", "double-fast", "double-fast-sparse", "double-fast-cost"], conflicts_with_all = ["search", "scan_only"])]
+    lz_quick: Option<String>,
     /// Exact token match extension experiment, without changing candidate budgets.
     #[arg(long, value_parser = ["scalar", "avx2", "avx512"], conflicts_with_all = ["search", "scan_only", "matcher", "chain_batch"])]
     match_extension: Option<String>,
@@ -428,10 +434,12 @@ fn run(args: Args) -> Result<()> {
         };
     }
     params.validate()?;
-    if args.match_extension.is_some()
+    if (args.match_extension.is_some() || args.lz_scout.is_some() || args.lz_quick.is_some())
         && params.lz_method() == rs_jxl::scheduler::params::LzMethod::None
     {
-        return Err("selected candidate disables LZ77; match extension would not execute".into());
+        return Err(
+            "selected candidate disables LZ77; requested LZ experiment would not execute".into(),
+        );
     }
     let matcher = args.effective_matcher();
     let mut base = EncodeOptions {
@@ -526,6 +534,28 @@ fn run(args: Args) -> Result<()> {
         ..Default::default()
     });
     let lz = base.modular.source_lz77.as_mut().unwrap();
+    if let Some(mode) = &args.lz_scout {
+        use rs_jxl::tools::lz77::{SourceScout, SourceScoutMode, SourceScoutReceipt};
+        lz.scout = SourceScout {
+            mode: match mode.as_str() {
+                "observe" => SourceScoutMode::Observe,
+                "route" => SourceScoutMode::Route,
+                _ => unreachable!("validated LZ scout mode"),
+            },
+            receipt: Some(std::sync::Arc::new(SourceScoutReceipt::default())),
+        };
+    }
+    if let Some(mode) = &args.lz_quick {
+        use rs_jxl::tools::lz77::SourceQuickMode;
+        lz.quick = match mode.as_str() {
+            "sparse" => SourceQuickMode::Sparse,
+            "double-fast" => SourceQuickMode::DoubleFast,
+            "double-fast-sparse" => SourceQuickMode::DoubleFastSparse,
+            "double-fast-cost" => SourceQuickMode::DoubleFastCost,
+            _ => unreachable!("validated quick seed mode"),
+        };
+        lz.quick_receipt = Some(std::sync::Arc::new(Default::default()));
+    }
     if let Some(mode) = &args.match_extension {
         use rs_jxl::tools::lz77::{MatchExtension, MatchExtensionReceipt};
         lz.match_extension = match mode.as_str() {
@@ -657,6 +687,16 @@ fn run(args: Args) -> Result<()> {
         .as_ref()
         .and_then(|config| config.match_extension_receipt.clone());
     let refinement_receipt = base.modular.refinement.receipt.clone();
+    let lz_scout_receipt = base
+        .modular
+        .source_lz77
+        .as_ref()
+        .and_then(|config| config.scout.receipt.clone());
+    let lz_quick_receipt = base
+        .modular
+        .source_lz77
+        .as_ref()
+        .and_then(|config| config.quick_receipt.clone());
     let tree_learning_receipt = base.modular.tree_learning_receipt.clone();
     let start = Instant::now();
     let encoded = if args.search {
@@ -841,6 +881,43 @@ fn run(args: Args) -> Result<()> {
             "extensions": r.extensions, "batch_groups": r.batch_groups,
         })
     });
+    let lz_scout = lz_scout_receipt.map(|receipt| {
+        let r = receipt.snapshot();
+        serde_json::json!({
+            "mode": args.lz_scout, "calls": r.calls,
+            "total_seconds": r.total_elapsed_ns as f64 * 1e-9,
+            "full_calls": r.full_calls, "literal_calls": r.literal_calls, "fast_calls": r.fast_calls,
+            "latest": {
+                "decision": format!("{:?}", r.decision), "confidence": format!("{:?}", r.confidence),
+                "reason": format!("{:?}", r.reason), "input_tokens": r.input_tokens,
+                "input_streams": r.input_streams, "sampled_streams": r.sampled_streams,
+                "sampled_tokens": r.sampled_tokens, "coverage": r.coverage,
+                "useful_matches": r.useful_matches, "matched_tokens": r.matched_tokens,
+                "spatial_match_tokens": r.spatial_match_tokens, "match_coverage": r.match_coverage,
+                "literal_bits": r.literal_bits, "savings_bits": r.savings_bits,
+                "sparse_anchors": r.sparse_anchors, "compared_values": r.compared_values,
+                "work_limited": r.work_limited, "elapsed_seconds": r.elapsed_ns as f64 * 1e-9,
+                "distance_bins": r.distance_bins.map(|b| serde_json::json!({
+                    "max_distance": b.max_distance, "matches": b.matches,
+                    "tokens": b.tokens, "savings_bits": b.savings_bits,
+                })),
+            },
+        })
+    });
+    let lz_quick = lz_quick_receipt.map(|receipt| {
+        let r = receipt.snapshot();
+        serde_json::json!({
+            "mode": args.lz_quick, "calls": r.calls,
+            "sparse_calls": r.sparse_calls, "double_fast_calls": r.double_fast_calls,
+            "cost_ranked_calls": r.cost_ranked_calls,
+            "preserved_careful_calls": r.preserved_careful_calls,
+            "queries": r.queries, "query_misses": r.query_misses,
+            "unprofitable_queries": r.unprofitable_queries, "matches": r.matches,
+            "useful_matches": r.useful_matches, "long_matches": r.long_matches,
+            "matched_values": r.matched_values, "skipped_positions": r.skipped_positions,
+            "parse_seconds": r.parse_seconds, "useful_saving_bits": r.useful_saving_bits,
+        })
+    });
     println!(
         "{}",
         serde_json::json!({
@@ -855,6 +932,7 @@ fn run(args: Args) -> Result<()> {
             "fast_context": fast_context,
             "ma_seed": ma_seed,
             "match_extension": match_extension,
+            "lz_scout": lz_scout, "lz_quick": lz_quick,
             "refinement": refinement,
             "tree_learning": args.tree_learning.as_deref().unwrap_or("legacy"),
             "tree_learning_work": tree_learning_work,
@@ -995,6 +1073,34 @@ fn tree_learning_is_explicit_and_excludes_other_tree_experiments() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lz_scout_and_quick_are_opt_in_fixed_plan_tools() {
+        let args = Args::try_parse_from(["lab", "input.png"]).unwrap();
+        assert!(args.lz_scout.is_none() && args.lz_quick.is_none());
+        for (flag, modes) in [
+            ("--lz-scout", &["observe", "route"][..]),
+            (
+                "--lz-quick",
+                &[
+                    "sparse",
+                    "double-fast",
+                    "double-fast-sparse",
+                    "double-fast-cost",
+                ][..],
+            ),
+        ] {
+            for mode in modes {
+                assert!(Args::try_parse_from(["lab", "input.png", flag, mode]).is_ok());
+                for conflict in ["--search", "--scan-only"] {
+                    assert!(
+                        Args::try_parse_from(["lab", "input.png", flag, mode, conflict]).is_err()
+                    );
+                }
+            }
+            assert!(Args::try_parse_from(["lab", "input.png", flag, "unknown"]).is_err());
+        }
+    }
 
     #[test]
     fn match_extensions_are_explicit_and_route_checked() {

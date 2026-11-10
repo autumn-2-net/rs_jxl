@@ -14,6 +14,152 @@ fn tokens(values: &[u32]) -> Vec<Literal> {
         .collect()
 }
 
+#[test]
+fn quick_seed_experiments_replay_through_full_source_dispatch() {
+    let values: Vec<u32> = (0..2048).map(|i| ((i % 97) * 31) as u32).collect();
+    let input = tokens(&values);
+    for mode in [
+        SourceQuickMode::Sparse,
+        SourceQuickMode::DoubleFast,
+        SourceQuickMode::DoubleFastSparse,
+    ] {
+        for method in [SourceLz77Method::Lz77b3w3t, SourceLz77Method::Optc8] {
+            let receipt = std::sync::Arc::new(SourceQuickReceipt::default());
+            let config = SourceConfig {
+                method,
+                quick: mode,
+                quick_receipt: Some(receipt.clone()),
+                max_match_length: 71,
+                require_global_savings: false,
+                ..Default::default()
+            };
+            for width in [0, 1, 31] {
+                let output = parse_source_with_state(&input, width, &config).unwrap();
+                replay(&input, &output.commands, width);
+                assert!(output.enabled);
+            }
+            assert_eq!(receipt.snapshot().calls, 3);
+        }
+    }
+}
+
+#[test]
+fn observing_lz_profitability_does_not_change_source_decisions() {
+    let values: Vec<u32> = (0..4096).map(|i| ((i * i + i / 31) % 257) as u32).collect();
+    let input = tokens(&values);
+    let config = SourceConfig::new(SourceLz77Method::Optc8);
+    let expected = parse_source_with_state(&input, 31, &config).unwrap();
+    let observed = SourceConfig {
+        scout: SourceScout {
+            mode: SourceScoutMode::Observe,
+            receipt: None,
+        },
+        ..config
+    };
+    let actual = parse_source_with_state(&input, 31, &observed).unwrap();
+    assert_eq!(actual, expected);
+    replay(&input, &actual.commands, 31);
+}
+
+#[test]
+fn cost_ranked_mode_preserves_careful_seed_contract_and_combined_boundary() {
+    for (total, forced, streams) in [
+        (1024, false, 1),
+        (65535, false, 1),
+        (65536, false, 2),
+        (70000, true, 1),
+    ] {
+        let input = tokens(&(0..total).map(|n| 65536 + n % 31).collect::<Vec<_>>());
+        let inputs: Vec<_> = input.chunks(input.len() / streams).collect();
+        let widths = vec![31; inputs.len()];
+        let receipt = std::sync::Arc::new(SourceQuickReceipt::default());
+        let config = SourceConfig {
+            method: SourceLz77Method::Optc8,
+            quick: SourceQuickMode::DoubleFastCost,
+            quick_receipt: Some(receipt.clone()),
+            careful_first_pass: forced,
+            require_global_savings: false,
+            max_match_length: 511,
+            ..Default::default()
+        };
+        let mut work = Work::default();
+        let result = run(&inputs, &widths, &config, &mut work).unwrap();
+        let careful = forced || total < 65536;
+        assert_eq!(work.careful_seed, careful);
+        let stats = receipt.snapshot();
+        assert_eq!(
+            stats.cost_ranked_calls,
+            if careful { 0 } else { inputs.len() as u64 }
+        );
+        assert_eq!(
+            stats.preserved_careful_calls,
+            if careful { inputs.len() as u64 } else { 0 }
+        );
+        if careful {
+            let baseline = SourceConfig {
+                quick: SourceQuickMode::Off,
+                quick_receipt: None,
+                ..config
+            };
+            assert_eq!(
+                result,
+                run(&inputs, &widths, &baseline, &mut Work::default()).unwrap()
+            );
+            assert_eq!(work.shared_index_builds, 0);
+        }
+        for (original, commands) in inputs.iter().zip(&result.commands) {
+            replay(original, commands, 31);
+        }
+    }
+}
+
+#[test]
+fn scout_literal_route_bypasses_matching_with_exact_dense_negative_evidence() {
+    let input = tokens(&(0..2048).map(|n| 0xf000_0000 + n).collect::<Vec<_>>());
+    let receipt = std::sync::Arc::new(SourceScoutReceipt::default());
+    let config = SourceConfig {
+        method: SourceLz77Method::Optc8,
+        scout: SourceScout {
+            mode: SourceScoutMode::Route,
+            receipt: Some(receipt.clone()),
+        },
+        ..Default::default()
+    };
+    let mut work = Work::default();
+    let output = run(&[&input], &[31], &config, &mut work).unwrap();
+    assert_eq!(receipt.snapshot().decision, SourceScoutDecision::Literal);
+    assert!(!output.enabled);
+    assert_eq!(
+        (work.fast_tasks, work.optimal_tasks, work.passes),
+        (0, 0, 0)
+    );
+    replay(&input, &output.commands[0], 31);
+}
+
+#[test]
+fn scout_fast_route_skips_dp_but_respects_forced_acceptance_diagnostics() {
+    let input = tokens(&(0..8193).map(|n| 0x1234_0000 + n % 31).collect::<Vec<_>>());
+    for require_global_savings in [true, false] {
+        let receipt = std::sync::Arc::new(SourceScoutReceipt::default());
+        let config = SourceConfig {
+            method: SourceLz77Method::Optc8,
+            scout: SourceScout {
+                mode: SourceScoutMode::Route,
+                receipt: Some(receipt.clone()),
+            },
+            require_global_savings,
+            ..Default::default()
+        };
+        let mut work = Work::default();
+        let output = run(&[&input], &[31], &config, &mut work).unwrap();
+        assert_eq!(receipt.snapshot().decision, SourceScoutDecision::Fast);
+        assert!(output.enabled);
+        assert_eq!(work.passes, usize::from(!require_global_savings));
+        assert_eq!(work.careful_seed, !require_global_savings);
+        replay(&input, &output.commands[0], 31);
+    }
+}
+
 fn replay(input: &[Literal], commands: &[Command], width: usize) {
     let mut decoded = Vec::new();
     for &command in commands {

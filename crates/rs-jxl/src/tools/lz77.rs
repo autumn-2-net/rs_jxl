@@ -74,10 +74,12 @@ pub use source::{
     SourceBlockDyadic, SourceBlockEnvelope, SourceBlockMode, SourceBucketMode,
     SourceBucketSelection, SourceChainCache, SourceConfig, SourceDeepPrefix, SourceFastPrefix,
     SourceFastRanges, SourceIndexMode, SourceIndexTags, SourceIntervalDp, SourceMatchCost,
-    SourceParallelism, SourceParseOutcome, SourceRunKeys, SourceSeedBlocks, SourceSeedGuided,
-    SourceStreamsOutcome, SourceSuffixMode, parse_source, parse_source_rle_streams_with_state,
-    parse_source_rle_with_state, parse_source_streams, parse_source_streams_with_state,
-    parse_source_with_state,
+    SourceParallelism, SourceParseOutcome, SourceQuickMode, SourceQuickReceipt, SourceQuickStats,
+    SourceRunKeys, SourceScout, SourceScoutConfidence, SourceScoutDecision, SourceScoutDistanceBin,
+    SourceScoutMode, SourceScoutReason, SourceScoutReceipt, SourceScoutSnapshot, SourceSeedBlocks,
+    SourceSeedGuided, SourceStreamsOutcome, SourceSuffixMode, parse_source,
+    parse_source_rle_streams_with_state, parse_source_rle_with_state, parse_source_streams,
+    parse_source_streams_with_state, parse_source_with_state,
 };
 
 pub const MIN_MATCH: usize = 3;

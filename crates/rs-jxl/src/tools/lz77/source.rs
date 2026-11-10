@@ -85,7 +85,14 @@ mod histograms;
 mod prices;
 mod profile;
 mod sais;
+mod scout;
 mod search;
+pub use scout::{
+    SourceScout, SourceScoutConfidence, SourceScoutDecision, SourceScoutDistanceBin,
+    SourceScoutMode, SourceScoutReason, SourceScoutReceipt, SourceScoutSnapshot,
+};
+mod quick;
+pub use quick::{SourceQuickMode, SourceQuickReceipt, SourceQuickStats};
 
 /// enc_lz77.cc's JXL_LOSSLESS_LZ77_MATCH_COST modes 0..7.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -271,6 +278,12 @@ pub enum SourceFastPrefix {
 #[derive(Clone, Debug)]
 pub struct SourceConfig {
     pub method: SourceLz77Method,
+    /// Opt-in sampled profitability routing; Off preserves source dispatch.
+    pub scout: SourceScout,
+    /// Opt-in sparse or two-key seed finder. Does not alter the final DP.
+    pub quick: SourceQuickMode,
+    /// Optional per-seed counters, aggregated outside the matching loop.
+    pub quick_receipt: Option<std::sync::Arc<SourceQuickReceipt>>,
     /// Opt-in exact extension kernel; does not change candidates or wire semantics.
     pub match_extension: super::MatchExtension,
     /// Compare independent fast-ring/spatial candidates four at a time.
@@ -572,6 +585,9 @@ impl Default for SourceConfig {
     fn default() -> Self {
         Self {
             method: SourceLz77Method::Lz77b3w3t,
+            scout: SourceScout::default(),
+            quick: SourceQuickMode::Off,
+            quick_receipt: None,
             match_extension: super::MatchExtension::Legacy,
             batch_fast_matches: false,
             match_extension_receipt: None,
@@ -1449,8 +1465,37 @@ fn run(
             enabled: !config.require_global_savings && !inputs.is_empty(),
         });
     }
-    let optimal = config.method.chain_maximum().is_some();
-    let careful = optimal && (config.careful_first_pass || total < 65_536);
+    let mut scout_costs = if config.scout.mode == SourceScoutMode::Off {
+        None
+    } else {
+        Some(Costs::raw(inputs, config))
+    };
+    let recommendation = if let Some(costs) = &scout_costs {
+        scout::probe(inputs, widths, costs, config)?
+    } else {
+        SourceScoutDecision::Full
+    };
+    let route = if config.scout.mode == SourceScoutMode::Route && config.require_global_savings {
+        recommendation
+    } else {
+        SourceScoutDecision::Full
+    };
+    if route == SourceScoutDecision::Literal {
+        return Ok(SourceStreamsOutcome {
+            commands: inputs
+                .iter()
+                .map(|input| literals(input))
+                .collect::<Result<_>>()?,
+            enabled: false,
+        });
+    }
+    let optimal = config.method.chain_maximum().is_some() && route != SourceScoutDecision::Fast;
+    let careful = optimal
+        && matches!(
+            config.quick,
+            SourceQuickMode::Off | SourceQuickMode::DoubleFastCost
+        )
+        && (config.careful_first_pass || total < 65_536);
     #[cfg(test)]
     {
         _work.careful_seed = careful;
@@ -1463,11 +1508,12 @@ fn run(
         values.push(data);
     }
     drop(values_profile);
-    let mut shared = if !careful {
-        blocks::shared_index(&values, widths, config)?
-    } else {
-        None
-    };
+    let mut shared =
+        if !careful && config.quick == SourceQuickMode::Off && route != SourceScoutDecision::Fast {
+            blocks::shared_index(&values, widths, config)?
+        } else {
+            None
+        };
     #[cfg(test)]
     {
         _work.shared_index_builds += usize::from(shared.is_some());
@@ -1478,7 +1524,19 @@ fn run(
         .map(|part| &inputs[part.owner][part.begin..part.end])
         .collect();
     let seed_total: usize = seed_inputs.iter().map(|s| s.len()).sum();
-    let costs = Costs::raw(&seed_inputs, config);
+    // Reuse the probe's raw cost model only for the identical stream layout;
+    // warm seed partitions can duplicate history and change the population.
+    let same_population = parts.len() == inputs.len()
+        && parts.iter().enumerate().all(|(i, part)| {
+            part.owner == i && part.begin == 0 && part.end == inputs[i].len() && part.prefix == 0
+        });
+    let costs = if same_population {
+        scout_costs
+            .take()
+            .unwrap_or_else(|| Costs::raw(&seed_inputs, config))
+    } else {
+        Costs::raw(&seed_inputs, config)
+    };
     let seed_prices = prices::Prices::new(&costs)?;
     let seed_penalties = if careful {
         None
@@ -1499,7 +1557,23 @@ fn run(
         }
         let sums = seed_prices.cumulative(input, config)?;
         let commands = if careful {
-            careful_stream(input, data, width, config, &costs, &sums, saving)?
+            let commands = careful_stream(input, data, width, config, &costs, &sums, saving)?;
+            if config.quick == SourceQuickMode::DoubleFastCost
+                && let Some(receipt) = &config.quick_receipt
+            {
+                receipt.record_careful();
+            }
+            commands
+        } else if config.quick != SourceQuickMode::Off {
+            quick::parse(
+                input,
+                data,
+                width,
+                config,
+                seed_penalties.as_ref().expect("quick seed penalties"),
+                &sums,
+                saving,
+            )?
         } else {
             let penalties = seed_penalties.as_ref().expect("fast-seed penalty table");
             match config.method.fast_capacity() {
