@@ -11,6 +11,11 @@ use std::collections::BTreeMap;
 
 use crate::{Error, Result};
 
+#[path = "palette_runs.rs"]
+mod runs;
+#[path = "palette_screen.rs"]
+mod screen;
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum PaletteOrder {
     #[default]
@@ -24,6 +29,16 @@ pub enum PaletteOrder {
     Hilbert,
     Adjacency,
     FrequencyBandsAdjacency,
+    /// Experimental: descending full-tuple raster run count, lexical ties.
+    RunFrequency,
+    /// Experimental: most frequent run starters first, lexical order inside
+    /// both partitions. The cutoff is a hypothesis, not a JXL coding boundary.
+    HotRuns {
+        hot_colors: usize,
+    },
+    /// Experimental: keep default ordering unless sampled index residuals and
+    /// the complete palette table support a run-aware or lexical alternative.
+    ScreenedRuns,
 }
 
 impl PaletteOrder {
@@ -81,6 +96,7 @@ pub enum PaletteMapping {
 /// palettes stay sorted. `ordered=false` bypasses order/geometry, not mapping.
 /// Geometry/Hilbert/adjacency require 3..=4 channels; at >4 channels source
 /// modes 6..9 fall through to unbanded signed Morton, while geometry is ignored.
+/// Run-aware experiments support >=3 channels and only scan when selected.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct PaletteTools {
     pub order: PaletteOrder,
@@ -451,7 +467,22 @@ pub(super) fn reorder(
         .map(|c| map.get(c).map(|e| e.count))
         .collect::<Result<_>>()?;
     let n = colors.len();
-    let order = if channels <= 4 && tools.geometry != PaletteGeometry::None {
+    let order = if (channels > 4 || tools.geometry == PaletteGeometry::None)
+        && tools.order == PaletteOrder::ScreenedRuns
+    {
+        screen::order(colors, &frequencies, map, planes, width, height)?
+    } else if (channels > 4 || tools.geometry == PaletteGeometry::None)
+        && matches!(
+            tools.order,
+            PaletteOrder::RunFrequency | PaletteOrder::HotRuns { .. }
+        )
+    {
+        let hot_colors = match tools.order {
+            PaletteOrder::HotRuns { hot_colors } => Some(hot_colors),
+            _ => None,
+        };
+        runs::order(colors, map, planes, hot_colors)?
+    } else if channels <= 4 && tools.geometry != PaletteGeometry::None {
         let tuples: Vec<_> = colors
             .iter()
             .map(|color| {

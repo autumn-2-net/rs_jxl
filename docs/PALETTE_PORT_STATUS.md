@@ -99,6 +99,16 @@ PaletteTools { order: PaletteOrder, geometry: PaletteGeometry, mapping: PaletteM
 - `PaletteOrder::from_source_mode` accepts 0..9;
   `PaletteGeometry::from_source_mode` accepts 0..2. Other values are errors.
 
+Separate Rust-only experiments added on 2026-11-10 are
+`PaletteOrder::RunFrequency`, `PaletteOrder::HotRuns { hot_colors }`, and
+`PaletteOrder::ScreenedRuns`.
+They do not extend the frozen C++ selector numbering or become default routing.
+See [the run-order report](PALETTE_RUN_ORDER_20261110.md) for semantics, safety
+checks and measurements; these are not claimed as source-port features.
+The [screened selector](PALETTE_SCREEN_20261110.md) uses sampled index costs and
+full table costs, not multiple complete encodes. It falls back on ambiguous or
+unavailable estimates and makes no encoded-size guarantee.
+
 Successful exact-delta palettes keep their own residual-frequency order. Ordinary
 fallbacks use the selected tools; exact-zero masks are computed from original
 samples before ordinary palette ordering and index shifting. Range errors and

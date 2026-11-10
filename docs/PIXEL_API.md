@@ -105,6 +105,14 @@ an input callback API: the complete result is still collected in memory.
 - `palette_policy.tools`: optional source palette ordering/geometry and exact
   flat-map lookup; default tool selection is unchanged. Native candidate and
   patch-atlas projections preserve an explicit selection.
+  Named Rust experiments `PaletteOrder::RunFrequency` and
+  `PaletteOrder::HotRuns { hot_colors }` order explicit absolute colors by raster
+  run-start statistics. They do not add source numeric modes or alter implicit
+  colors/successful delta palettes. See [run-order experiments](PALETTE_RUN_ORDER_20261110.md).
+  `PaletteOrder::ScreenedRuns` is a separate opt-in preflight selector: it keeps
+  the default order unless sampled index costs plus full palette-table costs
+  favor an alternative consistently. It does not perform multiple full encodes
+  or guarantee the smallest final stream. See [screening](PALETTE_SCREEN_20261110.md).
 - `squeeze`: explicit reversible horizontal/vertical passes.
 - `sampling`: source MA sampling/quantile policy; absent uses explicit legacy sampling.
 - `source_constant_channels`: explicit constant-tail bypass for source sampling,

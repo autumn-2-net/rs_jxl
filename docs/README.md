@@ -189,6 +189,8 @@ rejected experiments and remaining limitations remain part of the record.
 - [MA model costs, reuse and small-node experiments, 2026-11-09](MA_STRATEGY_EXPERIMENTS_20261109.md)
 - [Shared MA prefix experiment, 2026-11-09](MA_SHARED_PREFIX_EXPERIMENT_20261109.md)
 - [Exact tile patch experiment, 2026-11-09](TILE_PATCH_EXPERIMENT_20261109.md)
+- [Palette run-order experiment, 2026-11-10](PALETTE_RUN_ORDER_20261110.md)
+- [Sampled palette-order screening, 2026-11-10](PALETTE_SCREEN_20261110.md)
 
 ### Decoding and Reconstruction
 
