@@ -377,6 +377,7 @@ must repeat the relevant checks; historical binding validation remains separate.
 - [Rust pixel API](docs/PIXEL_API.md)
 - [MA tree budget modes and CLI controls](docs/MA_TREE_BUDGET.md)
 - [Exact MA partition reuse and dominance pruning](docs/MA_SEARCH_PRUNING.md)
+- [Experimental context-map-aware ANS clustering](docs/CONTEXT_MAP_REFINEMENT_20261110.md)
 - [Progressive original-group scheduling](docs/PROGRESSIVE_GROUP_SCHEDULER.md)
 - [Incremental output and frame indexes](docs/STREAMING_OUTPUT.md)
 - [Fast lossless source port](docs/FJXL_PORT_STATUS.md)

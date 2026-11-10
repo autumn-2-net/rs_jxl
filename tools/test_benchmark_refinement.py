@@ -28,6 +28,17 @@ class RefinementHarnessTests(unittest.TestCase):
         receipt.update(changes)
         return receipt
 
+    @classmethod
+    def context_map_receipt(cls, **changes):
+        receipt = cls.receipt("context-map", context_map=True, context_map_shortlist=8,
+                              context_map_merge_limit=4, context_map_proposals=0,
+                              context_map_wins=0, context_map_proposed_merges=0,
+                              context_map_selected_merges=0, context_map_pairs=0,
+                              context_map_map_trials=0, context_map_skipped=0,
+                              context_map_seconds=0.0)
+        receipt.update(changes)
+        return receipt
+
     def test_generated_fixtures_preserve_full_depth_and_hidden_colors(self):
         if any(importlib.util.find_spec(name) is None for name in ("cv2", "numpy")):
             self.skipTest("PNG oracle requires numpy and opencv-python")
@@ -39,14 +50,34 @@ class RefinementHarnessTests(unittest.TestCase):
                 self.assertEqual((pixels.width, pixels.height), (67, 51))
                 self.assertEqual(pixels.depth, 16 if "16bit" in path.name else 8)
 
+    def test_lz_policy_is_shared_by_all_variants(self):
+        with TemporaryDirectory() as folder:
+            argv = ["--encoder", "new", "--decoder", "djxl", "--synthetic",
+                    "--out", str(Path(folder) / "out.json"), "--variants", "baseline", "context-map"]
+            for mode in (1, 2):
+                args = arguments(argv + ["--lz", str(mode)])
+                for variant in args.variants:
+                    cmd = command(args, "in.png", "out.jxl", variant)
+                    self.assertEqual(cmd[cmd.index("--lz") + 1], str(mode))
+            with self.assertRaises(SystemExit), redirect_stderr(StringIO()):
+                arguments(argv + ["--lz", "3"])
+
     def test_switches_are_independent_and_baseline_unchanged(self):
         args = SimpleNamespace(encoder=Path("new"), frozen=Path("old"),
-                               effort=9, threads=8, buffering=None, leaf_offset_samples=37)
+                               effort=9, threads=8, buffering=None, lz=0, leaf_offset_samples=37,
+                               context_map_shortlist=11, context_map_merges=3)
         for variant in VARIANTS:
             cmd = command(args, "input.png", "out.jxl", variant)
             self.assertEqual("--refine-entropy" in cmd, variant in ("entropy", "combined"))
             self.assertEqual("--refine-leaves" in cmd, variant in ("leaves", "combined"))
+            self.assertEqual("--refine-context-map" in cmd, variant == "context-map")
             self.assertEqual(cmd[0], "old" if variant == "frozen" else "new")
+            if variant == "context-map":
+                self.assertEqual(cmd[-5:], ["--refine-context-map", "--context-map-shortlist", "11",
+                                           "--context-map-merges", "3"])
+            else:
+                self.assertNotIn("--context-map-shortlist", cmd)
+                self.assertNotIn("--context-map-merges", cmd)
             if variant.startswith("offset-"):
                 self.assertEqual(cmd[-4:], ["--leaf-offset", variant.removeprefix("offset-"),
                                            "--leaf-offset-samples", "37"])
@@ -60,6 +91,8 @@ class RefinementHarnessTests(unittest.TestCase):
                     "--out", str(Path(directory) / "report.json")]
             defaults = arguments(argv)
             self.assertEqual(defaults.leaf_offset_samples, 1024)
+            self.assertEqual(defaults.context_map_shortlist, 8)
+            self.assertEqual(defaults.context_map_merges, 4)
             self.assertEqual(defaults.variants, ["baseline", "entropy", "leaves", "combined"])
             args = arguments(argv + ["--variants", "offset-entropy", "baseline",
                                      "offset-mean", "offset-median", "--leaf-offset-samples", "17"])
@@ -67,6 +100,65 @@ class RefinementHarnessTests(unittest.TestCase):
             for invalid in ("0", "-1", "1.5"):
                 with self.subTest(invalid=invalid), redirect_stderr(StringIO()), self.assertRaises(SystemExit):
                     arguments(argv + ["--leaf-offset-samples", invalid])
+
+    def test_context_map_arguments_and_limits(self):
+        with TemporaryDirectory() as directory:
+            argv = ["--encoder", "encoder_lab", "--decoder", "djxl", "--synthetic",
+                    "--out", str(Path(directory) / "report.json"),
+                    "--variants", "baseline", "context-map"]
+            defaults = arguments(argv)
+            cmd = command(defaults, "in.png", "out.jxl", "context-map")
+            self.assertEqual(cmd[-5:], ["--refine-context-map", "--context-map-shortlist", "8",
+                                       "--context-map-merges", "4"])
+            args = arguments(argv + ["--context-map-shortlist", "13", "--context-map-merges", "2"])
+            self.assertEqual((args.context_map_shortlist, args.context_map_merges), (13, 2))
+            for flag in ("--context-map-shortlist", "--context-map-merges"):
+                for invalid in ("0", "-1", "1.5"):
+                    with self.subTest(flag=flag, invalid=invalid), redirect_stderr(StringIO()), self.assertRaises(SystemExit):
+                        arguments(argv + [flag, invalid])
+
+    def test_context_map_receipts_allow_zero_skipped_and_winning_work(self):
+        for changes in ({}, dict(context_map_skipped=2),
+                        dict(context_map_proposals=2, context_map_proposed_merges=4,
+                             context_map_pairs=12, context_map_map_trials=8, context_map_seconds=0.2),
+                        dict(context_map_proposals=2, context_map_wins=1,
+                             context_map_proposed_merges=4, context_map_selected_merges=2,
+                             context_map_pairs=12, context_map_map_trials=8,
+                             context_map_seconds=0.2, saved_bits=16)):
+            with self.subTest(changes=changes):
+                validate_receipt({"refinement": self.context_map_receipt(**changes)}, "context-map")
+        for variant in ("entropy", "leaves", "combined", "offset-mean"):
+            # Existing receipts may omit all context-map fields.
+            validate_receipt({"refinement": self.receipt(variant)}, variant)
+            receipt = dict(self.context_map_receipt(context_map=False), **self.receipt(variant))
+            validate_receipt({"refinement": receipt}, variant)
+            for changes in (dict(context_map=True), dict(context_map_skipped=1),
+                            dict(context_map_seconds=0.1)):
+                with self.subTest(variant=variant, changes=changes), self.assertRaises(ValueError):
+                    validate_receipt({"refinement": dict(receipt, **changes)}, variant)
+
+    def test_invalid_context_map_receipts(self):
+        receipt = self.context_map_receipt(context_map_proposals=2, context_map_wins=1,
+                                           context_map_proposed_merges=4, context_map_selected_merges=2)
+        changes = [("context_map", False), ("context_map", 1), ("entropy", True),
+                   ("leaves", True), ("offset_mode", "mean"), ("offset_samples", 1),
+                   ("context_map_wins", 3), ("context_map_selected_merges", 5),
+                   ("context_map_shortlist", 0), ("context_map_merge_limit", 0)]
+        for key in receipt:
+            if key.startswith("context_map_") and key != "context_map_seconds":
+                changes.extend([(key, -1), (key, True), (key, 1.5)])
+        for value in (True, -1, float("nan"), float("inf"), "0", None):
+            changes.append(("context_map_seconds", value))
+        for key, value in changes:
+            with self.subTest(key=key, value=value), self.assertRaises(ValueError):
+                validate_receipt({"refinement": dict(receipt, **{key: value})}, "context-map")
+        for key in receipt:
+            missing = dict(receipt)
+            del missing[key]
+            with self.subTest(missing=key), self.assertRaises(ValueError):
+                validate_receipt({"refinement": missing}, "context-map")
+        with self.assertRaises(ValueError):
+            validate_receipt({"refinement": self.receipt("context-map")}, "context-map")
 
     def test_receipts_distinguish_requested_and_winning_work(self):
         receipt = self.receipt(
@@ -142,8 +234,9 @@ class RefinementHarnessTests(unittest.TestCase):
                 decoder_summary([sample(invalid)])
 
     def test_mocked_trials_check_actual_size_and_official_decoder_pixels(self):
-        for failure in (None, "growth", "size-report", "pixels"):
-            with self.subTest(failure=failure), TemporaryDirectory() as directory:
+        for variant, failure in ((variant, failure) for variant in ("offset-mean", "context-map")
+                                 for failure in (None, "growth", "size-report", "pixels")):
+            with self.subTest(variant=variant, failure=failure), TemporaryDirectory() as directory:
                 folder = Path(directory)
                 source = fixtures(folder)[-1]
                 original = source.read_bytes()
@@ -153,13 +246,13 @@ class RefinementHarnessTests(unittest.TestCase):
                 decoder.write_bytes(b"fake decoder identity")
                 args = arguments(["--encoder", str(encoder), "--decoder", str(decoder),
                                   "--case", str(source), "--out", str(folder / "report.json"),
-                                  "--variants", "offset-mean", "baseline", "--repeats", "1"])
+                                  "--variants", variant, "baseline", "--repeats", "1"])
                 last_variant = None
 
                 def process(cmd, env, timeout):
                     nonlocal last_variant
                     if cmd[0] == str(encoder):
-                        last_variant = "offset-mean" if "--leaf-offset" in cmd else "baseline"
+                        last_variant = variant if "--leaf-offset" in cmd or "--refine-context-map" in cmd else "baseline"
                         size = 101 if failure == "growth" and last_variant != "baseline" else 100
                         Path(cmd[cmd.index("--output") + 1]).write_bytes(b"x" * size)
                         reported = 99 if failure == "size-report" else size
@@ -168,7 +261,9 @@ class RefinementHarnessTests(unittest.TestCase):
                                            mpix_per_second=pixels / 1e6 / 0.1, search=False,
                                            model_costs=dict(tree_bits=1, entropy_header_bits=1, total_bits=2),
                                            fast_context=None,
-                                           refinement=None if last_variant == "baseline" else self.receipt(last_variant))
+                                           refinement=(None if last_variant == "baseline" else
+                                                       self.context_map_receipt(context_map_skipped=2)
+                                                       if last_variant == "context-map" else self.receipt(last_variant)))
                         return dict(returncode=0, stdout=json.dumps(measurement), stderr="", wall_seconds=0.2)
                     self.assertEqual(cmd[0], str(decoder))
                     Path(cmd[2]).write_bytes(changed if failure == "pixels" else original)
@@ -190,10 +285,14 @@ class RefinementHarnessTests(unittest.TestCase):
                 self.assertEqual(report["status"], "passed" if failure is None else "failed", report["errors"])
                 self.assertGreater(pixel_check.call_count, 0)
                 if failure is None:
-                    summary = report["cases"][0]["summaries"]["offset-mean"]
+                    summary = report["cases"][0]["summaries"][variant]
                     self.assertEqual(summary["decoder_wall_seconds"], 0.3)
                     self.assertEqual(summary["ratios_to_baseline"]["decoder_wall_seconds"], 1)
                     self.assertIn("input/output", report["decoder_timing"])
+                    if variant == "context-map":
+                        receipt = report["cases"][0]["variants"][variant][0]["measurement"]["refinement"]
+                        self.assertTrue(receipt["context_map"])
+                        self.assertEqual(receipt["context_map_skipped"], 2)
                 else:
                     self.assertTrue(report["errors"])
                     if failure == "growth":

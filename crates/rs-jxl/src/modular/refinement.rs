@@ -14,6 +14,7 @@ use crate::entropy::stream::{Coding, Model, Token};
 use crate::{Error, Result};
 
 pub use super::leaf_offset::{OffsetMode, OffsetOptions};
+pub use crate::entropy::cluster::neighborhood::ContextMapOptions;
 
 #[derive(Debug, Clone, Default)]
 pub struct Options {
@@ -21,13 +22,15 @@ pub struct Options {
     pub leaves: bool,
     /// Static offset fitting with frozen topology/predictors; default disabled.
     pub offsets: Option<OffsetOptions>,
+    /// ANS merge proposals including context-map cost; default disabled.
+    pub context_map: Option<ContextMapOptions>,
     /// Invocation-local diagnostics, aggregated outside pixel/token hot loops.
     pub receipt: Option<Arc<Receipt>>,
 }
 
 impl Options {
     pub(crate) fn enabled(&self) -> bool {
-        self.entropy || self.leaves || self.offsets.is_some()
+        self.entropy || self.leaves || self.offsets.is_some() || self.context_map.is_some()
     }
 }
 
@@ -44,6 +47,16 @@ pub struct Stats {
     pub offset_population: usize,
     pub offset_candidates: usize,
     pub offset_seconds: f64,
+    pub context_map_proposals: usize,
+    pub context_map_wins: usize,
+    pub context_map_proposed_merges: usize,
+    pub context_map_selected_merges: usize,
+    pub context_map_pairs: usize,
+    pub context_map_map_trials: usize,
+    pub context_map_skipped: usize,
+    /// Proposal search (including map trials) and candidate model construction;
+    /// excludes final candidate-output serialization, counted in write_seconds.
+    pub context_map_seconds: f64,
     pub entropy_wins: usize,
     pub saved_bits: usize,
     pub refit_seconds: f64,
@@ -72,6 +85,14 @@ impl Receipt {
         total.offset_population += stats.offset_population;
         total.offset_candidates += stats.offset_candidates;
         total.offset_seconds += stats.offset_seconds;
+        total.context_map_proposals += stats.context_map_proposals;
+        total.context_map_wins += stats.context_map_wins;
+        total.context_map_proposed_merges += stats.context_map_proposed_merges;
+        total.context_map_selected_merges += stats.context_map_selected_merges;
+        total.context_map_pairs += stats.context_map_pairs;
+        total.context_map_map_trials += stats.context_map_map_trials;
+        total.context_map_skipped += stats.context_map_skipped;
+        total.context_map_seconds += stats.context_map_seconds;
         total.entropy_wins += stats.entropy_wins;
         total.saved_bits += stats.saved_bits;
         total.refit_seconds += stats.refit_seconds;
@@ -86,6 +107,7 @@ struct Trial<T> {
     costs: Option<Arc<encode::receipt_cost::ModelCostReceipt>>,
     origin: Origin,
     alternate: bool,
+    map_merges: usize,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -125,7 +147,7 @@ pub(super) fn choose<T>(
         } else {
             Coding::Ans
         };
-        let mut write = |model: &Model, alternate: bool| -> Result<()> {
+        let mut write = |model: &Model, alternate: bool, map_merges: usize| -> Result<()> {
             let mut scratch = options.clone();
             // Scratch output must not charge the final model-cost receipt.
             scratch.model_cost_receipt = options
@@ -154,11 +176,29 @@ pub(super) fn choose<T>(
                     costs: scratch.model_cost_receipt,
                     origin,
                     alternate,
+                    map_merges,
                 });
             }
             Ok(())
         };
-        write(&base, false)?;
+        write(&base, false, 0)?;
+        if let Some(search) = &options.refinement.context_map {
+            let start = Instant::now();
+            let candidates =
+                base.context_map_candidates(&streams, &options.entropy_options, search)?;
+            stats.context_map_seconds += start.elapsed().as_secs_f64();
+            if let Some((models, work)) = candidates {
+                stats.context_map_proposals += models.len();
+                stats.context_map_proposed_merges += work.merges;
+                stats.context_map_pairs += work.pairs;
+                stats.context_map_map_trials += work.map_trials;
+                for (model, merges) in models {
+                    write(&model, false, merges)?;
+                }
+            } else {
+                stats.context_map_skipped += 1;
+            }
+        }
         if options.refinement.entropy {
             let start = Instant::now();
             let alternate = Model::build_with_options(
@@ -170,7 +210,7 @@ pub(super) fn choose<T>(
             );
             stats.model_seconds += start.elapsed().as_secs_f64();
             match alternate {
-                Ok(model) => write(&model, true)?,
+                Ok(model) => write(&model, true, 0)?,
                 // An explicitly wide prefix alphabet need not fit ANS.
                 Err(Error::InvalidInput(_)) if matches!(other_coding, Coding::Ans) => {}
                 Err(error) => return Err(error),
@@ -216,6 +256,8 @@ pub(super) fn choose<T>(
     stats.refit_wins = usize::from(best.origin == Origin::Predictors);
     stats.offset_wins = usize::from(best.origin == Origin::Offsets);
     stats.entropy_wins = usize::from(best.alternate);
+    stats.context_map_wins = usize::from(best.map_merges != 0);
+    stats.context_map_selected_merges = best.map_merges;
     stats.saved_bits = original_bits - best.bits;
     if let (Some(final_costs), Some(costs)) = (&options.model_cost_receipt, best.costs) {
         final_costs.record(costs.tree_bits(), costs.entropy_header_bits());

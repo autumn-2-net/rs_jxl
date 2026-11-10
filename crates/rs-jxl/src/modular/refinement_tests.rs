@@ -13,6 +13,83 @@ fn tree() -> Tree {
 }
 
 #[test]
+fn context_map_trials_reuse_tokens_and_require_smaller_serialized_output() {
+    use crate::entropy::cluster::ClusterStrategy;
+    fn branches(nodes: &mut Vec<Node>, lo: i32, hi: i32) -> usize {
+        let id = nodes.len();
+        nodes.push(Node::Leaf {
+            predictor: Predictor::Zero,
+            offset: 0,
+            multiplier: 1,
+        });
+        if hi - lo > 1 {
+            let mid = (lo + hi) / 2;
+            let greater = branches(nodes, mid, hi);
+            let less_equal = branches(nodes, lo, mid);
+            nodes[id] = Node::Split {
+                property: 2,
+                threshold: mid - 1,
+                greater,
+                less_equal,
+            };
+        }
+        id
+    }
+    let mut nodes = Vec::new();
+    branches(&mut nodes, 0, 1024);
+    let tree = Tree::new(nodes).unwrap();
+    let mut tokens = Vec::new();
+    let mut state = 19u32;
+    for context in 0..1024 {
+        state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+        let id = if context < 2 {
+            context as u32
+        } else {
+            state >> 31
+        };
+        let scale = if context < 2 { 150 } else { 1 };
+        tokens.extend(std::iter::repeat_n(Token::literal(context, id), 2 * scale));
+        tokens.extend(std::iter::repeat_n(Token::literal(context, 1 - id), scale));
+    }
+    for candidate_bits in [80, 100, 120] {
+        let receipt = Arc::new(Receipt::default());
+        let mut options = encode::ModularOptions::default();
+        options.entropy = Coding::Ans;
+        options.entropy_options.clustering = ClusterStrategy::Fast;
+        options.refinement = Options {
+            context_map: Some(ContextMapOptions::default()),
+            receipt: Some(receipt.clone()),
+            ..Default::default()
+        };
+        let tokenize_calls = Cell::new(0);
+        let write_calls = Cell::new(0);
+        let selected = choose(
+            &tree,
+            &[],
+            &options,
+            |_| {
+                tokenize_calls.set(tokenize_calls.get() + 1);
+                Ok((vec![tokens.clone(), vec![]], false))
+            },
+            |_, _, _, _| {
+                let trial = write_calls.get();
+                write_calls.set(trial + 1);
+                Ok((if trial == 0 { 100 } else { candidate_bits }, trial))
+            },
+        )
+        .unwrap();
+        let stats = receipt.snapshot();
+        assert_eq!(tokenize_calls.get(), 1);
+        assert!(write_calls.get() >= 2);
+        assert_eq!(selected != 0, candidate_bits < 100);
+        assert_eq!(stats.context_map_wins, usize::from(candidate_bits < 100));
+        assert_eq!(stats.saved_bits, 100 - candidate_bits.min(100));
+        assert!(stats.context_map_proposals > 0);
+        assert!(stats.context_map_proposals <= 2);
+    }
+}
+
+#[test]
 fn offset_trials_select_serialized_size_not_the_proxy() {
     use crate::modular::{group::Channel, weighted};
     let tree = Tree::new(vec![Node::Leaf {

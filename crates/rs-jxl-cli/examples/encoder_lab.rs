@@ -144,6 +144,13 @@ struct Args {
     /// Compare actual Prefix/ANS outputs while reusing learned trees and tokens.
     #[arg(long, conflicts_with_all = ["search", "scan_only"])]
     refine_entropy: bool,
+    /// Try additional ANS merges including actual context-map signaling cost.
+    #[arg(long, conflicts_with_all = ["search", "scan_only"])]
+    refine_context_map: bool,
+    #[arg(long, requires = "refine_context_map", value_parser = clap::value_parser!(u32).range(1..))]
+    context_map_shortlist: Option<u32>,
+    #[arg(long, requires = "refine_context_map", value_parser = clap::value_parser!(u32).range(1..))]
+    context_map_merges: Option<u32>,
     /// Refit sampled MA leaf predictors on all pixels; retain smaller output.
     #[arg(long, conflicts_with_all = ["search", "scan_only", "fast_context"])]
     refine_leaves: bool,
@@ -441,10 +448,20 @@ fn run(args: Args) -> Result<()> {
         };
         base.modular.tree_learning_receipt = Some(std::sync::Arc::new(Default::default()));
     }
-    if args.refine_entropy || args.refine_leaves || args.leaf_offset.is_some() {
+    if args.refine_entropy
+        || args.refine_leaves
+        || args.leaf_offset.is_some()
+        || args.refine_context_map
+    {
         base.modular.refinement = rs_jxl::modular::refinement::Options {
             entropy: args.refine_entropy,
             leaves: args.refine_leaves,
+            context_map: args.refine_context_map.then(|| {
+                rs_jxl::modular::refinement::ContextMapOptions {
+                    shortlist: args.context_map_shortlist.unwrap_or(8) as usize,
+                    max_merges: args.context_map_merges.unwrap_or(4) as usize,
+                }
+            }),
             offsets: args.leaf_offset.as_deref().map(|mode| {
                 use rs_jxl::modular::refinement::{OffsetMode, OffsetOptions};
                 OffsetOptions {
@@ -799,6 +816,17 @@ fn run(args: Args) -> Result<()> {
             "offset_leaves": stats.offset_leaves, "offset_samples": stats.offset_samples,
             "offset_population": stats.offset_population,
             "offset_candidates": stats.offset_candidates, "offset_seconds": stats.offset_seconds,
+            "context_map": args.refine_context_map,
+            "context_map_shortlist": args.context_map_shortlist.unwrap_or(8),
+            "context_map_merge_limit": args.context_map_merges.unwrap_or(4),
+            "context_map_proposals": stats.context_map_proposals,
+            "context_map_wins": stats.context_map_wins,
+            "context_map_proposed_merges": stats.context_map_proposed_merges,
+            "context_map_selected_merges": stats.context_map_selected_merges,
+            "context_map_pairs": stats.context_map_pairs,
+            "context_map_map_trials": stats.context_map_map_trials,
+            "context_map_skipped": stats.context_map_skipped,
+            "context_map_seconds": stats.context_map_seconds,
             "entropy_wins": stats.entropy_wins, "saved_bits": stats.saved_bits,
             "refit_seconds": stats.refit_seconds, "model_seconds": stats.model_seconds,
             "write_seconds": stats.write_seconds,
@@ -858,8 +886,12 @@ fn main() -> std::process::ExitCode {
 #[test]
 fn refinement_flags_are_opt_in_and_cannot_hide_inside_outer_search() {
     let defaults = Args::try_parse_from(["encoder_lab", "in.png"]).unwrap();
-    assert!(!defaults.refine_entropy && !defaults.refine_leaves);
-    for flag in ["--refine-entropy", "--refine-leaves"] {
+    assert!(!defaults.refine_entropy && !defaults.refine_leaves && !defaults.refine_context_map);
+    for flag in [
+        "--refine-entropy",
+        "--refine-leaves",
+        "--refine-context-map",
+    ] {
         assert!(Args::try_parse_from(["encoder_lab", "in.png", flag]).is_ok());
         for conflict in ["--search", "--scan-only"] {
             assert!(Args::try_parse_from(["encoder_lab", "in.png", flag, conflict]).is_err());
@@ -873,6 +905,21 @@ fn refinement_flags_are_opt_in_and_cannot_hide_inside_outer_search() {
     ])
     .unwrap();
     assert!(both.refine_entropy && both.refine_leaves);
+}
+
+#[test]
+fn context_map_budgets_require_opt_in_and_positive_values() {
+    for flag in ["--context-map-shortlist", "--context-map-merges"] {
+        assert!(Args::try_parse_from(["encoder_lab", "in.png", flag, "4"]).is_err());
+        assert!(
+            Args::try_parse_from(["encoder_lab", "in.png", "--refine-context-map", flag, "0"])
+                .is_err()
+        );
+        assert!(
+            Args::try_parse_from(["encoder_lab", "in.png", "--refine-context-map", flag, "4"])
+                .is_ok()
+        );
+    }
 }
 
 #[test]

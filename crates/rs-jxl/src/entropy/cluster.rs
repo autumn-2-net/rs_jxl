@@ -24,14 +24,18 @@
 //!
 //! Native AVX2 conditioning, entropy, distance and KL dispatch lives in simd.rs,
 //! with source FMA distinctions and portable scalar fallback. Source audit
-//! hooks and final-plan replay are not ported. No context-map signaling cost is added:
-//! the source merge heuristic does not include it either.
+//! hooks and final-plan replay are not ported. The default merge heuristic omits
+//! context-map signaling, as in the source. Opt-in post-clustering proposals
+//! that account for it live separately in `neighborhood`.
 
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 
 use super::ans_histogram::{MAX_ALPHABET_SIZE as ANS_MAX_ALPHABET, fast_population_cost};
 use crate::{Error, Result};
+
+#[path = "cluster_neighborhood.rs"]
+pub(crate) mod neighborhood;
 
 const MAX_ALPHABET: usize = super::prefix_code::MAX_ALPHABET_SIZE;
 const MAX_CLUSTERS: usize = 256;

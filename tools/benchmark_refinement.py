@@ -26,7 +26,7 @@ from compare_cpp_port import (
 
 OFFSET_MODES = ("mean", "median", "entropy")
 VARIANTS = ("baseline", "frozen", "entropy", "leaves", "combined",
-            "offset-mean", "offset-median", "offset-entropy")
+            "offset-mean", "offset-median", "offset-entropy", "context-map")
 
 
 def arguments(argv=None):
@@ -42,18 +42,23 @@ def arguments(argv=None):
                    default=["baseline", "entropy", "leaves", "combined"])
     p.add_argument("--effort", type=int, choices=range(1, 11), default=9)
     p.add_argument("--threads", type=int, default=8)
+    p.add_argument("--lz", type=int, choices=(0, 1, 2), default=0,
+                   help="Use the same native LZ77 policy for baseline and every trial")
     p.add_argument("--buffering", type=int, choices=(-1, 0, 1, 2))
     p.add_argument("--repeats", type=int, default=3)
     p.add_argument("--warmups", type=int, default=0)
     p.add_argument("--leaf-offset-samples", type=int, default=1024,
                    help="Per-leaf fitting reservoir only; not an MA or input population cap")
+    p.add_argument("--context-map-shortlist", type=int, default=8)
+    p.add_argument("--context-map-merges", type=int, default=4)
     p.add_argument("--timeout", type=float, default=180)
     p.add_argument("--out", type=Path, required=True)
     args = p.parse_args(argv)
     if (not 1 <= args.threads <= 256 or args.repeats < 1 or args.warmups < 0
             or args.leaf_offset_samples < 1
+            or args.context_map_shortlist < 1 or args.context_map_merges < 1
             or not math.isfinite(args.timeout) or args.timeout <= 0):
-        p.error("Invalid threads/repeats/warmups/timeout/leaf-offset-samples")
+        p.error("Invalid threads/repeats/warmups/timeout/leaf-offset-samples/context-map limits")
     if "baseline" not in args.variants or len(set(args.variants)) != len(args.variants):
         p.error("Use distinct variants including baseline")
     if "frozen" in args.variants and args.frozen is None:
@@ -101,10 +106,15 @@ def command(args, source, output, variant):
               "--threads", str(args.threads), "--model-costs", "--output", str(output)]
     if args.buffering is not None:
         result += ["--buffering", str(args.buffering)]
+    if args.lz:
+        result += ["--lz", str(args.lz)]
     if variant in ("entropy", "combined"):
         result += ["--refine-entropy"]
     if variant in ("leaves", "combined"):
         result += ["--refine-leaves"]
+    if variant == "context-map":
+        result += ["--refine-context-map", "--context-map-shortlist", str(args.context_map_shortlist),
+                   "--context-map-merges", str(args.context_map_merges)]
     if variant in tuple(f"offset-{mode}" for mode in OFFSET_MODES):
         result += ["--leaf-offset", variant.removeprefix("offset-"),
                    "--leaf-offset-samples", str(args.leaf_offset_samples)]
@@ -157,6 +167,27 @@ def validate_receipt(measurement, variant):
             raise ValueError(f"Invalid refinement timer {key}")
     if offset_mode is None and receipt["offset_seconds"] != 0:
         raise ValueError("Unrequested offset fitting timer")
+    context_map_fields = ("context_map", "context_map_shortlist", "context_map_merge_limit",
+                          "context_map_proposals", "context_map_wins", "context_map_proposed_merges",
+                          "context_map_selected_merges", "context_map_pairs", "context_map_map_trials",
+                          "context_map_skipped", "context_map_seconds")
+    # Older encoders do not include these fields for the existing variants.
+    if variant == "context-map" or any(key in receipt for key in context_map_fields):
+        if receipt.get("context_map") is not (variant == "context-map"):
+            raise ValueError("Requested context-map refinement was not executed")
+        for key in context_map_fields[1:-1]:
+            minimum = 1 if key in ("context_map_shortlist", "context_map_merge_limit") else 0
+            if type(receipt.get(key)) is not int or receipt[key] < minimum:
+                raise ValueError(f"Invalid refinement counter {key}")
+        if (receipt["context_map_wins"] > receipt["context_map_proposals"]
+                or receipt["context_map_selected_merges"] > receipt["context_map_proposed_merges"]):
+            raise ValueError("Invalid context-map work counts")
+        seconds = receipt.get("context_map_seconds")
+        if (isinstance(seconds, bool) or not isinstance(seconds, (int, float))
+                or not math.isfinite(seconds) or seconds < 0):
+            raise ValueError("Invalid refinement timer context_map_seconds")
+        if not receipt["context_map"] and any(receipt[key] for key in context_map_fields[3:]):
+            raise ValueError("Unrequested context-map refinement")
 
 
 def validate_sizes(variants):

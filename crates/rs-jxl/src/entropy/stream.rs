@@ -398,6 +398,17 @@ impl Model {
             )?;
             (clustered, map)
         };
+        Self::from_clustering(streams, clustered, map, lz77, prefix, options)
+    }
+
+    fn from_clustering(
+        streams: &[Vec<Token>],
+        clustered: Vec<Vec<u64>>,
+        map: Vec<u8>,
+        lz77: bool,
+        prefix: bool,
+        options: &EntropyOptions,
+    ) -> Result<Self> {
         let num_histograms = clustered.len();
         let search = choose_config_plan_and_histograms(
             streams,
@@ -431,7 +442,7 @@ impl Model {
         let streaming = if options.streaming_mode {
             Some(StreamingState {
                 config: initial_config(options),
-                context_ranges: std::iter::once(0..counts.len()).collect(),
+                context_ranges: std::iter::once(0..map.len()).collect(),
                 encoded_histograms: cache_histograms(&tables)?,
             })
         } else {
@@ -456,6 +467,41 @@ impl Model {
             log_alpha_size: plan.log_alpha_size,
             streaming,
         })
+    }
+
+    pub(crate) fn context_map_candidates(
+        &self,
+        streams: &[Vec<Token>],
+        options: &EntropyOptions,
+        search: &super::cluster::neighborhood::ContextMapOptions,
+    ) -> Result<Option<(Vec<(Self, usize)>, super::cluster::neighborhood::Work)>> {
+        search.validate()?;
+        // Refinement runs before any payload is committed. Source e9 also uses
+        // streaming table policy for closed groups; that is not an append.
+        // Never rebuild tables pinned by genuinely incremental batches.
+        let appended = self
+            .streaming
+            .as_ref()
+            .is_some_and(|state| state.context_ranges.as_slice() != [0..self.map.len()]);
+        if !self.uses_ans()
+            || appended
+            || options.add_fixed_histograms
+            || options.add_missing_symbols
+            || self.histogram_count() <= 1
+        {
+            return Ok(None);
+        }
+        let (raw, _) = raw_histograms(streams, self.map.len(), self.lz77, options)?;
+        let (plans, work) =
+            super::cluster::neighborhood::propose(&raw, &self.map, self.histogram_count(), search)?;
+        let models = plans
+            .into_iter()
+            .map(|plan| {
+                Self::from_clustering(streams, plan.counts, plan.map, self.lz77, false, options)
+                    .map(|model| (model, plan.merges))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Some((models, work)))
     }
 
     fn estimated_bits(&self, streams: &[Vec<Token>]) -> Result<f64> {
@@ -885,6 +931,10 @@ impl Model {
 #[cfg(test)]
 #[path = "streaming_tests.rs"]
 mod streaming_tests;
+
+#[cfg(test)]
+#[path = "stream_context_map_tests.rs"]
+mod context_map_tests;
 
 #[cfg(test)]
 mod tests {

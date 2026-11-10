@@ -242,6 +242,9 @@ impl ModularOptions {
                 ));
             }
         }
+        if let Some(search) = &self.refinement.context_map {
+            search.validate()?;
+        }
         self.source_ma_parallel.workers.validate()?;
         if self.tree_learning.enabled()
             && (self.source_ma_seed.is_some()
