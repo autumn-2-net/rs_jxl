@@ -1068,7 +1068,7 @@ fn optimal_stream(
         values,
         width,
         config,
-        &prices::Prices::new(costs)?,
+        &prices::Prices::with_lengths(costs, config)?,
         seed_tokens,
         _work,
         None,
@@ -1361,7 +1361,7 @@ fn range_replayed(
     let mut budget = replay::Budget::new(cache_limit);
     for pass in 0..2 {
         let costs = Costs::fitted(&seed, widths, config);
-        let prices = prices::Prices::new(&costs)?;
+        let prices = prices::Prices::with_lengths(&costs, config)?;
         let mut parsed = reserved(inputs.len())?;
         #[cfg(test)]
         {
@@ -1603,7 +1603,7 @@ fn run(
     }
     for pass in 0..config.match_cost.passes() {
         let costs = Costs::fitted(&seed, widths, config);
-        let prices = prices::Prices::new(&costs)?;
+        let prices = prices::Prices::with_lengths(&costs, config)?;
         let mut parsed = reserved(inputs.len())?;
         #[cfg(test)]
         {

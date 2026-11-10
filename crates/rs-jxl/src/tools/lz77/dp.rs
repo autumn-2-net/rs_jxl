@@ -289,33 +289,81 @@ impl MatchCache {
             }
             return length;
         }
-        // LZ77MatchLength's eight-value block comparison, using safe slices.
-        while limit - length >= 8 {
-            #[cfg(test)]
-            {
-                self.compared_values += 8;
+        'matching: {
+            while limit - length >= 8 {
+                #[cfg(test)]
+                {
+                    self.compared_values += 8;
+                }
+                let current = &values[position + length..position + length + 8];
+                let candidate = &values[previous + length..previous + length + 8];
+                #[cfg(all(
+                    feature = "experimental-lz77-hotspots",
+                    target_arch = "x86_64",
+                    target_feature = "sse2"
+                ))]
+                {
+                    let different = mismatch_mask_eight(
+                        current.try_into().unwrap(),
+                        candidate.try_into().unwrap(),
+                    );
+                    if different != 0 {
+                        // Two consecutive mask bits represent each u32 token.
+                        length += different.trailing_zeros() as usize / 2;
+                        break 'matching;
+                    }
+                }
+                #[cfg(not(all(
+                    feature = "experimental-lz77-hotspots",
+                    target_arch = "x86_64",
+                    target_feature = "sse2"
+                )))]
+                if current != candidate {
+                    break;
+                }
+                length += 8;
             }
-            if values[position + length..position + length + 8]
-                != values[previous + length..previous + length + 8]
-            {
-                break;
+            while length < limit {
+                #[cfg(test)]
+                {
+                    self.compared_values += 1;
+                }
+                if values[position + length] != values[previous + length] {
+                    break 'matching;
+                }
+                length += 1;
             }
-            length += 8;
-        }
-        while length < limit {
-            #[cfg(test)]
-            {
-                self.compared_values += 1;
-            }
-            if values[position + length] != values[previous + length] {
-                break;
-            }
-            length += 1;
         }
         if let Some(end) = self.ends.get_mut(distance) {
             *end = (*end).max(position + length);
         }
         length
+    }
+}
+
+#[cfg(all(
+    feature = "experimental-lz77-hotspots",
+    target_arch = "x86_64",
+    target_feature = "sse2"
+))]
+#[inline]
+fn mismatch_mask_eight(current: &[u32; 8], candidate: &[u32; 8]) -> u16 {
+    use std::arch::x86_64::{_mm_cmpeq_epi32, _mm_loadu_si128, _mm_movemask_epi8, _mm_packs_epi32};
+
+    // SAFETY: SSE2 is a compile-time baseline here. Both arrays contain eight
+    // u32s, so each unaligned 16-byte load is in bounds; shared reads may overlap.
+    unsafe {
+        let first = _mm_cmpeq_epi32(
+            _mm_loadu_si128(current.as_ptr().cast()),
+            _mm_loadu_si128(candidate.as_ptr().cast()),
+        );
+        let second = _mm_cmpeq_epi32(
+            _mm_loadu_si128(current.as_ptr().add(4).cast()),
+            _mm_loadu_si128(candidate.as_ptr().add(4).cast()),
+        );
+        // Equality lanes are -1 or 0. Signed packing preserves these values
+        // and their order, unlike ANDing the halves for a whole-block test.
+        !(_mm_movemask_epi8(_mm_packs_epi32(first, second)) as u16)
     }
 }
 
@@ -426,6 +474,10 @@ struct Work {
     intervals: usize,
     scalar_endpoints: usize,
     tree_updates: usize,
+    #[cfg(feature = "experimental-lz77-hotspots")]
+    cached_fringe_hits: usize,
+    #[cfg(feature = "experimental-lz77-hotspots")]
+    cached_fringe_endpoints: usize,
 }
 
 pub(super) struct RangeParser {
@@ -579,6 +631,20 @@ impl RangeParser {
         #[cfg(test)]
         {
             self.work.intervals += 1;
+        }
+        #[cfg(feature = "experimental-lz77-hotspots")]
+        if first < aligned && self.previous_block == Some(first >> Self::SHIFT) {
+            let certificate = self.path[self.depth as usize];
+            // The cached path covers this entire block, never a future fringe.
+            // Strict legacy ties must still materialize before queued offers.
+            if certificate.cost.is_finite() && self.better(certificate, offer) {
+                #[cfg(test)]
+                {
+                    self.work.cached_fringe_hits += 1;
+                    self.work.cached_fringe_endpoints += aligned - first;
+                }
+                first = aligned;
+            }
         }
         while first < aligned {
             self.relax(first, offer);
@@ -1007,6 +1073,182 @@ mod tests {
         }
     }
 
+    #[test]
+    #[cfg(feature = "experimental-lz77-hotspots")]
+    fn cached_fringe_prune_respects_coverage_finite_costs_and_tie_modes() {
+        for source_ties in [false, true] {
+            for (cover_start, advanced, begin, end, certificate_cost, cost, skipped) in [
+                (16, Some(16), 3, 33, 7.0, 8.0, 13),
+                (
+                    16,
+                    Some(16),
+                    3,
+                    8,
+                    7.0,
+                    7.0,
+                    if source_ties { 5 } else { 0 },
+                ),
+                (16, Some(16), 3, 8, 7.0, 6.0, 0),
+                (16, Some(16), 3, 8, 7.0, f64::INFINITY, 5),
+                (16, Some(16), 3, 8, 7.0, f64::NEG_INFINITY, 0),
+                (16, Some(16), 3, 8, 7.0, f64::NAN, 0),
+                (16, Some(16), 3, 8, f64::INFINITY, 8.0, 0),
+                (16, Some(16), 3, 8, f64::NEG_INFINITY, 8.0, 0),
+                (16, Some(16), 3, 8, f64::NAN, 8.0, 0),
+                (16, Some(16), 15, 20, 7.0, 8.0, 1),
+                (16, Some(16), 16, 18, 7.0, 8.0, 0),
+                (16, Some(16), 17, 18, 7.0, 8.0, 0),
+                (17, Some(16), 3, 8, 7.0, 8.0, 0),
+                (16, None, 3, 8, 7.0, 8.0, 0),
+                (16, Some(32), 3, 8, 7.0, 8.0, 0),
+            ] {
+                let mut pruned = RangeParser::new(96).unwrap();
+                let mut plain = RangeParser::new(96).unwrap();
+                for parser in [&mut pruned, &mut plain] {
+                    parser.source_ties = source_ties;
+                    parser.interval(1, cover_start - 1, 31, 1, certificate_cost);
+                    if let Some(position) = advanced {
+                        parser.advance(position);
+                    }
+                }
+                let origin = advanced.unwrap_or(16);
+                pruned.interval(origin, begin, end, 2, cost);
+                // Suppress only the new guard; retain the old interval engine.
+                let previous = plain.previous_block.take();
+                plain.interval(origin, begin, end, 2, cost);
+                plain.previous_block = previous;
+                assert_eq!(pruned.work.cached_fringe_endpoints, skipped);
+                assert_eq!(pruned.work.cached_fringe_hits, usize::from(skipped != 0));
+                assert_eq!(plain.work.cached_fringe_hits, 0);
+                assert_eq!(
+                    pruned.work.scalar_endpoints + skipped,
+                    plain.work.scalar_endpoints
+                );
+                for position in origin..=96 {
+                    pruned.advance(position);
+                    plain.advance(position);
+                    let (actual, expected) =
+                        (pruned.steps.get(position), plain.steps.get(position));
+                    assert_eq!(actual.cost.to_bits(), expected.cost.to_bits());
+                    assert_eq!(
+                        (actual.length, actual.distance),
+                        (expected.length, expected.distance)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "experimental-lz77-hotspots")]
+    fn cached_fringe_prune_matches_unpruned_steps_and_scalar_oracle() {
+        for source_ties in [false, true] {
+            for compact in [None, Some(37)] {
+                for size in [17, 31, 32, 33, 63, 65, 129] {
+                    let original = input(&vec![7; size]);
+                    let mut pruned = RangeParser::with_storage(size, compact).unwrap();
+                    let mut plain = RangeParser::with_storage(size, compact).unwrap();
+                    pruned.source_ties = source_ties;
+                    plain.source_ties = source_ties;
+                    let mut reference = vec![Step::default(); size + 1];
+                    reference[0].cost = 0.0;
+                    let mut random = size as u32;
+                    for origin in 0..size {
+                        pruned.advance(origin);
+                        plain.advance(origin);
+                        let (actual, expected) =
+                            (pruned.steps.get(origin), plain.steps.get(origin));
+                        assert_eq!(actual.cost, reference[origin].cost);
+                        assert_eq!(actual.cost, expected.cost);
+                        assert_eq!(
+                            (actual.length, actual.distance),
+                            (expected.length, expected.distance)
+                        );
+                        if source_ties {
+                            assert_eq!(actual.length, reference[origin].length);
+                            assert_eq!(
+                                pruned.steps.physical_distance(actual.distance).unwrap(),
+                                reference[origin].distance
+                            );
+                        }
+                        let cost = reference[origin].cost + 4.0;
+                        pruned.literal(origin, cost);
+                        plain.literal(origin, cost);
+                        if cost < reference[origin + 1].cost {
+                            reference[origin + 1] = Step {
+                                cost,
+                                length: 1,
+                                distance: 0,
+                            };
+                        }
+                        if origin == 0 || size - origin < MIN_MATCH {
+                            continue;
+                        }
+                        for offer in 0..8 {
+                            let begin = if offer <= 1 {
+                                MIN_MATCH
+                            } else {
+                                MIN_MATCH + next(&mut random) as usize % 19
+                            };
+                            let end = if offer == 0 {
+                                size - origin + 1
+                            } else if offer == 1 {
+                                MIN_MATCH + 1
+                            } else {
+                                (begin + 1 + next(&mut random) as usize % 65).min(size - origin + 1)
+                            };
+                            if begin >= end {
+                                continue;
+                            }
+                            let distance = (offer + 1).min(origin);
+                            let cost = reference[origin].cost
+                                + if offer == 0 {
+                                    0.0
+                                } else if offer == 1 {
+                                    1.0
+                                } else {
+                                    f64::from(next(&mut random) % 9) * 0.25
+                                };
+                            pruned.interval(origin, begin, end, distance, cost);
+                            let previous = plain.previous_block.take();
+                            plain.interval(origin, begin, end, distance, cost);
+                            plain.previous_block = previous;
+                            // Independent explicit endpoint DP, in origin order.
+                            for (offset, step) in reference[origin + begin..origin + end]
+                                .iter_mut()
+                                .enumerate()
+                            {
+                                if cost < step.cost {
+                                    *step = Step {
+                                        cost,
+                                        length: (begin + offset) as u32,
+                                        distance: distance as u32,
+                                    };
+                                }
+                            }
+                        }
+                    }
+                    pruned.advance(size);
+                    plain.advance(size);
+                    assert_eq!(pruned.cost(size), reference[size].cost);
+                    assert_eq!(pruned.cost(size), plain.cost(size));
+                    let commands = pruned.backtrack(&original).unwrap();
+                    assert_eq!(commands, plain.backtrack(&original).unwrap());
+                    expand(&commands, &original, &options());
+                    if size >= 32 {
+                        assert!(pruned.work.cached_fringe_hits > 0);
+                    }
+                    assert_eq!(plain.work.cached_fringe_hits, 0);
+                    assert_eq!(
+                        pruned.work.scalar_endpoints + pruned.work.cached_fringe_endpoints,
+                        plain.work.scalar_endpoints
+                    );
+                    assert_eq!(pruned.work.tree_updates, plain.work.tree_updates);
+                }
+            }
+        }
+    }
+
     fn exhaustive_cost(
         original: &[Literal],
         costs: &EntropyCosts<'_>,
@@ -1219,6 +1461,94 @@ mod tests {
         }
         assert!(!plain.is_enabled());
         assert!(plain.compared_values > cached.compared_values);
+    }
+
+    #[test]
+    fn ordinary_match_extension_finds_first_mismatch_and_exact_tails() {
+        for alignment in 0..4 {
+            let position = 64 + alignment;
+            let distance = position - (3 - alignment);
+            for limit in (0..=24).chain([63, 64, 65, 255, 256, 257]) {
+                for matched in 0..=limit {
+                    // No padding after the requested suffix, and varying
+                    // 16-byte alignment for the two compared ranges.
+                    let mut values = vec![u32::MAX; position + limit];
+                    if matched < limit {
+                        values[position + matched] ^= 0x8000_0101;
+                        if matched + 1 < limit {
+                            values[position + matched + 1] ^= 1;
+                        }
+                    }
+                    let mut plain = MatchCache::uncached();
+                    let mut cached = MatchCache::new(distance).unwrap();
+                    for prefix in [0, matched.min(3), matched] {
+                        for cache in [&mut plain, &mut cached] {
+                            assert_eq!(
+                                cache.length_with_prefix(
+                                    &values, position, distance, limit, prefix,
+                                ),
+                                matched,
+                                "alignment={alignment}, limit={limit}, matched={matched}, prefix={prefix}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_match_extension_checks_every_bit_in_each_block_lane() {
+        for lane in 0..8 {
+            for bit in 0..32 {
+                let mut values = [0xa55a_5aa5; 24];
+                values[16 + lane] ^= 1 << bit;
+                assert_eq!(
+                    MatchCache::uncached().length(&values, 16, 16, 8),
+                    lane,
+                    "lane={lane}, bit={bit}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_match_extension_preserves_overlapping_cached_mismatch_bounds() {
+        for distance in [1, 2, 3, 7, 8, 9, 16, 31, 64] {
+            for matched in (0..=33).chain([63, 64, 65, 255]) {
+                let mut values: Vec<_> = (0..distance + matched + 1)
+                    .map(|i| (i % distance) as u32 ^ 0xa55a_5aa5)
+                    .collect();
+                values[distance + matched] ^= u32::MAX;
+                let mut cache = MatchCache::new(distance).unwrap();
+                assert_eq!(
+                    cache.length_with_prefix(
+                        &values,
+                        distance,
+                        distance,
+                        matched + 1,
+                        matched.min(3),
+                    ),
+                    matched
+                );
+                for advance in 0..=matched {
+                    let position = distance + advance;
+                    let remaining = matched - advance;
+                    let work = cache.compared_values;
+                    assert_eq!(
+                        cache.length(&values, position, distance, remaining.saturating_sub(1)),
+                        remaining.saturating_sub(1)
+                    );
+                    assert_eq!(cache.compared_values, work);
+                    assert_eq!(
+                        cache.length(&values, position, distance, remaining + 1),
+                        remaining,
+                        "distance={distance}, matched={matched}, advance={advance}"
+                    );
+                    assert_eq!(cache.ends[distance], distance + matched);
+                }
+            }
+        }
     }
 
     #[test]

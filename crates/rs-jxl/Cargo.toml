@@ -7,6 +7,7 @@ publish.workspace = true
 
 [features]
 experimental-lz77 = []
+experimental-lz77-hotspots = []
 decoder-avx512 = ["jxl-decoder/avx512"]
 decoder-profile = ["jxl-decoder/decoder-profile"]
 

@@ -7,6 +7,61 @@ const SYMBOLS: usize = 256;
 const CONTEXTS: usize = 65536;
 const ROWS: usize = 8192;
 const MISSING: u16 = u16::MAX;
+#[cfg(feature = "experimental-lz77-hotspots")]
+const LENGTH_TOKENS: usize = 128;
+
+#[cfg(feature = "experimental-lz77-hotspots")]
+struct LengthPrices {
+    config: HybridUintConfig,
+    min_symbol: u32,
+    ends: Vec<u64>,
+    bits: Vec<f32>,
+}
+
+#[cfg(feature = "experimental-lz77-hotspots")]
+impl LengthPrices {
+    fn new(
+        rows: &[([f32; SYMBOLS], &super::ContextCost)],
+        config: &SourceConfig,
+    ) -> Result<Option<Self>> {
+        let uint = config.length_uint_config;
+        let count = uint.encode(u32::MAX).token as usize + 1;
+        // This bounds a cache, not supported match lengths or configurations.
+        if uint.lsb_in_token() != 0
+            || count > LENGTH_TOKENS
+            || config.min_symbol().checked_add(count as u32 - 1).is_none()
+        {
+            return Ok(None);
+        }
+        let mut ends = reserved(count)?;
+        let mut extra = reserved(count)?;
+        let mut value = 0u64;
+        while value <= u64::from(u32::MAX) {
+            let encoded = uint.encode(value as u32);
+            debug_assert_eq!(encoded.token as usize, ends.len());
+            value = ((value >> encoded.nbits) + 1) << encoded.nbits;
+            ends.push(value);
+            extra.push(encoded.nbits);
+        }
+        let mut bits = reserved(rows.len() * count)?;
+        for (dense, sparse) in rows {
+            let row = Row {
+                dense: Some(dense),
+                sparse: Some(sparse),
+                lengths: None,
+            };
+            for (token, &nbits) in extra.iter().enumerate() {
+                bits.push(nbits as f32 + row.bits(config.min_symbol() + token as u32));
+            }
+        }
+        Ok(Some(Self {
+            config: uint,
+            min_symbol: config.min_symbol(),
+            ends,
+            bits,
+        }))
+    }
+}
 
 // Compiled once per fast-seed group, independently of the wider DP price rows.
 pub(super) struct Penalties<'a> {
@@ -45,12 +100,16 @@ pub(super) struct Prices<'a> {
     rows: Vec<([f32; SYMBOLS], &'a super::ContextCost)>,
     distance_tokens: [f32; 128],
     small_distances: [f32; 512],
+    #[cfg(feature = "experimental-lz77-hotspots")]
+    lengths: Option<LengthPrices>,
 }
 
 #[derive(Clone, Copy)]
 pub(super) struct Row<'a> {
     dense: Option<&'a [f32; SYMBOLS]>,
     sparse: Option<&'a super::ContextCost>,
+    #[cfg(feature = "experimental-lz77-hotspots")]
+    lengths: Option<(&'a LengthPrices, &'a [f32])>,
 }
 
 impl Row<'_> {
@@ -81,6 +140,25 @@ impl Row<'_> {
         mut visit: impl FnMut(usize, usize, f32),
     ) {
         debug_assert_eq!(config.length_uint_config.lsb_in_token(), 0);
+        #[cfg(feature = "experimental-lz77-hotspots")]
+        if begin >= end {
+            return;
+        }
+        #[cfg(feature = "experimental-lz77-hotspots")]
+        if let Some((table, prices)) = self.lengths {
+            debug_assert_eq!(table.config, config.length_uint_config);
+            debug_assert_eq!(table.min_symbol, config.min_symbol());
+            let first = table.config.encode((begin - MIN_MATCH) as u32).token as usize;
+            for (&boundary, &price) in table.ends[first..].iter().zip(&prices[first..]) {
+                let stop = MIN_MATCH + boundary.min((end - MIN_MATCH) as u64) as usize;
+                visit(begin, stop, price);
+                if stop == end {
+                    return;
+                }
+                begin = stop;
+            }
+            unreachable!("compiled length intervals cover all u32 values");
+        }
         while begin < end {
             let value = (begin - MIN_MATCH) as u32;
             let encoded = config.length_uint_config.encode(value);
@@ -94,6 +172,30 @@ impl Row<'_> {
 }
 
 impl<'a> Prices<'a> {
+    #[cfg(not(feature = "experimental-lz77-hotspots"))]
+    #[inline]
+    pub(super) fn with_lengths(costs: &'a Costs, _config: &SourceConfig) -> Result<Self> {
+        Self::new(costs)
+    }
+
+    #[cfg(feature = "experimental-lz77-hotspots")]
+    pub(super) fn with_lengths(costs: &'a Costs, config: &SourceConfig) -> Result<Self> {
+        let mut prices = Self::new(costs)?;
+        // Indexed blocks use their own cost view, and non-000 range parsing
+        // enumerates explicit endpoints instead of calling Row::intervals.
+        let indexed_blocks = config.block_mode != super::SourceBlockMode::Disabled
+            && (config.shared_index || config.index_mode != super::SourceIndexMode::Disabled);
+        if indexed_blocks
+            || (config.match_cost.range()
+                && config.length_uint_config != HybridUintConfig::new(0, 0, 0).unwrap())
+        {
+            return Ok(prices);
+        }
+        let _profile = crate::profile::scope("lz77.source.compile_lengths");
+        prices.lengths = LengthPrices::new(&prices.rows, config)?;
+        Ok(prices)
+    }
+
     pub(super) fn new(costs: &'a Costs) -> Result<Self> {
         let _profile = crate::profile::scope("lz77.source.compile_prices");
         let count = costs.literals.range(..CONTEXTS as u32).count().min(ROWS);
@@ -129,10 +231,39 @@ impl<'a> Prices<'a> {
             rows,
             distance_tokens,
             small_distances,
+            #[cfg(feature = "experimental-lz77-hotspots")]
+            lengths: None,
         })
     }
 
     #[inline]
+    #[cfg(feature = "experimental-lz77-hotspots")]
+    pub(super) fn row(&self, context: u32) -> Row<'_> {
+        if let Some(&index) = self
+            .contexts
+            .get(context as usize)
+            .filter(|&&index| index != MISSING)
+        {
+            let (dense, sparse) = &self.rows[index as usize];
+            Row {
+                dense: Some(dense),
+                sparse: Some(sparse),
+                lengths: self.lengths.as_ref().map(|table| {
+                    let begin = index as usize * table.ends.len();
+                    (table, &table.bits[begin..begin + table.ends.len()])
+                }),
+            }
+        } else {
+            Row {
+                dense: None,
+                sparse: self.costs.literals.get(&context),
+                lengths: None,
+            }
+        }
+    }
+
+    #[inline]
+    #[cfg(not(feature = "experimental-lz77-hotspots"))]
     pub(super) fn row(&self, context: u32) -> Row<'_> {
         if let Some((dense, sparse)) = self
             .contexts
@@ -216,6 +347,155 @@ mod tests {
     use super::super::{Command, ContextCost, SourceBucketMode, SourceLz77Method};
     use super::*;
     use std::collections::BTreeMap;
+
+    #[test]
+    #[cfg(feature = "experimental-lz77-hotspots")]
+    fn routes_without_compiled_intervals_keep_original_prices() {
+        let costs = Costs {
+            literals: BTreeMap::from([(
+                0,
+                ContextCost {
+                    bits: BTreeMap::from([(224, 1.25)]),
+                    penalty: 0.0,
+                },
+            )]),
+            distances: ContextCost {
+                bits: BTreeMap::new(),
+                penalty: 0.0,
+            },
+        };
+        for config in [
+            SourceConfig {
+                block_mode: super::super::SourceBlockMode::Intervals,
+                shared_index: true,
+                ..SourceConfig::default()
+            },
+            SourceConfig {
+                match_cost: super::super::SourceMatchCost::RangeRefit,
+                length_uint_config: HybridUintConfig::default(),
+                ..SourceConfig::default()
+            },
+        ] {
+            let prices = Prices::with_lengths(&costs, &config).unwrap();
+            assert!(prices.lengths.is_none());
+            for length in MIN_MATCH..1000 {
+                assert_eq!(
+                    prices.row(0).length(length, &config),
+                    costs.length(0, length, &config)
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "experimental-lz77-hotspots")]
+    fn capped_lengths_allow_high_symbol_offsets_without_cache_overflow() {
+        let config = SourceConfig {
+            max_match_length: MIN_MATCH,
+            min_symbol: Some(u32::MAX),
+            ..SourceConfig::default()
+        };
+        config.validate().unwrap();
+        let costs = Costs {
+            literals: BTreeMap::from([(
+                0,
+                ContextCost {
+                    bits: BTreeMap::from([(u32::MAX, 1.25)]),
+                    penalty: 0.0,
+                },
+            )]),
+            distances: ContextCost {
+                bits: BTreeMap::new(),
+                penalty: 0.0,
+            },
+        };
+        let prices = Prices::with_lengths(&costs, &config).unwrap();
+        assert!(prices.lengths.is_none());
+        let mut seen = Vec::new();
+        prices
+            .row(0)
+            .intervals(MIN_MATCH, MIN_MATCH + 1, &config, |a, b, cost| {
+                seen.push((a, b, cost));
+            });
+        assert_eq!(seen, [(MIN_MATCH, MIN_MATCH + 1, 1.25)]);
+    }
+
+    #[test]
+    #[cfg(feature = "experimental-lz77-hotspots")]
+    fn compiled_length_intervals_cover_boundaries_and_sparse_fallback() {
+        let costs = Costs {
+            literals: [0, 17, u32::MAX]
+                .into_iter()
+                .map(|context| {
+                    (
+                        context,
+                        ContextCost {
+                            bits: (0..1000)
+                                .map(|symbol| (symbol, (symbol % 13) as f32 / 7.0))
+                                .collect(),
+                            penalty: 0.0,
+                        },
+                    )
+                })
+                .collect(),
+            distances: ContextCost {
+                bits: BTreeMap::new(),
+                penalty: 0.0,
+            },
+        };
+        for (split, msb) in [(0, 0), (4, 0), (4, 2), (7, 3), (15, 15)] {
+            for offset in [224, 512, 900] {
+                let config = SourceConfig {
+                    length_uint_config: HybridUintConfig::new(split, msb, 0).unwrap(),
+                    min_symbol: Some(offset),
+                    ..SourceConfig::default()
+                };
+                let compiled = Prices::with_lengths(&costs, &config).unwrap();
+                let plain = Prices::new(&costs).unwrap();
+                assert_eq!(compiled.lengths.is_some(), (split, msb) <= (4, 2));
+                for context in [0, 17, 99, u32::MAX] {
+                    for value in [
+                        0,
+                        1,
+                        2,
+                        15,
+                        16,
+                        17,
+                        255,
+                        1023,
+                        65535,
+                        1 << 20,
+                        u32::MAX - 2048,
+                    ] {
+                        for span in [0, 1, 17, 2048] {
+                            if u64::from(value) + MIN_MATCH as u64 + span as u64 > usize::MAX as u64
+                            {
+                                continue;
+                            }
+                            let begin = value as usize + MIN_MATCH;
+                            let end = begin + span;
+                            let mut expected = Vec::new();
+                            plain
+                                .row(context)
+                                .intervals(begin, end, &config, |a, b, bits| {
+                                    expected.push((a, b, bits.to_bits()));
+                                });
+                            let mut actual = Vec::new();
+                            compiled
+                                .row(context)
+                                .intervals(begin, end, &config, |a, b, bits| {
+                                    actual.push((a, b, bits.to_bits()));
+                                });
+                            assert_eq!(
+                                actual, expected,
+                                "{split}/{msb} {offset} {context} {begin} {end}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn compiled_prices_preserve_sparse_contexts_symbols_and_float_bits() {
@@ -325,7 +605,7 @@ mod tests {
                             .collect(),
                     ];
                     let costs = Costs::fitted(&seed, &[37], &config);
-                    let prices = Prices::new(&costs).unwrap();
+                    let prices = Prices::with_lengths(&costs, &config).unwrap();
                     assert_eq!(
                         prices.cumulative(&input, &config).unwrap(),
                         costs.cumulative(&input, &config).unwrap()
