@@ -7,6 +7,13 @@ non-default `experimental-lz77-hotspots` Cargo feature. Normal builds compile
 out the SIMD helper, DP pruning and cached length fields/lookup paths. No new
 runtime flag or default search policy is introduced.
 
+Follow-up: [100-image single/eight-thread comparison](LZ77_CORPUS100_20261110.md).
+The final experimental binary measured -1.15% and -0.69% summed native time,
+respectively, with unchanged sizes. All 1,084 main/follow-up outputs passed
+official pixel checks. Flagged slowdowns did not persist above both follow-up
+thresholds, but timing reversals also affected a faster control; the small
+aggregate gains do not change the default-disabled decision.
+
 Baseline: `a1e12d0` on `main`. Native Rust pixel-lossless encoding only; no
 changes to the codestream, decoder, search budget, effort mapping or public API.
 This is a focused hotspot experiment, not a new corpus-wide performance claim.
@@ -91,11 +98,84 @@ regression, and one combined screen does not attribute gains to each change.
 ### Texture Investigation
 
 `texture-profile.json` shows no optimal DP or compiled-length calls for this
-image. Its LZ77 scopes decreased, while the longest MA task increased. Thus
-the profile does not support blaming the new length table. One-thread controls
-in `serial-controls.json` showed approximately 1.528 -> 1.511 s for the texture.
-This suggests a parallel-tail/timing effect, but does not prove the eight-thread
-regression harmless. A repeated final control is required before acceptance.
+image. Its LZ77 scopes decreased, while the longest recorded MA scope increased.
+MA cumulative scope time actually decreased (1.556366 -> 1.449348 s). The
+longest scope alone does not establish a critical-path regression or a change
+in MA work. The earlier parallel-tail explanation was a hypothesis, not an
+identified cause. One-thread controls in `serial-controls.json` showed
+approximately 1.528 -> 1.511 s for the texture. See the repeated controls below.
+
+### MA Timing Retest
+
+The disputed comparison was repeated with the exact frozen original binaries:
+`palette-before.exe` (SHA256 above) and `palette-combined.exe`
+(`56b8721d90e1feda6e73bb538f6bccfb047b14a2c710f8d2fd9ac949c4f57459`).
+This is not a comparison against the later guarded `palette-final.exe` build.
+No encoder source was changed or rebuilt during these measurements.
+
+Input: `rough_linen_Displacement_1k.png`, 1024 x 1026, 16-bit grayscale.
+Each control used 12 measured alternating-order trials and two predetermined
+warmups per binary. All trials, including warmups, remain in the JSON reports.
+The native encoding timer excludes CLI startup and file IO.
+
+| Control | Before median s | Combined median s | Time change | Before MPix/s | Combined MPix/s |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 8 threads, profiling off | 0.337065 | 0.332490 | -1.36% | 3.1170 | 3.1599 |
+| 1 thread, profiling off | 1.625414 | 1.671138 | +2.81% | 0.6464 | 0.6287 |
+| 8 threads, profiling on | 0.381994 | 0.336667 | -11.87% | 2.7504 | 3.1207 |
+| 1 thread, profiling on | 1.678275 | 1.676602 | -0.10% | 0.6260 | 0.6266 |
+
+The profile-enabled rows are diagnostics, not evidence of production speedup.
+They must not be mixed with uninstrumented measurements.
+
+The profile records elapsed `Instant` wall time, not exclusive thread CPU time.
+Nested scopes and parallel tasks overlap; descheduling and waits are included.
+The report's `longest` field has no group identity or task completion timeline,
+so it is not necessarily the final task on the encoding critical path.
+
+Work counters across every profiled old/new trial have identical sorted
+per-group `(distinct, nodes, leaves)` tuples: 20 groups, 685,472 distinct
+training samples in total, 28,572 nodes and 14,296 leaves. The measured
+histogram-cache build/reuse and search counts also match. Scratch creation
+versus reuse varies with concurrent leases; the total acquisitions are stable
+within each thread count (28,572 at one thread, 32,506 at eight threads).
+Thus these counters show no added MA search, but do not imply identical CPU
+cost or memory-allocation behavior.
+
+For eight threads, median cumulative `ma.learn` time is 1.735321 -> 1.746037 s;
+the median of each trial's longest MA scope is 189.917 -> 125.287 ms. For one
+thread, cumulative time is 1.212866 -> 1.229884 s. Neither reproduces the
+original large maximum-scope increase as a stable MA regression.
+
+A fifth A/A control uses **the same `palette-before.exe` for both labels**,
+also with 12 trials plus two warmups per label, eight threads and profiling.
+Whole-encode medians differ by +1.67% (0.332781 -> 0.338349 s) despite identical
+code. Across its 24 measured trials, the longest MA scope ranges from 103.193
+to 211.927 ms, covering the original single-pair 106.497 -> 175.087 ms result.
+This demonstrates substantial variability in that metric without a code
+change; it does not prove all differences between builds are noise.
+
+Within an independent group, `frame::encode_prepared_independent` learns MA
+before creating its LZ77 stream. LZ77 does not feed back into that group's MA
+learning. However, `orchestration::encode_frame_areas` dispatches complete
+groups concurrently, so one group's LZ77 can overlap another group's MA.
+Resource contention and scheduling can affect elapsed scope times, but these
+aggregate counters cannot identify which mechanism caused a particular spike.
+
+**Conclusion:** withdraw the attribution to a slower MA algorithm or a proven
+MA parallel tail. The initial +23.21% texture slowdown did not persist in this
+retest. The uninstrumented single-thread +2.81% remains recorded and is not
+declared harmless. This texture-only check does not explain the later PDF
+regression or justify enabling the experiment by default.
+
+All 140 outputs across the five controls passed official `djxl` sample checks
+(repetitions of one image, not 140 images). Every output is 1,841,476 bytes,
+14.021960 bpp; encoded byte identity was not required. Temporary outputs were
+cleaned. Local artifacts under `out/lz-length-20261110/`:
+
+- `ma-retest-t8.json`, `ma-retest-t1.json`
+- `ma-retest-t8-profile.json`, `ma-retest-t1-profile.json`
+- `ma-retest-aa-t8-profile.json`
 
 ## Final Disposition
 

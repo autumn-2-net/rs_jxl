@@ -13,6 +13,62 @@ fn tree() -> Tree {
 }
 
 #[test]
+fn offset_trials_select_serialized_size_not_the_proxy() {
+    use crate::modular::{group::Channel, weighted};
+    let tree = Tree::new(vec![Node::Leaf {
+        predictor: Predictor::Zero,
+        offset: 0,
+        multiplier: 1,
+    }])
+    .unwrap();
+    let channels = [Channel {
+        width: 1024,
+        height: 1,
+        hshift: 0,
+        vshift: 0,
+        samples: vec![100; 1024],
+    }];
+    let views = [training::TrainingStream {
+        channels: &channels,
+        wp: weighted::Header::default(),
+        stream_id: 0,
+    }];
+    for proposed_bits in [80, 100, 120] {
+        let receipt = Arc::new(Receipt::default());
+        let options = encode::ModularOptions {
+            refinement: Options {
+                offsets: Some(OffsetOptions {
+                    mode: OffsetMode::Mean,
+                    ..Default::default()
+                }),
+                receipt: Some(receipt.clone()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let selected = choose(
+            &tree,
+            &views,
+            &options,
+            |_| Ok((vec![vec![Token::literal(0, 0); 1024]], false)),
+            |tree, _, _, _| {
+                let Node::Leaf { offset, .. } = tree.nodes()[0] else {
+                    unreachable!()
+                };
+                Ok((if offset == 0 { 100 } else { proposed_bits }, offset))
+            },
+        )
+        .unwrap();
+        assert_eq!(selected, if proposed_bits < 100 { 100 } else { 0 });
+        let stats = receipt.snapshot();
+        assert_eq!(stats.offset_proposals, 1);
+        assert_eq!(stats.offset_wins, usize::from(proposed_bits < 100));
+        assert_eq!(stats.models, 2);
+        assert_eq!(stats.refit_wins, 0);
+    }
+}
+
+#[test]
 fn exact_entropy_trial_reuses_tokens_and_only_charges_winning_header() {
     for values in [
         vec![0; 2000],

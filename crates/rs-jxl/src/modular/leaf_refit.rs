@@ -132,6 +132,15 @@ fn collect_stats(
     allowed: &[Predictor],
     previous_channels: usize,
 ) -> Result<Vec<Option<LeafStats>>> {
+    let ordered = ordered_streams(tree, streams, previous_channels)?;
+    collect_validated_stats(tree, &ordered, allowed, previous_channels)
+}
+
+pub(super) fn ordered_streams<'a, 'b>(
+    tree: &Tree,
+    streams: &'a [TrainingStream<'b>],
+    previous_channels: usize,
+) -> Result<Vec<&'a TrainingStream<'b>>> {
     // Match the native encoder's property-slot bound, not a resource policy.
     if previous_channels > 60 {
         return Err(Error::InvalidInput("previous_channels exceeds 60".into()));
@@ -172,6 +181,15 @@ fn collect_stats(
         }
     }
 
+    Ok(ordered)
+}
+
+fn collect_validated_stats(
+    tree: &Tree,
+    ordered: &[&TrainingStream<'_>],
+    allowed: &[Predictor],
+    previous_channels: usize,
+) -> Result<Vec<Option<LeafStats>>> {
     let mut stats = Vec::new();
     stats
         .try_reserve_exact(tree.leaves())

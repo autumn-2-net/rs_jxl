@@ -14,6 +14,7 @@ pub(crate) mod frame;
 pub(crate) mod global;
 pub mod group;
 pub mod layout;
+mod leaf_offset;
 mod leaf_refit;
 pub mod ma_train;
 pub(crate) mod orchestration;

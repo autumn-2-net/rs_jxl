@@ -147,6 +147,12 @@ struct Args {
     /// Refit sampled MA leaf predictors on all pixels; retain smaller output.
     #[arg(long, conflicts_with_all = ["search", "scan_only", "fast_context"])]
     refine_leaves: bool,
+    /// Fit static MA leaf offsets, retaining only smaller serialized output.
+    #[arg(long, value_parser = ["mean", "median", "entropy"], conflicts_with_all = ["search", "scan_only", "fast_context"])]
+    leaf_offset: Option<String>,
+    /// Per-leaf fitting reservoir capacity (default 1024); does not cap MA training.
+    #[arg(long, requires = "leaf_offset", value_parser = clap::value_parser!(u32).range(1..))]
+    leaf_offset_samples: Option<u32>,
     /// Opt-in PR5007 split costs or split costs plus near-zero interval search.
     #[arg(long, value_parser = ["cost", "symmetric"], conflicts_with_all = ["search", "scan_only", "fast_context", "ma_seed"])]
     tree_learning: Option<String>,
@@ -435,10 +441,22 @@ fn run(args: Args) -> Result<()> {
         };
         base.modular.tree_learning_receipt = Some(std::sync::Arc::new(Default::default()));
     }
-    if args.refine_entropy || args.refine_leaves {
+    if args.refine_entropy || args.refine_leaves || args.leaf_offset.is_some() {
         base.modular.refinement = rs_jxl::modular::refinement::Options {
             entropy: args.refine_entropy,
             leaves: args.refine_leaves,
+            offsets: args.leaf_offset.as_deref().map(|mode| {
+                use rs_jxl::modular::refinement::{OffsetMode, OffsetOptions};
+                OffsetOptions {
+                    mode: match mode {
+                        "mean" => OffsetMode::Mean,
+                        "median" => OffsetMode::Median,
+                        "entropy" => OffsetMode::Entropy,
+                        _ => unreachable!("validated offset mode"),
+                    },
+                    samples_per_leaf: args.leaf_offset_samples.unwrap_or(1024) as usize,
+                }
+            }),
             receipt: Some(std::sync::Arc::new(Default::default())),
         };
     }
@@ -775,6 +793,12 @@ fn run(args: Args) -> Result<()> {
             "entropy": args.refine_entropy, "leaves": args.refine_leaves,
             "domains": stats.domains, "models": stats.models,
             "refit_proposals": stats.refit_proposals, "refit_wins": stats.refit_wins,
+            "offset_mode": args.leaf_offset,
+            "offset_sample_limit": args.leaf_offset_samples.unwrap_or(1024),
+            "offset_proposals": stats.offset_proposals, "offset_wins": stats.offset_wins,
+            "offset_leaves": stats.offset_leaves, "offset_samples": stats.offset_samples,
+            "offset_population": stats.offset_population,
+            "offset_candidates": stats.offset_candidates, "offset_seconds": stats.offset_seconds,
             "entropy_wins": stats.entropy_wins, "saved_bits": stats.saved_bits,
             "refit_seconds": stats.refit_seconds, "model_seconds": stats.model_seconds,
             "write_seconds": stats.write_seconds,
@@ -849,6 +873,52 @@ fn refinement_flags_are_opt_in_and_cannot_hide_inside_outer_search() {
     ])
     .unwrap();
     assert!(both.refine_entropy && both.refine_leaves);
+}
+
+#[test]
+fn leaf_offsets_are_explicit_and_validate_sampling_and_conflicts() {
+    assert!(
+        Args::try_parse_from(["encoder_lab", "in.png"])
+            .unwrap()
+            .leaf_offset
+            .is_none()
+    );
+    for mode in ["mean", "median", "entropy"] {
+        let args = Args::try_parse_from([
+            "encoder_lab",
+            "in.png",
+            "--leaf-offset",
+            mode,
+            "--leaf-offset-samples",
+            "512",
+        ])
+        .unwrap();
+        assert_eq!(args.leaf_offset.as_deref(), Some(mode));
+        assert_eq!(args.leaf_offset_samples, Some(512));
+        for conflict in [
+            vec!["--search"],
+            vec!["--scan-only"],
+            vec!["--fast-context", "auto12"],
+        ] {
+            let mut argv = vec!["encoder_lab", "in.png", "--leaf-offset", mode];
+            argv.extend(conflict);
+            assert!(Args::try_parse_from(argv).is_err());
+        }
+    }
+    assert!(
+        Args::try_parse_from(["encoder_lab", "in.png", "--leaf-offset-samples", "512"]).is_err()
+    );
+    assert!(
+        Args::try_parse_from([
+            "encoder_lab",
+            "in.png",
+            "--leaf-offset",
+            "entropy",
+            "--leaf-offset-samples",
+            "0"
+        ])
+        .is_err()
+    );
 }
 
 #[test]

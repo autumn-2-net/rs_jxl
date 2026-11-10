@@ -13,17 +13,21 @@ use crate::bit_writer::BitWriter;
 use crate::entropy::stream::{Coding, Model, Token};
 use crate::{Error, Result};
 
+pub use super::leaf_offset::{OffsetMode, OffsetOptions};
+
 #[derive(Debug, Clone, Default)]
 pub struct Options {
     pub entropy: bool,
     pub leaves: bool,
+    /// Static offset fitting with frozen topology/predictors; default disabled.
+    pub offsets: Option<OffsetOptions>,
     /// Invocation-local diagnostics, aggregated outside pixel/token hot loops.
     pub receipt: Option<Arc<Receipt>>,
 }
 
 impl Options {
     pub(crate) fn enabled(&self) -> bool {
-        self.entropy || self.leaves
+        self.entropy || self.leaves || self.offsets.is_some()
     }
 }
 
@@ -33,6 +37,13 @@ pub struct Stats {
     pub models: usize,
     pub refit_proposals: usize,
     pub refit_wins: usize,
+    pub offset_proposals: usize,
+    pub offset_wins: usize,
+    pub offset_leaves: usize,
+    pub offset_samples: usize,
+    pub offset_population: usize,
+    pub offset_candidates: usize,
+    pub offset_seconds: f64,
     pub entropy_wins: usize,
     pub saved_bits: usize,
     pub refit_seconds: f64,
@@ -54,6 +65,13 @@ impl Receipt {
         total.models += stats.models;
         total.refit_proposals += stats.refit_proposals;
         total.refit_wins += stats.refit_wins;
+        total.offset_proposals += stats.offset_proposals;
+        total.offset_wins += stats.offset_wins;
+        total.offset_leaves += stats.offset_leaves;
+        total.offset_samples += stats.offset_samples;
+        total.offset_population += stats.offset_population;
+        total.offset_candidates += stats.offset_candidates;
+        total.offset_seconds += stats.offset_seconds;
         total.entropy_wins += stats.entropy_wins;
         total.saved_bits += stats.saved_bits;
         total.refit_seconds += stats.refit_seconds;
@@ -66,8 +84,15 @@ struct Trial<T> {
     value: T,
     bits: usize,
     costs: Option<Arc<encode::receipt_cost::ModelCostReceipt>>,
-    refitted: bool,
+    origin: Origin,
     alternate: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Origin {
+    Original,
+    Predictors,
+    Offsets,
 }
 
 pub(super) fn choose<T>(
@@ -84,7 +109,7 @@ pub(super) fn choose<T>(
     };
     let mut best: Option<Trial<T>> = None;
     let mut original_bits = 0;
-    let mut evaluate = |tree: &Tree, refitted: bool| -> Result<()> {
+    let mut evaluate = |tree: &Tree, origin: Origin| -> Result<()> {
         let (streams, lz77) = tokenize(tree)?;
         let start = Instant::now();
         let base = Model::build_with_options(
@@ -127,7 +152,7 @@ pub(super) fn choose<T>(
                     value,
                     bits,
                     costs: scratch.model_cost_receipt,
-                    refitted,
+                    origin,
                     alternate,
                 });
             }
@@ -153,7 +178,7 @@ pub(super) fn choose<T>(
         }
         Ok(())
     };
-    evaluate(tree, false)?;
+    evaluate(tree, Origin::Original)?;
     // Explicit fixed trees/predictor plans remain exact user instructions.
     if options.refinement.leaves
         && options.fixed_tree.is_none()
@@ -170,11 +195,26 @@ pub(super) fn choose<T>(
         stats.refit_seconds += start.elapsed().as_secs_f64();
         if let Some(refined) = refined {
             stats.refit_proposals += 1;
-            evaluate(&refined, true)?;
+            evaluate(&refined, Origin::Predictors)?;
+        }
+    }
+    if let Some(offsets) = &options.refinement.offsets {
+        let start = Instant::now();
+        let (refined, fitted) =
+            super::leaf_offset::fit(tree, views, options.previous_channels, offsets)?;
+        stats.offset_seconds += start.elapsed().as_secs_f64();
+        stats.offset_leaves += fitted.leaves;
+        stats.offset_samples += fitted.samples;
+        stats.offset_population += fitted.population;
+        stats.offset_candidates += fitted.candidates;
+        if let Some(refined) = refined {
+            stats.offset_proposals += 1;
+            evaluate(&refined, Origin::Offsets)?;
         }
     }
     let best = best.expect("baseline was encoded");
-    stats.refit_wins = usize::from(best.refitted);
+    stats.refit_wins = usize::from(best.origin == Origin::Predictors);
+    stats.offset_wins = usize::from(best.origin == Origin::Offsets);
     stats.entropy_wins = usize::from(best.alternate);
     stats.saved_bits = original_bits - best.bits;
     if let (Some(final_costs), Some(costs)) = (&options.model_cost_receipt, best.costs) {

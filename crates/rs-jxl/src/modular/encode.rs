@@ -231,6 +231,17 @@ impl ModularOptions {
             ));
         }
         self.entropy_options.validate()?;
+        if let Some(offsets) = &self.refinement.offsets {
+            offsets.validate()?;
+            if self.fixed_tree.is_some()
+                || self.custom_tree.is_some()
+                || self.fast_context.is_some()
+            {
+                return Err(Error::InvalidInput(
+                    "leaf offset fitting conflicts with explicit tree plans".into(),
+                ));
+            }
+        }
         self.source_ma_parallel.workers.validate()?;
         if self.tree_learning.enabled()
             && (self.source_ma_seed.is_some()

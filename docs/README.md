@@ -192,6 +192,9 @@ rejected experiments and remaining limitations remain part of the record.
 - [Palette run-order experiment, 2026-11-10](PALETTE_RUN_ORDER_20261110.md)
 - [Sampled palette-order screening, 2026-11-10](PALETTE_SCREEN_20261110.md)
 - [LZ77 match, price-cache and DP experiments, 2026-11-10](LZ77_MATCH_PRICE_20261110.md)
+- [LZ77 100-image single/eight-thread comparison, 2026-11-10](LZ77_CORPUS100_20261110.md)
+- [Static MA leaf offset experiment, 2026-11-10](MA_LEAF_OFFSET_20261110.md)
+- [MA leaf offset 100-image bpp comparison, 2026-11-10](MA_LEAF_OFFSET_CORPUS100_20261110.md)
 
 ### Decoding and Reconstruction
 
