@@ -21,6 +21,7 @@ mod default_budget_tests;
 pub mod entropy;
 pub mod entropy_writer;
 pub mod frame_header;
+pub mod head_tail;
 pub mod huffman;
 pub mod modular_policy;
 pub mod quantization;

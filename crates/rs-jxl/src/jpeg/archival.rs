@@ -101,6 +101,7 @@ impl TranscodeOptions {
             tier: SpeedTier::try_from(10 - self.effort.clamp(2, 10) as i8)?,
             threads: self.threads,
             cooperative_ma: self.cooperative_ma,
+            ac_head_tail: None,
             decoding_speed: self.decoding_speed,
             sample_limit: self.limits.sample_limit,
             reconstruction_quality: self

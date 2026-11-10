@@ -41,6 +41,10 @@ use super::stream::{Token, write_uint_config};
 use crate::bit_writer::BitWriter;
 use crate::{Error, Result};
 
+#[path = "config_head_tail.rs"]
+mod head_tail;
+pub(super) use head_tail::search as search_head_tail;
+
 const LOG_ALPHA_SIZE: u8 = 8;
 const ALPHABET_SIZE: usize = 1 << LOG_ALPHA_SIZE;
 const LZ77_MIN_SYMBOL: u32 = 224;
@@ -156,6 +160,7 @@ impl WeightedUintHistogram {
 enum HistogramValues<'a> {
     Raw(&'a [u32]),
     Weighted(WeightedUintHistogram),
+    Exact(head_tail::ExactValues),
 }
 
 impl<'a> HistogramValues<'a> {
@@ -175,6 +180,7 @@ impl<'a> HistogramValues<'a> {
         match self {
             Self::Weighted(weighted) => weighted.add_to(cfg, counts),
             Self::Raw(values) => super::simd::add_tokens(values, cfg, counts),
+            Self::Exact(values) => values.add_to(cfg, counts),
         }
     }
 }
@@ -686,6 +692,28 @@ fn search_config_plan_with_workers(
     options: &EntropyOptions,
     use_workers: bool,
 ) -> Result<SearchPlan> {
+    search_config_plan_with_candidates(
+        streams,
+        context_map,
+        num_histograms,
+        lz77,
+        prefix_codes,
+        options,
+        use_workers,
+        None,
+    )
+}
+
+fn search_config_plan_with_candidates(
+    streams: &[Vec<Token>],
+    context_map: &[u8],
+    num_histograms: usize,
+    lz77: bool,
+    prefix_codes: bool,
+    options: &EntropyOptions,
+    use_workers: bool,
+    candidate_override: Option<&[HybridUintConfig]>,
+) -> Result<SearchPlan> {
     let _profile = crate::profile::scope("entropy.uint_config_search");
     crate::profile::note(
         "entropy.uint_config_search",
@@ -735,11 +763,11 @@ fn search_config_plan_with_workers(
     let mut weighted_histograms = 0usize;
     let mut weighted_values = 0usize;
     let mut weighted_bins = 0usize;
-    let candidates = match options.uint_config {
+    let candidates = candidate_override.unwrap_or(match options.uint_config {
         UintConfigStrategy::Fast => &FAST_CONFIGS[..],
         UintConfigStrategy::Best => &BEST_CONFIGS[..],
         UintConfigStrategy::Fixed(_) => unreachable!(),
-    };
+    });
     #[cfg(test)]
     let probe = super::worker_test::current();
     let choose = |histogram: usize| {
@@ -752,6 +780,7 @@ fn search_config_plan_with_workers(
             candidates,
             alphabet_size,
             literal_limit,
+            candidate_override.is_some(),
         )
     };
     let parallel = !crate::execution::is_serial()
@@ -775,9 +804,12 @@ fn search_config_plan_with_workers(
         // SIMD now uses bounded batches instead of a volume-sized scratch Vec.
         // Source MaxVectorSize returns bytes (32 for AVX2), even though this
         // allocation expression adds it to a uint32 element count.
+        // Exact head/tail counting also retains sorted values and value/count
+        // pairs while building each histogram's distribution.
+        let bytes_per_value = if candidate_override.is_some() { 12 } else { 4 };
         let scratch = largest
             .saturating_add(32)
-            .saturating_mul(4)
+            .saturating_mul(bytes_per_value)
             .saturating_add(1 << 20);
         let mut selected = super::jobs::map(
             &order,
@@ -850,11 +882,17 @@ fn search_histogram(
     candidates: &[HybridUintConfig],
     alphabet_size: usize,
     literal_limit: usize,
+    exact_values: bool,
 ) -> Result<HistogramChoice> {
-    let data = HistogramValues::new(values, candidates)?;
+    let data = if exact_values && values.len() >= 512 {
+        HistogramValues::Exact(head_tail::ExactValues::new(values)?)
+    } else {
+        HistogramValues::new(values, candidates)?
+    };
     let (weighted_values, weighted_bins) = match &data {
         HistogramValues::Weighted(weighted) => (values.len(), weighted.values.len()),
         HistogramValues::Raw(_) => (0, 0),
+        HistogramValues::Exact(exact) => (values.len(), exact.len()),
     };
     let mut best = None;
     let mut best_cost = f32::MAX;

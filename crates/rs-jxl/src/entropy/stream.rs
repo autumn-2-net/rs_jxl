@@ -418,6 +418,17 @@ impl Model {
             prefix,
             options,
         )?;
+        Self::from_search(clustered, map, lz77, prefix, options, search)
+    }
+
+    fn from_search(
+        clustered: Vec<Vec<u64>>,
+        map: Vec<u8>,
+        lz77: bool,
+        prefix: bool,
+        options: &EntropyOptions,
+        search: super::config_search::SearchPlan,
+    ) -> Result<Self> {
         let mut plan = search.plan;
         // Adaptive search already counted the winning configuration and lengths.
         // Fixed/streaming policies retain the clustered raw counts, including
@@ -467,6 +478,48 @@ impl Model {
             log_alpha_size: plan.log_alpha_size,
             streaming,
         })
+    }
+
+    pub(crate) fn head_tail_candidate(
+        &self,
+        streams: &[Vec<Token>],
+        options: &EntropyOptions,
+    ) -> Result<(Option<Self>, usize, usize)> {
+        if !self.uses_ans()
+            || self.streaming.is_some()
+            || options.streaming_mode
+            || options.add_fixed_histograms
+            || options.add_missing_symbols
+            || matches!(options.uint_config, UintConfigStrategy::Fixed(_))
+        {
+            return Ok((None, 0, 0));
+        }
+        let (search, configurations) = super::config_search::search_head_tail(
+            streams,
+            &self.map,
+            self.histogram_count(),
+            self.lz77,
+            options,
+        )?;
+        let changed = self
+            .configs
+            .iter()
+            .zip(&search.plan.configs)
+            .filter(|(a, b)| a != b)
+            .count();
+        if changed == 0 && self.log_alpha_size == search.plan.log_alpha_size {
+            return Ok((None, configurations, 0));
+        }
+        debug_assert!(search.counts.is_some());
+        Self::from_search(
+            Vec::new(),
+            self.map.clone(),
+            self.lz77,
+            false,
+            options,
+            search,
+        )
+        .map(|model| (Some(model), configurations, changed))
     }
 
     pub(crate) fn context_map_candidates(
@@ -935,6 +988,10 @@ mod streaming_tests;
 #[cfg(test)]
 #[path = "stream_context_map_tests.rs"]
 mod context_map_tests;
+
+#[cfg(test)]
+#[path = "stream_head_tail_tests.rs"]
+mod head_tail_tests;
 
 #[cfg(test)]
 mod tests {

@@ -23,8 +23,17 @@ pub enum LzPolicy<'a> {
 /// AC group. Acceptance of LZ is retained independently of actual copy count.
 pub struct CoefficientEntropy {
     model: Model,
+    head_tail: Option<Model>,
     streams: Vec<Vec<Token>>,
     lz_enabled: bool,
+}
+
+fn source_options(tier: SpeedTier, decoding_speed: u8) -> EntropyOptions {
+    let mut options = EntropyOptions::for_speed_tier(tier);
+    if decoding_speed >= 1 {
+        options.max_histograms = 6;
+    }
+    options
 }
 
 impl CoefficientEntropy {
@@ -35,10 +44,7 @@ impl CoefficientEntropy {
         decoding_speed: u8,
         max_tokens: usize,
     ) -> Result<Self> {
-        let mut options = EntropyOptions::for_speed_tier(tier);
-        if decoding_speed >= 1 {
-            options.max_histograms = 6;
-        }
+        let options = source_options(tier, decoding_speed);
         let lz = if tier > SpeedTier::Tortoise {
             LzPolicy::Disabled
         } else {
@@ -127,6 +133,7 @@ impl CoefficientEntropy {
         )?;
         Ok(Self {
             model,
+            head_tail: None,
             streams,
             lz_enabled,
         })
@@ -141,13 +148,57 @@ impl CoefficientEntropy {
     pub fn write_model(&self, writer: &mut BitWriter) -> Result<()> {
         self.model.write_header(writer)
     }
+    pub(super) fn propose_head_tail(
+        &mut self,
+        tier: SpeedTier,
+        decoding_speed: u8,
+        receipt: &super::head_tail::Receipt,
+    ) -> Result<()> {
+        let start = std::time::Instant::now();
+        let (candidate, configurations, changed) = self
+            .model
+            .head_tail_candidate(&self.streams, &source_options(tier, decoding_speed))?;
+        receipt.proposal(
+            self.model.histogram_count(),
+            changed,
+            configurations,
+            candidate.is_some(),
+            start.elapsed().as_secs_f64(),
+        );
+        self.head_tail = candidate;
+        Ok(())
+    }
+    pub(super) fn has_head_tail(&self) -> bool {
+        self.head_tail.is_some()
+    }
+    pub(super) fn write_trial_model(&self, writer: &mut BitWriter) -> Result<()> {
+        self.head_tail
+            .as_ref()
+            .expect("confirmed head/tail candidate")
+            .write_header(writer)
+    }
     pub fn write_group(&self, index: usize, writer: &mut BitWriter) -> Result<()> {
+        self.write_group_variant(index, writer, false)
+    }
+    pub(super) fn write_group_variant(
+        &self,
+        index: usize,
+        writer: &mut BitWriter,
+        trial: bool,
+    ) -> Result<()> {
         let stream = self
             .streams
             .get(index)
             .ok_or_else(|| Error::InvalidInput("JPEG AC group index out of range".into()))?;
         // One histogram group, so there is no per-group selector field.
-        self.model.write_stream(stream, writer)
+        let model = if trial {
+            self.head_tail
+                .as_ref()
+                .expect("confirmed head/tail candidate")
+        } else {
+            &self.model
+        };
+        model.write_stream(stream, writer)
     }
 }
 

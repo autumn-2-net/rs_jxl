@@ -36,6 +36,8 @@ pub struct Options {
     pub threads: usize,
     /// Default-off cooperative auxiliary learners; gathering remains serial.
     pub cooperative_ma: Option<WorkerLimits>,
+    /// Explicit head/tail experiment; ordinary transcode/search leave this off.
+    pub ac_head_tail: Option<std::sync::Arc<super::head_tail::Receipt>>,
     pub decoding_speed: u8,
     /// `usize::MAX` means no ceiling on samples selected by the learning policy.
     pub sample_limit: usize,
@@ -53,6 +55,7 @@ impl Default for Options {
             tier: SpeedTier::Falcon,
             threads: 1,
             cooperative_ma: None,
+            ac_head_tail: None,
             decoding_speed: 0,
             sample_limit: usize::MAX,
             reconstruction_quality: 4,
@@ -225,13 +228,17 @@ fn tokenize_groups(
         )
         .map_err(ac_token_error)
     })?;
-    CoefficientEntropy::source(
+    let mut entropy = CoefficientEntropy::source(
         streams,
         model.num_ac_contexts(),
         options.tier,
         options.decoding_speed,
         options.max_tokens,
-    )
+    )?;
+    if let Some(receipt) = &options.ac_head_tail {
+        entropy.propose_head_tail(options.tier, options.decoding_speed, receipt)?;
+    }
+    Ok(entropy)
 }
 
 pub fn encode_coefficients(jpeg: &JpegData, options: &Options) -> Result<Vec<u8>> {
@@ -271,17 +278,29 @@ fn prepare_ac(
 }
 
 enum AcData<'a> {
-    Direct(&'a Dct8Orders, &'a CoefficientEntropy),
+    Direct(&'a Dct8Orders, &'a CoefficientEntropy, bool),
     Cached(&'a search_cache::AcPayload),
 }
 
 impl AcData<'_> {
+    fn head_tail(&self) -> Option<AcData<'_>> {
+        match self {
+            Self::Direct(orders, entropy, false) if entropy.has_head_tail() => {
+                Some(AcData::Direct(orders, entropy, true))
+            }
+            _ => None,
+        }
+    }
     fn write_global(&self, writer: &mut BitWriter, groups: usize) -> Result<()> {
         match self {
-            Self::Direct(orders, entropy) => {
+            Self::Direct(orders, entropy, trial) => {
                 entropy::write_single_histogram_group(writer, groups)?;
                 entropy::write_orders(orders, writer)?;
-                entropy.write_model(writer)
+                if *trial {
+                    entropy.write_trial_model(writer)
+                } else {
+                    entropy.write_model(writer)
+                }
             }
             Self::Cached(payload) => payload.write_global(writer),
         }
@@ -289,7 +308,7 @@ impl AcData<'_> {
 
     fn write_group(&self, index: usize, writer: &mut BitWriter) -> Result<()> {
         match self {
-            Self::Direct(_, entropy) => entropy.write_group(index, writer),
+            Self::Direct(_, entropy, trial) => entropy.write_group_variant(index, writer, *trial),
             Self::Cached(payload) => payload.write_group(index, writer),
         }
     }
@@ -450,6 +469,11 @@ impl Prepared {
         pool: Option<&rayon::ThreadPool>,
         cache: Option<&mut SearchCache<'_>>,
     ) -> Result<Vec<u8>> {
+        if cache.is_some() && options.ac_head_tail.is_some() {
+            return Err(Error::InvalidInput(
+                "head/tail experiment cannot use source-search AC cache".into(),
+            ));
+        }
         let layout = TranscodeLayout::new(jpeg).map_err(invalid)?;
         let geometry = FrameGeometry::new(jpeg.width, jpeg.height, layout.subsampling())?;
         let cfl = JpegCfl::compute(&layout, options.cfl);
@@ -482,7 +506,7 @@ impl Prepared {
             AcData::Cached(cache.get_or_build(jpeg, geometry, options, build_ac)?)
         } else {
             direct = build_ac()?;
-            AcData::Direct(&direct.0, &direct.1)
+            AcData::Direct(&direct.0, &direct.1, false)
         };
         let maps = cfl.dimensions_in_tiles();
         let maps = CflMaps {
@@ -585,78 +609,90 @@ impl Prepared {
                 cooperative: options.cooperative_ma,
             },
         )?;
-        let mut sections: Vec<_> = (0..geometry.section_count())
-            .map(|_| BitWriter::new(options.max_output_bytes))
-            .collect();
-        let section = |index| {
-            if geometry.section_count() == 1 {
-                0
-            } else {
-                index
+        // Reuse the prepared auxiliaries/coefficients; arbitrate the complete
+        // container so alignment, TOC widths and box headers are included.
+        let emit = |ac: &AcData<'_>| -> Result<Vec<u8>> {
+            let mut sections: Vec<_> = (0..geometry.section_count())
+                .map(|_| BitWriter::new(options.max_output_bytes))
+                .collect();
+            let section = |index| {
+                if geometry.section_count() == 1 {
+                    0
+                } else {
+                    index
+                }
+            };
+            let global = &mut sections[0];
+            dc_quant.write(global)?;
+            QuantizerParams::jpeg().write(global)?;
+            ac_tokens::write_block_context_map(model, global)?;
+            entropy::write_jpeg_color_correlation(global)?;
+            auxiliary.write_global_info(global)?;
+            for (index, dc_group) in dc.iter().enumerate() {
+                let writer = &mut sections[section(index + 1)];
+                writer.write(2, u64::from(dc_group.extra_dc_precision))?;
+                auxiliary.write_stream(index + 1, writer)?;
+                let metadata = &ac_metadata[index];
+                let area = metadata.rect.width * metadata.rect.height;
+                let bits = (usize::BITS - (area - 1).leading_zeros()) as u8;
+                writer.write(bits, (area - 1) as u64)?;
+                auxiliary.write_stream(1 + 2 * geometry.dc_group_count() + index, writer)?;
             }
-        };
-        let global = &mut sections[0];
-        dc_quant.write(global)?;
-        QuantizerParams::jpeg().write(global)?;
-        ac_tokens::write_block_context_map(model, global)?;
-        entropy::write_jpeg_color_correlation(global)?;
-        auxiliary.write_global_info(global)?;
-        for (index, dc_group) in dc.iter().enumerate() {
-            let writer = &mut sections[section(index + 1)];
-            writer.write(2, u64::from(dc_group.extra_dc_precision))?;
-            auxiliary.write_stream(index + 1, writer)?;
-            let metadata = &ac_metadata[index];
-            let area = metadata.rect.width * metadata.rect.height;
-            let bits = (usize::BITS - (area - 1).leading_zeros()) as u8;
-            writer.write(bits, (area - 1) as u64)?;
-            auxiliary.write_stream(1 + 2 * geometry.dc_group_count() + index, writer)?;
-        }
-        let global_ac = &mut sections[section(1 + geometry.dc_group_count())];
-        ac_quant.write_header(global_ac, |w, _| auxiliary.write_stream(quant_id, w))?;
-        ac.write_global(global_ac, geometry.group_count())?;
-        for index in 0..geometry.group_count() {
-            ac.write_group(
-                index,
-                &mut sections[section(2 + geometry.dc_group_count() + index)],
+            let global_ac = &mut sections[section(1 + geometry.dc_group_count())];
+            ac_quant.write_header(global_ac, |w, _| auxiliary.write_stream(quant_id, w))?;
+            ac.write_global(global_ac, geometry.group_count())?;
+            for index in 0..geometry.group_count() {
+                ac.write_group(
+                    index,
+                    &mut sections[section(2 + geometry.dc_group_count() + index)],
+                )?;
+            }
+            let sections = sections
+                .into_iter()
+                .map(|mut w| {
+                    w.zero_pad_to_byte()?;
+                    w.into_bytes().map_err(Error::from)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let sizes: Vec<_> = sections.iter().map(Vec::len).collect();
+            let frame_header = frame_header::write_header(
+                geometry,
+                layout.color_transform(),
+                &sizes,
+                options.max_output_bytes,
             )?;
-        }
-        let sections = sections
-            .into_iter()
-            .map(|mut w| {
-                w.zero_pad_to_byte()?;
-                w.into_bytes().map_err(Error::from)
+            let mut output = BitWriter::new(options.max_output_bytes);
+            output.append_byte_aligned(&self.image_header)?;
+            output.append_byte_aligned(&frame_header)?;
+            for bytes in sections {
+                output.append_byte_aligned(&bytes)?;
+            }
+            let codestream = output.into_bytes()?;
+            let mut boxes: Vec<(&[u8; 4], &[u8])> = self
+                .exif
+                .as_deref()
+                .map(|payload| (b"Exif", payload))
+                .into_iter()
+                .collect();
+            if let Some(payload) = self.xmp.as_deref() {
+                boxes.push((b"xml ", payload));
+            }
+            super::container::wrap_with_metadata(
+                &codestream,
+                &self.reconstruction,
+                self.level,
+                &boxes,
+                options.max_output_bytes,
+            )
+        };
+        let baseline = emit(&ac)?;
+        if let Some(receipt) = &options.ac_head_tail {
+            receipt.select(baseline, || {
+                ac.head_tail().map(|trial| emit(&trial)).transpose()
             })
-            .collect::<Result<Vec<_>>>()?;
-        let sizes: Vec<_> = sections.iter().map(Vec::len).collect();
-        let frame_header = frame_header::write_header(
-            geometry,
-            layout.color_transform(),
-            &sizes,
-            options.max_output_bytes,
-        )?;
-        let mut output = BitWriter::new(options.max_output_bytes);
-        output.append_byte_aligned(&self.image_header)?;
-        output.append_byte_aligned(&frame_header)?;
-        for bytes in sections {
-            output.append_byte_aligned(&bytes)?;
+        } else {
+            Ok(baseline)
         }
-        let codestream = output.into_bytes()?;
-        let mut boxes: Vec<(&[u8; 4], &[u8])> = self
-            .exif
-            .as_deref()
-            .map(|payload| (b"Exif", payload))
-            .into_iter()
-            .collect();
-        if let Some(payload) = self.xmp.as_deref() {
-            boxes.push((b"xml ", payload));
-        }
-        super::container::wrap_with_metadata(
-            &codestream,
-            &self.reconstruction,
-            self.level,
-            &boxes,
-            options.max_output_bytes,
-        )
     }
 }
 
