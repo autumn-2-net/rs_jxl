@@ -185,7 +185,7 @@ def encode_and_verify(args, source, expected, variant, folder, env, receipt, *, 
 
 
 def benchmark(args, *, make_command=None, read_notes=None, check_route=None,
-              baseline="baseline", comparison="batch1"):
+              baseline="baseline", comparison="batch1", finalize_report=None):
     make_command = command if make_command is None else make_command
     read_notes = profile_notes if read_notes is None else read_notes
     check_route = validate_route if check_route is None else check_route
@@ -276,6 +276,11 @@ def benchmark(args, *, make_command=None, read_notes=None, check_route=None,
                 except OSError as error:
                     message = str(error)
                 report["errors"].append(message)
+            if finalize_report is not None:
+                try:
+                    finalize_report(report)
+                except (Exception, KeyboardInterrupt) as error:
+                    report["errors"].append(f"{type(error).__name__}: {error}")
             if report["errors"] or not report["temporary_outputs_cleaned"]:
                 report["status"] = "failed"
             json.dump(report, output, indent=2, default=str, allow_nan=False)

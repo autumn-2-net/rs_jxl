@@ -120,20 +120,13 @@ impl Index<'_> {
                     != self.values[c.position..c.position + MIN_MATCH]);
         let length = if reject {
             0
+        } else if q.zeros >= 3 {
+            self.zero_length(q.position, c.position, q.limit, q.zeros)
         } else {
-            let prefix = if q.zeros < 3 {
-                MIN_MATCH
-            } else if q.zeros > 3 {
-                (q.zeros - 1)
-                    .min(self.zeros[c.position] as usize)
-                    .min(q.limit - 1)
-            } else {
-                0
-            };
-            prefix
+            MIN_MATCH
                 + match_length(
-                    &self.values[q.position + prefix..q.position + q.limit],
-                    &self.values[c.position + prefix..c.position + q.limit],
+                    &self.values[q.position + MIN_MATCH..q.position + q.limit],
+                    &self.values[c.position + MIN_MATCH..c.position + q.limit],
                 )
         };
         if length >= required {

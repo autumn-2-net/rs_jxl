@@ -181,7 +181,7 @@ class ChainInterleaveTests(unittest.TestCase):
             with self.subTest(key=key, value=value), self.assertRaises(ValueError):
                 bench.validate_measurement(data, 100, expected)
 
-    def run_mock(self, root, failure=None):
+    def run_mock(self, root, failure=None, *, finalize_report=None):
         for name in ("encoder", "djxl", "input.png"):
             (root / name).write_bytes(b"original")
         args = bench.arguments(self.argv(root) + ["--repeats", "2", "--warmups", "1"])
@@ -232,11 +232,36 @@ class ChainInterleaveTests(unittest.TestCase):
                              side_effect=ValueError("hidden RGB mismatch") if failure == "pixels" else None) as compare, \
                 patch.dict(os.environ, {"RS_JXL_PROFILE": "trace", "JXL_INHERITED": "1", "RS_JXL_OTHER": "x"}), \
                 contextlib.redirect_stdout(io.StringIO()):
-            report = bench.benchmark(args)
+            report = bench.benchmark(args, finalize_report=finalize_report)
         self.assertTrue(report["temporary_outputs_cleaned"])
         self.assertTrue(all(not artifact.exists() for artifact in artifacts))
         self.assertEqual(json.loads(args.out.read_text(encoding="utf-8"))["status"], report["status"])
         return report, calls, compare.call_count
+
+    def test_finalize_callback_precedes_publication_and_preserves_failures(self):
+        for failure in (None, "encoder"):
+            for error in (None, OSError("finalize IO"), RuntimeError("finalize error"), KeyboardInterrupt()):
+                with self.subTest(failure=failure, error=error), tempfile.TemporaryDirectory() as directory:
+                    finalized = []
+
+                    def finalize(report):
+                        self.assertTrue(report["temporary_outputs_cleaned"])
+                        self.assertEqual(bool(report["errors"]), failure is not None)
+                        report["finalized"] = True
+                        finalized.append(report)
+                        if error is not None:
+                            raise error
+
+                    with patch.object(bench.json, "dump", wraps=bench.json.dump) as publication:
+                        report, _, _ = self.run_mock(Path(directory), failure, finalize_report=finalize)
+                    self.assertEqual(len(finalized), 1)
+                    self.assertIs(finalized[0], report)
+                    publication.assert_called_once()
+                    saved = json.loads((Path(directory) / "report.json").read_text(encoding="utf-8"))
+                    self.assertTrue(saved["finalized"])
+                    self.assertEqual(saved["status"], "failed" if failure or error is not None else "passed")
+                    if error is not None:
+                        self.assertTrue(any(type(error).__name__ in message for message in saved["errors"]))
 
     def test_rotation_separate_profiles_native_medians_and_regressions_retained(self):
         with tempfile.TemporaryDirectory() as directory:

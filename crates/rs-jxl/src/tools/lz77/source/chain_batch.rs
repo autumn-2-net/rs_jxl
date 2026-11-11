@@ -6,7 +6,6 @@
 //! collisions. DP remains global and consumes batches in increasing position order.
 
 use super::distances::FastCodes;
-use super::index::Dominance;
 use super::matchers::{filled, hash, window};
 use super::search::{match_length, physical};
 use super::{MIN_MATCH, Match, SourceConfig, SourceIndexMode, SourceLz77Method, SourceMatchCost};
@@ -17,8 +16,10 @@ const HASH_BITS: usize = 15;
 const BATCH: usize = 16384;
 const SPECULATIVE_MATCH: usize = 128;
 
+mod frontier;
 mod interleave;
 mod speculation;
+use frontier::Frontier;
 use speculation::Speculation;
 
 #[derive(Clone, Copy)]
@@ -39,7 +40,7 @@ impl Layout {
         let coarse = size
             .checked_mul(12)?
             .checked_add(((1 << HASH_BITS) + window + 1) * 4)?
-            .checked_add(size.min(BATCH) * size_of::<Dominance>())?
+            .checked_add(size.min(BATCH) * size_of::<Frontier>())?
             .checked_add(super::WINDOW_SIZE + 1)?;
         if coarse > budget {
             return None;
@@ -172,6 +173,23 @@ impl<'a> Index<'a> {
         self.find_limited(position, usize::MAX, visit);
     }
 
+    #[inline]
+    fn zero_length(&self, position: usize, previous: usize, limit: usize, zeros: usize) -> usize {
+        let other = self.zeros[previous] as usize;
+        let prefix = zeros.min(other).min(limit);
+        // Unequal runs prove the first mismatch unless the requested length
+        // already ends inside both runs. Equal saturated runs prove only the
+        // prefix: continue comparing after it, including overlapping copies.
+        if prefix == limit || zeros != other {
+            return prefix;
+        }
+        prefix
+            + match_length(
+                &self.values[position + prefix..position + limit],
+                &self.values[previous + prefix..previous + limit],
+            )
+    }
+
     fn find_limited(&self, position: usize, maximum: usize, mut visit: impl FnMut(Match)) {
         let full_limit = self.maximum.min(self.values.len() - position);
         let limit = full_limit.min(maximum);
@@ -202,11 +220,6 @@ impl<'a> Index<'a> {
                 break;
             }
             let required = MIN_MATCH.max(best.saturating_sub(2));
-            let prefix = if zeros > 3 {
-                (zeros - 1).min(self.zeros[p] as usize).min(limit - 1)
-            } else {
-                0
-            };
             let reject = zeros < 3
                 && (required > limit
                     || self.values[position + required - 1] != self.values[p + required - 1]
@@ -214,12 +227,13 @@ impl<'a> Index<'a> {
                         != self.values[p..p + MIN_MATCH]);
             let length = if reject {
                 0
+            } else if zeros >= 3 {
+                self.zero_length(position, p, limit, zeros)
             } else {
-                let prefix = if zeros < 3 { MIN_MATCH } else { prefix };
-                prefix
+                MIN_MATCH
                     + match_length(
-                        &self.values[position + prefix..position + limit],
-                        &self.values[p + prefix..p + limit],
+                        &self.values[position + MIN_MATCH..position + limit],
+                        &self.values[p + MIN_MATCH..p + limit],
                     )
             };
             if length >= required {
@@ -254,7 +268,7 @@ impl<'a> Index<'a> {
 
 pub(super) struct Batch<'a> {
     index: Index<'a>,
-    frontiers: Vec<Dominance>,
+    frontiers: Vec<Frontier>,
     begin: usize,
     end: usize,
     workers: usize,
@@ -300,7 +314,7 @@ impl<'a> Batch<'a> {
         );
         Ok(Some(Self {
             index,
-            frontiers: filled(values.len().min(BATCH), Dominance::new())?,
+            frontiers: super::reserved(values.len().min(BATCH))?,
             begin: 0,
             end: 0,
             workers,
@@ -363,6 +377,11 @@ impl<'a> Batch<'a> {
             self.window_overflows = 0;
             let count = self.end - self.begin;
             let tasks = self.workers.min(count.div_ceil(1024));
+            // Capacity was reserved fallibly in new(). Demand-only streams need
+            // no initialized frontiers; grow the live prefix only when used.
+            if self.frontiers.len() < count {
+                self.frontiers.resize_with(count, Frontier::new);
+            }
             let mut remaining = &mut self.frontiers[..count];
             let mut parts = Vec::with_capacity(tasks);
             for task in 0..tasks {
@@ -382,7 +401,7 @@ impl<'a> Batch<'a> {
                     let count = frontiers.len();
                     let mut visit = |position: usize, m: Match| {
                         let frontier = &mut frontiers[position - *begin];
-                        frontier.add(m.length, m.symbol, m.symbol as f32);
+                        frontier.add(m.length, m.symbol);
                         frontier.overflowed |= m.length == SPECULATIVE_MATCH
                             && index.maximum.min(index.values.len() - position) > SPECULATIVE_MATCH;
                     };
@@ -417,7 +436,7 @@ impl<'a> Batch<'a> {
                     // Long-copy interiors are often skipped by the global DP.
                     // Bound speculative comparisons, not the consumed match set.
                     index.find_limited(position, SPECULATIVE_MATCH, |m| {
-                        frontier.add(m.length, m.symbol, m.symbol as f32);
+                        frontier.add(m.length, m.symbol);
                         frontier.overflowed |= truncated && m.length == SPECULATIVE_MATCH;
                     });
                 }
@@ -437,7 +456,7 @@ impl<'a> Batch<'a> {
         } else {
             for entry in &frontier.entries[..frontier.size] {
                 visit(Match {
-                    length: entry.length,
+                    length: entry.length as usize,
                     symbol: entry.symbol,
                     distance: physical(entry.symbol, self.width),
                 });
@@ -451,7 +470,7 @@ impl Drop for Batch<'_> {
         crate::profile::note(
             "lz77.source.chain_batch_work",
             format_args!(
-                "tokens={} computed={} consumed={} overflow_requeries={} demand_only={} lanes={} interleaved_positions={} adaptive={} demand_queries={} unused={}",
+                "tokens={} computed={} consumed={} overflow_requeries={} demand_only={} lanes={} interleaved_positions={} adaptive={} demand_queries={} unused={} frontier_slots={} frontier_stride={}",
                 self.index.values.len(),
                 self.computed,
                 self.consumed,
@@ -462,6 +481,8 @@ impl Drop for Batch<'_> {
                 self.adaptive,
                 self.demand_queries,
                 self.computed - (self.consumed - self.demand_queries),
+                self.frontiers.len(),
+                size_of::<Frontier>(),
             ),
         );
     }
@@ -472,3 +493,6 @@ mod tests;
 
 #[cfg(test)]
 mod parallel_tests;
+
+#[cfg(test)]
+mod zero_tests;

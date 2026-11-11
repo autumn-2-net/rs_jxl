@@ -3,6 +3,8 @@
 ## Scope
 
 Follow-up to [cooperative Batch scheduling and speculative-work feedback](CHAIN_BATCH_FEEDBACK_20261111.md).
+
+Later implementation and measurements: [compact frontiers and deferred initialization](CHAIN_BATCH_MEMORY_20261111.md).
 This experiment enables that existing combination only when its actual execution
 context has at least two workers. It does not enable FXZ query interleaving,
 change match budgets, alter global DP, or change the JXL format.

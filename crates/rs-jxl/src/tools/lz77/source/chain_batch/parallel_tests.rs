@@ -1,3 +1,4 @@
+use super::super::index::Dominance;
 use super::*;
 use crate::execution;
 use crate::tools::lz77::source::{Literal, SourceParallelism, Work, run};

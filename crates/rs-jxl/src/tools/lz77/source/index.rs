@@ -214,6 +214,7 @@ impl Dominance {
         }
         MIN_MATCH
     }
+    #[cfg(test)]
     pub(super) fn clear(&mut self) {
         // Only entries[..size] are live; keep the initialized backing storage.
         self.size = 0;

@@ -123,7 +123,7 @@ fn refined_prefixes_count_skipped_collisions_against_the_original_chain_budget()
 fn batch<'a>(values: &'a [u32], width: usize, workers: usize) -> Batch<'a> {
     Batch {
         index: Index::new(values, width, &config(), layout(window(values.len()), true)).unwrap(),
-        frontiers: filled(values.len().min(BATCH), Dominance::new()).unwrap(),
+        frontiers: super::super::reserved(values.len().min(BATCH)).unwrap(),
         begin: 0,
         end: 0,
         workers,
@@ -648,6 +648,7 @@ fn adaptive_single_worker_does_not_compute_unused_positions_or_requery_long_matc
     assert_eq!(actual.computed, 0);
     assert_eq!(actual.overflows, 0);
     assert_eq!(actual.consumed, actual.demand_queries);
+    assert!(actual.frontiers.is_empty());
 }
 
 #[test]
@@ -655,12 +656,17 @@ fn adaptive_warmup_boundary_and_skipped_window_have_exact_work_accounting() {
     let values = fixture(BATCH * 2);
     let mut actual = batch(&values, 37, 3);
     actual.adaptive = true;
+    assert!(actual.frontiers.is_empty());
+    let capacity = actual.frontiers.capacity();
     for position in 0..128 {
         actual.find_matches(position, |_| {});
         assert_eq!(actual.computed, 0);
         assert_eq!(actual.demand_queries, position + 1);
+        assert!(actual.frontiers.is_empty());
     }
     actual.find_matches(128, |_| {});
+    assert_eq!(actual.frontiers.len(), 2048);
+    assert_eq!(actual.frontiers.capacity(), capacity);
     assert_eq!(
         (actual.computed, actual.consumed, actual.demand_queries),
         (2048, 129, 128)
@@ -680,4 +686,6 @@ fn adaptive_warmup_boundary_and_skipped_window_have_exact_work_accounting() {
         actual.computed - (actual.consumed - actual.demand_queries),
         2047
     );
+    assert_eq!(actual.frontiers.len(), 2048);
+    assert_eq!(actual.frontiers.capacity(), capacity);
 }

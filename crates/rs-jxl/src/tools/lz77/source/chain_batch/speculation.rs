@@ -111,4 +111,34 @@ mod tests {
             assert_eq!(p.window(), 0);
         }
     }
+
+    #[test]
+    fn evidence_boundaries_and_successful_retry_reset_are_exact() {
+        for (span, long, accepted) in [(170, 8, true), (171, 8, false), (170, 9, false)] {
+            let mut p = Speculation::new(8);
+            for position in 0..127 {
+                p.demand(position, position < long);
+            }
+            p.demand(span - 1, false);
+            assert_eq!(p.window() != 0, accepted);
+        }
+        for (consumed, overflows, accepted) in
+            [(3072, 192, true), (3071, 0, false), (3072, 193, false)]
+        {
+            let mut p = Speculation::new(8);
+            p.window = 4096;
+            p.finish(4096, consumed, overflows);
+            assert_eq!(p.window() != 0, accepted);
+        }
+        let mut p = Speculation::new(8);
+        p.finish(4096, 1, 0);
+        assert_eq!(p.observations, 512);
+        for position in 0..512 {
+            p.demand(position, false);
+        }
+        assert_eq!(p.window(), 4096);
+        p.finish(4096, 4096, 0);
+        assert_eq!(p.window(), 8192);
+        assert_eq!(p.observations, OBSERVATIONS);
+    }
 }
