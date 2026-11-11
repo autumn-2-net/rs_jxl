@@ -100,6 +100,76 @@ pub(super) struct StreamArena {
 }
 
 impl StreamArena {
+    /// Seed-qualified Chain Batch dispatch. Include ineligible streams as roots
+    /// too, so one batch cannot serialize unrelated parsers. The mask must use
+    /// this config's seed eligibility; indexed-arena gates remain separate.
+    pub(super) fn chain_batches(
+        inputs: &[&[Literal]],
+        eligible: &[bool],
+        config: &SourceConfig,
+    ) -> Result<Option<Self>> {
+        if eligible.len() != inputs.len() {
+            return Err(Error::Encoding(
+                "source LZ77 chain batch eligibility length mismatch".into(),
+            ));
+        }
+        let Some(limits) = config.parallelism else {
+            return Ok(None);
+        };
+        if !config.chain_batch
+            || !config.chain_batch_streams
+            || config.method != SourceLz77Method::Optc256
+            || config.bucket_route().enabled
+            || config.index_mode != SourceIndexMode::Disabled
+            || config.match_cost != super::SourceMatchCost::SymbolId
+            || limits.max_workers == 0
+            || execution::is_serial()
+            || rayon::current_thread_index().is_none()
+            || !inputs
+                .iter()
+                .zip(eligible)
+                .any(|(input, &batch)| batch && !input.is_empty())
+        {
+            return Ok(None);
+        }
+        let count = inputs.iter().filter(|input| !input.is_empty()).count();
+        if count <= 1 {
+            return Ok(None);
+        }
+        let mut order = reserved(count)?;
+        order.extend((0..inputs.len()).filter(|&i| !inputs[i].is_empty()));
+        order.sort_by_key(|&i| std::cmp::Reverse(inputs[i].len()));
+        let scratch = order
+            .iter()
+            .map(|&i| {
+                // Keep Schedule's conservative Rust DP/cost/cache allowance,
+                // including fallback chain scratch for ineligible streams.
+                // Immutable chains and bounded frontiers are additional live
+                // allocations, not a replacement for parser scratch. A missing
+                // layout means Batch::new falls back without allocating it.
+                let batch = if eligible[i] {
+                    super::chain_batch::scratch_bytes(inputs[i].len(), config).unwrap_or(0)
+                } else {
+                    0
+                };
+                inputs[i]
+                    .len()
+                    .saturating_add(1)
+                    .saturating_mul(64)
+                    .saturating_add(40 << 20)
+                    .saturating_add(batch)
+            })
+            .max()
+            .unwrap_or(0);
+        let slots = limits.max_workers.min(execution::worker_count()).max(1);
+        Ok(Some(Self {
+            roots: limits.tasks(count, scratch).min(slots).max(1),
+            slots,
+            order,
+            quiet: config.stream_arena_quiet,
+        }))
+    }
+
     pub(super) fn new(
         inputs: &[&[Literal]],
         config: &SourceConfig,
@@ -275,6 +345,9 @@ impl Schedule {
 
 #[cfg(test)]
 mod arena_tests;
+
+#[cfg(test)]
+mod chain_arena_tests;
 
 #[cfg(test)]
 mod tests {

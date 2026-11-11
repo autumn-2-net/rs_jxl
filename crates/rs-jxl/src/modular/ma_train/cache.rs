@@ -414,6 +414,29 @@ impl PropertyHistogram {
                 first.subtract(a[i], bin, weight)?;
                 second.subtract(b[i], bin, weight)?;
             }
+        } else if plan.cache_pair14_eligible(self.predictors.len()) {
+            // Bind columns once, retaining record-major checked-error order.
+            let mut histograms = self.predictors.iter_mut();
+            let mut columns: [(&mut BinHistogram, &[ResidualToken]); 14] =
+                std::array::from_fn(|predictor| {
+                    (
+                        histograms.next().expect("14 identity cache predictors"),
+                        &samples.residuals[predictor][..],
+                    )
+                });
+            for &i in removed {
+                let bin = values[i].index();
+                let weight = u32::from(samples.counts[i]);
+                self.used[bin] = self.used[bin].checked_sub(1).ok_or_else(|| {
+                    Error::Encoding("MA cached record subtraction underflow".into())
+                })?;
+                self.weights[bin] = self.weights[bin].checked_sub(weight).ok_or_else(|| {
+                    Error::Encoding("MA cached weight subtraction underflow".into())
+                })?;
+                for (histogram, tokens) in &mut columns {
+                    histogram.subtract(tokens[i], bin, weight)?;
+                }
+            }
         } else {
             for &i in removed {
                 let bin = values[i].index();
@@ -668,3 +691,7 @@ impl HistogramCache {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "cache_identity14_tests.rs"]
+mod identity14_tests;

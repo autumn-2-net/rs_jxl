@@ -96,7 +96,10 @@ fn refined_prefixes_count_skipped_collisions_against_the_original_chain_budget()
     assert_eq!(collisions, 12);
     let position = values.len();
     values.extend(prefix);
-    for cap in [8, 256] {
+    let reference = Index::new(&values, 0, &config(), layout(128, true)).unwrap();
+    let required_visits = reference.ordinal[position] - reference.ordinal[0];
+    assert!(required_visits > 8 && required_visits <= 256);
+    for cap in [8, 256, required_visits - 1, required_visits] {
         let config = SourceConfig {
             chain_limit: Some(cap),
             ..config()
@@ -109,7 +112,11 @@ fn refined_prefixes_count_skipped_collisions_against_the_original_chain_budget()
         source.find_matches(position, false, |m| expected.push(m));
         index.find(position, |m| actual.push(m));
         assert_eq!(actual, expected);
-        assert_eq!(actual.iter().any(|m| m.distance == position), cap == 256);
+        assert_eq!(
+            actual.iter().any(|m| m.distance == position),
+            cap >= required_visits
+        );
+        compare_interleaved(&index, 0, values.len(), usize::MAX);
     }
 }
 
@@ -120,11 +127,18 @@ fn batch<'a>(values: &'a [u32], width: usize, workers: usize) -> Batch<'a> {
         begin: 0,
         end: 0,
         workers,
+        lanes: 1,
         width,
         computed: 0,
         consumed: 0,
         overflows: 0,
+        interleaved_positions: 0,
         demand_only: false,
+        adaptive: false,
+        speculation: Speculation::new(workers),
+        demand_queries: 0,
+        window_consumed: 0,
+        window_overflows: 0,
     }
 }
 
@@ -188,14 +202,17 @@ fn overflowing_symbol_frontiers_requery_without_losing_longer_matches() {
     }
     let position = values.len();
     values.extend_from_slice(&prefix);
-    let mut batch = batch(&values, 0, 1);
-    let reference = frontier(|visit| batch.index.find(position, visit));
-    assert!(reference.len() > 16);
-    assert_eq!(
-        frontier(|visit| batch.find_matches(position, visit)),
-        reference
-    );
-    assert_eq!(batch.overflows, 1);
+    for lanes in [1, 2, 4, 8] {
+        let mut batch = batch(&values, 0, 1);
+        batch.lanes = lanes;
+        let reference = frontier(|visit| batch.index.find(position, visit));
+        assert!(reference.len() > 16);
+        assert_eq!(
+            frontier(|visit| batch.find_matches(position, visit)),
+            reference
+        );
+        assert_eq!(batch.overflows, 1);
+    }
 }
 
 #[test]
@@ -355,13 +372,23 @@ fn chain_batches_preserve_global_dp_commands_acceptance_contexts_and_pool_sizes(
         };
         let expected =
             super::super::run(&inputs, &[37, 0, 1], &baseline, &mut Work::default()).unwrap();
-        for threads in [1, 3] {
+        for (threads, lanes) in [
+            (1, 1),
+            (3, 1),
+            (1, 2),
+            (3, 2),
+            (1, 4),
+            (3, 4),
+            (1, 8),
+            (3, 8),
+        ] {
             let pool = rayon::ThreadPoolBuilder::new()
                 .num_threads(threads)
                 .build()
                 .unwrap();
             let config = SourceConfig {
                 chain_batch: true,
+                chain_batch_lanes: lanes,
                 parallelism: Some(SourceParallelism::default()),
                 ..baseline.clone()
             };
@@ -401,4 +428,256 @@ fn immutable_chains_preserve_the_full_dictionary_window_boundary() {
         assert_eq!(actual, expected, "p={p}");
         assert!(actual.iter().all(|m| m.distance < window));
     }
+    compare_interleaved(&index, window - 7, values.len() - (window - 7), usize::MAX);
+}
+
+fn compare_interleaved(index: &Index<'_>, begin: usize, count: usize, maximum: usize) {
+    let mut expected = vec![Vec::new(); count];
+    for (offset, matches) in expected.iter_mut().enumerate() {
+        index.find_limited(begin + offset, maximum, |m| matches.push(m));
+    }
+    for lanes in [2, 4, 8] {
+        let mut actual = vec![Vec::new(); count];
+        let mut visit = |p: usize, m| actual[p - begin].push(m);
+        match lanes {
+            2 => index.find_interleaved::<2>(begin, count, maximum, &mut visit),
+            4 => index.find_interleaved::<4>(begin, count, maximum, &mut visit),
+            8 => index.find_interleaved::<8>(begin, count, maximum, &mut visit),
+            _ => unreachable!(),
+        }
+        // Primitive visit-order equivalence only; complete JXL outputs are
+        // accepted by original decoded samples, not encoded-byte identities.
+        assert_eq!(
+            actual, expected,
+            "lanes={lanes} begin={begin} maximum={maximum}"
+        );
+    }
+}
+
+#[test]
+fn interleaved_queries_preserve_order_and_limits_for_every_lane_count() {
+    let mut values = fixture(521);
+    values.extend([0; 139]);
+    values.extend([17; 137]);
+    values.extend([1, 2, 3, 0, 0, 0, 4, 5, 6]);
+    for refined in [false, true] {
+        for window in [1, 4, 64, 512] {
+            for cap in [1, 8, 256] {
+                let config = SourceConfig {
+                    chain_limit: Some(cap),
+                    ..config()
+                };
+                let index = Index::new(&values, 37, &config, layout(window, refined)).unwrap();
+                for maximum in [0, 2, 3, 127, 128, 129, usize::MAX] {
+                    compare_interleaved(&index, 0, values.len(), maximum);
+                    compare_interleaved(&index, values.len() - 7, 7, maximum);
+                }
+                compare_interleaved(&index, values.len(), 0, usize::MAX);
+            }
+        }
+    }
+}
+
+#[test]
+fn interleaved_batches_preserve_refills_requeries_and_demand_fallback() {
+    let mut values = fixture(BATCH + 517);
+    values.extend(std::iter::repeat_n(17, 301));
+    values.extend(std::iter::repeat_n(0, 301));
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(3)
+        .build()
+        .unwrap();
+    for lanes in [2, 4, 8] {
+        for workers in [1, 3] {
+            pool.install(|| {
+                let mut actual = batch(&values, 37, workers);
+                actual.lanes = lanes;
+                for position in (0..BATCH).step_by(3).chain([
+                    BATCH + 17,
+                    BATCH + 519,
+                    BATCH + 820,
+                    values.len() - 1,
+                ]) {
+                    let expected = frontier(|visit| actual.index.find(position, visit));
+                    assert_eq!(
+                        frontier(|visit| actual.find_matches(position, visit)),
+                        expected
+                    );
+                }
+                assert!(actual.overflows > 0);
+                assert_eq!(actual.interleaved_positions, actual.computed);
+                assert!(!actual.demand_only);
+
+                let mut skipped = batch(&values, 37, workers);
+                skipped.lanes = lanes;
+                for position in [0, BATCH + 17, values.len() - 1] {
+                    let expected = frontier(|visit| skipped.index.find(position, visit));
+                    assert_eq!(
+                        frontier(|visit| skipped.find_matches(position, visit)),
+                        expected
+                    );
+                }
+                assert!(skipped.demand_only);
+                assert_eq!(skipped.interleaved_positions, BATCH);
+            });
+        }
+    }
+}
+
+#[test]
+fn interleaving_options_are_explicit_and_bounded() {
+    assert_eq!(SourceConfig::default().chain_batch_lanes, 1);
+    for lanes in [1, 2, 4, 8] {
+        assert!(
+            SourceConfig {
+                chain_batch_lanes: lanes,
+                ..config()
+            }
+            .validate()
+            .is_ok()
+        );
+    }
+    for lanes in [0, 3, 5, 7, 9, 255] {
+        assert!(
+            SourceConfig {
+                chain_batch_lanes: lanes,
+                ..config()
+            }
+            .validate()
+            .is_err()
+        );
+    }
+    for lanes in [2, 4, 8] {
+        assert!(
+            SourceConfig {
+                chain_batch_lanes: lanes,
+                ..SourceConfig::default()
+            }
+            .validate()
+            .is_err()
+        );
+    }
+}
+
+#[test]
+fn interleaving_retains_global_savings_rejection_and_coarse_memory_fallback() {
+    let size = 65539;
+    let full = Layout::new(size, usize::MAX).unwrap();
+    let coarse = Layout::new(size, full.bytes - 1).unwrap();
+    assert_eq!(coarse.fine_buckets, 0);
+    for (values, enabled) in [((0..size as u32).collect(), false), (fixture(size), true)] {
+        let input: Vec<_> = values
+            .into_iter()
+            .enumerate()
+            .map(|(p, value)| Literal {
+                value,
+                context: (p % 3) as u32,
+            })
+            .collect();
+        let base = SourceConfig {
+            chain_batch: false,
+            require_global_savings: true,
+            ..config()
+        };
+        let expected = super::super::run(&[&input], &[37], &base, &mut Work::default()).unwrap();
+        assert_eq!(expected.enabled, enabled);
+        for lanes in [1, 2, 4, 8] {
+            let candidate = SourceConfig {
+                chain_batch: true,
+                chain_batch_lanes: lanes,
+                chain_batch_bytes: coarse.bytes,
+                ..base.clone()
+            };
+            let mut work = Work::default();
+            let actual = super::super::run(&[&input], &[37], &candidate, &mut work).unwrap();
+            assert_eq!(actual, expected);
+            assert_eq!(work.chain_batch_streams, usize::from(enabled));
+            replay(&input, &actual.commands[0]);
+        }
+    }
+}
+
+#[test]
+fn adaptive_batches_preserve_frontiers_across_dense_sparse_and_long_regions() {
+    let mut values = fixture(BATCH * 3);
+    values.extend(std::iter::repeat_n(17, BATCH));
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(3)
+        .build()
+        .unwrap();
+    pool.install(|| {
+        for lanes in [1, 2, 4, 8] {
+            let mut actual = batch(&values, 37, 3);
+            actual.adaptive = true;
+            actual.lanes = lanes;
+            let positions = (0..5000)
+                .chain((12000..30000).step_by(73))
+                .chain(32000..36000)
+                .chain([BATCH * 3 + 1, BATCH * 3 + 171, values.len() - 2]);
+            for position in positions {
+                let expected = frontier(|visit| actual.index.find(position, visit));
+                assert_eq!(
+                    frontier(|visit| actual.find_matches(position, visit)),
+                    expected
+                );
+            }
+            assert!(actual.computed > 0);
+            assert!(actual.demand_queries > 128);
+            assert!(actual.computed >= actual.consumed - actual.demand_queries);
+            assert!(actual.computed < values.len() / 2);
+            assert_eq!(
+                actual.interleaved_positions,
+                if lanes == 1 { 0 } else { actual.computed }
+            );
+        }
+    });
+}
+
+#[test]
+fn adaptive_single_worker_does_not_compute_unused_positions_or_requery_long_matches() {
+    let values = fixture(BATCH * 2);
+    let mut actual = batch(&values, 37, 1);
+    actual.adaptive = true;
+    for position in (0..values.len()).step_by(13) {
+        let expected = frontier(|visit| actual.index.find(position, visit));
+        assert_eq!(
+            frontier(|visit| actual.find_matches(position, visit)),
+            expected
+        );
+    }
+    assert_eq!(actual.computed, 0);
+    assert_eq!(actual.overflows, 0);
+    assert_eq!(actual.consumed, actual.demand_queries);
+}
+
+#[test]
+fn adaptive_warmup_boundary_and_skipped_window_have_exact_work_accounting() {
+    let values = fixture(BATCH * 2);
+    let mut actual = batch(&values, 37, 3);
+    actual.adaptive = true;
+    for position in 0..128 {
+        actual.find_matches(position, |_| {});
+        assert_eq!(actual.computed, 0);
+        assert_eq!(actual.demand_queries, position + 1);
+    }
+    actual.find_matches(128, |_| {});
+    assert_eq!(
+        (actual.computed, actual.consumed, actual.demand_queries),
+        (2048, 129, 128)
+    );
+    for position in [3000, 3001] {
+        let expected = frontier(|visit| actual.index.find(position, visit));
+        assert_eq!(
+            frontier(|visit| actual.find_matches(position, visit)),
+            expected
+        );
+    }
+    assert_eq!(
+        (actual.computed, actual.consumed, actual.demand_queries),
+        (2048, 131, 130)
+    );
+    assert_eq!(
+        actual.computed - (actual.consumed - actual.demand_queries),
+        2047
+    );
 }

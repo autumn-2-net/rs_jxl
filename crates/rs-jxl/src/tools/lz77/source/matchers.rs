@@ -416,7 +416,8 @@ pub(super) struct Chain<'a> {
     limit: usize,
     head: Vec<u32>,
     chain: Vec<u32>,
-    val: Vec<u32>,
+    // Only masked 15-bit hashes are stored; u16::MAX remains an invalid tag.
+    val: Vec<u16>,
     zeros: Vec<u32>,
     headz: Vec<u32>,
     chainz: Vec<u32>,
@@ -463,7 +464,7 @@ impl<'a> Chain<'a> {
             head: filled(1 << 15, u32::MAX)?,
             chainz: chain.clone(),
             chain,
-            val: filled(window, u32::MAX)?,
+            val: filled(window, u16::MAX)?,
             zeros: filled(window, 0)?,
             headz: filled(window + 1, u32::MAX)?,
             numzeros: 0,
@@ -479,7 +480,7 @@ impl<'a> Chain<'a> {
     pub(super) fn update(&mut self, position: usize) {
         let hash = hash(self.values, position) as usize & ((1 << 15) - 1);
         let slot = position & (self.window - 1);
-        self.val[slot] = hash as u32;
+        self.val[slot] = hash as u16;
         if self.head[hash] != u32::MAX {
             self.chain[slot] = self.head[hash];
         }
@@ -1063,6 +1064,9 @@ mod fast_tests;
 
 #[cfg(test)]
 mod short_tests;
+
+#[cfg(test)]
+mod chain_metadata_tests;
 
 #[cfg(test)]
 mod tests {

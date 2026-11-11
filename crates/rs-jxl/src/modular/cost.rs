@@ -126,6 +126,25 @@ const WP_CUTOFFS: [i32; 33] = [
     11, 15, 23, 31, 47, 63, 95, 127, 191, 255, 392, 500,
 ];
 
+// All cutoffs are in [-500, 500]. Clamping also covers both unbounded end
+// buckets, so the raster loop needs one lookup instead of a binary search.
+static WP_CONTEXTS: [u8; 1002] = {
+    let mut table = [0; 1002];
+    let mut index = 0;
+    while index < table.len() {
+        let property = index as i32 - 500;
+        let mut cutoff = 0;
+        while cutoff < WP_CUTOFFS.len() {
+            if WP_CUTOFFS[cutoff] >= property {
+                table[index] += 1;
+            }
+            cutoff += 1;
+        }
+        index += 1;
+    }
+    table
+};
+
 /// The source's 19 distinct RCT candidates, in first-wins tie order.
 pub const RCT_CANDIDATES: [u32; 19] = [
     0, 6, 5, 10, 26, 40, 12, 19, 8, 4, 9, 15, 16, 17, 32, 33, 2, 1, 3,
@@ -254,7 +273,7 @@ fn gradient_context(n: Neighbors, mode: Backend) -> usize {
 }
 
 fn wp_context(property: i32) -> usize {
-    WP_CUTOFFS.len() - WP_CUTOFFS.partition_point(|&cutoff| cutoff < property)
+    WP_CONTEXTS[(property.clamp(-500, 501) + 500) as usize] as usize
 }
 
 fn add_residual(histogram: &mut Histogram, residual: i32, extra: &mut usize) -> Result<()> {
@@ -1052,7 +1071,7 @@ mod tests {
             assert_eq!(gradient_context(n, Backend::Scalar), scalar);
             assert_eq!(gradient_context(n, Backend::Sse2), 16 - scalar);
         }
-        for property in -510..=510 {
+        for property in (-510..=510).chain([i32::MIN, i32::MIN + 1, i32::MAX - 1, i32::MAX]) {
             assert_eq!(
                 wp_context(property),
                 WP_CUTOFFS.iter().filter(|&&c| c >= property).count()

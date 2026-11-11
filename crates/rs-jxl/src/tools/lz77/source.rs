@@ -317,6 +317,17 @@ pub struct SourceConfig {
     /// at least 65536 tokens and a seed with more than one wire token per four inputs;
     /// highly repetitive streams keep the demand-driven mutable chain.
     pub chain_batch: bool,
+    /// Independent immutable chain queries interleaved within each batch worker.
+    /// 1 preserves serial querying; 2/4/8 are opt-in memory-latency experiments.
+    /// Does not change per-query visit budgets, match sets or the global DP.
+    pub chain_batch_lanes: u8,
+    /// Cooperatively schedule batch and ordinary streams on the caller pool.
+    /// False retains the old all-streams-serial batch experiment for comparison.
+    pub chain_batch_streams: bool,
+    /// Learn speculative lookahead from consumed queries, not token frequency.
+    /// Sparse/long-match regions and single-worker execution query on demand.
+    /// This changes only precomputation, never the consumed candidate budget.
+    pub chain_batch_adaptive: bool,
     /// Peak index/build/batch scratch allowance per stream, excluding the
     /// existing DP/input/output. Clamped by parallelism.scratch_bytes. A small
     /// budget disables refinement first, then falls back to the mutable chain.
@@ -531,6 +542,13 @@ impl SourceConfig {
     }
     fn validate(&self) -> Result<()> {
         self.match_extension.validate()?;
+        if !matches!(self.chain_batch_lanes, 1 | 2 | 4 | 8)
+            || (self.chain_batch_lanes != 1 && !self.chain_batch)
+        {
+            return Err(Error::InvalidInput(
+                "chain batch lanes must be 1/2/4/8; interleaving requires chain_batch".into(),
+            ));
+        }
         if self.batch_fast_matches && self.match_extension == super::MatchExtension::Legacy {
             return Err(Error::InvalidInput(
                 "batched matches require an explicit extension kernel".into(),
@@ -599,6 +617,9 @@ impl Default for SourceConfig {
             chain_limit: None,
             chain_match_cache: SourceChainCache::Auto,
             chain_batch: false,
+            chain_batch_lanes: 1,
+            chain_batch_streams: true,
+            chain_batch_adaptive: true,
             chain_batch_bytes: 128 << 20,
             bucket_dominance: false,
             index_interval_dp: SourceIntervalDp::Disabled,
@@ -1683,19 +1704,43 @@ fn run(
         {
             _work.passes += 1;
         }
-        // Chain batches own intra-stream matching jobs. Retain the caller's
-        // executor instead of entering Schedule's serial independent-stream
-        // closures, which would disable their parallel work.
-        let chain_batches = inputs
-            .iter()
-            .zip(&seed)
-            .any(|(input, seed)| chain_batch::enabled(input.len(), wire_token_count(seed), config));
+        let chain_eligible: Vec<_> = if config.chain_batch {
+            inputs
+                .iter()
+                .zip(&seed)
+                .map(|(input, seed)| {
+                    chain_batch::enabled(input.len(), wire_token_count(seed), config)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let chain_batches = chain_eligible.iter().any(|&eligible| eligible);
+        // Batch children and independent streams share the caller executor.
+        // The legacy serial schedule is retained only as an ablation/fallback.
         let schedule = if shared.is_some() || chain_batches {
             Schedule::jobs(inputs.len(), 1)
         } else {
             Schedule::new(inputs, config, false)
         };
-        let arena = workers::StreamArena::new(inputs, config, shared.is_some())?;
+        let arena = if chain_batches && config.chain_batch_streams && shared.is_none() {
+            workers::StreamArena::chain_batches(inputs, &chain_eligible, config)?
+        } else {
+            workers::StreamArena::new(inputs, config, shared.is_some())?
+        };
+        if chain_batches {
+            crate::profile::note(
+                "lz77.source.chain_schedule",
+                format_args!(
+                    "cooperative={} roots={} streams={} eligible={} streams_enabled={}",
+                    arena.is_some(),
+                    arena.as_ref().map_or(schedule.tasks, |a| a.roots),
+                    inputs.iter().filter(|input| !input.is_empty()).count(),
+                    chain_eligible.iter().filter(|&&enabled| enabled).count(),
+                    config.chain_batch_streams,
+                ),
+            );
+        }
         #[cfg(test)]
         {
             _work.optimal_tasks = arena.as_ref().map_or(schedule.tasks, |a| a.roots);

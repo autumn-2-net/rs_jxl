@@ -17,6 +17,10 @@ const HASH_BITS: usize = 15;
 const BATCH: usize = 16384;
 const SPECULATIVE_MATCH: usize = 128;
 
+mod interleave;
+mod speculation;
+use speculation::Speculation;
+
 #[derive(Clone, Copy)]
 struct Layout {
     window: usize,
@@ -76,6 +80,10 @@ fn budget(config: &SourceConfig) -> usize {
     config
         .chain_batch_bytes
         .min(config.parallelism.map_or(usize::MAX, |p| p.scratch_bytes))
+}
+
+pub(super) fn scratch_bytes(size: usize, config: &SourceConfig) -> Option<usize> {
+    Layout::new(size, budget(config)).map(|layout| layout.bytes)
 }
 
 struct Index<'a> {
@@ -239,11 +247,18 @@ pub(super) struct Batch<'a> {
     begin: usize,
     end: usize,
     workers: usize,
+    lanes: u8,
     width: usize,
     computed: usize,
     consumed: usize,
     overflows: usize,
+    interleaved_positions: usize,
     demand_only: bool,
+    adaptive: bool,
+    speculation: Speculation,
+    demand_queries: usize,
+    window_consumed: usize,
+    window_overflows: usize,
 }
 
 impl<'a> Batch<'a> {
@@ -262,12 +277,14 @@ impl<'a> Batch<'a> {
         crate::profile::note(
             "lz77.source.chain_batch",
             format_args!(
-                "tokens={} workers={} refined={} scratch_bound={} batch={}",
+                "tokens={} workers={} refined={} scratch_bound={} batch={} lanes={} adaptive={}",
                 values.len(),
                 workers,
                 layout.fine_buckets != 0,
                 layout.bytes,
                 BATCH,
+                config.chain_batch_lanes,
+                config.chain_batch_adaptive,
             ),
         );
         Ok(Some(Self {
@@ -276,28 +293,63 @@ impl<'a> Batch<'a> {
             begin: 0,
             end: 0,
             workers,
+            lanes: config.chain_batch_lanes,
             width,
             computed: 0,
             consumed: 0,
             overflows: 0,
+            interleaved_positions: 0,
             demand_only: false,
+            adaptive: config.chain_batch_adaptive,
+            speculation: Speculation::new(workers),
+            demand_queries: 0,
+            window_consumed: 0,
+            window_overflows: 0,
         }))
     }
 
     pub(super) fn find_matches(&mut self, position: usize, mut visit: impl FnMut(Match)) {
         debug_assert!(position >= self.begin);
-        if position >= self.end && self.computed >= BATCH && self.consumed * 4 < self.computed {
-            self.demand_only = true;
+        if position >= self.end {
+            if self.adaptive {
+                if self.end > self.begin {
+                    self.speculation.finish(
+                        self.end - self.begin,
+                        self.window_consumed,
+                        self.window_overflows,
+                    );
+                    self.begin = position;
+                    self.end = position;
+                }
+                self.demand_only = self.speculation.window() == 0;
+            } else if self.computed >= BATCH && self.consumed * 4 < self.computed {
+                self.demand_only = true;
+            }
         }
         if self.demand_only {
             self.consumed += 1;
-            self.index.find(position, visit);
+            self.demand_queries += 1;
+            let mut long = false;
+            self.index.find(position, |m| {
+                long |= m.length >= SPECULATIVE_MATCH;
+                visit(m);
+            });
+            if self.adaptive {
+                self.speculation.demand(position, long);
+            }
             return;
         }
         if position >= self.end {
             let _profile = crate::profile::scope("lz77.source.chain_batch_fill");
             self.begin = position;
-            self.end = self.index.values.len().min(position + BATCH);
+            let window = if self.adaptive {
+                self.speculation.window()
+            } else {
+                BATCH
+            };
+            self.end = self.index.values.len().min(position + window);
+            self.window_consumed = 0;
+            self.window_overflows = 0;
             let count = self.end - self.begin;
             let tasks = self.workers.min(count.div_ceil(1024));
             let mut remaining = &mut self.frontiers[..count];
@@ -310,7 +362,40 @@ impl<'a> Batch<'a> {
                 parts.push((self.begin + begin, frontiers));
             }
             let index = &self.index;
+            let lanes = self.lanes;
             super::workers::each(&mut parts, |_, (begin, frontiers)| {
+                if lanes != 1 {
+                    frontiers.fill(Dominance::new());
+                    let count = frontiers.len();
+                    let mut visit = |position: usize, m: Match| {
+                        let frontier = &mut frontiers[position - *begin];
+                        frontier.add(m.length, m.symbol, m.symbol as f32);
+                        frontier.overflowed |= m.length == SPECULATIVE_MATCH
+                            && index.maximum.min(index.values.len() - position) > SPECULATIVE_MATCH;
+                    };
+                    match lanes {
+                        2 => index.find_interleaved::<2>(
+                            *begin,
+                            count,
+                            SPECULATIVE_MATCH,
+                            &mut visit,
+                        ),
+                        4 => index.find_interleaved::<4>(
+                            *begin,
+                            count,
+                            SPECULATIVE_MATCH,
+                            &mut visit,
+                        ),
+                        8 => index.find_interleaved::<8>(
+                            *begin,
+                            count,
+                            SPECULATIVE_MATCH,
+                            &mut visit,
+                        ),
+                        _ => unreachable!("validated chain batch lanes"),
+                    }
+                    return;
+                }
                 for (offset, frontier) in frontiers.iter_mut().enumerate() {
                     *frontier = Dominance::new();
                     let position = *begin + offset;
@@ -325,11 +410,16 @@ impl<'a> Batch<'a> {
                 }
             });
             self.computed += count;
+            if lanes != 1 {
+                self.interleaved_positions += count;
+            }
         }
         self.consumed += 1;
+        self.window_consumed += 1;
         let frontier = &self.frontiers[position - self.begin];
         if frontier.overflowed {
             self.overflows += 1;
+            self.window_overflows += 1;
             self.index.find(position, visit);
         } else {
             for entry in &frontier.entries[..frontier.size] {
@@ -348,12 +438,17 @@ impl Drop for Batch<'_> {
         crate::profile::note(
             "lz77.source.chain_batch_work",
             format_args!(
-                "tokens={} computed={} consumed={} overflow_requeries={} demand_only={}",
+                "tokens={} computed={} consumed={} overflow_requeries={} demand_only={} lanes={} interleaved_positions={} adaptive={} demand_queries={} unused={}",
                 self.index.values.len(),
                 self.computed,
                 self.consumed,
                 self.overflows,
                 self.demand_only,
+                self.lanes,
+                self.interleaved_positions,
+                self.adaptive,
+                self.demand_queries,
+                self.computed - (self.consumed - self.demand_queries),
             ),
         );
     }

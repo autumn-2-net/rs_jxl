@@ -105,6 +105,16 @@ fn parse_quantile_splits(value: &str) -> std::result::Result<u8, String> {
     }
 }
 
+fn parse_chain_batch_lanes(value: &str) -> std::result::Result<u8, String> {
+    match value {
+        "1" => Ok(1),
+        "2" => Ok(2),
+        "4" => Ok(4),
+        "8" => Ok(8),
+        _ => Err("chain-batch-lanes must be 1, 2, 4 or 8".into()),
+    }
+}
+
 #[derive(Parser)]
 struct Args {
     input: PathBuf,
@@ -260,6 +270,16 @@ struct Args {
     reuse_preparation_mib: Option<u16>,
     #[arg(long)]
     chain_batch: bool,
+    /// Independent immutable-chain queries per batch worker; experimental above 1.
+    #[arg(long, default_value_t = 1, value_parser = parse_chain_batch_lanes,
+          requires_ifs = [("2", "chain_batch"), ("4", "chain_batch"), ("8", "chain_batch")])]
+    chain_batch_lanes: u8,
+    /// Retain the old all-streams-serial Chain Batch schedule for ablation.
+    #[arg(long, requires = "chain_batch")]
+    chain_batch_legacy_schedule: bool,
+    /// Retain the old fixed speculative window for ablation.
+    #[arg(long, requires = "chain_batch")]
+    chain_batch_fixed_window: bool,
     /// Sample JXL token profitability without changing or with routing the parse.
     #[arg(long, value_parser = ["observe", "route"], conflicts_with_all = ["search", "scan_only"])]
     lz_scout: Option<String>,
@@ -526,6 +546,9 @@ fn run(args: Args) -> Result<()> {
     base.modular.source_lz77 = Some(SourceConfig {
         compact_steps: true,
         chain_batch: args.chain_batch,
+        chain_batch_lanes: args.chain_batch_lanes,
+        chain_batch_streams: !args.chain_batch_legacy_schedule,
+        chain_batch_adaptive: !args.chain_batch_fixed_window,
         parallelism: Some(SourceParallelism {
             max_workers: base.threads.min(64),
             fast_streams: true,
@@ -1073,6 +1096,57 @@ fn tree_learning_is_explicit_and_excludes_other_tree_experiments() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chain_batch_interleaving_is_explicit_and_requires_batching() {
+        let defaults = Args::try_parse_from(["lab", "input.png"]).unwrap();
+        assert!(!defaults.chain_batch);
+        assert_eq!(defaults.chain_batch_lanes, 1);
+        assert!(!defaults.chain_batch_legacy_schedule);
+        assert!(!defaults.chain_batch_fixed_window);
+        for flag in [
+            "--chain-batch-legacy-schedule",
+            "--chain-batch-fixed-window",
+        ] {
+            assert!(Args::try_parse_from(["lab", "input.png", flag]).is_err());
+            assert!(Args::try_parse_from(["lab", "input.png", "--chain-batch", flag]).is_ok());
+        }
+        let batch = Args::try_parse_from(["lab", "input.png", "--chain-batch"]).unwrap();
+        assert!(batch.chain_batch);
+        assert_eq!(batch.chain_batch_lanes, 1);
+        assert!(Args::try_parse_from(["lab", "input.png", "--chain-batch-lanes", "1"]).is_ok());
+        for lanes in ["1", "2", "4", "8"] {
+            let args = Args::try_parse_from([
+                "lab",
+                "input.png",
+                "--chain-batch",
+                "--chain-batch-lanes",
+                lanes,
+            ])
+            .unwrap();
+            assert!(args.chain_batch);
+            assert_eq!(args.chain_batch_lanes.to_string(), lanes);
+            if lanes != "1" {
+                let error =
+                    Args::try_parse_from(["lab", "input.png", "--chain-batch-lanes", lanes])
+                        .err()
+                        .expect("interleaving requires chain batch");
+                assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument);
+            }
+        }
+        for lanes in ["0", "3", "5", "6", "7", "9", "256", "-1", "auto"] {
+            assert!(
+                Args::try_parse_from([
+                    "lab",
+                    "input.png",
+                    "--chain-batch",
+                    "--chain-batch-lanes",
+                    lanes,
+                ])
+                .is_err()
+            );
+        }
+    }
 
     #[test]
     fn lz_scout_and_quick_are_opt_in_fixed_plan_tools() {
