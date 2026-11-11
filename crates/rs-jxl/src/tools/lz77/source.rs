@@ -317,6 +317,10 @@ pub struct SourceConfig {
     /// at least 65536 tokens and a seed with more than one wire token per four inputs;
     /// highly repetitive streams keep the demand-driven mutable chain.
     pub chain_batch: bool,
+    /// Restrict enabled Chain Batch to at least two effective caller workers.
+    /// Null/serial scopes, one-thread pools and logical worker limits fall back
+    /// before index allocation or stream scheduling. Does not enable batching.
+    pub chain_batch_parallel_only: bool,
     /// Independent immutable chain queries interleaved within each batch worker.
     /// 1 preserves serial querying; 2/4/8 are opt-in memory-latency experiments.
     /// Does not change per-query visit budgets, match sets or the global DP.
@@ -617,6 +621,7 @@ impl Default for SourceConfig {
             chain_limit: None,
             chain_match_cache: SourceChainCache::Auto,
             chain_batch: false,
+            chain_batch_parallel_only: false,
             chain_batch_lanes: 1,
             chain_batch_streams: true,
             chain_batch_adaptive: true,
@@ -1704,7 +1709,7 @@ fn run(
         {
             _work.passes += 1;
         }
-        let chain_eligible: Vec<_> = if config.chain_batch {
+        let chain_eligible: Vec<_> = if chain_batch::available(config) {
             inputs
                 .iter()
                 .zip(&seed)

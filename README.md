@@ -45,7 +45,10 @@ Actions artifacts only. Nothing is published to PyPI.
 - Separate FJXL fast lossless pipeline, with scalar and native x86 kernels;
   source eligibility is distinct from the cumulative Modular effort policy.
 - RLE/LZ77 greedy, lazy and optimal parsing, including indexed/block/suffix
-  source routes and cooperative multi-stream execution.
+  source routes and cooperative multi-stream execution. Eligible pixel-source
+  Optc256 streams use parallel-only adaptive Chain Batch by default; serial and
+  unsupported routes fall back before Batch index allocation. See
+  [admission and measurements](docs/CHAIN_BATCH_PARALLEL_20261111.md).
 - Absolute/delta/global/per-channel palettes, reversible squeeze and spatial
   progressive DC/AC grouping.
 - Lossless repeated-component patches, atlas references and dictionary emission.
@@ -383,7 +386,9 @@ must repeat the relevant checks; historical binding validation remains separate.
 - [Bounded palette MinLA and EZeng experiment](docs/PALETTE_MINLA_20261110.md)
 - [FXZ-inspired immutable chain query interleaving](docs/FXZ_CHAIN_INTERLEAVE_20261111.md)
 - [Chain Batch stream scheduling and speculation feedback](docs/CHAIN_BATCH_FEEDBACK_20261111.md)
+- [Parallel-only Chain Batch admission](docs/CHAIN_BATCH_PARALLEL_20261111.md)
 - [Weighted cost, MA subtraction and Chain tag kernel follow-up](docs/LOSSLESS_KERNEL_FOLLOWUP_20261111.md)
+- [MA collection and rejected Weighted row experiments](docs/ENCODER_ROW_KERNELS_20261111.md)
 - [Progressive original-group scheduling](docs/PROGRESSIVE_GROUP_SCHEDULER.md)
 - [Incremental output and frame indexes](docs/STREAMING_OUTPUT.md)
 - [Fast lossless source port](docs/FJXL_PORT_STATUS.md)

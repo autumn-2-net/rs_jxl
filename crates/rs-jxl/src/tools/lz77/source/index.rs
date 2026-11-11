@@ -214,6 +214,11 @@ impl Dominance {
         }
         MIN_MATCH
     }
+    pub(super) fn clear(&mut self) {
+        // Only entries[..size] are live; keep the initialized backing storage.
+        self.size = 0;
+        self.overflowed = false;
+    }
     pub(super) fn add(&mut self, length: usize, symbol: u32, cost: f32) {
         let mut begin = 0;
         while begin < self.size

@@ -830,6 +830,8 @@ pub(super) fn scout_execution_options(base: &EncodeOptions, enabled: bool) -> En
                 .source_lz77
                 .get_or_insert_with(|| crate::tools::lz77::SourceConfig {
                     compact_steps: true,
+                    chain_batch: true,
+                    chain_batch_parallel_only: true,
                     ..Default::default()
                 });
         lz.parallelism

@@ -128,6 +128,7 @@ fn scout_enables_exact_channel_gather_without_overwriting_explicit_gather() {
     assert!(gather.sparse);
     let lz = tuned.modular.source_lz77.as_ref().unwrap();
     assert!(lz.compact_steps);
+    assert!(lz.chain_batch && lz.chain_batch_parallel_only);
     let workers = lz.parallelism.unwrap();
     assert_eq!(workers.max_workers, 8);
     assert!(workers.fast_streams);
@@ -152,6 +153,7 @@ fn scout_enables_exact_channel_gather_without_overwriting_explicit_gather() {
     assert!(!gather.sparse);
     let lz = preserved.modular.source_lz77.unwrap();
     assert!(!lz.compact_steps);
+    assert!(!lz.chain_batch);
     assert_eq!(lz.parallelism.unwrap().max_workers, 2);
     assert!(!lz.parallelism.unwrap().fast_streams);
 }

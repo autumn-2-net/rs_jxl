@@ -64,16 +64,27 @@ impl Layout {
     }
 }
 
-pub(super) fn enabled(size: usize, seed_tokens: usize, config: &SourceConfig) -> bool {
+// Check before collecting per-stream seed statistics. Serial and unsupported
+// routes must not scan the seed solely to reject Batch afterwards.
+pub(super) fn available(config: &SourceConfig) -> bool {
     config.chain_batch
         && config.method == SourceLz77Method::Optc256
         && !config.bucket_route().enabled
         && config.index_mode == SourceIndexMode::Disabled
         && config.match_cost == SourceMatchCost::SymbolId
-        && size >= 65536
+        && (!config.chain_batch_parallel_only || batch_workers(config) > 1)
+}
+
+pub(super) fn enabled(size: usize, seed_tokens: usize, config: &SourceConfig) -> bool {
+    size >= 65536
         // A full batch would otherwise redo positions skipped inside long copies.
         && seed_tokens > size / 4
+        && available(config)
         && Layout::new(size, budget(config)).is_some()
+}
+
+fn batch_workers(config: &SourceConfig) -> usize {
+    super::workers::index_workers(config, BATCH / 1024, 1024)
 }
 
 fn budget(config: &SourceConfig) -> usize {
@@ -273,7 +284,7 @@ impl<'a> Batch<'a> {
         }
         let layout = Layout::new(values.len(), budget(config)).expect("checked chain batch layout");
         let index = Index::new(values, width, config, layout)?;
-        let workers = super::workers::index_workers(config, BATCH / 1024, 1024);
+        let workers = batch_workers(config);
         crate::profile::note(
             "lz77.source.chain_batch",
             format_args!(
@@ -365,7 +376,9 @@ impl<'a> Batch<'a> {
             let lanes = self.lanes;
             super::workers::each(&mut parts, |_, (begin, frontiers)| {
                 if lanes != 1 {
-                    frontiers.fill(Dominance::new());
+                    for frontier in frontiers.iter_mut() {
+                        frontier.clear();
+                    }
                     let count = frontiers.len();
                     let mut visit = |position: usize, m: Match| {
                         let frontier = &mut frontiers[position - *begin];
@@ -397,7 +410,7 @@ impl<'a> Batch<'a> {
                     return;
                 }
                 for (offset, frontier) in frontiers.iter_mut().enumerate() {
-                    *frontier = Dominance::new();
+                    frontier.clear();
                     let position = *begin + offset;
                     let truncated =
                         index.maximum.min(index.values.len() - position) > SPECULATIVE_MATCH;
@@ -456,3 +469,6 @@ impl Drop for Batch<'_> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod parallel_tests;

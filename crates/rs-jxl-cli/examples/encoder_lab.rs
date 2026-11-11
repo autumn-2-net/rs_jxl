@@ -270,6 +270,9 @@ struct Args {
     reuse_preparation_mib: Option<u16>,
     #[arg(long)]
     chain_batch: bool,
+    /// Enable cooperative/adaptive Chain Batch only with multiple actual workers.
+    #[arg(long, conflicts_with_all = ["chain_batch", "chain_batch_lanes", "chain_batch_legacy_schedule", "chain_batch_fixed_window", "match_extension"])]
+    chain_batch_parallel: bool,
     /// Independent immutable-chain queries per batch worker; experimental above 1.
     #[arg(long, default_value_t = 1, value_parser = parse_chain_batch_lanes,
           requires_ifs = [("2", "chain_batch"), ("4", "chain_batch"), ("8", "chain_batch")])]
@@ -545,7 +548,8 @@ fn run(args: Args) -> Result<()> {
     });
     base.modular.source_lz77 = Some(SourceConfig {
         compact_steps: true,
-        chain_batch: args.chain_batch,
+        chain_batch: args.chain_batch || args.chain_batch_parallel,
+        chain_batch_parallel_only: args.chain_batch_parallel,
         chain_batch_lanes: args.chain_batch_lanes,
         chain_batch_streams: !args.chain_batch_legacy_schedule,
         chain_batch_adaptive: !args.chain_batch_fixed_window,
@@ -1101,6 +1105,7 @@ mod tests {
     fn chain_batch_interleaving_is_explicit_and_requires_batching() {
         let defaults = Args::try_parse_from(["lab", "input.png"]).unwrap();
         assert!(!defaults.chain_batch);
+        assert!(!defaults.chain_batch_parallel);
         assert_eq!(defaults.chain_batch_lanes, 1);
         assert!(!defaults.chain_batch_legacy_schedule);
         assert!(!defaults.chain_batch_fixed_window);
@@ -1144,6 +1149,42 @@ mod tests {
                     lanes,
                 ])
                 .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn parallel_chain_batch_keeps_legacy_ablation_flags_separate() {
+        for threads in ["1", "2", "8"] {
+            let args = Args::try_parse_from([
+                "lab",
+                "input.png",
+                "--chain-batch-parallel",
+                "--threads",
+                threads,
+            ])
+            .unwrap();
+            assert!(args.chain_batch_parallel);
+            assert!(!args.chain_batch);
+            assert_eq!(args.chain_batch_lanes, 1);
+            assert!(!args.chain_batch_fixed_window);
+            assert!(!args.chain_batch_legacy_schedule);
+        }
+        for flags in [
+            vec!["--chain-batch"],
+            vec!["--chain-batch-legacy-schedule"],
+            vec!["--chain-batch-fixed-window"],
+            vec!["--chain-batch-lanes", "1"],
+            vec!["--chain-batch-lanes", "2"],
+            vec!["--chain-batch-lanes", "4"],
+            vec!["--chain-batch-lanes", "8"],
+            vec!["--match-extension", "scalar"],
+        ] {
+            let mut args = vec!["lab", "input.png", "--chain-batch-parallel"];
+            args.extend(flags);
+            assert!(
+                Args::try_parse_from(args.iter().copied()).is_err(),
+                "{args:?}"
             );
         }
     }

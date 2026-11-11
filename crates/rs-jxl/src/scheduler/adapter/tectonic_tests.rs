@@ -165,6 +165,7 @@ fn explicit_lz_tools_survive_candidates_without_overriding_wire_policy() {
                 .modular,
         ] {
             let lz = options.source_lz77.as_ref().unwrap();
+            assert!(!lz.chain_batch);
             assert!(lz.stream_arena && lz.stream_arena_quiet && lz.index_word_match);
             assert_eq!(lz.parallelism, parallelism);
             assert_eq!(lz.index_mode, SourceIndexMode::All);
@@ -186,6 +187,65 @@ fn explicit_lz_tools_survive_candidates_without_overriding_wire_policy() {
         .unwrap();
     assert!(options.modular.source_lz77.is_none());
     assert!(!options.modular.lz77);
+}
+
+#[test]
+fn default_pixel_lz_enables_parallel_only_batch_without_changing_lower_tier_workers() {
+    let image = Image::new(
+        32,
+        32,
+        PixelLayout::Rgb,
+        PixelData::U8(vec![19; 32 * 32 * 3]),
+    )
+    .unwrap();
+    for threads in [1, 2, 8, 256] {
+        let base = EncodeOptions {
+            threads,
+            ..Default::default()
+        };
+        for effort in [3, 5, 7, 8, 9, 10] {
+            let params = CandidateParams::default().backend(effort).unwrap();
+            let options = project_native(&params, &image, &base)
+                .unwrap()
+                .exact_options()
+                .unwrap();
+            if let Some(lz) = &options.modular.source_lz77 {
+                assert!(lz.chain_batch && lz.chain_batch_parallel_only);
+                assert!(lz.chain_batch_streams && lz.chain_batch_adaptive);
+                assert_eq!(lz.chain_batch_lanes, 1);
+                if lz.method == SourceLz77Method::Optc256 {
+                    assert_eq!(lz.parallelism.unwrap().max_workers, threads.min(64));
+                    assert!(!lz.parallelism.unwrap().fast_streams);
+                } else {
+                    assert!(lz.parallelism.is_none());
+                }
+            }
+        }
+        // Explicit low-level settings remain authoritative, including extensions
+        // that deliberately cannot coexist with immutable Chain Batch.
+        let explicit = EncodeOptions {
+            modular: crate::ModularOptions {
+                source_lz77: Some(SourceConfig {
+                    match_extension: crate::tools::lz77::MatchExtension::Scalar,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            ..base
+        };
+        let params = CandidateParams::default().backend(9).unwrap();
+        let options = project_native(&params, &image, &explicit)
+            .unwrap()
+            .exact_options()
+            .unwrap();
+        let lz = options.modular.source_lz77.as_ref().unwrap();
+        assert!(!lz.chain_batch);
+        assert!(lz.parallelism.is_none());
+        assert_eq!(
+            lz.match_extension,
+            crate::tools::lz77::MatchExtension::Scalar
+        );
+    }
 }
 
 #[test]

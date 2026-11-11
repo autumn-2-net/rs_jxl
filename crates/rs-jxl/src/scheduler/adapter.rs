@@ -470,7 +470,23 @@ fn project_native_metadata(
             // Explicit Rust tool switches replace source process-wide knobs.
             // Keep those across candidates; only the candidate-owned parser,
             // seed/bucket parameters and actual wire model are overridden here.
-            ..base.modular.source_lz77.clone().unwrap_or_default()
+            ..base
+                .modular
+                .source_lz77
+                .clone()
+                .unwrap_or_else(|| SourceConfig {
+                    chain_batch: true,
+                    chain_batch_parallel_only: true,
+                    // Keep lower-tier seed/stream execution unchanged. Batch only
+                    // applies to Optc256 and still checks the installed executor.
+                    parallelism: (method == LzMethod::Optc256).then_some(
+                        crate::tools::lz77::SourceParallelism {
+                            max_workers: base.threads.clamp(1, 64),
+                            ..Default::default()
+                        },
+                    ),
+                    ..Default::default()
+                })
         }),
     };
     // Kept coherent for diagnostic consumers. source_lz77 is the active path;

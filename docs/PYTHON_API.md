@@ -80,6 +80,13 @@ original = rs_jxl.reconstruct_jpeg(archived)
 pixel_jxl = rs_jxl.encode("input.jpg", lossless_jpeg=False, strip_metadata=True)
 ```
 
+Pixel source encoding automatically uses adaptive/cooperative Chain Batch on
+eligible Optc256 streams with at least two effective native workers. Existing
+`threads` controls this; no extra Python flag is required. Single-thread and
+serial child scopes fall back before Batch allocation, and not every image or
+effort uses this route. JPEG byte-transcode policy is unchanged. Details and
+the explicit Rust override are in [the Batch report](CHAIN_BATCH_PARALLEL_20261111.md).
+
 encode defaults: effort=7, threads=1, lossless=True, distance=0,
 lossless_jpeg=True, source_search=False. JPEG bytes default to coefficient
 transcoding; unsupported structures fail without pixel fallback.

@@ -695,3 +695,7 @@ impl HistogramCache {
 #[cfg(test)]
 #[path = "cache_identity14_tests.rs"]
 mod identity14_tests;
+
+#[cfg(test)]
+#[path = "cache_collect_identity14_tests.rs"]
+mod collect_identity14_tests;

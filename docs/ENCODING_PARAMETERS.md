@@ -41,6 +41,12 @@ CLI 有一个重要区别：`rs-jxl encode input.jpg ...` 是像素路径；JPEG
 | `strip_metadata` | **False**，像素路径 | 允许丢弃不支持的输入附加元数据；支持的色彩元数据仍保留，不是无条件删去 ICC |
 | `borrow_inputs` | **False**，像素/多帧/layers 接口 | 可选借用适合的连续缓冲区；不是端到端零复制，期间调用者不得修改输入及别名 |
 
+像素 source 编码在符合条件的 Optc256 整数流上默认启用协作式、自适应 Chain Batch，
+但必须有至少两个实际可用的原生工作线程。无需额外 Python 参数，仍使用 `threads`；
+单线程、串行子任务及不适用路线在分配 Batch 索引前回退。并非设置多线程后每张图都会启用，
+JPEG 字节转码策略也没有改变。门控条件、实测及 Rust 显式覆盖见
+[Batch 报告](CHAIN_BATCH_PARALLEL_20261111.md)。
+
 `output=None` 返回编码字节；指定路径写文件并返回 `Path`；指定可写二进制流写入后
 返回 `None`。这些 Python 编码接口先完成编码再写输出，不是真正逐帧流式编码。
 原生流接口另见 [Streaming Output](STREAMING_OUTPUT.md)。

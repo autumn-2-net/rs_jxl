@@ -143,6 +143,8 @@ fn execution_options(base: &EncodeOptions, literal: bool) -> EncodeOptions {
         .source_lz77
         .get_or_insert_with(|| SourceConfig {
             compact_steps: true,
+            chain_batch: true,
+            chain_batch_parallel_only: true,
             fast_ranges: SourceFastRanges::Both,
             fast_prefix: Some(SourceFastPrefix::Simd),
             ..Default::default()
@@ -617,6 +619,9 @@ mod tests {
             threads: 16,
             ..Default::default()
         };
+        let automatic = execution_options(&base, false);
+        let lz = automatic.modular.source_lz77.as_ref().unwrap();
+        assert!(lz.chain_batch && lz.chain_batch_parallel_only);
         base.modular.source_ma_parallel.subtrees = true;
         base.modular.source_ma_parallel.workers.tasks = 3;
         base.modular.source_ma_parallel.quiet = true;
@@ -636,6 +641,7 @@ mod tests {
         assert!(tuned.modular.source_ma_parallel.quiet);
         let lz = tuned.modular.source_lz77.as_ref().unwrap();
         assert!(!lz.compact_steps);
+        assert!(!lz.chain_batch);
         assert_eq!(lz.fast_ranges, SourceFastRanges::RepeatedInsert);
         assert_eq!(lz.fast_prefix, Some(SourceFastPrefix::Disabled));
         assert_eq!(lz.parallelism.unwrap().max_workers, 2);
