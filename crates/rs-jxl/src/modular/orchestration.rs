@@ -48,6 +48,7 @@ fn reuse_preparation(
 ) -> Result<Arc<PreparedLayout>> {
     if let Some(cache) = &options.candidate_cache
         && options.representation_receipt.is_none()
+        && options.palette_group_receipt.is_none()
         && cache.matches(image)
     {
         return cache.get_or_build(key(), build, prepared_bytes);
@@ -376,7 +377,7 @@ fn prepare_layout(
     if group_size_shift > 3 {
         return Err(Error::InvalidInput("group size shift must be 0..3".into()));
     }
-    let policy = source_policy(options, responsive)?;
+    let mut policy = source_policy(options, responsive)?;
     let mut state = effective_depth(image)?;
     // The 16-bit promise is stricter than Level 10's 32-bit headroom. Respect
     // it even when the container independently needs Level 10 for other fields.
@@ -400,7 +401,57 @@ fn prepare_layout(
     };
     let (mut channels, mut transforms) = encode::planes(image, full, &raw)?;
     group::validate_layout(&channels, 0)?;
-    if options.palette_policy.is_some() {
+    let mut grouped = false;
+    if let Some(grouping) = policy.grouping {
+        let ordinary = image.color_channels() == 3
+            && matches!(image.channel_count(), 3 | 4)
+            && (0..image.channel_count()).all(|c| {
+                image.channel_depth(c) == image.channel_depth(0) && image.channel_shift(c) == 0
+            })
+            && image.channel_depth(0).exponent_bits_per_sample == 0;
+        let alpha_ok = grouping != super::palette_groups::Grouping::YaCoCg
+            || image
+                .metadata()
+                .extra_channels
+                .first()
+                .is_some_and(|c| c.channel_type == crate::metadata::ExtraChannelType::Alpha);
+        let script = if ordinary && alpha_ok {
+            super::palette_groups::apply(
+                &mut channels,
+                &mut state,
+                image.bits(),
+                grouping,
+                policy.palette_colors as u32,
+                max_depth,
+            )?
+        } else {
+            None
+        };
+        grouped = script.is_some();
+        if let Some(receipt) = &options.palette_group_receipt {
+            let tables = if grouped {
+                if grouping == super::palette_groups::Grouping::YaCoCg {
+                    2
+                } else {
+                    1
+                }
+            } else {
+                0
+            };
+            receipt.record(grouped, tables);
+        }
+        if let Some(script) = script {
+            transforms.extend(script);
+            // The script already specifies the representation. Do not palette
+            // its indices again or search RCTs across index/extra channels.
+            policy.palette_colors = 0;
+            policy.channel_colors_pre_transform_percent = 0.0;
+            policy.channel_colors_percent = 0.0;
+            policy.do_color = false;
+            policy.grouping = None;
+        }
+    }
+    if !grouped && options.palette_policy.is_some() {
         transforms.extend(palette::apply_palettes(
             &mut channels,
             &mut state,
@@ -408,7 +459,8 @@ fn prepare_layout(
             PaletteStage::PreRct,
             &policy,
         )?);
-    } else if !policy.responsive
+    } else if !grouped
+        && !policy.responsive
         && let Some(limit) = options.palette_colors
     {
         let count = channels.len();
@@ -451,7 +503,7 @@ fn prepare_layout(
         // Source increments even if a tiny grayscale default schedule is empty.
         state.max_bitdepth += 2;
     }
-    let allow_rct = state.max_bitdepth < max_depth;
+    let allow_rct = !grouped && state.max_bitdepth < max_depth;
     let receipt = options
         .representation_receipt
         .as_ref()
@@ -997,6 +1049,10 @@ pub(crate) fn encode_layout_trial(
 #[cfg(test)]
 #[path = "receipt_tests.rs"]
 mod receipt_tests;
+
+#[cfg(test)]
+#[path = "palette_groups_tests.rs"]
+mod palette_groups_tests;
 
 #[cfg(test)]
 mod tests {

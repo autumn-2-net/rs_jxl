@@ -104,6 +104,9 @@ pub struct PaletteOptions {
     pub mode: PaletteMode,
     /// Optional frozen-source experiments; defaults retain ordinary ordering.
     pub tools: PaletteTools,
+    /// Opt-in full-frame partial-channel transform script. Declined layouts
+    /// retain the ordinary palette policy; accepted scripts own color transforms.
+    pub grouping: Option<super::palette_groups::Grouping>,
 }
 
 impl Default for PaletteOptions {
@@ -121,6 +124,7 @@ impl Default for PaletteOptions {
             direct: false,
             mode: PaletteMode::Absolute,
             tools: PaletteTools::default(),
+            grouping: None,
         }
     }
 }
@@ -129,6 +133,19 @@ impl PaletteOptions {
     pub fn validate(&self) -> Result<()> {
         self.mode.validate()?;
         self.tools.order.validate()?;
+        if self.grouping.is_some()
+            && (self.palette_colors < 2
+                || self.responsive
+                || self.groupwise
+                || self.direct
+                || self.force_palette
+                || self.mode != PaletteMode::Absolute
+                || self.tools != PaletteTools::default())
+        {
+            return Err(Error::InvalidInput(
+                "partial palettes require full-frame absolute/default palette tools and a positive cap >= 2".into(),
+            ));
+        }
         if !(-1..=9).contains(&self.speed_tier) || self.palette_colors.unsigned_abs() > 70911 {
             return Err(Error::InvalidInput(
                 "palette speed tier or color limit exceeds supported range".into(),

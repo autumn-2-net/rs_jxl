@@ -11,12 +11,17 @@ use super::predictor::predict_one;
 use super::training::TrainingStream;
 use super::tree::{Node, Tree, pack_signed};
 
+mod distribution;
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum OffsetMode {
     Mean,
     Median,
     #[default]
     Entropy,
+    /// Broader sample-distribution proposals using the baseline literal mapping.
+    /// Can refit existing unit-multiplier offsets, including shallow MA plans.
+    Distribution,
 }
 
 #[derive(Debug, Clone)]
@@ -63,6 +68,7 @@ const TOKENS: usize = 240;
 
 struct Samples {
     node: usize,
+    baseline: i32,
     count: u64,
     sum: i128,
     random: u64,
@@ -74,6 +80,7 @@ impl Samples {
     fn new(node: usize) -> Self {
         Self {
             node,
+            baseline: 0,
             count: 0,
             sum: 0,
             random: node as u64,
@@ -88,7 +95,7 @@ impl Samples {
             .checked_add(1)
             .ok_or(Error::Limit("offset population overflow"))?;
         self.sum += i128::from(residual);
-        self.all_zero &= residual == 0;
+        self.all_zero &= (residual as i32) == self.baseline;
         if self.values.len() < capacity {
             if self.values.len() == self.values.capacity() {
                 self.values
@@ -128,7 +135,7 @@ impl Samples {
         match mode {
             OffsetMode::Mean => result.push(mean),
             OffsetMode::Median => result.push(median),
-            OffsetMode::Entropy => {
+            OffsetMode::Entropy | OffsetMode::Distribution => {
                 for center in [mean, median] {
                     for delta in [0, -1, 1, -2, 2] {
                         if let Some(offset) = center.checked_add(delta) {
@@ -190,7 +197,22 @@ pub(super) fn fit(
     previous_channels: usize,
     options: &OffsetOptions,
 ) -> Result<(Option<Tree>, FitStats)> {
+    fit_with_configs(tree, streams, previous_channels, options, None)
+}
+
+pub(super) fn fit_with_configs(
+    tree: &Tree,
+    streams: &[TrainingStream<'_>],
+    previous_channels: usize,
+    options: &OffsetOptions,
+    configs: Option<&[HybridUintConfig]>,
+) -> Result<(Option<Tree>, FitStats)> {
     options.validate()?;
+    if configs.is_some_and(|configs| configs.len() != tree.leaves()) {
+        return Err(Error::InvalidInput(
+            "offset context configuration count".into(),
+        ));
+    }
     let ordered = super::leaf_refit::ordered_streams(tree, streams, previous_channels)?;
     let mut leaves = Vec::new();
     leaves
@@ -212,7 +234,13 @@ pub(super) fn fit(
                 offset, multiplier, ..
             } => {
                 offset_counts[UINT.encode(pack_signed(offset)).token as usize] += 1;
-                leaves.push((offset == 0 && multiplier == 1).then(|| Samples::new(node)));
+                leaves.push(
+                    (multiplier == 1 && (offset == 0 || options.mode == OffsetMode::Distribution))
+                        .then(|| Samples {
+                            baseline: offset,
+                            ..Samples::new(node)
+                        }),
+                );
             }
         }
     }
@@ -238,6 +266,9 @@ pub(super) fn fit(
                 Ok(())
             },
         )?;
+    }
+    if options.mode == OffsetMode::Distribution {
+        return fit_distribution(tree, &mut leaves, offset_counts, configs);
     }
     let mut nodes = tree.nodes().to_vec();
     for leaf in leaves.iter_mut().flatten().filter(|s| s.count != 0) {
@@ -280,6 +311,107 @@ pub(super) fn fit(
         Some(Tree::new(nodes)?)
     };
     Ok((proposal, stats))
+}
+
+fn replacement_cost(counts: &[u64; TOKENS], old: i32, new: i32) -> f64 {
+    let old = UINT.encode(pack_signed(old));
+    let new = UINT.encode(pack_signed(new));
+    let extra = f64::from(new.nbits) - f64::from(old.nbits);
+    if old.token == new.token {
+        return extra;
+    }
+    let removed = counts[old.token as usize];
+    let added = counts[new.token as usize];
+    xlogx(removed) - xlogx(removed - 1) + xlogx(added) - xlogx(added + 1) + extra
+}
+
+fn fit_distribution(
+    tree: &Tree,
+    leaves: &mut [Option<Samples>],
+    mut counts: [u64; TOKENS],
+    configs: Option<&[HybridUintConfig]>,
+) -> Result<(Option<Tree>, FitStats)> {
+    struct Proposal {
+        node: usize,
+        costs: Vec<(i32, f64)>,
+        selected: usize,
+    }
+    let mut proposals = Vec::new();
+    let mut stats = FitStats::default();
+    for (context, leaf) in leaves.iter_mut().enumerate() {
+        let Some(leaf) = leaf.as_mut().filter(|leaf| leaf.count != 0) else {
+            continue;
+        };
+        stats.population = stats
+            .population
+            .checked_add(
+                usize::try_from(leaf.count)
+                    .map_err(|_| Error::Limit("offset population overflow"))?,
+            )
+            .ok_or(Error::Limit("offset population overflow"))?;
+        stats.samples += leaf.values.len();
+        if leaf.all_zero {
+            continue;
+        }
+        let config = configs.map_or_else(HybridUintConfig::default, |configs| configs[context]);
+        let costs = distribution::scores(leaf, config)?;
+        debug_assert_eq!(costs[0].0, leaf.baseline);
+        stats.candidates += costs.len();
+        proposals.push(Proposal {
+            node: leaf.node,
+            costs,
+            selected: 0,
+        });
+    }
+    // Revisit only cached scores, not pixels: offsets share a signaling histogram.
+    // Alternating sweeps reduce the one-way BFS bias without another encode.
+    for sweep in 0..3 {
+        let mut changed = false;
+        for position in 0..proposals.len() {
+            let index = if sweep % 2 == 0 {
+                position
+            } else {
+                proposals.len() - 1 - position
+            };
+            let proposal = &mut proposals[index];
+            let (old, mut best_bits) = proposal.costs[proposal.selected];
+            let mut best = proposal.selected;
+            for (candidate, &(offset, residual_bits)) in proposal.costs.iter().enumerate() {
+                let bits = residual_bits + replacement_cost(&counts, old, offset);
+                if bits + 1e-9 * best_bits.abs().max(1.0) < best_bits {
+                    best = candidate;
+                    best_bits = bits;
+                }
+            }
+            if best != proposal.selected {
+                counts[UINT.encode(pack_signed(old)).token as usize] -= 1;
+                counts[UINT.encode(pack_signed(proposal.costs[best].0)).token as usize] += 1;
+                proposal.selected = best;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    let mut nodes = tree.nodes().to_vec();
+    for proposal in proposals {
+        let selected = proposal.costs[proposal.selected].0;
+        if selected != proposal.costs[0].0 {
+            if let Node::Leaf { offset, .. } = &mut nodes[proposal.node] {
+                *offset = selected;
+            }
+            stats.leaves += 1;
+        }
+    }
+    Ok((
+        if stats.leaves == 0 {
+            None
+        } else {
+            Some(Tree::new(nodes)?)
+        },
+        stats,
+    ))
 }
 
 #[cfg(test)]

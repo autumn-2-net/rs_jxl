@@ -95,8 +95,9 @@ class RefinementHarnessTests(unittest.TestCase):
             self.assertEqual(defaults.context_map_merges, 4)
             self.assertEqual(defaults.variants, ["baseline", "entropy", "leaves", "combined"])
             args = arguments(argv + ["--variants", "offset-entropy", "baseline",
-                                     "offset-mean", "offset-median", "--leaf-offset-samples", "17"])
+                                     "offset-mean", "offset-median", "offset-distribution", "--leaf-offset-samples", "17"])
             self.assertEqual(args.leaf_offset_samples, 17)
+            self.assertIn("offset-distribution", args.variants)
             for invalid in ("0", "-1", "1.5"):
                 with self.subTest(invalid=invalid), redirect_stderr(StringIO()), self.assertRaises(SystemExit):
                     arguments(argv + ["--leaf-offset-samples", invalid])

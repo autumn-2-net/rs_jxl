@@ -9,6 +9,7 @@ fn fast(mode: Mode, bias: Bias) -> Options {
         bias,
         scan: Scan::Auto,
         predictors: PredictorSet::Basic,
+        cross_channel: false,
         receipt: Some(Arc::new(Receipt::default())),
     }
 }
@@ -177,6 +178,104 @@ fn conflicting_predefined_trees_fail_instead_of_silently_ignoring_experiment() {
 }
 
 #[test]
+fn cross_channel_axis_uses_available_budget_and_has_its_own_receipt() {
+    let mut random = 91u32;
+    let pixels: Vec<_> = (0..67 * 31)
+        .map(|_| {
+            random = random.wrapping_mul(1664525).wrapping_add(1013904223);
+            (random >> 16) as i32
+        })
+        .collect();
+    let plane = Channel {
+        width: 67,
+        height: 31,
+        hshift: 0,
+        vshift: 0,
+        samples: pixels,
+    };
+    let channels = [plane.clone(), plane];
+    let streams = [training::TrainingStream {
+        channels: &channels,
+        wp: weighted::Header::default(),
+        stream_id: 19,
+    }];
+    for previous in [0, 1] {
+        let receipt = Arc::new(Receipt::default());
+        let options = ModularOptions {
+            previous_channels: previous,
+            fast_context: Some(Options {
+                cross_channel: true,
+                receipt: Some(receipt.clone()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let tree = training::learn(&streams, &options).unwrap();
+        let selected = tree
+            .nodes()
+            .iter()
+            .any(|node| matches!(node, Node::Split { property: 18, .. }));
+        assert_eq!(selected, previous != 0);
+        assert_eq!(receipt.snapshot().cross_channel != 0, selected);
+    }
+    assert!(
+        Options {
+            mode: Mode::Leaf,
+            cross_channel: true,
+            ..Default::default()
+        }
+        .validate()
+        .is_err()
+    );
+}
+
+#[test]
+fn cross_channel_plans_and_offsets_roundtrip_hidden_rgb_and_integer_depths() {
+    use crate::modular::refinement::{OffsetMode, OffsetOptions};
+    for bits in [8, 16, 31] {
+        let max = (1u32 << bits) - 1;
+        let words: Vec<_> = (0..35 * 9 * 4)
+            .map(|i| {
+                if i % 4 == 3 {
+                    0
+                } else {
+                    (((i / 4) as u32).wrapping_mul(0x9e3779b9) ^ (i % 4) as u32 * 71) & max
+                }
+            })
+            .collect();
+        let pixels = match bits {
+            8 => PixelData::U8(words.iter().map(|&v| v as u8).collect()),
+            16 => PixelData::U16(words.iter().map(|&v| v as u16).collect()),
+            _ => PixelData::U32(words),
+        };
+        let image = Image::new(35, 9, PixelLayout::Rgba, pixels).unwrap();
+        for predictors in [PredictorSet::Basic, PredictorSet::Full] {
+            let mut options = EncodeOptions::default();
+            options.threads = 2;
+            options.modular.previous_channels = 1;
+            options.modular.fast_context = Some(Options {
+                mode: Mode::Auto12,
+                bias: Bias::Static,
+                predictors,
+                cross_channel: true,
+                ..Default::default()
+            });
+            options.modular.refinement.offsets = Some(OffsetOptions {
+                mode: OffsetMode::Distribution,
+                ..Default::default()
+            });
+            let bytes = crate::encode(&image, &options).unwrap();
+            let decoded = decode(&bytes, &DecodeOptions::default()).unwrap();
+            assert_eq!(
+                decoded.frames[0].pixels,
+                *image.pixels(),
+                "{bits} {predictors:?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn quantile_coordinates_cover_wide_values_without_new_property_ids() {
     let pixels = [
         -1_000_000,
@@ -198,7 +297,7 @@ fn quantile_coordinates_cover_wide_values_without_new_property_ids() {
         is_meta: false,
     };
     for property in [10, 11] {
-        let coordinates = thresholds(&[&view], property).unwrap();
+        let coordinates = thresholds(&[&view], property, &Previous::new()).unwrap();
         assert!(coordinates.windows(2).all(|p| p[0] < p[1]));
         assert!(coordinates.len() < 12);
         assert!(coordinates.iter().all(|&v| v < i32::MAX));

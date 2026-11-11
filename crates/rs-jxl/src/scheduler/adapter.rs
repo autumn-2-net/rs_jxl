@@ -357,6 +357,11 @@ fn project_native_metadata(
         .as_ref()
         .map(|p| p.tools)
         .unwrap_or_default();
+    let palette_grouping = options
+        .modular
+        .palette_policy
+        .as_ref()
+        .and_then(|p| p.grouping);
     // JXL_LOSSLESS_PALETTE_FORCE is available as an explicit base-policy
     // override, not a predictor/default change. Keep its source color-cap gate.
     let force_palette = (1..=65536).contains(&params.palette_colors)
@@ -407,6 +412,7 @@ fn project_native_metadata(
             force_palette,
             mode,
             tools: palette_tools,
+            grouping: palette_grouping,
             ..Default::default()
         });
     }

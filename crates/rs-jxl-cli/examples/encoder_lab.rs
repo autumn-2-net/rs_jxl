@@ -132,12 +132,21 @@ struct Args {
     /// Override the source MA sample fraction for a direct candidate experiment.
     #[arg(long)]
     learning_fraction: Option<f32>,
+    /// Number of earlier channels available to ordinary MA learning (default 0).
+    #[arg(long, conflicts_with_all = ["search", "scan_only", "context_cross_channel"], value_parser = clap::value_parser!(u8).range(0..=60))]
+    previous_channels: Option<u8>,
     /// Override pre-transform channel compaction for a direct candidate.
     #[arg(long)]
     pre_colors: Option<f32>,
     /// Explicit lossless palette permutation (source modes 0..9).
     #[arg(long, value_parser = clap::value_parser!(u8).range(0..=9))]
     palette_order: Option<u8>,
+    /// Explicit full-frame partial-channel palette candidate, not an auto selector.
+    #[arg(long, value_parser = ["rg", "yco", "ycg", "cocg", "ya-cocg"], conflicts_with_all = ["search", "scan_only", "palette_order", "force_palette"])]
+    palette_grouping: Option<String>,
+    /// Color cap for grouping admission and its ordinary paired baseline.
+    #[arg(long, conflicts_with_all = ["search", "scan_only"], value_parser = clap::value_parser!(u32).range(2..=70911))]
+    palette_group_colors: Option<u32>,
     /// Source buffering mode: -1 automatic, 0 full-frame, 1 large, 2 groupwise.
     #[arg(long, allow_hyphen_values = true, value_parser = clap::value_parser!(i8).range(-1..=2))]
     buffering: Option<i8>,
@@ -165,7 +174,7 @@ struct Args {
     #[arg(long, conflicts_with_all = ["search", "scan_only", "fast_context"])]
     refine_leaves: bool,
     /// Fit static MA leaf offsets, retaining only smaller serialized output.
-    #[arg(long, value_parser = ["mean", "median", "entropy"], conflicts_with_all = ["search", "scan_only", "fast_context"])]
+    #[arg(long, value_parser = ["mean", "median", "entropy", "distribution"], conflicts_with_all = ["search", "scan_only"])]
     leaf_offset: Option<String>,
     /// Per-leaf fitting reservoir capacity (default 1024); does not cap MA training.
     #[arg(long, requires = "leaf_offset", value_parser = clap::value_parser!(u32).range(1..))]
@@ -250,6 +259,9 @@ struct Args {
     /// Score Basic4 or all fourteen standard predictors, including native WP.
     #[arg(long, value_parser = ["basic", "full"], requires = "fast_context")]
     context_predictors: Option<String>,
+    /// Add a shallow axis on the previous compatible channel's residual magnitude.
+    #[arg(long, requires = "fast_context")]
+    context_cross_channel: bool,
     /// Shared-preparation shallow seed, optionally refined or re-evaluated.
     #[arg(long, value_parser = ["only", "refine", "repair"], conflicts_with_all = ["fast_context", "search", "scan_only", "ma_histogram_bins"])]
     ma_seed: Option<String>,
@@ -438,6 +450,23 @@ fn run(args: Args) -> Result<()> {
         }
     }
     params.probe_lz77 = args.lz;
+    if let Some(count) = args.previous_channels {
+        params.max_properties = count;
+    }
+    if let Some(cap) = args.palette_group_colors {
+        params.palette_colors = cap;
+    } else if args.palette_grouping.is_some() {
+        params.palette_colors = 4096;
+    }
+    if args.palette_grouping.is_some() {
+        if args.buffering.is_some_and(|mode| mode != 0) {
+            return Err("partial palette experiments require --buffering 0".into());
+        }
+        params.buffering = rs_jxl::scheduler::params::SourceBuffering::FullFrame;
+    }
+    if args.context_cross_channel {
+        params.max_properties = params.max_properties.max(1);
+    }
     if let Some(rct) = args.rct {
         params.rct = Some(u32::from(rct));
     }
@@ -500,6 +529,7 @@ fn run(args: Args) -> Result<()> {
                         "mean" => OffsetMode::Mean,
                         "median" => OffsetMode::Median,
                         "entropy" => OffsetMode::Entropy,
+                        "distribution" => OffsetMode::Distribution,
                         _ => unreachable!("validated offset mode"),
                     },
                     samples_per_leaf: args.leaf_offset_samples.unwrap_or(1024) as usize,
@@ -520,6 +550,21 @@ fn run(args: Args) -> Result<()> {
             },
             ..Default::default()
         });
+    }
+    if let Some(mode) = args.palette_grouping.as_deref() {
+        use rs_jxl::modular::palette_groups::Grouping;
+        base.modular.palette_policy = Some(rs_jxl::modular::palette::PaletteOptions {
+            grouping: Some(match mode {
+                "rg" => Grouping::Rg,
+                "yco" => Grouping::YCo,
+                "ycg" => Grouping::YCg,
+                "cocg" => Grouping::CoCg,
+                "ya-cocg" => Grouping::YaCoCg,
+                _ => unreachable!("validated palette grouping"),
+            }),
+            ..Default::default()
+        });
+        base.modular.palette_group_receipt = Some(std::sync::Arc::new(Default::default()));
     }
     base.modular.parallel_tokens = true;
     base.modular.parallel_weighted = args.parallel_wp;
@@ -648,6 +693,7 @@ fn run(args: Args) -> Result<()> {
     if let Some(mode) = &args.fast_context {
         use rs_jxl::modular::fast_context::{Bias, Mode, Options, PredictorSet, Receipt, Scan};
         base.modular.fast_context = Some(Options {
+            cross_channel: args.context_cross_channel,
             mode: match mode.as_str() {
                 "leaf" => Mode::Leaf,
                 "gradient12" => Mode::Gradient12,
@@ -707,6 +753,7 @@ fn run(args: Args) -> Result<()> {
     let mut search_report = serde_json::Value::Null;
     let mut model_costs = serde_json::Value::Null;
     let mut fast_context = serde_json::Value::Null;
+    let mut ma_previous_channels = None;
     let mut ma_seed = serde_json::Value::Null;
     let match_receipt = base
         .modular
@@ -714,6 +761,7 @@ fn run(args: Args) -> Result<()> {
         .as_ref()
         .and_then(|config| config.match_extension_receipt.clone());
     let refinement_receipt = base.modular.refinement.receipt.clone();
+    let palette_group_receipt = base.modular.palette_group_receipt.clone();
     let lz_scout_receipt = base
         .modular
         .source_lz77
@@ -831,6 +879,7 @@ fn run(args: Args) -> Result<()> {
                 "total_bits": receipt.bits(),
             });
         }
+        ma_previous_channels = Some(result.artifact.options.modular.previous_channels);
         if let Some(options) = &result.artifact.options.modular.fast_context {
             let receipt = options
                 .receipt
@@ -841,6 +890,8 @@ fn run(args: Args) -> Result<()> {
                 "mode": args.fast_context, "bias": args.context_bias.as_deref().unwrap_or("off"),
                 "scan": args.context_scan.as_deref().unwrap_or("auto"),
                 "predictors": args.context_predictors.as_deref().unwrap_or("basic"),
+                "cross_channel": args.context_cross_channel,
+                "cross_channel_plans": receipt.cross_channel,
                 "trees": receipt.trees, "leaves": receipt.leaves, "pixels": receipt.pixels,
                 "offset_leaves": receipt.offset_leaves, "horizontal": receipt.horizontal,
                 "vertical": receipt.vertical, "single": receipt.single,
@@ -864,6 +915,13 @@ fn run(args: Args) -> Result<()> {
         result.bytes
     };
     let pixels = f64::from(image.width()) * f64::from(image.height());
+    let palette_grouping = palette_group_receipt.map(|receipt| {
+        let stats = receipt.snapshot();
+        serde_json::json!({
+            "mode": args.palette_grouping, "colors": params.palette_colors,
+            "attempts": stats.attempts, "applied": stats.applied, "tables": stats.tables,
+        })
+    });
     let tree_learning_work = tree_learning_receipt.map(|receipt| {
         let stats = receipt.snapshot();
         serde_json::json!({
@@ -957,6 +1015,9 @@ fn run(args: Args) -> Result<()> {
             "description_cost": format!("{:?}", args.description_cost),
             "model_costs": model_costs,
             "fast_context": fast_context,
+            "max_previous_channels": params.max_properties,
+            "ma_previous_channels": ma_previous_channels,
+            "palette_grouping": palette_grouping,
             "ma_seed": ma_seed,
             "match_extension": match_extension,
             "lz_scout": lz_scout, "lz_quick": lz_quick,
@@ -1035,7 +1096,7 @@ fn leaf_offsets_are_explicit_and_validate_sampling_and_conflicts() {
             .leaf_offset
             .is_none()
     );
-    for mode in ["mean", "median", "entropy"] {
+    for mode in ["mean", "median", "entropy", "distribution"] {
         let args = Args::try_parse_from([
             "encoder_lab",
             "in.png",
@@ -1047,15 +1108,26 @@ fn leaf_offsets_are_explicit_and_validate_sampling_and_conflicts() {
         .unwrap();
         assert_eq!(args.leaf_offset.as_deref(), Some(mode));
         assert_eq!(args.leaf_offset_samples, Some(512));
-        for conflict in [
-            vec!["--search"],
-            vec!["--scan-only"],
-            vec!["--fast-context", "auto12"],
-        ] {
+        for conflict in [vec!["--search"], vec!["--scan-only"]] {
             let mut argv = vec!["encoder_lab", "in.png", "--leaf-offset", mode];
             argv.extend(conflict);
             assert!(Args::try_parse_from(argv).is_err());
         }
+        let args = Args::try_parse_from([
+            "encoder_lab",
+            "in.png",
+            "--leaf-offset",
+            mode,
+            "--fast-context",
+            "auto12",
+            "--context-bias",
+            "static",
+            "--context-predictors",
+            "full",
+        ])
+        .unwrap();
+        assert_eq!(args.leaf_offset.as_deref(), Some(mode));
+        assert_eq!(args.fast_context.as_deref(), Some("auto12"));
     }
     assert!(
         Args::try_parse_from(["encoder_lab", "in.png", "--leaf-offset-samples", "512"]).is_err()
@@ -1741,6 +1813,19 @@ fn fast_context_modes_are_explicit_and_require_their_primary_switch() {
     assert!(defaults.fast_context.is_none());
     assert!(defaults.context_bias.is_none());
     assert!(defaults.context_scan.is_none());
+    assert!(!defaults.context_cross_channel);
+    assert!(Args::try_parse_from(["encoder_lab", "input.png", "--context-cross-channel"]).is_err());
+    assert!(
+        Args::try_parse_from([
+            "encoder_lab",
+            "input.png",
+            "--fast-context",
+            "auto12",
+            "--context-cross-channel",
+        ])
+        .unwrap()
+        .context_cross_channel
+    );
     for mode in ["leaf", "gradient12", "directional12", "auto12"] {
         for bias in ["off", "static", "adaptive"] {
             let args = Args::try_parse_from([
@@ -1767,4 +1852,72 @@ fn fast_context_modes_are_explicit_and_require_their_primary_switch() {
                 .is_err()
         );
     }
+}
+
+#[test]
+fn palette_grouping_controls_are_explicit_and_validate_modes() {
+    let plain = Args::try_parse_from(["encoder_lab", "input.png"]).unwrap();
+    assert!(plain.palette_grouping.is_none() && plain.palette_group_colors.is_none());
+    for mode in ["rg", "yco", "ycg", "cocg", "ya-cocg"] {
+        let args = Args::try_parse_from([
+            "encoder_lab",
+            "input.png",
+            "--palette-grouping",
+            mode,
+            "--palette-group-colors",
+            "4096",
+            "--buffering",
+            "0",
+        ])
+        .unwrap();
+        assert_eq!(args.palette_grouping.as_deref(), Some(mode));
+        assert_eq!(args.palette_group_colors, Some(4096));
+    }
+    assert!(
+        Args::try_parse_from(["encoder_lab", "input.png", "--palette-group-colors", "4096"])
+            .is_ok()
+    );
+    for extra in ["--search", "--scan-only", "--force-palette"] {
+        assert!(
+            Args::try_parse_from([
+                "encoder_lab",
+                "input.png",
+                "--palette-grouping",
+                "rg",
+                extra
+            ])
+            .is_err()
+        );
+    }
+    for cap in ["0", "1", "70912"] {
+        assert!(
+            Args::try_parse_from(["encoder_lab", "input.png", "--palette-group-colors", cap])
+                .is_err()
+        );
+    }
+}
+
+#[test]
+fn ordinary_ma_cross_channel_budget_does_not_require_a_fast_tree() {
+    let plain = Args::try_parse_from(["encoder_lab", "input.png"]).unwrap();
+    assert!(plain.previous_channels.is_none());
+    for count in ["0", "1", "2", "60"] {
+        let args = Args::try_parse_from(["encoder_lab", "input.png", "--previous-channels", count])
+            .unwrap();
+        assert_eq!(args.previous_channels.unwrap().to_string(), count);
+        assert!(args.fast_context.is_none() && args.leaf_offset.is_none());
+    }
+    assert!(
+        Args::try_parse_from(["encoder_lab", "input.png", "--previous-channels", "61"]).is_err()
+    );
+    assert!(
+        Args::try_parse_from([
+            "encoder_lab",
+            "input.png",
+            "--previous-channels",
+            "1",
+            "--search"
+        ])
+        .is_err()
+    );
 }

@@ -182,6 +182,12 @@ pub(super) fn learn_with_budget_and_gather(
     let mut ordered: Vec<_> = streams.iter().collect();
     ordered.sort_unstable_by_key(|stream| stream.stream_id);
     let mut views = Vec::new();
+    let mut previous_views = super::fast_context::Previous::new();
+    let cross_channel = options.previous_channels > 0
+        && options
+            .fast_context
+            .as_ref()
+            .is_some_and(|fast| fast.cross_channel);
     let mut max_channels = 0;
     let mut previous_id = None;
     for stream in &ordered {
@@ -204,6 +210,15 @@ pub(super) fn learn_with_budget_and_gather(
                 return Err(Error::InvalidInput(
                     "MA training plane dimensions/buffer mismatch".into(),
                 ));
+            }
+            if cross_channel {
+                if let Some(reference) = super::fast_context::previous_view(
+                    stream.channels,
+                    channel,
+                    stream.stream_id as u32,
+                ) {
+                    previous_views.insert((stream.stream_id as u32, channel as u32), reference);
+                }
             }
             views.push(ChannelView {
                 channel: channel as u32,
@@ -230,7 +245,7 @@ pub(super) fn learn_with_budget_and_gather(
         if let Some(budget) = budget {
             budget.consume(samples)?;
         }
-        return super::fast_context::learn(
+        return super::fast_context::learn_with_previous(
             &views,
             max_channels,
             options.tree_leaf_limit(),
@@ -240,6 +255,7 @@ pub(super) fn learn_with_budget_and_gather(
                 .map(|stream| (stream.stream_id as u32, stream.wp))
                 .collect::<Vec<_>>(),
             fast,
+            &previous_views,
         );
     }
 

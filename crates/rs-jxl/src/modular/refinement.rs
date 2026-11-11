@@ -131,94 +131,115 @@ pub(super) fn choose<T>(
     };
     let mut best: Option<Trial<T>> = None;
     let mut original_bits = 0;
-    let mut evaluate = |tree: &Tree, origin: Origin| -> Result<()> {
-        let (streams, lz77) = tokenize(tree)?;
-        let start = Instant::now();
-        let base = Model::build_with_options(
-            &streams,
-            tree.leaves() + usize::from(lz77),
-            lz77,
-            options.entropy,
-            &options.entropy_options,
-        )?;
-        stats.model_seconds += start.elapsed().as_secs_f64();
-        let other_coding = if base.uses_ans() {
-            Coding::Prefix
-        } else {
-            Coding::Ans
-        };
-        let mut write = |model: &Model, alternate: bool, map_merges: usize| -> Result<()> {
-            let mut scratch = options.clone();
-            // Scratch output must not charge the final model-cost receipt.
-            scratch.model_cost_receipt = options
-                .model_cost_receipt
-                .as_ref()
-                .map(|_| Arc::new(encode::receipt_cost::ModelCostReceipt::default()));
+    let mut evaluate =
+        |tree: &Tree, origin: Origin| -> Result<Option<Vec<crate::entropy::HybridUintConfig>>> {
+            let (streams, lz77) = tokenize(tree)?;
             let start = Instant::now();
-            let result = serialize(tree, model, &streams, &scratch);
-            stats.write_seconds += start.elapsed().as_secs_f64();
-            let (bits, value) = match result {
-                Ok(output) => output,
-                // A successful baseline remains usable when a larger optional
-                // output reaches the writer ceiling. Allocation/coding errors
-                // are distinct and must not be hidden by this fallback.
-                Err(Error::Limit("encoded output size")) if best.is_some() => return Ok(()),
-                Err(error) => return Err(error),
-            };
-            stats.models += 1;
-            if best.is_none() {
-                original_bits = bits;
-            }
-            if best.as_ref().is_none_or(|old| bits < old.bits) {
-                best = Some(Trial {
-                    value,
-                    bits,
-                    costs: scratch.model_cost_receipt,
-                    origin,
-                    alternate,
-                    map_merges,
-                });
-            }
-            Ok(())
-        };
-        write(&base, false, 0)?;
-        if let Some(search) = &options.refinement.context_map {
-            let start = Instant::now();
-            let candidates =
-                base.context_map_candidates(&streams, &options.entropy_options, search)?;
-            stats.context_map_seconds += start.elapsed().as_secs_f64();
-            if let Some((models, work)) = candidates {
-                stats.context_map_proposals += models.len();
-                stats.context_map_proposed_merges += work.merges;
-                stats.context_map_pairs += work.pairs;
-                stats.context_map_map_trials += work.map_trials;
-                for (model, merges) in models {
-                    write(&model, false, merges)?;
-                }
-            } else {
-                stats.context_map_skipped += 1;
-            }
-        }
-        if options.refinement.entropy {
-            let start = Instant::now();
-            let alternate = Model::build_with_options(
+            let base = Model::build_with_options(
                 &streams,
                 tree.leaves() + usize::from(lz77),
                 lz77,
-                other_coding,
+                options.entropy,
                 &options.entropy_options,
-            );
+            )?;
             stats.model_seconds += start.elapsed().as_secs_f64();
-            match alternate {
-                Ok(model) => write(&model, true, 0)?,
-                // An explicitly wide prefix alphabet need not fit ANS.
-                Err(Error::InvalidInput(_)) if matches!(other_coding, Coding::Ans) => {}
-                Err(error) => return Err(error),
+            let offset_configs = if origin == Origin::Original
+                && options
+                    .refinement
+                    .offsets
+                    .as_ref()
+                    .is_some_and(|o| o.mode == OffsetMode::Distribution)
+            {
+                let mut configs = Vec::new();
+                configs
+                    .try_reserve_exact(tree.leaves())
+                    .map_err(|_| Error::Limit("offset model configurations"))?;
+                for context in 0..tree.leaves() {
+                    configs.push(base.context_uint_config(context).ok_or_else(|| {
+                        Error::Encoding("missing offset context configuration".into())
+                    })?);
+                }
+                Some(configs)
+            } else {
+                None
+            };
+            let other_coding = if base.uses_ans() {
+                Coding::Prefix
+            } else {
+                Coding::Ans
+            };
+            let mut write = |model: &Model, alternate: bool, map_merges: usize| -> Result<()> {
+                let mut scratch = options.clone();
+                // Scratch output must not charge the final model-cost receipt.
+                scratch.model_cost_receipt = options
+                    .model_cost_receipt
+                    .as_ref()
+                    .map(|_| Arc::new(encode::receipt_cost::ModelCostReceipt::default()));
+                let start = Instant::now();
+                let result = serialize(tree, model, &streams, &scratch);
+                stats.write_seconds += start.elapsed().as_secs_f64();
+                let (bits, value) = match result {
+                    Ok(output) => output,
+                    // A successful baseline remains usable when a larger optional
+                    // output reaches the writer ceiling. Allocation/coding errors
+                    // are distinct and must not be hidden by this fallback.
+                    Err(Error::Limit("encoded output size")) if best.is_some() => return Ok(()),
+                    Err(error) => return Err(error),
+                };
+                stats.models += 1;
+                if best.is_none() {
+                    original_bits = bits;
+                }
+                if best.as_ref().is_none_or(|old| bits < old.bits) {
+                    best = Some(Trial {
+                        value,
+                        bits,
+                        costs: scratch.model_cost_receipt,
+                        origin,
+                        alternate,
+                        map_merges,
+                    });
+                }
+                Ok(())
+            };
+            write(&base, false, 0)?;
+            if let Some(search) = &options.refinement.context_map {
+                let start = Instant::now();
+                let candidates =
+                    base.context_map_candidates(&streams, &options.entropy_options, search)?;
+                stats.context_map_seconds += start.elapsed().as_secs_f64();
+                if let Some((models, work)) = candidates {
+                    stats.context_map_proposals += models.len();
+                    stats.context_map_proposed_merges += work.merges;
+                    stats.context_map_pairs += work.pairs;
+                    stats.context_map_map_trials += work.map_trials;
+                    for (model, merges) in models {
+                        write(&model, false, merges)?;
+                    }
+                } else {
+                    stats.context_map_skipped += 1;
+                }
             }
-        }
-        Ok(())
-    };
-    evaluate(tree, Origin::Original)?;
+            if options.refinement.entropy {
+                let start = Instant::now();
+                let alternate = Model::build_with_options(
+                    &streams,
+                    tree.leaves() + usize::from(lz77),
+                    lz77,
+                    other_coding,
+                    &options.entropy_options,
+                );
+                stats.model_seconds += start.elapsed().as_secs_f64();
+                match alternate {
+                    Ok(model) => write(&model, true, 0)?,
+                    // An explicitly wide prefix alphabet need not fit ANS.
+                    Err(Error::InvalidInput(_)) if matches!(other_coding, Coding::Ans) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            Ok(offset_configs)
+        };
+    let offset_configs = evaluate(tree, Origin::Original)?;
     // Explicit fixed trees/predictor plans remain exact user instructions.
     if options.refinement.leaves
         && options.fixed_tree.is_none()
@@ -240,8 +261,17 @@ pub(super) fn choose<T>(
     }
     if let Some(offsets) = &options.refinement.offsets {
         let start = Instant::now();
-        let (refined, fitted) =
-            super::leaf_offset::fit(tree, views, options.previous_channels, offsets)?;
+        let (refined, fitted) = if let Some(configs) = offset_configs.as_deref() {
+            super::leaf_offset::fit_with_configs(
+                tree,
+                views,
+                options.previous_channels,
+                offsets,
+                Some(configs),
+            )?
+        } else {
+            super::leaf_offset::fit(tree, views, options.previous_channels, offsets)?
+        };
         stats.offset_seconds += start.elapsed().as_secs_f64();
         stats.offset_leaves += fitted.leaves;
         stats.offset_samples += fitted.samples;

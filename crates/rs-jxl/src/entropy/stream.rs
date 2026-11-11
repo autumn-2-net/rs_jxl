@@ -603,6 +603,14 @@ impl Model {
         self.map.len()
     }
 
+    /// Current literal mapping, before a proposed encoder-side refinement.
+    pub(crate) fn context_uint_config(&self, context: usize) -> Option<HybridUintConfig> {
+        self.map
+            .get(context)
+            .and_then(|&index| self.configs.get(usize::from(index)))
+            .copied()
+    }
+
     /// Source initialize_global_state=false: append a new local context range,
     /// retaining previous coding tables, wire mode and HybridUint mapping.
     /// `contexts` includes this batch's distance context when LZ77 is enabled.
@@ -1144,6 +1152,35 @@ mod tests {
             (u32::BITS - (split - msb).leading_zeros()) as u8,
         );
         HybridUintConfig::new(split, msb, lsb).unwrap()
+    }
+
+    #[test]
+    fn context_uint_config_tracks_raw_context_mapping_and_rejects_missing_contexts() {
+        let streams = [vec![
+            Token::literal(0, 16),
+            Token::literal(1, 1024),
+            Token::literal(1, 2048),
+        ]];
+        for strategy in [
+            UintConfigStrategy::Fast,
+            UintConfigStrategy::Best,
+            UintConfigStrategy::Fixed(HybridUintConfig::new(15, 0, 0).unwrap()),
+        ] {
+            let options = EntropyOptions {
+                uint_config: strategy,
+                ..Default::default()
+            };
+            let model =
+                Model::build_with_options(&streams, 2, false, Coding::Prefix, &options).unwrap();
+            for context in 0..2 {
+                assert_eq!(
+                    model.context_uint_config(context),
+                    Some(model.configs[usize::from(model.map[context])])
+                );
+            }
+            assert!(model.context_uint_config(2).is_none());
+            assert!(model.context_uint_config(usize::MAX).is_none());
+        }
     }
 
     #[test]

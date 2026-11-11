@@ -24,9 +24,9 @@ from compare_cpp_port import (
     file_sha256, png_samples, run_process, sha256,
 )
 
-OFFSET_MODES = ("mean", "median", "entropy")
+OFFSET_MODES = ("mean", "median", "entropy", "distribution")
 VARIANTS = ("baseline", "frozen", "entropy", "leaves", "combined",
-            "offset-mean", "offset-median", "offset-entropy", "context-map")
+            "offset-mean", "offset-median", "offset-entropy", "offset-distribution", "context-map")
 
 
 def arguments(argv=None):

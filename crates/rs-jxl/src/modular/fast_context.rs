@@ -2,6 +2,7 @@
 //! predictors. This is an alternative learner, not a prefix followed by the
 //! original exhaustive search. No fNBLI predictor or entropy coder is emitted.
 
+mod cross;
 mod rows;
 mod scan;
 mod stats;
@@ -112,11 +113,19 @@ pub struct Options {
     pub scan: Scan,
     /// Full is opt-in and requires each view's exact stream WP header.
     pub predictors: PredictorSet,
+    /// Also try standard property 18 when a compatible previous channel exists.
+    /// Requires the caller's Modular previous_channels budget to be nonzero.
+    pub cross_channel: bool,
     pub receipt: Option<Arc<Receipt>>,
 }
 
 impl Options {
     pub fn validate(&self) -> Result<()> {
+        if self.cross_channel && self.mode != Mode::Auto12 {
+            return Err(Error::InvalidInput(
+                "fast-context cross-channel candidate requires Auto12".into(),
+            ));
+        }
         if !self.scan.backend().available() {
             return Err(Error::InvalidInput(
                 "requested fast-context SIMD backend unavailable".into(),
@@ -135,6 +144,7 @@ pub struct Receipt {
     horizontal: AtomicUsize,
     vertical: AtomicUsize,
     single: AtomicUsize,
+    cross_channel: AtomicUsize,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -148,6 +158,8 @@ pub struct Snapshot {
     /// Plans split on property 10 (Left - TopLeft, vertical).
     pub vertical: usize,
     pub single: usize,
+    /// Selected channel plans using property 18, not prediction across channels.
+    pub cross_channel: usize,
 }
 
 impl Receipt {
@@ -160,6 +172,7 @@ impl Receipt {
             horizontal: self.horizontal.load(Ordering::Relaxed),
             vertical: self.vertical.load(Ordering::Relaxed),
             single: self.single.load(Ordering::Relaxed),
+            cross_channel: self.cross_channel.load(Ordering::Relaxed),
         }
     }
 }
@@ -310,7 +323,21 @@ fn leaf_plan(leaf: Leaf) -> Plan {
 
 // The small stratified pass only chooses legal split coordinates. Every pixel
 // participates in subsequent rate statistics, including rare/transparent data.
-fn thresholds(views: &[&ChannelView<'_>], property: usize) -> Result<Vec<i32>> {
+pub(super) type Previous<'a> = BTreeMap<(u32, u32), ChannelView<'a>>;
+
+pub(super) fn previous_view<'a>(
+    planes: &'a [super::group::Channel],
+    channel: usize,
+    group: u32,
+) -> Option<ChannelView<'a>> {
+    cross::previous(planes, channel, group)
+}
+
+fn thresholds(
+    views: &[&ChannelView<'_>],
+    property: usize,
+    previous: &Previous<'_>,
+) -> Result<Vec<i32>> {
     let mut samples = Vec::new();
     for view in views {
         let pixels = view.width * view.height;
@@ -322,6 +349,14 @@ fn thresholds(views: &[&ChannelView<'_>], property: usize) -> Result<Vec<i32>> {
                 .wrapping_add(u64::from(view.group))
                 .wrapping_mul(0x9e3779b97f4a7c15);
             let index = lo + (hash as usize % (hi - lo));
+            if property == 18 {
+                samples.push(cross::value(
+                    previous.get(&(view.group, view.channel)),
+                    index % view.width,
+                    index / view.width,
+                ));
+                continue;
+            }
             let n = Neighbors::from_plane(
                 view.pixels,
                 view.width,
@@ -356,6 +391,7 @@ fn scan_views(
     total: &mut Bin,
     options: &Options,
     shifted: bool,
+    previous: &Previous<'_>,
 ) -> Result<()> {
     let _scope = crate::profile::scope(if shifted {
         "ma.fast_context.bias_scan"
@@ -369,6 +405,12 @@ fn scan_views(
         .max()
         .unwrap_or(0);
     let mut row = rows::Rows::new(width, options.predictors);
+    let has_cross = axes.iter().any(|axis| axis.property == 18);
+    let mut cross_row = if has_cross {
+        vec![0; width]
+    } else {
+        Vec::new()
+    };
     for view in views {
         if view.width == 0 || view.height == 0 {
             continue;
@@ -380,15 +422,20 @@ fn scan_views(
         } else {
             None
         };
+        let reference = previous.get(&(view.group, view.channel));
         for y in 0..view.height {
             row.fill(view, y, options.scan.backend(), state.as_mut())?;
+            if has_cross {
+                cross::fill(reference, y, &mut cross_row[..view.width]);
+            }
             for x in 0..view.width {
                 total.add(row.residuals_at(x), options.bias, shifted);
                 for axis in axes.iter_mut() {
-                    let value = if axis.property == 10 {
-                        row.basic.vertical[x]
-                    } else {
-                        row.basic.horizontal[x]
+                    let value = match axis.property {
+                        10 => row.basic.vertical[x],
+                        11 => row.basic.horizontal[x],
+                        18 => cross_row[x],
+                        _ => unreachable!("validated shallow context property"),
                     };
                     let bin = axis
                         .thresholds
@@ -472,6 +519,7 @@ fn append_channels(nodes: &mut Vec<Node>, plans: &[Plan], first: usize) -> usize
 /// Views are validated by the shared training entry point before this call.
 /// Full requires exactly one header for every view's stream ID (`group`),
 /// including empty views. Unreferenced headers are ignored; Basic needs none.
+#[cfg(test)]
 pub(super) fn learn(
     views: &[ChannelView<'_>],
     channels: usize,
@@ -479,6 +527,27 @@ pub(super) fn learn(
     strict: bool,
     headers: &[(u32, weighted::Header)],
     options: &Options,
+) -> Result<Tree> {
+    learn_with_previous(
+        views,
+        channels,
+        limit,
+        strict,
+        headers,
+        options,
+        &Previous::new(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn learn_with_previous(
+    views: &[ChannelView<'_>],
+    channels: usize,
+    limit: usize,
+    strict: bool,
+    headers: &[(u32, weighted::Header)],
+    options: &Options,
+    previous: &Previous<'_>,
 ) -> Result<Tree> {
     let _scope = crate::profile::scope("ma.fast_context");
     options.validate()?;
@@ -497,13 +566,35 @@ pub(super) fn learn(
     let results = crate::execution::try_map(&by_channel, |_, views| {
         let mut axes = Vec::new();
         if options.mode != Mode::Leaf {
-            axes.push(Axis::new(10, thresholds(&views, 10)?, options.predictors));
+            axes.push(Axis::new(
+                10,
+                thresholds(&views, 10, previous)?,
+                options.predictors,
+            ));
         }
         if matches!(options.mode, Mode::Directional12 | Mode::Auto12) {
-            axes.push(Axis::new(11, thresholds(&views, 11)?, options.predictors));
+            axes.push(Axis::new(
+                11,
+                thresholds(&views, 11, previous)?,
+                options.predictors,
+            ));
+        }
+        if options.cross_channel
+            && options.mode == Mode::Auto12
+            && views
+                .iter()
+                .any(|view| previous.contains_key(&(view.group, view.channel)))
+        {
+            axes.push(Axis::new(
+                18,
+                thresholds(&views, 18, previous)?,
+                options.predictors,
+            ));
         }
         let mut total = Bin::new(options.predictors);
-        scan_views(&views, &headers, &mut axes, &mut total, options, false)?;
+        scan_views(
+            &views, &headers, &mut axes, &mut total, options, false, previous,
+        )?;
         if options.bias != Bias::Off {
             total.prepare_bias(options.bias);
             for axis in &mut axes {
@@ -511,7 +602,9 @@ pub(super) fn learn(
                     bin.prepare_bias(options.bias);
                 }
             }
-            scan_views(&views, &headers, &mut axes, &mut total, options, true)?;
+            scan_views(
+                &views, &headers, &mut axes, &mut total, options, true, previous,
+            )?;
         }
         let single = total.best(options.bias, options.predictors);
         let mut candidates: Vec<_> = axes
@@ -583,6 +676,8 @@ pub(super) fn learn(
                 &receipt.single
             } else if plan.property == 10 {
                 &receipt.vertical
+            } else if plan.property == 18 {
+                &receipt.cross_channel
             } else {
                 &receipt.horizontal
             };

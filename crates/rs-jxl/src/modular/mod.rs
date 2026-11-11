@@ -19,6 +19,7 @@ mod leaf_refit;
 pub mod ma_train;
 pub(crate) mod orchestration;
 pub mod palette;
+pub mod palette_groups;
 pub mod predict_simd;
 pub mod predictor;
 pub mod rct_simd;

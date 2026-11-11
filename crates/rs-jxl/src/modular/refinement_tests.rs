@@ -146,6 +146,68 @@ fn offset_trials_select_serialized_size_not_the_proxy() {
 }
 
 #[test]
+fn distribution_offset_trial_uses_real_config_and_keeps_exact_cost_fallback() {
+    use crate::entropy::{HybridUintConfig, options::UintConfigStrategy};
+    use crate::modular::{group::Channel, weighted};
+    let tree = Tree::new(vec![Node::Leaf {
+        predictor: Predictor::Zero,
+        offset: 17,
+        multiplier: 1,
+    }])
+    .unwrap();
+    let channels = [Channel {
+        width: 512,
+        height: 1,
+        hshift: 0,
+        vshift: 0,
+        samples: vec![100; 512],
+    }];
+    let views = [training::TrainingStream {
+        channels: &channels,
+        wp: weighted::Header::default(),
+        stream_id: 0,
+    }];
+    for candidate_bits in [80, 100, 120] {
+        let receipt = Arc::new(Receipt::default());
+        let mut options = encode::ModularOptions::default();
+        options.fast_context = Some(crate::modular::fast_context::Options {
+            bias: crate::modular::fast_context::Bias::Static,
+            ..Default::default()
+        });
+        options.entropy_options.uint_config =
+            UintConfigStrategy::Fixed(HybridUintConfig::new(0, 0, 0).unwrap());
+        options.refinement.offsets = Some(OffsetOptions {
+            mode: OffsetMode::Distribution,
+            ..Default::default()
+        });
+        options.refinement.receipt = Some(receipt.clone());
+        let calls = Cell::new(0);
+        let selected = choose(
+            &tree,
+            &views,
+            &options,
+            |_| {
+                calls.set(calls.get() + 1);
+                Ok((vec![vec![Token::literal(0, 200); 512]], false))
+            },
+            |tree, _, _, _| {
+                let Node::Leaf { offset, .. } = tree.nodes()[0] else {
+                    unreachable!()
+                };
+                Ok((if offset == 17 { 100 } else { candidate_bits }, offset))
+            },
+        )
+        .unwrap();
+        assert_eq!(selected != 17, candidate_bits < 100);
+        assert_eq!(calls.get(), 2);
+        assert_eq!(
+            receipt.snapshot().offset_wins,
+            usize::from(candidate_bits < 100)
+        );
+    }
+}
+
+#[test]
 fn exact_entropy_trial_reuses_tokens_and_only_charges_winning_header() {
     for values in [
         vec![0; 2000],

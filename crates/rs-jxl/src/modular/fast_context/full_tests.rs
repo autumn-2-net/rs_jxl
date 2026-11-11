@@ -255,6 +255,7 @@ fn full_scan_uses_stream_ids_and_resets_wp_per_view_and_bias_pass() {
                 &mut actual,
                 &options,
                 shifted,
+                &Previous::new(),
             )
             .unwrap();
             for (view, samples) in views.iter().zip(&samples) {

@@ -117,6 +117,8 @@ pub struct ModularOptions {
     pub tree_group_splits: Vec<usize>,
     /// Source global/per-group palette eligibility, ordering and cost rejection.
     pub palette_policy: Option<super::palette::PaletteOptions>,
+    /// Diagnostics for the explicit partial-channel palette experiment.
+    pub palette_group_receipt: Option<std::sync::Arc<super::palette_groups::Receipt>>,
     /// Opt-in Image layout diagnostics. Use a fresh collector for each native
     /// full/probe invocation; cloning options shares this single-use collector.
     /// None does not copy channels, transform scripts or pixel samples.
@@ -177,6 +179,7 @@ impl Default for ModularOptions {
             tree_groups: None,
             tree_group_splits: Vec::new(),
             palette_policy: None,
+            palette_group_receipt: None,
             representation_receipt: None,
             model_cost_receipt: None,
             source_lz77: None,
@@ -233,10 +236,7 @@ impl ModularOptions {
         self.entropy_options.validate()?;
         if let Some(offsets) = &self.refinement.offsets {
             offsets.validate()?;
-            if self.fixed_tree.is_some()
-                || self.custom_tree.is_some()
-                || self.fast_context.is_some()
-            {
+            if self.fixed_tree.is_some() || self.custom_tree.is_some() {
                 return Err(Error::InvalidInput(
                     "leaf offset fitting conflicts with explicit tree plans".into(),
                 ));
@@ -308,6 +308,12 @@ impl ModularOptions {
         }
         if let Some(policy) = &self.palette_policy {
             policy.validate()?;
+            if policy.grouping.is_some() && self.representation_receipt.is_some() {
+                return Err(Error::InvalidInput(
+                    "partial palettes cannot use the contiguous pre-RCT representation receipt"
+                        .into(),
+                ));
+            }
         }
         if let Some(policy) = &self.sampling {
             policy.validate()?;

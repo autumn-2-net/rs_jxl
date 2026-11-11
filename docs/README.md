@@ -195,6 +195,10 @@ rejected experiments and remaining limitations remain part of the record.
 - [LZ77 100-image single/eight-thread comparison, 2026-11-10](LZ77_CORPUS100_20261110.md)
 - [Static MA leaf offset experiment, 2026-11-10](MA_LEAF_OFFSET_20261110.md)
 - [MA leaf offset 100-image bpp comparison, 2026-11-10](MA_LEAF_OFFSET_CORPUS100_20261110.md)
+- [MA distribution-offset fitting, 2026-11-11](MA_LEAF_OFFSET_DISTRIBUTION_20261111.md)
+- [Shallow MA plans with distribution offsets, 2026-11-11](FAST_CONTEXT_OFFSETS_20261111.md)
+- [Ordinary e9 cross-channel MA comparison, 2026-11-12](MA_CROSS_CHANNEL_20261112.md)
+- [Partial-channel palette scripts, 2026-11-12](PARTIAL_CHANNEL_PALETTES_20261112.md)
 
 ### Decoding and Reconstruction
 

@@ -1,5 +1,9 @@
 # Static MA Leaf Offset Experiment
 
+New opt-in follow-up: [distribution-aware proposals](MA_LEAF_OFFSET_DISTRIBUTION_20261111.md)
+use the baseline literal configurations and broader candidates. On a fixed
+30-image subset, savings increased from 0.2266% to 0.5095%; defaults remain off.
+
 Follow-up: the [fixed 100-image test](MA_LEAF_OFFSET_CORPUS100_20261110.md)
 measured a 0.2064% weighted byte reduction for Entropy, with 400/400 official
 pixel checks passing. Its broader sample has smaller gains than the focused
@@ -78,7 +82,7 @@ options.modular.refinement.offsets = Some(OffsetOptions {
 ```
 
 `None` disables fitting. A zero capacity is invalid. Explicit fixed/custom trees
-and fast-context plans conflict with fitting so their semantics are not silently
+conflict with fitting so their semantics are not silently
 overridden. This experimental control is not added to the Python ABI yet.
 
 Lab CLI, built with `cargo build --release -p rs-jxl-cli --example encoder_lab`:
@@ -88,7 +92,8 @@ Lab CLI, built with `cargo build --release -p rs-jxl-cli --example encoder_lab`:
 ```
 
 Modes: `mean`, `median`, `entropy`. The switch cannot be combined with the outer
-`--search`, `--scan-only` or `--fast-context` experiments. Diagnostics report
+`--search` or `--scan-only` experiments. Fast-context combinations are now explicit
+opt-ins; see [the follow-up experiment](FAST_CONTEXT_OFFSETS_20261111.md). Diagnostics report
 proposal/win counts, changed leaves, retained samples, population, candidates,
 fitting time, model time and writing time. Proposed leaves are not necessarily
 accepted leaves. `saved_bits` is measured serialized domain savings.
