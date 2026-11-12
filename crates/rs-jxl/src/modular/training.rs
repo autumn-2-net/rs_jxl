@@ -133,7 +133,11 @@ pub(super) fn learn_with_gather(
             ));
         }
     }
-    let tree = if let Some(grouping) = &options.tree_groups {
+    // A block plan owns its complete bounded stream/channel dispatch. Optional
+    // learner sharding must not impose mandatory leaves or duplicate its scan.
+    let tree = if options.block_context.is_some() {
+        learn_with_budget_and_gather(streams, options, None, false, gather)?
+    } else if let Some(grouping) = &options.tree_groups {
         if let Some(gather) = gather {
             super::tree_groups::learn_with_gather(
                 streams,
@@ -230,6 +234,43 @@ pub(super) fn learn_with_budget_and_gather(
                 is_meta: plane.hshift < 0 || plane.vshift < 0,
             });
         }
+    }
+
+    if let Some(block) = &options.block_context {
+        // Keep the existing explicit group-domain contract even though this
+        // experiment compiles one plan rather than separate shard learners.
+        let splits = &options.tree_group_splits;
+        if !splits.is_empty()
+            && (splits.len() < 2
+                || splits.iter().any(|&id| id > i32::MAX as usize + 1)
+                || splits.windows(2).any(|p| p[0] >= p[1])
+                || ordered[0].stream_id < splits[0]
+                || ordered.last().expect("nonempty domain").stream_id
+                    >= *splits.last().expect("nonempty splits"))
+        {
+            return Err(Error::InvalidInput(
+                "invalid block-context MA stream group domain".into(),
+            ));
+        }
+        let samples = views.iter().try_fold(0usize, |n, v| {
+            n.checked_add(v.width * v.height)
+                .ok_or(Error::Limit("block-context population overflow"))
+        })?;
+        if options.sample_limit.is_some_and(|limit| samples > limit) {
+            return Err(Error::Limit(
+                "block-context full-scan sample budget exceeded",
+            ));
+        }
+        if let Some(budget) = budget {
+            budget.consume(samples)?;
+        }
+        let limit = options
+            .tree_groups
+            .as_ref()
+            .map_or(options.tree_leaf_limit(), |groups| {
+                options.tree_leaf_limit().min(groups.max_merged_leaves)
+            });
+        return super::block_context::learn(&views, limit, block);
     }
 
     if let Some(fast) = &options.fast_context {

@@ -188,6 +188,41 @@ pub(super) fn find_best_split_with_properties(
     removed: &[usize],
     redundant_properties: &mut Vec<u8>,
 ) -> Result<Option<Split>> {
+    find_best_split_collect(
+        samples,
+        indices,
+        parent_predictor,
+        options,
+        parents,
+        cache,
+        budget,
+        stats,
+        scratch_pool,
+        removed,
+        redundant_properties,
+        0,
+        &mut Vec::new(),
+    )
+}
+
+/// A nonzero width retains actual threshold candidates during the same sweep.
+/// It does not reinterpret the six predictor-preference slots as a beam.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn find_best_split_collect(
+    samples: &Samples<impl SampleStorage>,
+    indices: &[usize],
+    parent_predictor: usize,
+    options: &TrainOptions,
+    parents: &mut Option<Vec<ParentHistogram>>,
+    cache: &mut Option<HistogramCache>,
+    budget: &Arc<HistogramBudget>,
+    stats: &TrainingStats,
+    scratch_pool: &ScratchPool,
+    removed: &[usize],
+    redundant_properties: &mut Vec<u8>,
+    width: usize,
+    shortlist: &mut Vec<Split>,
+) -> Result<Option<Split>> {
     let _scope = crate::profile::scope("ma.find_best_split");
     pr5007::validate_options(options)?;
     let _node_scope = node_profile_scope(indices.len(), options.predictors.len());
@@ -356,7 +391,7 @@ pub(super) fn find_best_split_with_properties(
         }
     }
     let mut winners = [None; 6];
-    let candidates: Vec<Result<(Candidates, bool)>> = {
+    let candidates: Vec<Result<(Candidates, bool, Vec<Split>)>> = {
         let cache_stride = working_cache.as_ref().and_then(|cache| cache.stride);
         let collection_stride = histogram_stride(
             parents.iter().map(|p| p.counts.len()).max().unwrap_or(1),
@@ -372,12 +407,14 @@ pub(super) fn find_best_split_with_properties(
         let evaluate = |scratch: &mut PropertyScratch,
                         property: usize,
                         seen: Option<&mut Vec<SeenProperty>>| {
+            scratch.lookahead_width = width;
+            scratch.lookahead_candidates.clear();
             if options.property_dedup && working_redundant[property] != 0 {
                 stats.inherited_properties.fetch_add(1, Ordering::Relaxed);
-                return Ok(([None; 6], true));
+                return Ok(([None; 6], true, Vec::new()));
             }
             if !race.keep.is_empty() && race.keep[property] == 0 {
-                return Ok(([None; 6], false));
+                return Ok(([None; 6], false, Vec::new()));
             }
             with_property_values!(&samples.properties[property], |values| {
                 let mut histogram = property_jobs
@@ -415,7 +452,7 @@ pub(super) fn find_best_split_with_properties(
                         .map_or(scratch.used.as_slice(), |h| h.used.as_slice());
                     if used.iter().filter(|&&n| n != 0).take(2).count() < 2 {
                         stats.constant_properties.fetch_add(1, Ordering::Relaxed);
-                        return Ok(([None; 6], true));
+                        return Ok(([None; 6], true, Vec::new()));
                     }
                     if indices.len() >= 64
                         && let Some(seen) = seen
@@ -436,7 +473,7 @@ pub(super) fn find_best_split_with_properties(
                             histogram.valid = false;
                         }
                         stats.duplicate_properties.fetch_add(1, Ordering::Relaxed);
-                        return Ok(([None; 6], true));
+                        return Ok(([None; 6], true, Vec::new()));
                     }
                     if let Some(histogram) = histogram.as_mut() {
                         if cached_property {
@@ -548,7 +585,7 @@ pub(super) fn find_best_split_with_properties(
                 if initialize_cache && let Some(hook) = &stats.initial_cache_hook {
                     hook(property, InitialCacheStage::Scored)?;
                 }
-                Ok((candidates, false))
+                Ok((candidates, false, scratch.lookahead_candidates.clone()))
             })
         };
         if parallel {
@@ -567,7 +604,10 @@ pub(super) fn find_best_split_with_properties(
             let mut first_error = None;
             for property in 0..options.properties.len() {
                 match evaluate(&mut lease.scratch, property, None) {
-                    Ok((candidates, _)) => {
+                    Ok((candidates, _, alternatives)) => {
+                        for candidate in alternatives {
+                            super::lookahead::retain_best(shortlist, candidate, width);
+                        }
                         for (best, candidate) in winners.iter_mut().zip(candidates) {
                             if let Some(candidate) = candidate {
                                 keep_better(best, candidate);
@@ -596,7 +636,10 @@ pub(super) fn find_best_split_with_properties(
     // Indexed collection followed by strict ordered reduction preserves ties
     // independently of Rayon completion order. No worker mutates samples.
     for (property, candidates) in candidates.into_iter().enumerate() {
-        let (candidates, redundant) = candidates?;
+        let (candidates, redundant, alternatives) = candidates?;
+        for candidate in alternatives {
+            super::lookahead::retain_best(shortlist, candidate, width);
+        }
         if options.property_dedup {
             working_redundant[property] = u8::from(redundant);
         }

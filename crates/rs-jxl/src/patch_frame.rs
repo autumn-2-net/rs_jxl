@@ -95,6 +95,7 @@ pub(crate) fn write_dictionary(
     dictionary: Option<&patches::PatchDictionary>,
 ) -> Result<()> {
     if let Some(dictionary) = dictionary {
+        let _scope = crate::profile::scope("patch.dictionary");
         let raw = patches::tokenize(dictionary)?
             .into_iter()
             .map(|t| lz77::Literal {

@@ -16,6 +16,17 @@ use super::{
 };
 use crate::{Error, Result};
 
+mod activity;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SeedTopology {
+    #[default]
+    Quantile,
+    /// Joint directional histogram grid on the prepared MA population.
+    Activity25,
+    Activity81,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum SeedMode {
     Only,
@@ -27,7 +38,8 @@ pub enum SeedMode {
 #[derive(Clone, Debug)]
 pub struct SeedOptions {
     pub mode: SeedMode,
-    /// Initial depth only; does not cap the refined tree.
+    pub topology: SeedTopology,
+    /// Initial Quantile depth only; does not cap grid seeds or the refined tree.
     pub depth: u8,
     /// Approximate sampled-bit overhead per seed split, not final wire bits.
     pub split_bits: f32,
@@ -38,6 +50,7 @@ impl Default for SeedOptions {
     fn default() -> Self {
         Self {
             mode: SeedMode::Refine,
+            topology: SeedTopology::Quantile,
             depth: 3,
             split_bits: 24.0,
             receipt: None,
@@ -133,6 +146,91 @@ struct Work<'a> {
 }
 
 impl Work<'_> {
+    fn attach_activity(
+        &mut self,
+        mut state: PendingNode,
+        plan: activity::Plan,
+        samples: &mut Samples<impl SampleStorage>,
+        indices: &mut [usize],
+    ) -> Result<Seed> {
+        if plan.records != state.job.end - state.job.begin {
+            return Err(Error::InvalidInput(
+                "activity seed record domain mismatch".into(),
+            ));
+        }
+        self.receipt.predictor_changes.fetch_add(
+            usize::from(state.job.predictor != plan.predictor),
+            Ordering::Relaxed,
+        );
+        state.job.predictor = plan.predictor;
+        let cost = bits(&plan.parents[plan.predictor], self.options);
+        state.parents = Some(plan.parents);
+        self.receipt
+            .histogram_reuses
+            .fetch_add(1, Ordering::Relaxed);
+        let mut result = Seed {
+            state,
+            children: None,
+            leaves: 1,
+            cost,
+        };
+        let Some(children) = plan.children else {
+            return Ok(result);
+        };
+        if self.leaves == self.options.max_leaves {
+            if self.options.complete_search() {
+                return Err(Error::Limit(
+                    "MA activity seed exhausted explicit leaf budget",
+                ));
+            }
+            return Ok(result);
+        }
+        let (split, above_plan, below_plan) = *children;
+        let job = result.state.job;
+        if split.below_count == 0 || split.below_count >= job.end - job.begin {
+            return Err(Error::InvalidInput(
+                "activity seed contains an empty partition".into(),
+            ));
+        }
+        self.leaves += 1;
+        self.receipt.seed_splits.fetch_add(1, Ordering::Relaxed);
+        let cut = job.begin + split.below_count;
+        learner::partition_node::<true>(
+            samples,
+            &mut indices[job.begin..job.end],
+            split.property,
+            split.bin,
+            split.below_count,
+        );
+        let mut above = PendingNode::new(TrainingNode {
+            begin: cut,
+            predictor: above_plan.predictor,
+            ..job
+        });
+        let mut below = PendingNode::new(TrainingNode {
+            end: cut,
+            predictor: below_plan.predictor,
+            ..job
+        });
+        (above.range, below.range) = ma_parallel::children(
+            result.state.range,
+            self.options.properties[split.property],
+            samples.thresholds[split.property][split.bin],
+        );
+        let above = self.attach_activity(above, above_plan, samples, indices)?;
+        let below = self.attach_activity(below, below_plan, samples, indices)?;
+        let split_cost = above.cost + below.cost + self.seed.split_bits;
+        if split_cost >= cost {
+            self.leaves -= above.leaves + below.leaves - 1;
+            self.receipt.merged_branches.fetch_add(1, Ordering::Relaxed);
+        } else {
+            result.cost = split_cost;
+            result.leaves = above.leaves + below.leaves;
+            result.children = Some(Box::new((split, above, below)));
+        }
+        Ok(result)
+    }
+
     fn best_leaf(
         &self,
         state: &mut PendingNode,
@@ -473,10 +571,19 @@ pub(super) fn train(
         for root in roots {
             let mut state = PendingNode::new(root);
             state.range = ranges[root.node];
-            seeds.push((
-                root.node,
-                work.build(state, samples, &mut indices, seed.depth)?,
-            ));
+            let initial = if seed.topology == SeedTopology::Quantile {
+                work.build(state, samples, &mut indices, seed.depth)?
+            } else {
+                let plan = activity::plan(
+                    samples,
+                    &indices[root.begin..root.end],
+                    options,
+                    seed.topology == SeedTopology::Activity81,
+                    seed.split_bits,
+                )?;
+                work.attach_activity(state, plan, samples, &mut indices)?
+            };
+            seeds.push((root.node, initial));
         }
     }
     for (destination, seed) in seeds {
@@ -491,3 +598,6 @@ pub(super) fn train(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod activity_refine_tests;

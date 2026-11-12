@@ -552,6 +552,101 @@ fn source_add_oracle_fixtures_really_activate() {
 
 #[test]
 #[ignore = "requires explicit RS_JXL_DJXL official decoder path list"]
+fn source_patch_block_hybrids_and_parallel_gather_match_official_djxl() {
+    use rs_jxl::modular::{block_context, sample::GatherOptions};
+    use rs_jxl::scheduler::{CandidateParams, adapter, params::Override};
+    use std::sync::Arc;
+
+    let decoders = decoders();
+    let scratch = ScratchDir::new();
+    let mut checks = 0;
+    for bits in [8, 16] {
+        let fixture = fixture(Case {
+            width: 385,
+            bits,
+            layout: PixelLayout::Rgba,
+            pattern: Pattern::Backgrounds,
+        });
+        fixture.assert_active();
+        let mut params = CandidateParams::default().backend(9).unwrap();
+        params.patches = Override::On;
+        let base = EncodeOptions {
+            threads: 4,
+            ..Default::default()
+        };
+        let original = adapter::project_native(&params, &fixture.image, &base)
+            .unwrap()
+            .exact_options()
+            .unwrap();
+        for tile_size in [8, 16] {
+            for (reference_block, residual_block) in
+                [(false, false), (true, false), (false, true), (true, true)]
+            {
+                let mut options = original.clone();
+                let reference = Arc::new(block_context::Receipt::default());
+                let residual = Arc::new(block_context::Receipt::default());
+                let gather = GatherOptions {
+                    workers: 4,
+                    sparse: true,
+                    ..Default::default()
+                };
+                options.modular.source_gather = Some(gather.clone());
+                let policy = options.source_patch_reference.as_mut().unwrap();
+                policy.modular.source_gather = Some(gather);
+                if reference_block {
+                    policy.modular.block_context = Some(block_context::Options {
+                        tile_size,
+                        receipt: Some(reference.clone()),
+                        ..Default::default()
+                    });
+                }
+                if residual_block {
+                    options.modular.block_context = Some(block_context::Options {
+                        tile_size,
+                        receipt: Some(residual.clone()),
+                        ..Default::default()
+                    });
+                }
+                let context =
+                    format!("hybrid-{bits}-{tile_size}-{reference_block}-{residual_block}");
+                let encoded = encode(&fixture.image, &options).unwrap();
+                assert_eq!(reference.snapshot().trees > 0, reference_block, "{context}");
+                assert_eq!(residual.snapshot().trees > 0, residual_block, "{context}");
+                let input = scratch.path.join(format!("{context}.jxl"));
+                fs::write(&input, encoded).unwrap();
+                for (index, decoder) in decoders.iter().enumerate() {
+                    let output = scratch.path.join(format!("{context}-{index}.png"));
+                    let mut command = Command::new(decoder);
+                    command
+                        .arg(&input)
+                        .arg(&output)
+                        .arg(format!("--bits_per_sample={bits}"))
+                        .arg("--num_threads=1")
+                        .arg("--quiet")
+                        .arg("--output_extra_channels");
+                    run(&mut command, &scratch.path, &context);
+                    assert_png(&output, &fixture.image, &context);
+                    checks += 1;
+                    for (extra, data) in fixture.image.extra_planes().iter().enumerate() {
+                        let expected = Image::new(
+                            fixture.image.width(),
+                            fixture.image.height(),
+                            PixelLayout::Gray,
+                            data.clone(),
+                        )
+                        .unwrap();
+                        assert_png(&extra_png(&output, extra), &expected, &context);
+                        checks += 1;
+                    }
+                }
+            }
+        }
+    }
+    eprintln!("{checks} official hybrid main/extra-channel checks passed");
+}
+
+#[test]
+#[ignore = "requires explicit RS_JXL_DJXL official decoder path list"]
 fn source_add_signed_atlas_and_residual_match_official_djxl() {
     let decoders = decoders();
     let scratch = ScratchDir::new();

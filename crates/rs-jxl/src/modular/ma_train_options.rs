@@ -101,6 +101,8 @@ pub struct TrainOptions {
     pub tree_learning: TreeLearning,
     /// Optional invocation-owned evidence; never affects learned decisions.
     pub tree_learning_receipt: Option<std::sync::Arc<super::TreeLearningReceipt>>,
+    /// Opt-in two-ply search at initial learner roots; descendants stay greedy.
+    pub lookahead: Option<super::LookaheadOptions>,
     /// 2..=256 quantile/coordinate bins; WP retains its source preset bins.
     pub max_property_values: usize,
     /// Source preference for static/non-WP splits; finite and at least 1.
@@ -178,6 +180,7 @@ impl Default for TrainOptions {
             split_threshold: 16.0,
             tree_learning: TreeLearning::Legacy,
             tree_learning_receipt: None,
+            lookahead: None,
             max_property_values: 256,
             fast_decode_multiplier: 1.0,
             parallel: true,
@@ -254,6 +257,19 @@ impl TrainOptions {
 
     pub(super) fn validate(&self) -> Result<()> {
         self.parallel_tools.workers.validate()?;
+        if let Some(search) = &self.lookahead {
+            search.validate()?;
+            if self.seed.is_some()
+                || self.tree_learning == TreeLearning::Symmetric
+                || self.search != SearchOptions::default()
+                || self.scoring != ScoringOptions::default()
+            {
+                return Err(Error::InvalidInput(
+                    "MA lookahead requires ordinary one-sided split search/scoring and no seed"
+                        .into(),
+                ));
+            }
+        }
         if self.tree_learning.enabled()
             && (self.seed.is_some()
                 || self.search != SearchOptions::default()

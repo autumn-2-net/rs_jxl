@@ -406,14 +406,24 @@ pub(super) fn train_roots_with_layout<const REORDER: bool>(
         &nodes,
         options.static_property_range.unwrap_or([[0, u32::MAX]; 2]),
     );
+    let available_leaves = options.max_leaves.saturating_sub(nodes.len().div_ceil(2));
     let pending = roots
         .into_iter()
         .map(|job| {
             let mut pending = PendingNode::new(job);
             pending.range = ranges[job.node];
-            pending
+            super::lookahead::initialize(
+                &mut pending,
+                samples,
+                indices,
+                options,
+                stats,
+                scratch_pool,
+                available_leaves,
+            )?;
+            Ok(pending)
         })
-        .collect();
+        .collect::<Result<Vec<_>>>()?;
     train_pending_with_layout::<REORDER>(
         samples,
         options,

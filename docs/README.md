@@ -199,6 +199,10 @@ rejected experiments and remaining limitations remain part of the record.
 - [Shallow MA plans with distribution offsets, 2026-11-11](FAST_CONTEXT_OFFSETS_20261111.md)
 - [Ordinary e9 cross-channel MA comparison, 2026-11-12](MA_CROSS_CHANNEL_20261112.md)
 - [Partial-channel palette scripts, 2026-11-12](PARTIAL_CHANNEL_PALETTES_20261112.md)
+- [QLIC-inspired local prediction and off-grid patches, 2026-11-12](QLIC_LOCAL_DECISIONS_20261112.md)
+- [Source Patch speed, block hybrids and bpp/time plots, 2026-11-12](SOURCE_PATCH_SPEED_20261112.md)
+- [Two-ply MA lookahead and 42-RCT / cross-channel joint search, 2026-11-12](MA_LOOKAHEAD_RCT_JOINT_20261112.md)
+- [Static joint-gradient MA context experiment, 2026-11-12](STATIC_ACTIVITY_CONTEXT_20261112.md)
 
 ### Decoding and Reconstruction
 

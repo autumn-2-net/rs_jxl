@@ -49,8 +49,10 @@ pub(super) fn prepare(
     }
     // Source FindTextLikePatches takes Image3F, not the extra-channel planes.
     // Their independent declared depths and sample types never enter detection.
+    let read_scope = crate::profile::scope("patch.read_planes");
     let channels: Vec<_> = (0..image.color_channels()).collect();
     let planes: Vec<_> = channels.iter().map(|&c| read_plane(image, c)).collect();
+    drop(read_scope);
     let mut color_config = config.clone();
     color_config.floating_point = image.metadata().bit_depth.is_float();
     color_config.extra_channel_dim_shifts.clear();
@@ -114,6 +116,7 @@ pub(super) fn assemble(
     residual: Vec<Vec<i32>>,
     mut dictionary: patches::PatchDictionary,
 ) -> Result<(Image, Image, patches::PatchDictionary)> {
+    let _scope = crate::profile::scope("patch.assemble");
     let colors = image.color_channels();
     if channels.len() < colors
         || channels[..colors].iter().copied().ne(0..colors)

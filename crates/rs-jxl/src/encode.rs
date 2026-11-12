@@ -484,6 +484,17 @@ fn encode_logical_frame_from_plan(
 ) -> Result<TrialEncode<Vec<u8>>> {
     let mut stream = Vec::new();
     if let Some((reference, residual, dictionary)) = plan {
+        crate::profile::note(
+            "encode.patch_plan",
+            format_args!(
+                "atlas={}x{} residual={}x{} positions={}",
+                reference.width(),
+                reference.height(),
+                residual.width(),
+                residual.height(),
+                dictionary.positions.len(),
+            ),
+        );
         let reference_options = crate::frame::FrameOptions {
             reference_only: true,
             save_as_reference: 3,
@@ -508,6 +519,7 @@ fn encode_logical_frame_from_plan(
         atlas_options.tile_patches = None;
         atlas_options.source_patches = None;
         atlas_options.source_patch_reference = None;
+        let reference_scope = crate::profile::scope("encode.patch_reference");
         stream.extend(complete_or_return!(encode_frame_trial(
             canvas,
             &reference,
@@ -517,6 +529,8 @@ fn encode_logical_frame_from_plan(
             None,
             budget,
         )));
+        drop(reference_scope);
+        let _residual_scope = crate::profile::scope("encode.patch_residual");
         stream.extend(complete_or_return!(encode_frame_trial(
             canvas,
             &residual,

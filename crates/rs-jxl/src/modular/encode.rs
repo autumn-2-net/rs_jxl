@@ -86,6 +86,8 @@ pub struct ModularOptions {
     pub source_ma_search: ma_train::SearchOptions,
     /// Source whole-subtree switches and shared channel-root execution limits.
     pub source_ma_parallel: ma_train::ParallelOptions,
+    /// Experimental root-only two-ply MA split search; independent of effort.
+    pub source_ma_lookahead: Option<ma_train::LookaheadOptions>,
     /// Source JXL_MA_CHANNEL_TREE, disabled by default. Pixel entry points
     /// require integer main/extra channels of at most eight bits.
     pub source_channel_tree: ma_train::ChannelTreeMode,
@@ -109,6 +111,8 @@ pub struct ModularOptions {
     pub custom_tree: Option<Tree>,
     /// Experimental complete shallow MA plans; never enabled by effort alone.
     pub fast_context: Option<super::fast_context::Options>,
+    /// Independent tile-local standard-predictor MA experiment; default off.
+    pub block_context: Option<super::block_context::Options>,
     /// Shared-preparation MA warm start, disabled independently of effort.
     pub source_ma_seed: Option<ma_train::SeedOptions>,
     /// Independent source MA learners, merged using actual stream-ID splits.
@@ -164,6 +168,7 @@ impl Default for ModularOptions {
             source_ma_scoring: Default::default(),
             source_ma_search: Default::default(),
             source_ma_parallel: Default::default(),
+            source_ma_lookahead: None,
             source_channel_tree: Default::default(),
             source_channel_tree_final_only: false,
             parallel_tokens: false,
@@ -175,6 +180,7 @@ impl Default for ModularOptions {
             fixed_tree: None,
             custom_tree: None,
             fast_context: None,
+            block_context: None,
             source_ma_seed: None,
             tree_groups: None,
             tree_group_splits: Vec::new(),
@@ -246,11 +252,29 @@ impl ModularOptions {
             search.validate()?;
         }
         self.source_ma_parallel.workers.validate()?;
+        if let Some(search) = &self.source_ma_lookahead {
+            search.validate()?;
+            if self.source_ma_seed.is_some()
+                || self.tree_learning == ma_train::TreeLearning::Symmetric
+                || self.source_ma_search != Default::default()
+                || self.source_ma_scoring != Default::default()
+                || self.fast_context.is_some()
+                || self.block_context.is_some()
+                || self.custom_tree.is_some()
+                || self.fixed_tree.is_some()
+                || self.candidate_cache.is_some()
+            {
+                return Err(Error::InvalidInput(
+                    "MA lookahead conflicts with fixed/seed trees, candidate sharing or alternative split scoring/search".into(),
+                ));
+            }
+        }
         if self.tree_learning.enabled()
             && (self.source_ma_seed.is_some()
                 || self.source_ma_search != Default::default()
                 || self.source_ma_scoring != Default::default()
                 || self.fast_context.is_some()
+                || self.block_context.is_some()
                 || self.custom_tree.is_some()
                 || self.fixed_tree.is_some())
         {
@@ -283,6 +307,24 @@ impl ModularOptions {
                 || self.candidate_cache.is_some()
             {
                 return Err(Error::InvalidInput("fast_context conflicts with fixed/custom trees and candidate preparation reuse".into()));
+            }
+        }
+        if let Some(block) = &self.block_context {
+            block.validate()?;
+            if self.fixed_tree.is_some()
+                || self.custom_tree.is_some()
+                || self.fast_context.is_some()
+                || self.source_ma_seed.is_some()
+                || self.candidate_cache.is_some()
+                || self.source_channel_tree != ma_train::ChannelTreeMode::Disabled
+                || self.source_ma_search != Default::default()
+                || self.source_ma_scoring != Default::default()
+                || self.refinement.leaves
+                || self.refinement.offsets.is_some()
+            {
+                return Err(Error::InvalidInput(
+                    "block_context conflicts with fixed/custom/fast/seed trees, candidate preparation reuse, source tree search/scoring, and leaf refitting".into(),
+                ));
             }
         }
         if let Some(groups) = &self.tree_groups {
@@ -698,6 +740,7 @@ pub(super) fn train_options(options: &ModularOptions) -> ma_train::TrainOptions 
         split_threshold: options.split_threshold,
         tree_learning: options.tree_learning,
         tree_learning_receipt: options.tree_learning_receipt.clone(),
+        lookahead: options.source_ma_lookahead.clone(),
         seed: options.source_ma_seed.clone(),
         ..Default::default()
     };

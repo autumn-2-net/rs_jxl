@@ -52,6 +52,8 @@ set it afterwards for controlled direct-candidate experiments.
 
 | TilePatchOptions field | Default | Meaning |
 | --- | ---: | --- |
+| off_grid | false | Opt-in arbitrary destination origins for grid-seeded exact tiles; see the [follow-up experiment](QLIC_LOCAL_DECISIONS_20261112.md) |
+| max_discovery_positions | 262144 | Off-grid discovery guard; exhaustion declines the candidate, not the input |
 | force | false | Bypass admission for controlled diagnostic comparisons only |
 | min_estimated_savings | 0.02 | Finite 0..1; minimum net gain relative to a sampled coding-cost proxy |
 | full_frame_min_estimated_savings | 0.10 | Finite 0..1; stronger minimum when a dictionary forces frame-area encoding into full-frame processing |

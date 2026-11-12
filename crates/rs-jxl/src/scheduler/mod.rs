@@ -29,6 +29,7 @@ pub mod policy;
 pub mod prefix_screen;
 pub mod probe;
 pub mod progressive;
+pub mod rct_joint;
 pub mod regions;
 pub mod scan;
 pub mod search;

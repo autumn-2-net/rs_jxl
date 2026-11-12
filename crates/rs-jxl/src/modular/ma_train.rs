@@ -220,6 +220,8 @@ use split_search::{
 };
 
 mod learner;
+mod lookahead;
+pub use lookahead::{LookaheadOptions, LookaheadReceipt, LookaheadSnapshot};
 mod seed;
 mod symmetric;
 #[cfg(test)]
@@ -233,7 +235,7 @@ use learner::{
     partition_samples, train_nodes_with_layout, train_nodes_with_scratch, train_nodes_with_stats,
     train_pending_with_layout,
 };
-pub use seed::{SeedMode, SeedOptions, SeedReceipt, SeedSnapshot};
+pub use seed::{SeedMode, SeedOptions, SeedReceipt, SeedSnapshot, SeedTopology};
 
 const PROPERTY_RANGE: i32 = 511;
 const QUANTILE_RANGE: i32 = 512;

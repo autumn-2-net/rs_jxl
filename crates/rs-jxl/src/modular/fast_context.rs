@@ -2,6 +2,7 @@
 //! predictors. This is an alternative learner, not a prefix followed by the
 //! original exhaustive search. No fNBLI predictor or entropy coder is emitted.
 
+mod activity;
 mod cross;
 mod rows;
 mod scan;
@@ -72,6 +73,10 @@ pub enum Mode {
     Directional12,
     #[default]
     Auto12,
+    /// Joint signed gradient grid, pruned using static residual histograms.
+    Activity25,
+    /// Finer joint grid; still one statistics scan, not MA split search.
+    Activity81,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -121,6 +126,13 @@ pub struct Options {
 
 impl Options {
     pub fn validate(&self) -> Result<()> {
+        if matches!(self.mode, Mode::Activity25 | Mode::Activity81)
+            && (self.bias != Bias::Off || self.predictors != PredictorSet::Basic)
+        {
+            return Err(Error::InvalidInput(
+                "activity grids require Basic predictors and bias Off".into(),
+            ));
+        }
         if self.cross_channel && self.mode != Mode::Auto12 {
             return Err(Error::InvalidInput(
                 "fast-context cross-channel candidate requires Auto12".into(),
@@ -145,6 +157,7 @@ pub struct Receipt {
     vertical: AtomicUsize,
     single: AtomicUsize,
     cross_channel: AtomicUsize,
+    joint: AtomicUsize,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -160,6 +173,8 @@ pub struct Snapshot {
     pub single: usize,
     /// Selected channel plans using property 18, not prediction across channels.
     pub cross_channel: usize,
+    /// Channel plans using both standard directional properties 10 and 11.
+    pub joint: usize,
 }
 
 impl Receipt {
@@ -173,6 +188,7 @@ impl Receipt {
             vertical: self.vertical.load(Ordering::Relaxed),
             single: self.single.load(Ordering::Relaxed),
             cross_channel: self.cross_channel.load(Ordering::Relaxed),
+            joint: self.joint.load(Ordering::Relaxed),
         }
     }
 }
@@ -551,6 +567,9 @@ pub(super) fn learn_with_previous(
 ) -> Result<Tree> {
     let _scope = crate::profile::scope("ma.fast_context");
     options.validate()?;
+    if matches!(options.mode, Mode::Activity25 | Mode::Activity81) {
+        return activity::learn(views, channels, limit, strict, options);
+    }
     let headers = resolve_headers(views, headers, options.predictors)?;
     let mut plans = Vec::new();
     let mut singles = Vec::new();

@@ -1,4 +1,4 @@
-//! Exact fixed-grid repetition, inspired by Cygnus' encodeWithPatches idea.
+//! Exact tiled repetition, inspired by Cygnus' encodeWithPatches idea.
 //! This is an independent Rust detector, not a Java encoder/writer translation.
 //! Hashes are only an index: every admitted occurrence is compared in ALL
 //! supplied planes, including alpha and hidden RGB. The existing standard
@@ -16,16 +16,25 @@ use crate::{Error, Result};
 
 #[path = "patch_tile_admission.rs"]
 mod admission;
+#[path = "patch_off_grid.rs"]
+mod off_grid;
 
 #[derive(Clone, Debug)]
 pub struct TilePatchOptions {
+    /// Search arbitrary pixel origins for exact copies of grid-seeded tiles.
+    /// Independent experimental detector; the fixed-grid default is unchanged.
+    pub off_grid: bool,
+    /// Off-grid seed/occurrence count guard. Exhaustion declines this candidate,
+    /// never truncates input or fails ordinary encoding.
+    pub max_discovery_positions: usize,
     /// Diagnostic bypass of cheap admission. Never enabled by effort alone.
     pub force: bool,
     /// Estimated net saving as a fraction of a cheap sampled pixel-cost proxy.
     pub min_estimated_savings: f64,
     /// Stronger hurdle when a dictionary would leave the frame-area path.
     pub full_frame_min_estimated_savings: f64,
-    /// Complete, disjoint tiles anchored at (0, 0). Partial edges are untouched.
+    /// Seed tiles anchored at (0, 0); off_grid may also match shifted copies.
+    /// Partial edge blocks are never read outside the original image.
     pub tile_size: usize,
     pub min_occurrences: usize,
     /// Retained dictionary limits, not a prefix limit on input discovery.
@@ -39,6 +48,8 @@ pub struct TilePatchOptions {
 impl Default for TilePatchOptions {
     fn default() -> Self {
         Self {
+            off_grid: false,
+            max_discovery_positions: 262_144,
             force: false,
             min_estimated_savings: 0.02,
             full_frame_min_estimated_savings: 0.10,
@@ -78,6 +89,7 @@ impl TilePatchOptions {
             || self.max_unique_tiles == 0
             || self.max_positions == 0
             || self.max_reference_pixels == 0
+            || self.max_discovery_positions == 0
             || !self.min_estimated_savings.is_finite()
             || !(0.0..=1.0).contains(&self.min_estimated_savings)
             || !self.full_frame_min_estimated_savings.is_finite()
@@ -91,6 +103,8 @@ impl TilePatchOptions {
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct TilePatchStats {
+    pub windows_examined: usize,
+    pub discovery_limited: usize,
     pub calls: usize,
     pub tiles_examined: usize,
     pub constant_tiles: usize,
@@ -118,6 +132,8 @@ impl TilePatchReceipt {
     fn record(&self, other: TilePatchStats) {
         let mut total = self.0.lock().unwrap_or_else(|e| e.into_inner());
         total.calls += other.calls;
+        total.windows_examined += other.windows_examined;
+        total.discovery_limited += other.discovery_limited;
         total.tiles_examined += other.tiles_examined;
         total.constant_tiles += other.constant_tiles;
         total.repeated_groups += other.repeated_groups;
@@ -275,17 +291,24 @@ fn discover_inner(
         return Ok(None);
     }
     let mut index = Vec::new();
-    index
-        .try_reserve_exact(count)
-        .map_err(|_| Error::Limit("tile patch index allocation"))?;
-    for y in 0..rows {
-        for x in 0..cols {
-            let origin = y * side * image.width + x * side;
-            stats.tiles_examined += 1;
-            if let Some(hash) = fingerprint(image, origin, side) {
-                index.push(Tile { hash, origin });
-            } else {
-                stats.constant_tiles += 1;
+    if options.off_grid {
+        let Some(found) = off_grid::discover(image, options, stats)? else {
+            return Ok(None);
+        };
+        index = found;
+    } else {
+        index
+            .try_reserve_exact(count)
+            .map_err(|_| Error::Limit("tile patch index allocation"))?;
+        for y in 0..rows {
+            for x in 0..cols {
+                let origin = y * side * image.width + x * side;
+                stats.tiles_examined += 1;
+                if let Some(hash) = fingerprint(image, origin, side) {
+                    index.push(Tile { hash, origin });
+                } else {
+                    stats.constant_tiles += 1;
+                }
             }
         }
     }
@@ -297,6 +320,10 @@ fn discover_inner(
             .cmp(&a.len())
             .then(index[a.start].origin.cmp(&index[b.start].origin))
     });
+    if options.off_grid {
+        (index, ranges) =
+            off_grid::disjoint(image.width, side, &index, &ranges, options.min_occurrences);
+    }
     ranges.truncate(
         options
             .max_unique_tiles

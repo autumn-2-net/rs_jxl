@@ -12,6 +12,8 @@ use super::{
 
 #[derive(Default)]
 pub(super) struct PropertyScratch {
+    pub(super) lookahead_width: usize,
+    pub(super) lookahead_candidates: Vec<super::Split>,
     pub(super) symmetric: super::split_scoring::pr5007::SymmetricScratch,
     pub(super) dominated_predictors: usize,
     pub(super) splits: Vec<HistogramSplit>,
