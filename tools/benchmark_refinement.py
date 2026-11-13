@@ -26,7 +26,8 @@ from compare_cpp_port import (
 
 OFFSET_MODES = ("mean", "median", "entropy", "distribution")
 VARIANTS = ("baseline", "frozen", "entropy", "leaves", "combined",
-            "offset-mean", "offset-median", "offset-entropy", "offset-distribution", "context-map")
+            "offset-mean", "offset-median", "offset-entropy", "offset-distribution", "context-map",
+            "frozen-offset-distribution")
 
 
 def arguments(argv=None):
@@ -61,7 +62,7 @@ def arguments(argv=None):
         p.error("Invalid threads/repeats/warmups/timeout/leaf-offset-samples/context-map limits")
     if "baseline" not in args.variants or len(set(args.variants)) != len(args.variants):
         p.error("Use distinct variants including baseline")
-    if "frozen" in args.variants and args.frozen is None:
+    if any(v.startswith("frozen") for v in args.variants) and args.frozen is None:
         p.error("frozen variant requires --frozen")
     if not args.case and args.manifest is None and not args.synthetic:
         p.error("Provide --case, --manifest or --synthetic")
@@ -101,7 +102,9 @@ def fixtures(folder):
 
 
 def command(args, source, output, variant):
-    encoder = args.frozen if variant == "frozen" else args.encoder
+    encoder = args.frozen if variant.startswith("frozen") else args.encoder
+    if variant == "frozen-offset-distribution":
+        variant = "offset-distribution"
     result = [str(encoder), str(source), "--effort", str(args.effort),
               "--threads", str(args.threads), "--model-costs", "--output", str(output)]
     if args.buffering is not None:
@@ -124,6 +127,8 @@ def command(args, source, output, variant):
 def validate_receipt(measurement, variant):
     if variant == "frozen":
         return
+    if variant == "frozen-offset-distribution":
+        variant = "offset-distribution"
     if "refinement" not in measurement:
         raise ValueError("Missing refinement receipt")
     receipt = measurement["refinement"]
@@ -167,6 +172,10 @@ def validate_receipt(measurement, variant):
             raise ValueError(f"Invalid refinement timer {key}")
     if offset_mode is None and receipt["offset_seconds"] != 0:
         raise ValueError("Unrequested offset fitting timer")
+    for key in ("offset_token_fits", "offset_reused_tokens", "offset_raw_reused_tokens"):
+        if key in receipt and (type(receipt[key]) is not int or receipt[key] < 0
+                               or (offset_mode != "distribution" and receipt[key] != 0)):
+            raise ValueError(f"Invalid Distribution reuse counter {key}")
     context_map_fields = ("context_map", "context_map_shortlist", "context_map_merge_limit",
                           "context_map_proposals", "context_map_wins", "context_map_proposed_merges",
                           "context_map_selected_merges", "context_map_pairs", "context_map_map_trials",

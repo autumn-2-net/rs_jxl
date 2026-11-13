@@ -486,3 +486,292 @@ fn distribution_configuration_routes_to_bfs_context_not_node_index() {
         }
     }
 }
+
+#[test]
+fn literal_fit_matches_pixel_walk_for_signed_depths_offsets_and_stream_order() {
+    use crate::entropy::stream::Token;
+    for predictor in [
+        Predictor::Zero,
+        Predictor::Left,
+        Predictor::Top,
+        Predictor::Gradient,
+        Predictor::Select,
+        Predictor::Average0,
+        Predictor::Average1,
+        Predictor::Average2,
+        Predictor::Average3,
+        Predictor::Average4,
+        Predictor::TopRight,
+        Predictor::TopLeft,
+        Predictor::LeftLeft,
+    ] {
+        for scale in [1, 257] {
+            let make_leaf = |offset| Node::Leaf {
+                predictor,
+                offset,
+                multiplier: 1,
+            };
+            let tree = Tree::new(vec![
+                Node::Split {
+                    property: 0,
+                    threshold: 0,
+                    greater: 1,
+                    less_equal: 2,
+                },
+                Node::Split {
+                    property: 0,
+                    threshold: 1,
+                    greater: 3,
+                    less_equal: 4,
+                },
+                make_leaf(i32::MAX),
+                make_leaf(-37),
+                make_leaf(i32::MIN),
+            ])
+            .unwrap();
+            let make_channels = |seed| {
+                (0..3)
+                    .map(|c| Channel {
+                        width: 17,
+                        height: 3,
+                        hshift: 0,
+                        vshift: 0,
+                        samples: (0..51)
+                            .map(|i| ((i * 73 + c * 31 + seed) % 256 - 128) * scale)
+                            .collect(),
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let a = make_channels(7);
+            let b = make_channels(49);
+            let views = [
+                TrainingStream {
+                    stream_id: 9,
+                    ..stream(&a)
+                },
+                TrainingStream {
+                    stream_id: 2,
+                    ..stream(&b)
+                },
+            ];
+            let encode_options = encode::ModularOptions {
+                lz77: false,
+                ..Default::default()
+            };
+            let mut tokens: Vec<Vec<Token>> = vec![vec![]];
+            for view in &views {
+                tokens.push(
+                    encode::group_stream(
+                        view.channels,
+                        &tree,
+                        &encode_options,
+                        &view.wp,
+                        view.stream_id,
+                    )
+                    .unwrap()
+                    .0,
+                );
+                tokens.push(vec![]);
+            }
+            let options = OffsetOptions {
+                mode: OffsetMode::Distribution,
+                samples_per_leaf: 7,
+            };
+            let (mut pixel_samples, _) = collect_leaves(&tree, &options).unwrap();
+            let (mut token_samples, _) = collect_leaves(&tree, &options).unwrap();
+            for (view, encoded) in [(&views[1], &tokens[3]), (&views[0], &tokens[1])] {
+                encode::visit(
+                    view.channels,
+                    &view.wp,
+                    false,
+                    0,
+                    view.stream_id,
+                    |_, _, neighbors, weighted, properties, value| {
+                        let (context, predictor, _, _) = tree.lookup(properties)?;
+                        let prediction =
+                            predict_one(predictor, neighbors, Some(i64::from(weighted))).unwrap();
+                        pixel_samples[context]
+                            .as_mut()
+                            .unwrap()
+                            .add(i64::from(value) - prediction, 7)
+                    },
+                )
+                .unwrap();
+                for token in encoded {
+                    let sample = token_samples[token.context].as_mut().unwrap();
+                    let signed = ((token.value >> 1) as i32) ^ -((token.value & 1) as i32);
+                    sample
+                        .add(i64::from(signed.wrapping_add(sample.baseline)), 7)
+                        .unwrap();
+                }
+            }
+            for (pixel, token) in pixel_samples
+                .iter()
+                .flatten()
+                .zip(token_samples.iter().flatten())
+            {
+                assert_eq!(
+                    (pixel.count, pixel.sum, pixel.random, pixel.all_zero),
+                    (token.count, token.sum, token.random, token.all_zero)
+                );
+                assert_eq!(pixel.values, token.values);
+            }
+            let configs = [
+                HybridUintConfig::new(0, 0, 0).unwrap(),
+                HybridUintConfig::default(),
+                HybridUintConfig::new(4, 1, 2).unwrap(),
+            ];
+            let (pixel, ps) = fit_with_configs(&tree, &views, 0, &options, Some(&configs)).unwrap();
+            let (cached, cs) = fit_tokens(&tree, &views, 0, &tokens, &options, Some(&configs))
+                .unwrap()
+                .expect("safe literals");
+            assert_eq!(format!("{pixel:?}"), format!("{cached:?}"));
+            assert_eq!(
+                (ps.samples, ps.population, ps.candidates, ps.leaves),
+                (cs.samples, cs.population, cs.candidates, cs.leaves)
+            );
+            assert_eq!(cs.samples, 21);
+            assert_eq!(cs.population, 306);
+            // Check every remapped value against fresh native tokenization,
+            // independently of whether the distribution proxy proposes a win.
+            let mut nodes = tree.nodes().to_vec();
+            for (node, offset) in [(2, i32::MIN), (3, 81), (4, i32::MAX)] {
+                if let Node::Leaf { offset: value, .. } = &mut nodes[node] {
+                    *value = offset;
+                }
+            }
+            let after = Tree::new(nodes).unwrap();
+            assert_eq!(remap_tokens(&tree, &after, &mut tokens).unwrap(), 306);
+            for (view, cached) in views.iter().zip(tokens.iter().filter(|s| !s.is_empty())) {
+                let fresh = encode::group_stream(
+                    view.channels,
+                    &after,
+                    &encode_options,
+                    &view.wp,
+                    view.stream_id,
+                )
+                .unwrap()
+                .0;
+                assert_eq!(*cached, fresh);
+            }
+        }
+    }
+}
+
+#[test]
+fn literal_fit_explicitly_falls_back_for_wide_weighted_and_nonunit_data() {
+    let options = OffsetOptions {
+        mode: OffsetMode::Distribution,
+        ..Default::default()
+    };
+    for (predictor, multiplier, values) in [
+        (Predictor::Left, 1, vec![i32::MIN, 0]),
+        (Predictor::Weighted, 1, vec![10, -20]),
+        (Predictor::Zero, 2, vec![100, 102]),
+    ] {
+        let tree = Tree::new(vec![Node::Leaf {
+            predictor,
+            offset: 0,
+            multiplier,
+        }])
+        .unwrap();
+        let channels = [plane(values)];
+        let view = stream(&channels);
+        let encoding = encode::ModularOptions {
+            lz77: false,
+            ..Default::default()
+        };
+        let tokens = vec![
+            encode::group_stream(&channels, &tree, &encoding, &view.wp, 0)
+                .unwrap()
+                .0,
+        ];
+        assert!(
+            fit_tokens(&tree, &[view], 0, &tokens, &options, None)
+                .unwrap()
+                .is_none()
+        );
+        // Falling back still uses wide means and normal multiplier eligibility.
+        fit(&tree, &[stream(&channels)], 0, &options).unwrap();
+    }
+}
+
+#[test]
+fn raw_remapping_preserves_wide_residuals_and_rejects_incompatible_trees() {
+    let before = Tree::new(vec![Node::Leaf {
+        predictor: Predictor::Left,
+        offset: i32::MAX,
+        multiplier: 1,
+    }])
+    .unwrap();
+    let after = Tree::new(vec![Node::Leaf {
+        predictor: Predictor::Left,
+        offset: i32::MIN,
+        multiplier: 1,
+    }])
+    .unwrap();
+    let channels = [plane(vec![i32::MIN, i32::MAX, 0, -1].repeat(32))];
+    let wp = weighted::Header::default();
+    let mut raw = vec![
+        super::super::tokens::tokenize(&channels, &before, &wp, 0, 5, false).unwrap(),
+        vec![],
+    ];
+    assert_eq!(
+        remap_literals(&before, &after, &mut raw).unwrap(),
+        Some(128)
+    );
+    assert_eq!(
+        raw[0],
+        super::super::tokens::tokenize(&channels, &after, &wp, 0, 5, false).unwrap()
+    );
+    for incompatible in [leaf(0, 2), leaf(0, 1)] {
+        let other = Tree::new(vec![incompatible]).unwrap();
+        let unchanged = raw.clone();
+        assert_eq!(remap_literals(&before, &other, &mut raw).unwrap(), None);
+        assert_eq!(raw, unchanged);
+    }
+}
+
+#[test]
+fn stateless_literal_fit_bound_prevents_modulo_aliases_at_extreme_offsets() {
+    use crate::modular::predictor::Neighbors;
+    const B: i32 = (1 << 28) - 1;
+    for predictor in [
+        Predictor::Zero,
+        Predictor::Left,
+        Predictor::Top,
+        Predictor::Gradient,
+        Predictor::Select,
+        Predictor::Average0,
+        Predictor::Average1,
+        Predictor::Average2,
+        Predictor::Average3,
+        Predictor::Average4,
+        Predictor::TopRight,
+        Predictor::TopLeft,
+        Predictor::LeftLeft,
+    ] {
+        for mask in 0..128 {
+            let n = |bit| if mask & (1 << bit) == 0 { -B } else { B };
+            let neighbors = Neighbors {
+                left: n(0),
+                top: n(1),
+                toptop: n(2),
+                topleft: n(3),
+                topright: n(4),
+                leftleft: n(5),
+                toprightright: n(6),
+            };
+            let prediction = predict_one(predictor, neighbors, None).unwrap();
+            for pixel in [-B, B] {
+                let residual = i64::from(pixel) - prediction;
+                assert!(i32::try_from(residual).is_ok());
+                for offset in [i32::MIN, -17, 0, 17, i32::MAX] {
+                    let packed = pack_signed((residual - i64::from(offset)) as i32);
+                    let signed = ((packed >> 1) as i32) ^ -((packed & 1) as i32);
+                    assert_eq!(i64::from(signed.wrapping_add(offset)), residual);
+                }
+            }
+        }
+    }
+}

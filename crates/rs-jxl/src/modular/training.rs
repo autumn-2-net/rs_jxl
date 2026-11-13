@@ -774,6 +774,21 @@ impl SourceGather<'_, '_> {
             &self.policy.properties,
             execution::worker_count() > 1,
         )?;
+        if crate::profile::enabled() {
+            for wave in &waves {
+                crate::profile::note(
+                    "gather.plan",
+                    format!(
+                        "mode={:?} tasks={} chunks={} estimated_bytes={:.0} budget_bytes={}",
+                        options.mode,
+                        wave.tasks.len(),
+                        wave.chunks.len(),
+                        wave.estimated_bytes,
+                        options.batch_budget_bytes,
+                    ),
+                );
+            }
+        }
         // Tasks partition each eligible plane; warm-up rows never collect samples.
         // Each visited pixel can therefore consume at most one local allowance.
         let local_budget = (output.stats.visited_pixels > self.sample_limit as u64)

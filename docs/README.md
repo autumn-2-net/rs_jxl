@@ -203,6 +203,9 @@ rejected experiments and remaining limitations remain part of the record.
 - [Source Patch speed, block hybrids and bpp/time plots, 2026-11-12](SOURCE_PATCH_SPEED_20261112.md)
 - [Two-ply MA lookahead and 42-RCT / cross-channel joint search, 2026-11-12](MA_LOOKAHEAD_RCT_JOINT_20261112.md)
 - [Static joint-gradient MA context experiment, 2026-11-12](STATIC_ACTIVITY_CONTEXT_20261112.md)
+- [Source Patch integer background and deferred Delta computation, 2026-11-13](SOURCE_PATCH_DETECTOR_SPEED_20261113.md)
+- [Source Patch and full-pipeline hotspots on 50 images, 2026-11-13](SOURCE_PATCH_STAGE_PROFILE_20261113.md)
+- [Patch, cross-channel MA and Offset reuse follow-up, 2026-11-13](PATCH_MA_OFFSET_FOLLOWUP_20261113.md)
 
 ### Decoding and Reconstruction
 

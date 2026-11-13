@@ -475,3 +475,132 @@ fn unaligned_local_trials_preserve_prefix_and_have_no_larger_payload() {
         );
     }
 }
+
+#[test]
+fn local_source_lz_offset_reuse_reparses_and_preserves_actual_cost_selection() {
+    use crate::entropy::{HybridUintConfig, options::UintConfigStrategy};
+    use crate::modular::group::Channel;
+    use crate::tools::lz77::{SourceConfig, SourceLz77Method};
+    let tree = Tree::new(vec![Node::Leaf {
+        predictor: Predictor::Zero,
+        offset: 17,
+        multiplier: 1,
+    }])
+    .unwrap();
+    let planes = [Channel {
+        width: 64,
+        height: 16,
+        hshift: 0,
+        vshift: 0,
+        samples: (0..1024).map(|i| 1000 + i % 3).collect(),
+    }];
+    let wp = weighted::Header::default();
+    let receipt = Arc::new(Receipt::default());
+    let mut options = encode::ModularOptions::default();
+    options.entropy_options.uint_config =
+        UintConfigStrategy::Fixed(HybridUintConfig::new(0, 0, 0).unwrap());
+    options.source_lz77 = Some(SourceConfig {
+        method: SourceLz77Method::Optc256,
+        length_uint_config: options.entropy_options.lz77_length_config,
+        min_symbol: Some(options.entropy_options.lz77_min_symbol),
+        ..Default::default()
+    });
+    options.refinement.offsets = Some(OffsetOptions {
+        mode: OffsetMode::Distribution,
+        ..Default::default()
+    });
+    options.refinement.receipt = Some(receipt.clone());
+    let mut optimized = BitWriter::new(1 << 20);
+    write_local(&tree, &planes, &wp, 4, &options, &mut optimized).unwrap();
+    let stats = receipt.snapshot();
+    assert_eq!(stats.offset_proposals, 1);
+    assert_eq!(stats.offset_raw_reused_tokens, 1024);
+    assert_eq!(stats.offset_token_fits, 0);
+    // The uncached comparison invokes native tokenization and source parsing
+    // afresh for every tree, independently of the production raw cache.
+    options.refinement.receipt = None;
+    let views = [training::TrainingStream {
+        channels: &planes,
+        wp,
+        stream_id: 4,
+    }];
+    let fresh_bits = choose(
+        &tree,
+        &views,
+        &options,
+        |candidate| {
+            let (tokens, enabled) = encode::group_stream(&planes, candidate, &options, &wp, 4)?;
+            Ok((vec![tokens], enabled))
+        },
+        |candidate, model, streams, scratch| {
+            let mut writer = BitWriter::new(1 << 20);
+            encode::write_tree_and_model(candidate, model, &mut writer, scratch)?;
+            model.write_stream(&streams[0], &mut writer)?;
+            Ok((writer.bits_written(), writer.bits_written()))
+        },
+    )
+    .unwrap();
+    assert_eq!(optimized.bits_written(), fresh_bits);
+    assert!(stats.models >= 2);
+}
+
+#[test]
+fn literal_offset_reuse_keeps_strict_actual_size_fallback() {
+    use crate::entropy::{HybridUintConfig, options::UintConfigStrategy};
+    use crate::modular::group::Channel;
+    let tree = Tree::new(vec![Node::Leaf {
+        predictor: Predictor::Zero,
+        offset: 17,
+        multiplier: 1,
+    }])
+    .unwrap();
+    let planes = [Channel {
+        width: 512,
+        height: 1,
+        hshift: 0,
+        vshift: 0,
+        samples: vec![1000; 512],
+    }];
+    let wp = weighted::Header::default();
+    let views = [training::TrainingStream {
+        channels: &planes,
+        wp,
+        stream_id: 0,
+    }];
+    for candidate_bits in [80, 100, 120] {
+        let receipt = Arc::new(Receipt::default());
+        let mut options = encode::ModularOptions {
+            lz77: false,
+            ..Default::default()
+        };
+        options.entropy_options.uint_config =
+            UintConfigStrategy::Fixed(HybridUintConfig::new(0, 0, 0).unwrap());
+        options.refinement.offsets = Some(OffsetOptions {
+            mode: OffsetMode::Distribution,
+            ..Default::default()
+        });
+        options.refinement.receipt = Some(receipt.clone());
+        let calls = Cell::new(0);
+        let selected = choose(
+            &tree,
+            &views,
+            &options,
+            |candidate| {
+                calls.set(calls.get() + 1);
+                let (tokens, enabled) = encode::group_stream(&planes, candidate, &options, &wp, 0)?;
+                Ok((vec![tokens], enabled))
+            },
+            |candidate, _, _, _| {
+                let Node::Leaf { offset, .. } = candidate.nodes()[0] else {
+                    unreachable!()
+                };
+                Ok((if offset == 17 { 100 } else { candidate_bits }, offset))
+            },
+        )
+        .unwrap();
+        assert_eq!(selected != 17, candidate_bits < 100);
+        assert_eq!(calls.get(), 1);
+        assert_eq!(receipt.snapshot().offset_token_fits, 1);
+        assert_eq!(receipt.snapshot().offset_reused_tokens, 512);
+    }
+}

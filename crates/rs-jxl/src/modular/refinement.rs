@@ -2,9 +2,11 @@
 //! refitting and entropy-mode comparison; no external codec dependency.
 //!
 //! Each entropy alternative reuses the same tokens, LZ parse, transforms and
-//! tree. Leaf proposals only retokenize/reparse after learning; training and
-//! preparation are not repeated. Only actual serialized costs select a winner.
+//! tree. Literal-only Distribution trials can reuse baseline residual tokens;
+//! other leaf proposals retokenize/reparse after learning. Training/preparation
+//! are not repeated. Only actual serialized costs select a winner.
 
+use std::cell::{Cell, RefCell};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -47,6 +49,12 @@ pub struct Stats {
     pub offset_population: usize,
     pub offset_candidates: usize,
     pub offset_seconds: f64,
+    /// Distribution fits that avoided the predictor/property pixel walk.
+    pub offset_token_fits: usize,
+    /// Literal tokens reused for a proposed offset tree, without retokenizing.
+    pub offset_reused_tokens: usize,
+    /// Pre-LZ literals reused; candidates still run the original LZ parser.
+    pub offset_raw_reused_tokens: usize,
     pub context_map_proposals: usize,
     pub context_map_wins: usize,
     pub context_map_proposed_merges: usize,
@@ -72,6 +80,13 @@ impl Receipt {
         self.0.lock().expect("refinement receipt poisoned").clone()
     }
 
+    pub(super) fn record_raw_reuse(&self, tokens: usize) {
+        self.0
+            .lock()
+            .expect("refinement receipt poisoned")
+            .offset_raw_reused_tokens += tokens;
+    }
+
     fn record(&self, stats: &Stats) {
         let mut total = self.0.lock().expect("refinement receipt poisoned");
         total.domains += stats.domains;
@@ -85,6 +100,9 @@ impl Receipt {
         total.offset_population += stats.offset_population;
         total.offset_candidates += stats.offset_candidates;
         total.offset_seconds += stats.offset_seconds;
+        total.offset_token_fits += stats.offset_token_fits;
+        total.offset_reused_tokens += stats.offset_reused_tokens;
+        total.offset_raw_reused_tokens += stats.offset_raw_reused_tokens;
         total.context_map_proposals += stats.context_map_proposals;
         total.context_map_wins += stats.context_map_wins;
         total.context_map_proposed_merges += stats.context_map_proposed_merges;
@@ -117,6 +135,17 @@ enum Origin {
     Offsets,
 }
 
+pub(super) fn reuse_literals(tree: &Tree, options: &encode::ModularOptions) -> bool {
+    options
+        .refinement
+        .offsets
+        .as_ref()
+        .is_some_and(|o| o.mode == OffsetMode::Distribution)
+        && tree.nodes().iter().all(
+            |node| !matches!(node, super::tree::Node::Leaf { multiplier, .. } if *multiplier != 1),
+        )
+}
+
 pub(super) fn choose<T>(
     tree: &Tree,
     views: &[training::TrainingStream<'_>],
@@ -131,115 +160,131 @@ pub(super) fn choose<T>(
     };
     let mut best: Option<Trial<T>> = None;
     let mut original_bits = 0;
-    let mut evaluate =
-        |tree: &Tree, origin: Origin| -> Result<Option<Vec<crate::entropy::HybridUintConfig>>> {
-            let (streams, lz77) = tokenize(tree)?;
+    let mut evaluate = |tree: &Tree,
+                        origin: Origin,
+                        reused: Option<Vec<Vec<Token>>>|
+     -> Result<(
+        Option<Vec<crate::entropy::HybridUintConfig>>,
+        Option<Vec<Vec<Token>>>,
+    )> {
+        let (streams, lz77) = if let Some(streams) = reused {
+            (streams, false)
+        } else {
+            tokenize(tree)?
+        };
+        let start = Instant::now();
+        let base = Model::build_with_options(
+            &streams,
+            tree.leaves() + usize::from(lz77),
+            lz77,
+            options.entropy,
+            &options.entropy_options,
+        )?;
+        stats.model_seconds += start.elapsed().as_secs_f64();
+        let offset_configs = if origin == Origin::Original
+            && options
+                .refinement
+                .offsets
+                .as_ref()
+                .is_some_and(|o| o.mode == OffsetMode::Distribution)
+        {
+            let mut configs = Vec::new();
+            configs
+                .try_reserve_exact(tree.leaves())
+                .map_err(|_| Error::Limit("offset model configurations"))?;
+            for context in 0..tree.leaves() {
+                configs.push(base.context_uint_config(context).ok_or_else(|| {
+                    Error::Encoding("missing offset context configuration".into())
+                })?);
+            }
+            Some(configs)
+        } else {
+            None
+        };
+        let other_coding = if base.uses_ans() {
+            Coding::Prefix
+        } else {
+            Coding::Ans
+        };
+        let mut write = |model: &Model, alternate: bool, map_merges: usize| -> Result<()> {
+            let mut scratch = options.clone();
+            // Scratch output must not charge the final model-cost receipt.
+            scratch.model_cost_receipt = options
+                .model_cost_receipt
+                .as_ref()
+                .map(|_| Arc::new(encode::receipt_cost::ModelCostReceipt::default()));
             let start = Instant::now();
-            let base = Model::build_with_options(
+            let result = serialize(tree, model, &streams, &scratch);
+            stats.write_seconds += start.elapsed().as_secs_f64();
+            let (bits, value) = match result {
+                Ok(output) => output,
+                // A successful baseline remains usable when a larger optional
+                // output reaches the writer ceiling. Allocation/coding errors
+                // are distinct and must not be hidden by this fallback.
+                Err(Error::Limit("encoded output size")) if best.is_some() => return Ok(()),
+                Err(error) => return Err(error),
+            };
+            stats.models += 1;
+            if best.is_none() {
+                original_bits = bits;
+            }
+            if best.as_ref().is_none_or(|old| bits < old.bits) {
+                best = Some(Trial {
+                    value,
+                    bits,
+                    costs: scratch.model_cost_receipt,
+                    origin,
+                    alternate,
+                    map_merges,
+                });
+            }
+            Ok(())
+        };
+        write(&base, false, 0)?;
+        if let Some(search) = &options.refinement.context_map {
+            let start = Instant::now();
+            let candidates =
+                base.context_map_candidates(&streams, &options.entropy_options, search)?;
+            stats.context_map_seconds += start.elapsed().as_secs_f64();
+            if let Some((models, work)) = candidates {
+                stats.context_map_proposals += models.len();
+                stats.context_map_proposed_merges += work.merges;
+                stats.context_map_pairs += work.pairs;
+                stats.context_map_map_trials += work.map_trials;
+                for (model, merges) in models {
+                    write(&model, false, merges)?;
+                }
+            } else {
+                stats.context_map_skipped += 1;
+            }
+        }
+        if options.refinement.entropy {
+            let start = Instant::now();
+            let alternate = Model::build_with_options(
                 &streams,
                 tree.leaves() + usize::from(lz77),
                 lz77,
-                options.entropy,
+                other_coding,
                 &options.entropy_options,
-            )?;
+            );
             stats.model_seconds += start.elapsed().as_secs_f64();
-            let offset_configs = if origin == Origin::Original
-                && options
-                    .refinement
-                    .offsets
-                    .as_ref()
-                    .is_some_and(|o| o.mode == OffsetMode::Distribution)
-            {
-                let mut configs = Vec::new();
-                configs
-                    .try_reserve_exact(tree.leaves())
-                    .map_err(|_| Error::Limit("offset model configurations"))?;
-                for context in 0..tree.leaves() {
-                    configs.push(base.context_uint_config(context).ok_or_else(|| {
-                        Error::Encoding("missing offset context configuration".into())
-                    })?);
-                }
-                Some(configs)
-            } else {
-                None
-            };
-            let other_coding = if base.uses_ans() {
-                Coding::Prefix
-            } else {
-                Coding::Ans
-            };
-            let mut write = |model: &Model, alternate: bool, map_merges: usize| -> Result<()> {
-                let mut scratch = options.clone();
-                // Scratch output must not charge the final model-cost receipt.
-                scratch.model_cost_receipt = options
-                    .model_cost_receipt
-                    .as_ref()
-                    .map(|_| Arc::new(encode::receipt_cost::ModelCostReceipt::default()));
-                let start = Instant::now();
-                let result = serialize(tree, model, &streams, &scratch);
-                stats.write_seconds += start.elapsed().as_secs_f64();
-                let (bits, value) = match result {
-                    Ok(output) => output,
-                    // A successful baseline remains usable when a larger optional
-                    // output reaches the writer ceiling. Allocation/coding errors
-                    // are distinct and must not be hidden by this fallback.
-                    Err(Error::Limit("encoded output size")) if best.is_some() => return Ok(()),
-                    Err(error) => return Err(error),
-                };
-                stats.models += 1;
-                if best.is_none() {
-                    original_bits = bits;
-                }
-                if best.as_ref().is_none_or(|old| bits < old.bits) {
-                    best = Some(Trial {
-                        value,
-                        bits,
-                        costs: scratch.model_cost_receipt,
-                        origin,
-                        alternate,
-                        map_merges,
-                    });
-                }
-                Ok(())
-            };
-            write(&base, false, 0)?;
-            if let Some(search) = &options.refinement.context_map {
-                let start = Instant::now();
-                let candidates =
-                    base.context_map_candidates(&streams, &options.entropy_options, search)?;
-                stats.context_map_seconds += start.elapsed().as_secs_f64();
-                if let Some((models, work)) = candidates {
-                    stats.context_map_proposals += models.len();
-                    stats.context_map_proposed_merges += work.merges;
-                    stats.context_map_pairs += work.pairs;
-                    stats.context_map_map_trials += work.map_trials;
-                    for (model, merges) in models {
-                        write(&model, false, merges)?;
-                    }
-                } else {
-                    stats.context_map_skipped += 1;
-                }
+            match alternate {
+                Ok(model) => write(&model, true, 0)?,
+                // An explicitly wide prefix alphabet need not fit ANS.
+                Err(Error::InvalidInput(_)) if matches!(other_coding, Coding::Ans) => {}
+                Err(error) => return Err(error),
             }
-            if options.refinement.entropy {
-                let start = Instant::now();
-                let alternate = Model::build_with_options(
-                    &streams,
-                    tree.leaves() + usize::from(lz77),
-                    lz77,
-                    other_coding,
-                    &options.entropy_options,
-                );
-                stats.model_seconds += start.elapsed().as_secs_f64();
-                match alternate {
-                    Ok(model) => write(&model, true, 0)?,
-                    // An explicitly wide prefix alphabet need not fit ANS.
-                    Err(Error::InvalidInput(_)) if matches!(other_coding, Coding::Ans) => {}
-                    Err(error) => return Err(error),
-                }
-            }
-            Ok(offset_configs)
-        };
-    let offset_configs = evaluate(tree, Origin::Original)?;
+        }
+        let reusable = offset_configs.is_some()
+                && !options.lz77
+                && !lz77
+                && tree.nodes().iter().all(|node| {
+                    !matches!(node, super::tree::Node::Leaf { multiplier, .. } if *multiplier != 1)
+                })
+                && streams.iter().flatten().all(|t| !t.is_length && t.context < tree.leaves());
+        Ok((offset_configs, reusable.then_some(streams)))
+    };
+    let (offset_configs, mut offset_tokens) = evaluate(tree, Origin::Original, None)?;
     // Explicit fixed trees/predictor plans remain exact user instructions.
     if options.refinement.leaves
         && options.fixed_tree.is_none()
@@ -256,12 +301,27 @@ pub(super) fn choose<T>(
         stats.refit_seconds += start.elapsed().as_secs_f64();
         if let Some(refined) = refined {
             stats.refit_proposals += 1;
-            evaluate(&refined, Origin::Predictors)?;
+            evaluate(&refined, Origin::Predictors, None)?;
         }
     }
     if let Some(offsets) = &options.refinement.offsets {
         let start = Instant::now();
-        let (refined, fitted) = if let Some(configs) = offset_configs.as_deref() {
+        let cached_fit = if let Some(tokens) = offset_tokens.as_deref() {
+            super::leaf_offset::fit_tokens(
+                tree,
+                views,
+                options.previous_channels,
+                tokens,
+                offsets,
+                offset_configs.as_deref(),
+            )?
+        } else {
+            None
+        };
+        let (refined, fitted) = if let Some(fitted) = cached_fit {
+            stats.offset_token_fits += 1;
+            fitted
+        } else if let Some(configs) = offset_configs.as_deref() {
             super::leaf_offset::fit_with_configs(
                 tree,
                 views,
@@ -279,7 +339,11 @@ pub(super) fn choose<T>(
         stats.offset_candidates += fitted.candidates;
         if let Some(refined) = refined {
             stats.offset_proposals += 1;
-            evaluate(&refined, Origin::Offsets)?;
+            if let Some(tokens) = &mut offset_tokens {
+                stats.offset_reused_tokens +=
+                    super::leaf_offset::remap_tokens(tree, &refined, tokens)?;
+            }
+            evaluate(&refined, Origin::Offsets, offset_tokens.take())?;
         }
     }
     let best = best.expect("baseline was encoded");
@@ -311,12 +375,38 @@ pub(super) fn write_local(
         wp: *wp,
         stream_id,
     }];
+    let cache_raw = options.lz77 && reuse_literals(tree, options);
+    let raw_cache = RefCell::new(None::<Vec<Vec<crate::tools::lz77::Literal>>>);
+    let raw_reused = Cell::new(0);
     let best = choose(
         tree,
         &views,
         options,
-        |tree| {
-            let (tokens, lz77) = encode::group_stream(planes, tree, options, wp, stream_id)?;
+        |candidate| {
+            let width = planes.iter().map(|c| c.width).max().unwrap_or(1);
+            if cache_raw && std::ptr::eq(candidate, tree) {
+                let raw = super::tokens::tokenize(
+                    planes,
+                    candidate,
+                    wp,
+                    options.previous_channels,
+                    stream_id,
+                    false,
+                )?;
+                let (tokens, lz77) =
+                    encode::parse_group_tokens(&raw, candidate.leaves(), width, options)?;
+                *raw_cache.borrow_mut() = Some(vec![raw]);
+                return Ok((vec![tokens], lz77));
+            }
+            if let Some(raw) = raw_cache.borrow_mut().as_mut()
+                && let Some(count) = super::leaf_offset::remap_literals(tree, candidate, raw)?
+            {
+                let (tokens, lz77) =
+                    encode::parse_group_tokens(&raw[0], candidate.leaves(), width, options)?;
+                raw_reused.set(raw_reused.get() + count);
+                return Ok((vec![tokens], lz77));
+            }
+            let (tokens, lz77) = encode::group_stream(planes, candidate, options, wp, stream_id)?;
             Ok((vec![tokens], lz77))
         },
         |tree, model, streams, scratch| {
@@ -326,6 +416,9 @@ pub(super) fn write_local(
             Ok((output.bits_written(), output))
         },
     )?;
+    if let Some(receipt) = &options.refinement.receipt {
+        receipt.record_raw_reuse(raw_reused.get());
+    }
     writer.append_unaligned(&best)?;
     Ok(())
 }

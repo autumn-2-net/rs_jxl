@@ -96,11 +96,50 @@ pub(super) fn encode_prepared_shared_borrowed_trial(
         training::learn(&views, options)?
     };
     if options.refinement.enabled() {
+        let cache_raw = options.lz77 && super::refinement::reuse_literals(&tree, options);
+        let raw_cache = std::cell::RefCell::new(None::<Vec<Vec<crate::tools::lz77::Literal>>>);
+        let raw_reused = std::cell::Cell::new(0usize);
         let (global, encoded) = super::refinement::choose(
             &tree,
             &views,
             options,
-            |tree| shared_streams(&prepared, tree, options),
+            |candidate| {
+                if cache_raw && std::ptr::eq(candidate, &tree) {
+                    let parallel_channels = super::tokens::shared_channel_parallel(
+                        prepared.iter().copied(),
+                        options.parallel_tokens,
+                    )?;
+                    let tokenize = |g: &Prepared| {
+                        super::tokens::tokenize(
+                            &g.planes,
+                            candidate,
+                            &g.wp,
+                            options.previous_channels,
+                            g.stream_id,
+                            parallel_channels,
+                        )
+                    };
+                    let raw = if parallel_channels {
+                        prepared
+                            .iter()
+                            .map(|g| tokenize(g))
+                            .collect::<Result<Vec<_>>>()?
+                    } else {
+                        execution::try_map(&prepared, |_, g| tokenize(g))?
+                    };
+                    let parsed = parse_shared_raw(&prepared, candidate, options, &raw)?;
+                    *raw_cache.borrow_mut() = Some(raw);
+                    return Ok(parsed);
+                }
+                if let Some(raw) = raw_cache.borrow_mut().as_mut()
+                    && let Some(count) = super::leaf_offset::remap_literals(&tree, candidate, raw)?
+                {
+                    let parsed = parse_shared_raw(&prepared, candidate, options, raw)?;
+                    raw_reused.set(raw_reused.get() + count);
+                    return Ok(parsed);
+                }
+                shared_streams(&prepared, candidate, options)
+            },
             |tree, model, streams, scratch| {
                 let output = write_shared(
                     single, &prepared, tree, model, streams, scratch, limit, patches, None,
@@ -124,6 +163,9 @@ pub(super) fn encode_prepared_shared_borrowed_trial(
                 Ok((cost, output))
             },
         )?;
+        if let Some(receipt) = &options.refinement.receipt {
+            receipt.record_raw_reuse(raw_reused.get());
+        }
         if single {
             return Ok(TrialEncode::Complete((global, encoded)));
         }
@@ -155,9 +197,7 @@ fn shared_streams(
 ) -> Result<(Vec<Vec<crate::entropy::stream::Token>>, bool)> {
     let parallel_channels =
         super::tokens::shared_channel_parallel(prepared.iter().copied(), options.parallel_tokens)?;
-    let streams = if options.lz77
-        && let Some(source_lz77) = &options.source_lz77
-    {
+    let streams = if options.lz77 && options.source_lz77.is_some() {
         let tokenize = |g: &Prepared| {
             super::tokens::tokenize(
                 &g.planes,
@@ -176,24 +216,7 @@ fn shared_streams(
         } else {
             execution::try_map(prepared, |_, g| tokenize(g))?
         };
-        let inputs: Vec<_> = raw.iter().map(Vec::as_slice).collect();
-        let widths: Vec<_> = prepared
-            .iter()
-            .map(|g| g.planes.iter().map(|c| c.width).max().unwrap_or(1))
-            .collect();
-        let outcome = {
-            let _scope = crate::profile::scope("lz77.parse_shared");
-            crate::tools::lz77::parse_source_streams_with_state(&inputs, &widths, source_lz77)?
-        };
-        outcome
-            .commands
-            .into_iter()
-            .zip(widths)
-            .map(|(commands, width)| {
-                let (tokens, _) = encode::commands_to_tokens(commands, tree.leaves(), width)?;
-                Ok((tokens, outcome.enabled))
-            })
-            .collect::<Result<Vec<_>>>()?
+        return parse_shared_raw(prepared, tree, options, &raw);
     } else {
         let encode = |g: &Prepared| {
             encode::group_stream_with_channels(
@@ -217,6 +240,44 @@ fn shared_streams(
     let lz77 = streams.iter().any(|s| s.1);
     let streams: Vec<_> = streams.into_iter().map(|s| s.0).collect();
     Ok((streams, lz77))
+}
+
+fn parse_shared_raw(
+    prepared: &[&Prepared],
+    tree: &super::tree::Tree,
+    options: &ModularOptions,
+    raw: &[Vec<crate::tools::lz77::Literal>],
+) -> Result<(Vec<Vec<crate::entropy::stream::Token>>, bool)> {
+    if raw.len() != prepared.len() {
+        return Err(crate::Error::Encoding("offset raw stream count".into()));
+    }
+    let widths: Vec<_> = prepared
+        .iter()
+        .map(|g| g.planes.iter().map(|c| c.width).max().unwrap_or(1))
+        .collect();
+    if options.lz77
+        && let Some(source_lz77) = &options.source_lz77
+    {
+        let inputs: Vec<_> = raw.iter().map(Vec::as_slice).collect();
+        let outcome = {
+            let _scope = crate::profile::scope("lz77.parse_shared");
+            crate::tools::lz77::parse_source_streams_with_state(&inputs, &widths, source_lz77)?
+        };
+        let streams = outcome
+            .commands
+            .into_iter()
+            .zip(widths)
+            .map(|(commands, width)| {
+                encode::commands_to_tokens(commands, tree.leaves(), width).map(|s| s.0)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        return Ok((streams, outcome.enabled));
+    }
+    let streams = execution::try_map(raw, |index, tokens| {
+        encode::parse_group_tokens(tokens, tree.leaves(), widths[index], options)
+    })?;
+    let lz77 = streams.iter().any(|s| s.1);
+    Ok((streams.into_iter().map(|s| s.0).collect(), lz77))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -336,6 +397,106 @@ pub(super) fn encode_prepared_independent(
 mod tests {
     use super::super::{encode::FixedTree, group::Channel, predictor::Predictor};
     use super::*;
+
+    #[test]
+    fn shared_source_lz_offset_repack_preserves_empty_groups_widths_and_batch() {
+        use super::super::tree::{Node, Tree};
+        use crate::entropy::{HybridUintConfig, options::UintConfigStrategy};
+        use crate::tools::lz77::{SourceConfig, SourceLz77Method};
+        let before = Tree::new(vec![Node::Leaf {
+            predictor: Predictor::Left,
+            offset: i32::MAX,
+            multiplier: 1,
+        }])
+        .unwrap();
+        let after = Tree::new(vec![Node::Leaf {
+            predictor: Predictor::Left,
+            offset: i32::MIN,
+            multiplier: 1,
+        }])
+        .unwrap();
+        let groups: Vec<_> = [0, 17, 9, 0]
+            .into_iter()
+            .enumerate()
+            .map(|(id, width)| Prepared {
+                planes: if width == 0 {
+                    vec![]
+                } else {
+                    vec![Channel {
+                        width,
+                        height: 16,
+                        hshift: 0,
+                        vshift: 0,
+                        samples: (0..width * 16)
+                            .map(|i| [i32::MIN, i32::MAX, -17, 33][i % 4])
+                            .collect(),
+                    }]
+                },
+                transforms: vec![],
+                wp: weighted::Header::default(),
+                stream_id: id,
+            })
+            .collect();
+        let prepared: Vec<_> = groups.iter().collect();
+        let mut options = ModularOptions::default();
+        options.entropy_options.uint_config =
+            UintConfigStrategy::Fixed(HybridUintConfig::new(0, 0, 0).unwrap());
+        options.source_lz77 = Some(SourceConfig {
+            method: SourceLz77Method::Optc256,
+            length_uint_config: options.entropy_options.lz77_length_config,
+            min_symbol: Some(options.entropy_options.lz77_min_symbol),
+            ..Default::default()
+        });
+        let mut raw = groups
+            .iter()
+            .map(|g| {
+                super::super::tokens::tokenize(&g.planes, &before, &g.wp, 0, g.stream_id, false)
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let baseline = parse_shared_raw(&prepared, &before, &options, &raw).unwrap();
+        assert_eq!(
+            baseline,
+            shared_streams(&prepared, &before, &options).unwrap()
+        );
+        assert_eq!(
+            super::super::leaf_offset::remap_literals(&before, &after, &mut raw).unwrap(),
+            Some(416)
+        );
+        let repacked = parse_shared_raw(&prepared, &after, &options, &raw).unwrap();
+        assert_eq!(
+            repacked,
+            shared_streams(&prepared, &after, &options).unwrap()
+        );
+        assert!(repacked.0[0].is_empty() && repacked.0[3].is_empty());
+
+        // Exercise the actual shared refinement closure, not just its parser.
+        let receipt = std::sync::Arc::new(super::super::refinement::Receipt::default());
+        let biased = [1, 2].map(|id| Prepared {
+            planes: vec![Channel {
+                width: 32,
+                height: 16,
+                hshift: 0,
+                vshift: 0,
+                samples: vec![1000; 512],
+            }],
+            transforms: vec![],
+            wp: weighted::Header::default(),
+            stream_id: id,
+        });
+        options.fixed_tree = Some(FixedTree::Zero);
+        options.refinement.offsets = Some(super::super::refinement::OffsetOptions {
+            mode: super::super::refinement::OffsetMode::Distribution,
+            ..Default::default()
+        });
+        options.refinement.receipt = Some(receipt.clone());
+        encode_prepared_shared_borrowed_trial(None, &biased, &options, 1 << 20, None, 16, None)
+            .unwrap()
+            .into_complete()
+            .unwrap();
+        assert_eq!(receipt.snapshot().offset_raw_reused_tokens, 1024);
+        assert_eq!(receipt.snapshot().offset_proposals, 1);
+    }
 
     #[test]
     fn refinement_credits_only_selected_sections_and_preserves_cutoff() {

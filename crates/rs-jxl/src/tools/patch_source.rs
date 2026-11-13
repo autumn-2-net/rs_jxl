@@ -9,7 +9,8 @@
 //! Detection uses source scalar f32 operations, including external uint sample
 //! normalization (enc_external_image.cc / base/float.h), subtraction BEFORE
 //! quantization, mixed float/double comparison constants, and ordered weighted
-//! accumulation. These are not rational/integer replacement thresholds. Fast-
+//! accumulation. Only flat-seed equality has an exhaustively checked unsigned
+//! integer specialization; weighted similarity retains the f32 path. Fast-
 //! math/compiler reassociation and equal-area std::sort ties are not a portable
 //! cross-build identity guarantee. Fingerprints retain truncation toward zero
 //! and unsigned-byte memcmp ordering. Only grouping is quantized: the atlas
@@ -58,6 +59,10 @@ pub use float::{
 #[path = "patch_source_replay.rs"]
 mod replay;
 pub use replay::verify_add_replay;
+
+#[path = "patch_source_profile.rs"]
+mod detail;
+use detail::{Detail, Stage};
 
 /// The source outer gate, before detector overrides and seed availability.
 /// Override On does not bypass the speed/depth/groupwise gate.
@@ -219,6 +224,7 @@ fn color(image: ImageView<'_>, position: usize) -> [i32; 3] {
 #[derive(Clone, Copy)]
 struct Colorspace {
     scale: f32,
+    same_delta: u32,
 }
 
 impl Colorspace {
@@ -227,6 +233,9 @@ impl Colorspace {
         // sample by maximum is NOT equivalent to multiplying this reciprocal.
         Self {
             scale: 1.0f32 / ((1u32 << bits) - 1) as f32,
+            // Validated 1..16-bit samples: 0 through 13 bits, then 1, 3, 6.
+            // Threshold-adjacent tests compare every value with the f32 path.
+            same_delta: ((1u32 << bits) - 1) / 10_000,
         }
     }
 
@@ -274,6 +283,28 @@ impl<'a> DetectionView<'a> {
         }
     }
 
+    #[inline]
+    fn pick_channel(self, position: usize, channel: usize) -> f32 {
+        let channel = if self.color_channels == 1 { 0 } else { channel };
+        match self.samples {
+            DetectionSamples::Integer(image, colorspace) => {
+                image.planes[channel][position] as f32 * colorspace.scale
+            }
+            DetectionSamples::Float(planes) => planes[channel][position],
+        }
+    }
+
+    #[cfg(test)]
+    fn same_at(self, first: usize, second: usize) -> bool {
+        match self.samples {
+            DetectionSamples::Integer(image, colorspace) => image.planes[..self.color_channels]
+                .iter()
+                .all(|plane| plane[first].abs_diff(plane[second]) <= colorspace.same_delta),
+            DetectionSamples::Float(_) => same(self.pick(first), self.pick(second)),
+        }
+    }
+
+    #[cfg(test)]
     fn patch_sample(self, position: usize, reference: usize, channel: usize, delta: f32) -> i32 {
         match self.samples {
             DetectionSamples::Integer(image, _) => {
@@ -321,48 +352,54 @@ struct Work {
     component_pushes: usize,
     #[cfg(test)]
     low_peak: usize,
+    #[cfg(test)]
+    delta_buffers: usize,
 }
 
+#[cfg(test)]
 fn background(
     image: DetectionView<'_>,
     config: &SourcePatchConfig,
     _work: &mut Work,
+) -> Result<Option<Vec<usize>>> {
+    background_profiled(image, config, _work, &mut Detail::<false>::new())
+}
+
+fn background_profiled<const PROFILE: bool>(
+    image: DetectionView<'_>,
+    config: &SourcePatchConfig,
+    _work: &mut Work,
+    profile: &mut Detail<PROFILE>,
 ) -> Result<Option<Vec<usize>>> {
     let (pw, ph) = (image.width / SEED_SIDE, image.height / SEED_SIDE);
     if pw < 3 || ph < 3 {
         return Ok(None);
     }
     let mut seeds = zeros::<u8>(pw * ph)?;
-    let mut count = 0;
-    // RunOnPool(1, ph - 2) has an exclusive end in the frozen source. Keep its
-    // asymmetric final seed row rather than silently widening the scan.
-    for py in 1..ph - 2 {
-        for px in 1..pw - 1 {
-            let origin = py * SEED_SIDE * image.width + px * SEED_SIDE;
-            let base = image.pick(origin);
-            if !(0..SEED_SIDE).all(|y| {
-                (0..SEED_SIDE).all(|x| same(base, image.pick(origin + y * image.width + x)))
-            }) {
-                continue;
-            }
-            let mut equal = 0;
-            for y in py - 1..=py + 1 {
-                for x in px - 1..=px + 1 {
-                    equal += usize::from(same(
-                        base,
-                        image.pick(y * SEED_SIDE * image.width + x * SEED_SIDE),
-                    ));
-                }
-            }
-            if equal >= 8 {
-                seeds[py * pw + px] = 1;
-                count += 1;
+    let count = match image.samples {
+        DetectionSamples::Integer(view, colorspace) => {
+            match (image.color_channels, colorspace.same_delta == 0) {
+                (1, true) => integer_seeds::<1, true>(view, colorspace.same_delta, &mut seeds),
+                (1, false) => integer_seeds::<1, false>(view, colorspace.same_delta, &mut seeds),
+                (_, true) => integer_seeds::<3, true>(view, colorspace.same_delta, &mut seeds),
+                (_, false) => integer_seeds::<3, false>(view, colorspace.same_delta, &mut seeds),
             }
         }
+        DetectionSamples::Float(_) => mark_seeds(
+            image.width,
+            image.height,
+            &mut seeds,
+            |position| image.pick(position),
+            |base, position| same(base, image.pick(position)),
+        ),
+    };
+    if PROFILE {
+        profile.counts.seeds = count;
     }
     if count == 0 {
         return Ok(None);
     }
+    profile.switch(Stage::BackgroundSetup);
     let pixels = image.width * image.height;
     let mut origins = zeros::<usize>(pixels)?;
     origins.fill(usize::MAX);
@@ -413,6 +450,10 @@ fn background(
     {
         _work.initial_queue = queue.len();
     }
+    if PROFILE {
+        profile.counts.initial_queue = queue.len();
+    }
+    profile.switch(Stage::BackgroundFlood);
     while let Some((position, source)) = queue.pop_front() {
         neighbors(image.width, image.height, position, |next| {
             if origins[next] != usize::MAX {
@@ -430,11 +471,109 @@ fn background(
     Ok(Some(origins))
 }
 
+fn integer_seeds<const CHANNELS: usize, const EXACT: bool>(
+    image: ImageView<'_>,
+    tolerance: u32,
+    seeds: &mut [u8],
+) -> usize {
+    // Dispatch once per image, with seed origins loaded once per 4x4 cell.
+    let planes: [&[i32]; CHANNELS] = std::array::from_fn(|c| image.planes[c].as_slice());
+    mark_seeds(
+        image.width,
+        image.height,
+        seeds,
+        |position| planes.map(|plane| plane[position]),
+        |base, position| {
+            (0..CHANNELS).all(|c| {
+                if EXACT {
+                    base[c] == planes[c][position]
+                } else {
+                    base[c].abs_diff(planes[c][position]) <= tolerance
+                }
+            })
+        },
+    )
+}
+
+fn mark_seeds<T: Copy>(
+    width: usize,
+    height: usize,
+    seeds: &mut [u8],
+    pick: impl Fn(usize) -> T,
+    equal: impl Fn(T, usize) -> bool,
+) -> usize {
+    let (pw, ph) = (width / SEED_SIDE, height / SEED_SIDE);
+    let mut count = 0;
+    // Preserve RunOnPool(1, ph - 2)'s exclusive end and asymmetric final row.
+    for py in 1..ph - 2 {
+        for px in 1..pw - 1 {
+            let origin = py * SEED_SIDE * width + px * SEED_SIDE;
+            let base = pick(origin);
+            if !(0..SEED_SIDE).all(|y| (0..SEED_SIDE).all(|x| equal(base, origin + y * width + x)))
+            {
+                continue;
+            }
+            let mut matching = 0;
+            for y in py - 1..=py + 1 {
+                for x in px - 1..=px + 1 {
+                    matching += usize::from(equal(base, y * SEED_SIDE * width + x * SEED_SIDE));
+                }
+            }
+            if matching >= 8 {
+                seeds[py * pw + px] = 1;
+                count += 1;
+            }
+        }
+    }
+    count
+}
+
 #[derive(Eq, Ord, PartialEq, PartialOrd)]
 struct Fingerprint {
     width: usize,
     height: usize,
     bytes: Vec<u8>,
+}
+
+struct PendingPatch {
+    representative: (u32, u32),
+    reference: usize,
+    positions: Vec<(u32, u32)>,
+}
+
+fn representative_samples(
+    image: DetectionView<'_>,
+    patch: &PendingPatch,
+    width: usize,
+    height: usize,
+) -> Vec<i32> {
+    let mut samples = Vec::with_capacity(width * height * image.color_channels);
+    let (x0, y0) = (
+        patch.representative.0 as usize,
+        patch.representative.1 as usize,
+    );
+    for c in 0..image.color_channels {
+        match image.samples {
+            DetectionSamples::Integer(view, _) => {
+                let plane = &view.planes[c];
+                let base = plane[patch.reference];
+                for y in y0..y0 + height {
+                    let start = y * image.width + x0;
+                    samples.extend(plane[start..start + width].iter().map(|&v| v - base));
+                }
+            }
+            DetectionSamples::Float(_) => {
+                let base = image.pick_channel(patch.reference, c);
+                for y in y0..y0 + height {
+                    for x in x0..x0 + width {
+                        let delta = image.pick_channel(y * image.width + x, c) - base;
+                        samples.push(delta.to_bits() as i32);
+                    }
+                }
+            }
+        }
+    }
+    samples
 }
 
 fn detect(
@@ -450,20 +589,37 @@ fn detect_view(
     config: &SourcePatchConfig,
     work: &mut Work,
 ) -> Result<Vec<PatchInfo>> {
-    let Some(background) = background(image, config, work)? else {
+    if detail::enabled() {
+        detect_profiled::<true>(image, config, work)
+    } else {
+        detect_profiled::<false>(image, config, work)
+    }
+}
+
+fn detect_profiled<const PROFILE: bool>(
+    image: DetectionView<'_>,
+    config: &SourcePatchConfig,
+    work: &mut Work,
+) -> Result<Vec<PatchInfo>> {
+    let mut profile = Detail::<PROFILE>::new();
+    let Some(background) = background_profiled(image, config, work, &mut profile)? else {
         return Ok(Vec::new());
     };
+    profile.switch(Stage::ComponentScan);
     let pixels = image.width * image.height;
     let limits = &config.limits;
     let mut visited = zeros::<u8>(pixels)?;
     let mut stack = Vec::new();
-    let mut groups = BTreeMap::<Fingerprint, PatchInfo>::new();
+    let mut groups = BTreeMap::<Fingerprint, PendingPatch>::new();
     let mut positions = 0;
     for start in 0..pixels {
         if background[start] != usize::MAX || (config.fast && visited[start] != 0) {
             continue;
         }
         let (mut min_x, mut max_x) = (start % image.width, start % image.width);
+        if PROFILE {
+            profile.counts.components += 1;
+        }
         let (mut min_y, mut max_y) = (start / image.width, start / image.width);
         let mut border = None;
         let mut same_border = true;
@@ -536,8 +692,12 @@ fn detect_view(
             continue;
         }
         let (width, height) = (max_x - min_x + 1, max_y - min_y + 1);
+        profile.switch(Stage::FingerprintDelta);
+        if PROFILE {
+            profile.counts.rectangles += 1;
+            profile.counts.fingerprint_values += width * height * 3;
+        }
         let mut bytes = Vec::with_capacity(width * height * 3);
-        let mut deltas = Vec::with_capacity(width * height * image.color_channels);
         let (mut too_small, mut too_big) = (true, false);
         for (c, &base) in normalized_base.iter().enumerate() {
             for y in min_y..=max_y {
@@ -545,7 +705,7 @@ fn detect_view(
                     // Keep the source subtraction of normalized operands. The
                     // exact integer delta remains separate from its float key.
                     let position = y * image.width + x;
-                    let normalized = image.pick(position)[c] - base;
+                    let normalized = image.pick_channel(position, c) - base;
                     // Source float-to-int quantization of NaN is undefined.
                     // Never create an arithmetic patch containing nonfinite
                     // deltas; those input words remain in the untouched plane.
@@ -557,19 +717,18 @@ fn detect_view(
                     too_small &= q > -config.min_peak && q < config.min_peak;
                     too_big |= !(i8::MIN as i32..=i8::MAX as i32).contains(&q);
                     bytes.push((q / config.fingerprint_divisor) as i8 as u8);
-                    if image.color_channels == 3 || c == 0 {
-                        deltas.push(image.patch_sample(position, reference, c, normalized));
-                    }
                 }
             }
         }
         if too_small || too_big {
+            profile.switch(Stage::ComponentScan);
             #[cfg(test)]
             {
                 work.low_peak += usize::from(too_small);
             }
             continue;
         }
+        profile.switch(Stage::GroupLookup);
         let fingerprint = Fingerprint {
             width,
             height,
@@ -579,43 +738,66 @@ fn detect_view(
         if let Some(existing) = groups.get_mut(&fingerprint) {
             // std::pair<QuantizedPatch, positions> sorts equal keys by (x,y),
             // not the detector's (y,x) scan order. Retain that representative.
-            if position < existing.positions[0] {
-                existing.key.samples = deltas;
-                existing.positions.insert(0, position);
-            } else {
-                existing.positions.push(position);
+            if position < existing.representative {
+                existing.representative = position;
+                existing.reference = reference;
             }
+            existing.positions.push(position);
             positions += 1;
         } else if groups.len() < limits.max_unique_patches {
             groups.insert(
                 fingerprint,
-                PatchInfo {
-                    key: PatchKey {
-                        width,
-                        height,
-                        samples: deltas,
-                    },
+                PendingPatch {
+                    representative: position,
+                    reference,
                     positions: vec![position],
                 },
             );
             positions += 1;
         }
+        profile.switch(Stage::ComponentScan);
     }
-    let mut info: Vec<_> = groups
-        .into_values()
-        .filter(|p| p.positions.len() >= limits.min_occurrences)
-        .collect();
-    if info
+    profile.switch(Stage::FinalizeDelta);
+    if PROFILE {
+        profile.counts.groups = groups.len();
+    }
+    if groups
         .iter()
-        .map(|p| p.key.width * p.key.height)
+        .filter(|(_, p)| p.positions.len() >= limits.min_occurrences)
+        .map(|(key, _)| key.width * key.height)
         .max()
         .unwrap_or(0)
         < limits.min_max_patch_area
     {
         return Ok(Vec::new());
     }
-    for patch in &mut info {
+    // Only retained representatives need exact samples. Fingerprint equality
+    // is quantized, so retain each representative's own background origin.
+    let mut info = Vec::new();
+    for (key, mut patch) in groups {
+        if patch.positions.len() < limits.min_occurrences {
+            continue;
+        }
         patch.positions.sort_unstable();
+        let samples = representative_samples(image, &patch, key.width, key.height);
+        if PROFILE {
+            profile.counts.delta_values += samples.len();
+        }
+        #[cfg(test)]
+        {
+            work.delta_buffers += 1;
+        }
+        info.push(PatchInfo {
+            key: PatchKey {
+                width: key.width,
+                height: key.height,
+                samples,
+            },
+            positions: patch.positions,
+        });
+    }
+    if PROFILE {
+        profile.counts.retained_groups = info.len();
     }
     // Source area sort leaves equal-area order unspecified; use stable key
     // order for reproducible Rust output. This does not change pixel replay.
@@ -866,7 +1048,10 @@ pub fn discover_source(
             "subsampled patch extras require the metadata-aware frame adapter, not ImageView",
         ));
     }
+    let detector_scope = crate::profile::scope("patch.source.detect");
     let info = detect(image, config, &mut Work::default())?;
+    drop(detector_scope);
+    let packing_scope = crate::profile::scope("patch.source.pack_dictionary");
     let Some(packed) = pack_dictionary(
         &info,
         image.color_channels,
@@ -876,6 +1061,7 @@ pub fn discover_source(
     else {
         return Ok(None);
     };
+    drop(packing_scope);
     let reference = SignedPatchImage {
         width: packed.width,
         height: packed.height,
@@ -883,8 +1069,12 @@ pub fn discover_source(
         color_channels: image.color_channels,
         planes: packed.planes,
     };
+    let subtract_scope = crate::profile::scope("patch.source.subtract");
     let residual = subtract_add(image, &reference, &packed.dictionary)?;
+    drop(subtract_scope);
+    let replay_scope = crate::profile::scope("patch.source.verify_replay");
     verify_add_replay(image, &residual, &reference, &packed.dictionary)?;
+    drop(replay_scope);
     Ok(Some(AddPatchPlan {
         reference,
         dictionary: packed.dictionary,
@@ -969,6 +1159,10 @@ fn pack_dictionary(
 }
 
 #[cfg(test)]
+#[path = "patch_source_optimization_tests.rs"]
+mod optimization_tests;
+
+#[cfg(test)]
 mod tests {
     use super::super::{ReferenceImage, tokenize};
     use super::*;
@@ -1037,6 +1231,35 @@ mod tests {
                 .iter()
                 .any(|t| t.context == 5 && t.value == PatchBlendMode::Add as u32)
         );
+    }
+
+    #[test]
+    fn detail_timing_preserves_detector_results() {
+        for depth in [8, 16] {
+            for colors in [1, 3] {
+                let image = fixture(depth, colors, 1, 0, (1 << depth) - 1);
+                let view = DetectionView::integer(image.view());
+                let config = SourcePatchConfig::default();
+                assert_eq!(
+                    background(view, &config, &mut Work::default()).unwrap(),
+                    background_profiled(
+                        view,
+                        &config,
+                        &mut Work::default(),
+                        &mut Detail::<true>::new()
+                    )
+                    .unwrap(),
+                );
+                let expected =
+                    detect_profiled::<false>(view, &config, &mut Work::default()).unwrap();
+                let actual = detect_profiled::<true>(view, &config, &mut Work::default()).unwrap();
+                assert_eq!(expected.len(), actual.len());
+                for (a, b) in expected.iter().zip(&actual) {
+                    assert_eq!(a.key, b.key);
+                    assert_eq!(a.positions, b.positions);
+                }
+            }
+        }
     }
 
     #[test]

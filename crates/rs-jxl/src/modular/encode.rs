@@ -828,12 +828,21 @@ pub(super) fn group_stream_with_channels(
         stream_id,
         parallel_channels,
     )?;
+    parse_group_tokens(&raw, tree.leaves(), distance_multiplier, options)
+}
+
+pub(super) fn parse_group_tokens(
+    raw: &[lz77::Literal],
+    contexts: usize,
+    distance_multiplier: usize,
+    options: &ModularOptions,
+) -> Result<(Vec<Token>, bool)> {
     if options.lz77
         && let Some(config) = &options.source_lz77
     {
         let _scope = crate::profile::scope("lz77.parse_local");
-        let outcome = lz77::parse_source_with_state(&raw, distance_multiplier, config)?;
-        let (tokens, _) = commands_to_tokens(outcome.commands, tree.leaves(), distance_multiplier)?;
+        let outcome = lz77::parse_source_with_state(raw, distance_multiplier, config)?;
+        let (tokens, _) = commands_to_tokens(outcome.commands, contexts, distance_multiplier)?;
         return Ok((tokens, outcome.enabled));
     }
     // (4,0,0) length coding reserves symbols 224..255 in this stream.
@@ -845,9 +854,9 @@ pub(super) fn group_stream_with_channels(
     let commands = if !options.lz77 {
         raw.iter().copied().map(Command::Literal).collect()
     } else {
-        lz77::parse(&raw, distance_multiplier, &lz_options)?
+        lz77::parse(raw, distance_multiplier, &lz_options)?
     };
-    commands_to_tokens(commands, tree.leaves(), distance_multiplier)
+    commands_to_tokens(commands, contexts, distance_multiplier)
 }
 
 pub(crate) fn commands_to_tokens(

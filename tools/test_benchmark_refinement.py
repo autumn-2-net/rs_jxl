@@ -71,19 +71,43 @@ class RefinementHarnessTests(unittest.TestCase):
             self.assertEqual("--refine-entropy" in cmd, variant in ("entropy", "combined"))
             self.assertEqual("--refine-leaves" in cmd, variant in ("leaves", "combined"))
             self.assertEqual("--refine-context-map" in cmd, variant == "context-map")
-            self.assertEqual(cmd[0], "old" if variant == "frozen" else "new")
+            self.assertEqual(cmd[0], "old" if variant.startswith("frozen") else "new")
             if variant == "context-map":
                 self.assertEqual(cmd[-5:], ["--refine-context-map", "--context-map-shortlist", "11",
                                            "--context-map-merges", "3"])
             else:
                 self.assertNotIn("--context-map-shortlist", cmd)
                 self.assertNotIn("--context-map-merges", cmd)
-            if variant.startswith("offset-"):
-                self.assertEqual(cmd[-4:], ["--leaf-offset", variant.removeprefix("offset-"),
+            offset_variant = variant.removeprefix("frozen-")
+            if offset_variant.startswith("offset-"):
+                self.assertEqual(cmd[-4:], ["--leaf-offset", offset_variant.removeprefix("offset-"),
                                            "--leaf-offset-samples", "37"])
             else:
                 self.assertNotIn("--leaf-offset", cmd)
                 self.assertNotIn("--leaf-offset-samples", cmd)
+
+    def test_frozen_distribution_requires_binary_and_validates_real_receipt(self):
+        with TemporaryDirectory() as directory:
+            argv = ["--encoder", "new", "--decoder", "djxl", "--synthetic",
+                    "--out", str(Path(directory) / "out.json"), "--variants",
+                    "baseline", "frozen-offset-distribution", "offset-distribution"]
+            with self.assertRaises(SystemExit), redirect_stderr(StringIO()):
+                arguments(argv)
+            args = arguments(argv + ["--frozen", "old"])
+            self.assertEqual(args.frozen, Path("old"))
+        measurement = {"refinement": self.receipt("offset-distribution")}
+        validate_receipt(measurement, "frozen-offset-distribution")
+        for invalid in ({}, {"refinement": None},
+                        {"refinement": self.receipt("offset-mean")}):
+            with self.assertRaises(ValueError):
+                validate_receipt(invalid, "frozen-offset-distribution")
+        for key in ("offset_token_fits", "offset_reused_tokens", "offset_raw_reused_tokens"):
+            for value in (-1, True, 0.5):
+                with self.assertRaises(ValueError):
+                    validate_receipt({"refinement": self.receipt("offset-distribution", **{key: value})},
+                                     "offset-distribution")
+            with self.assertRaises(ValueError):
+                validate_receipt({"refinement": self.receipt("offset-mean", **{key: 1})}, "offset-mean")
 
     def test_arguments_default_and_explicit_fitting_capacity(self):
         with TemporaryDirectory() as directory:

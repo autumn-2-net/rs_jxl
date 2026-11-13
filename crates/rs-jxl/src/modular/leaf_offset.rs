@@ -12,6 +12,8 @@ use super::training::TrainingStream;
 use super::tree::{Node, Tree, pack_signed};
 
 mod distribution;
+mod reuse;
+pub(super) use reuse::{fit_tokens, remap_literals, remap_tokens};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum OffsetMode {
@@ -214,36 +216,7 @@ pub(super) fn fit_with_configs(
         ));
     }
     let ordered = super::leaf_refit::ordered_streams(tree, streams, previous_channels)?;
-    let mut leaves = Vec::new();
-    leaves
-        .try_reserve_exact(tree.leaves())
-        .map_err(|_| Error::Limit("offset leaf allocation"))?;
-    let mut offset_counts = [0u64; TOKENS];
-    let mut queue = VecDeque::from([0]);
-    while let Some(node) = queue.pop_front() {
-        match tree.nodes()[node] {
-            Node::Split {
-                greater,
-                less_equal,
-                ..
-            } => {
-                queue.push_back(greater);
-                queue.push_back(less_equal);
-            }
-            Node::Leaf {
-                offset, multiplier, ..
-            } => {
-                offset_counts[UINT.encode(pack_signed(offset)).token as usize] += 1;
-                leaves.push(
-                    (multiplier == 1 && (offset == 0 || options.mode == OffsetMode::Distribution))
-                        .then(|| Samples {
-                            baseline: offset,
-                            ..Samples::new(node)
-                        }),
-                );
-            }
-        }
-    }
+    let (mut leaves, mut offset_counts) = collect_leaves(tree, options)?;
     let mut stats = FitStats::default();
     if leaves.iter().all(Option::is_none) {
         return Ok((None, stats));
@@ -311,6 +284,43 @@ pub(super) fn fit_with_configs(
         Some(Tree::new(nodes)?)
     };
     Ok((proposal, stats))
+}
+
+fn collect_leaves(
+    tree: &Tree,
+    options: &OffsetOptions,
+) -> Result<(Vec<Option<Samples>>, [u64; TOKENS])> {
+    let mut leaves = Vec::new();
+    leaves
+        .try_reserve_exact(tree.leaves())
+        .map_err(|_| Error::Limit("offset leaf allocation"))?;
+    let mut offset_counts = [0u64; TOKENS];
+    let mut queue = VecDeque::from([0]);
+    while let Some(node) = queue.pop_front() {
+        match tree.nodes()[node] {
+            Node::Split {
+                greater,
+                less_equal,
+                ..
+            } => {
+                queue.push_back(greater);
+                queue.push_back(less_equal);
+            }
+            Node::Leaf {
+                offset, multiplier, ..
+            } => {
+                offset_counts[UINT.encode(pack_signed(offset)).token as usize] += 1;
+                leaves.push(
+                    (multiplier == 1 && (offset == 0 || options.mode == OffsetMode::Distribution))
+                        .then(|| Samples {
+                            baseline: offset,
+                            ..Samples::new(node)
+                        }),
+                );
+            }
+        }
+    }
+    Ok((leaves, offset_counts))
 }
 
 fn replacement_cost(counts: &[u64; TOKENS], old: i32, new: i32) -> f64 {
