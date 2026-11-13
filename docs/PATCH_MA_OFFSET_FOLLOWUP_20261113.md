@@ -289,6 +289,10 @@ the installed CLI and wheel were not rebuilt for this experiment.
 
 ## Artifacts
 
+The results above describe the first follow-up, committed as `16e1d82`. A
+subsequent Offset fitting implementation is described below; its measurements
+are kept separate from this first experiment.
+
 Ignored local results are under `out/patch-ma-followup-20261113/`:
 
 - `gather12.json`: raw runs, per-image medians, input/binary identities.
@@ -338,3 +342,167 @@ python -B tools/summarize_patch_ma_followup.py --report out/patch-ma-followup-20
 The benchmark scripts refuse to overwrite an existing report. Select a fresh
 output path for a repeat. Synthetic offset cases are reported separately from
 the 20 real images. No metadata roundtrip claim is made by these pixel tests.
+
+## Subsequent Offset Fitting Work
+
+After `16e1d82` was pushed, the user confirmed that Distribution refinement
+must remain opt-in until the added cost is satisfactory. No default effort,
+decoder, CI or Python ABI policy changes are part of this work.
+
+The subsequent native implementation has three computational changes:
+
+1. Fit Distribution samples from cached pre-LZ literals in ordinary e9, not
+   just no-LZ streams. Pair literals with the original transformed samples to
+   recover the signed predictor, then subtract in i64. This supports Weighted
+   and signed extremes without replaying predictor state or tree properties.
+2. Score independent leaves in ordered 64-leaf chunks on the existing execution
+   pool. The shared Offset signaling histogram still uses the same sequential
+   sweeps and BFS proposal order. The chunk size is dispatch granularity, not a
+   learning, sample, leaf-count or candidate limit.
+3. Cache the existing per-count entropy term lazily within each leaf's scoring
+   call. At most 256 `(count, value)` entries (4 KiB) are retained per active
+   scorer. Collisions recompute the original formula; candidate order and
+   floating-point accumulation order are unchanged. No whole-image speedup is
+   attributed to this cache in isolation.
+
+For unit-multiplier leaves, let the packed token represent
+`pixel - prediction - old_offset` modulo 2^32. Since all standard predictions
+except Average4 return an i32 value, compute the prediction modulo 2^32, then
+subtract that signed value from the original sample in i64. This preserves
+the wide residual's mean and reservoir values. Average4 retains a conservative
+source-value bound proving its prediction fits i32, otherwise the original
+pixel fitter is used. No input values are clamped or rejected by that fallback.
+
+### Offset-Dependent Routing Guard
+
+Review found a separate correctness condition missed by the original reuse
+path: zero-offset Gradient leaves can enable native LUT routing, whose
+property-9 evaluation clips a wide gradient. Nonzero offsets disable that
+route and use generic wrapping properties. Topology equality alone therefore
+does not prove that a cached literal still belongs to the same context.
+
+A compact iterative eligibility check conservatively accounts for static
+channel/group specialization. If Gradient-LUT context routing may be involved,
+cached fitting falls back to the original fitter, and offset remapping falls
+back to fresh native tokenization. Both transitions are covered, including
+returning to zero offset. A single static Gradient leaf without a property-9
+decision remains eligible for reuse. No LUT or decoder semantics are changed.
+
+Regressions exercise positive/negative integer overflow, threshold -8193 and
+its clipping boundary, static splits above/below property 9, ineligible
+thresholds, and unchanged buffers on fallback. The end-to-end refinement test
+also checks that LZ and non-LZ trials really retokenize before serialization,
+including when predictor refitting is requested.
+
+The original 585-image-output verification did not exercise these custom-tree
+edge cases. A passing ordinary corpus is not a proof that remapping every
+topologically identical tree is safe. Correctness remains original decoded
+pixels, not equality with an earlier compressed file.
+
+### Follow-Up Artifacts
+
+`out/offset-fit-20261113/` contains the frozen control, exploratory and guarded
+executables. `real20-results.json` is the completed pre-guard pilot, not the
+acceptance report for the guarded implementation. Its same-20-image comparison
+observed a 2.44% reduction in total time with unchanged sizes. It is retained
+as exploratory evidence, not pooled with later runs.
+
+### Guarded Implementation Results
+
+The final guarded executable was tested on the same predetermined 20 real
+images (128.260 MP, ten strata), e9 and eight threads. All three variants use
+every image. Native timings exclude process startup, input and official
+decoder verification; this screen has one timed trial per image/variant.
+
+| Variant | Actual bytes | Mean image bpp | Weighted bpp | Native seconds | MPix/s |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| e9, Offset disabled | 69,694,537 | 6.576639 | 4.347081 | 68.300811 | 1.877868 |
+| Previous Distribution Offset | 68,260,862 | 6.541034 | 4.257658 | 90.618923 | 1.415377 |
+| Guarded token-fit Distribution Offset | 68,260,862 | 6.541034 | 4.257658 | 88.293313 | 1.452657 |
+
+This is a 2.57% total native-time reduction versus the previous Offset
+implementation, with every image's actual size unchanged. It is not a new
+compression-ratio improvement. The unchanged 1,817 proposals and 1,632 wins
+confirm that this work preserved the sampled search on this cohort; 2,029
+fits used cached pre-LZ literals instead of replaying predictors/properties.
+
+The 94.835 MP `Graveyard_27x39_ENGLISH.png` dominates the total: 57.916688 to
+55.812177 seconds, both 41,619,010 bytes. The other 19 images together take
+32.702235 versus 32.481136 seconds, only a 0.68% improvement. Negative timing
+results are retained: e.g. the first screen's `Nuclear_Throne_screenshot_02`
+takes 2.021262 versus 3.182301 seconds, despite lower fitted-Offset work time.
+This is not evidence of a universal per-image speedup. Domain-local timing
+sums can overlap under parallel execution and are not end-to-end wall time.
+
+Relative to disabling Offset, this cohort saves 2.06% of total bytes but
+still adds 29.27% native time. The arithmetic mean bpp is not the same as
+aggregate size divided by total pixels; both are shown explicitly. Keep
+Distribution opt-in, as agreed, rather than promoting it on this evidence.
+
+Verification completed: 90 Offset-related Rust tests passed, with one
+opt-in microbenchmark ignored; the final real-image screen passed 60 official
+`djxl` pixel checks, and eight separate 8/16-bit gray, gray-alpha, RGB/RGBA
+fixtures passed another 24 checks including hidden RGB. Synthetic inputs do
+not enter the real-image bpp or timing totals. The ignored microbenchmark
+means the entropy cache has not been measured in isolation. No full workspace,
+cross-platform, peak-memory or Python-wheel acceptance is claimed here.
+
+Final artifacts under `out/offset-fit-20261113/`:
+
+- `final20-results.json`: guarded implementation, all real-image trials.
+- `synthetic-results.json`: separate synthetic correctness trials.
+- `final20.summary.{json,md}`: cohort and per-stratum summaries.
+- `final20.bpp-v-time.png`: arithmetic mean bpp versus summed native time.
+- `final20.totalMiB-v-time.png`: actual total size versus summed native time.
+- `bin/before.exe`, `bin/guarded.exe`: frozen comparison executables.
+
+### Targeted Timing Counterchecks
+
+Four apparent regressions from the screen were repeated three times with
+rotated variant order, still at e9/eight threads. These are deliberately chosen
+counterexamples, not an independent random cohort, and are never pooled with
+the 20-image total. Every size stayed unchanged and all 36 official pixel
+checks passed. Per-image native medians:
+
+| Image | Previous Offset s | Guarded Offset s | Time change |
+| --- | ---: | ---: | ---: |
+| 1247 | 2.189061 | 2.265211 | +3.48% |
+| Nuclear Throne | 2.323423 | 2.327355 | +0.17% |
+| SeisinkiVulnus | 0.915207 | 0.976973 | +6.75% |
+| 0554 | 2.456667 | 2.504621 | +1.95% |
+| Sum | 7.884357 | 8.074159 | +2.41% |
+
+The initial Nuclear Throne slowdown of roughly 57% did not repeat at that
+magnitude, but these medians do not establish a general speed win either.
+Results are from a shared host without process-affinity isolation; no unrelated
+workloads were stopped. Do not infer the cause from one stage timer, or claim
+statistical significance from these short repeats. Actual-size fallback
+protects size selection, not elapsed time. The current implementation is an
+opt-in tradeoff, not grounds to enable Offset on every e9 encode.
+
+`repeat4-results.json` and `repeat4.summary.{json,md}` retain all timed trials
+and the four-image summary, including every slower measurement. Reproduce
+with the same benchmark command using `--repeats 3` and four `--case` paths
+for the named images instead of `--manifest` (use a fresh output path).
+
+The `1247` and Nuclear Throne cases were also repeated three times at one
+thread, in `serial2-results.json` and `serial2.summary.{json,md}`. Their summed
+native medians are 23.720136 versus 22.896523 seconds (-3.47%), with identical
+sizes and another 18 successful official pixel checks. `1247` improves from
+12.627114 to 11.812830 seconds (-6.45%); Nuclear Throne is effectively flat
+at 11.093022 versus 11.083694 seconds. This supports a workload-dependent
+computation benefit, but does not isolate the three implementation changes
+or prove that parallel scoring alone caused the eight-thread regressions.
+
+Across the final screen, separate synthetic checks and targeted repeats,
+138 encoded outputs passed official original-sample comparisons. Repeated
+outputs are counted as checks, not additional distinct images. The earlier
+unguarded pilot is excluded from this acceptance count.
+
+Final screen and figure commands (not the targeted repeats):
+
+```powershell
+python -B tools/benchmark_refinement.py --encoder out/offset-fit-20261113/bin/guarded.exe --frozen out/offset-fit-20261113/bin/before.exe --decoder ../jxl_python/out/build/windows-clang-cl-cli/libjxl/tools/djxl.exe --manifest out/patch-ma-followup-20261113/offset20.json --variants baseline frozen-offset-distribution offset-distribution --effort 9 --threads 8 --repeats 1 --timeout 1800 --out out/offset-fit-20261113/final20-results.json
+
+python -B tools/summarize_patch_ma_followup.py --report out/offset-fit-20261113/final20-results.json --baseline frozen-offset-distribution --manifest out/patch-ma-followup-20261113/offset20.json --out out/offset-fit-20261113/final20 --plot
+```

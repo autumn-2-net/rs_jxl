@@ -1,4 +1,5 @@
-//! Bounded reuse of literal-only streams. LZ commands are never rewritten.
+//! Bounded reuse of literal streams, including cached input to LZ parsing.
+//! Parsed LZ commands are never used to fit or rewrite residuals.
 
 use crate::entropy::{HybridUintConfig, stream::Token};
 use crate::tools::lz77::Literal;
@@ -7,8 +8,9 @@ use crate::{Error, Result};
 use super::{FitStats, OffsetMode, OffsetOptions, collect_leaves, fit_distribution};
 use crate::modular::{
     leaf_refit::ordered_streams,
+    predictor::Predictor,
     training::TrainingStream,
-    tree::{Node, Tree, pack_signed},
+    tree::{ChannelTree, Node, Tree, pack_signed},
 };
 
 fn unpack(value: u32) -> i32 {
@@ -24,6 +26,45 @@ pub(in crate::modular) fn fit_tokens(
     options: &OffsetOptions,
     configs: Option<&[HybridUintConfig]>,
 ) -> Result<Option<(Option<Tree>, FitStats)>> {
+    fit_values(
+        tree,
+        views,
+        previous_channels,
+        streams,
+        options,
+        configs,
+        |t| (!t.is_length).then_some((t.context, t.value)),
+    )
+}
+
+pub(in crate::modular) fn fit_literals(
+    tree: &Tree,
+    views: &[TrainingStream<'_>],
+    previous_channels: usize,
+    streams: &[Vec<Literal>],
+    options: &OffsetOptions,
+    configs: Option<&[HybridUintConfig]>,
+) -> Result<Option<(Option<Tree>, FitStats)>> {
+    fit_values(
+        tree,
+        views,
+        previous_channels,
+        streams,
+        options,
+        configs,
+        |t| Some((t.context as usize, t.value)),
+    )
+}
+
+fn fit_values<T>(
+    tree: &Tree,
+    views: &[TrainingStream<'_>],
+    previous_channels: usize,
+    streams: &[Vec<T>],
+    options: &OffsetOptions,
+    configs: Option<&[HybridUintConfig]>,
+    literal: impl Fn(&T) -> Option<(usize, u32)>,
+) -> Result<Option<(Option<Tree>, FitStats)>> {
     options.validate()?;
     if configs.is_some_and(|configs| configs.len() != tree.leaves()) {
         return Err(Error::InvalidInput(
@@ -32,24 +73,35 @@ pub(in crate::modular) fn fit_tokens(
     }
     ordered_streams(tree, views, previous_channels)?;
     if options.mode != OffsetMode::Distribution
-        || tree.nodes().iter().any(|node| {
-            matches!(node, Node::Leaf { predictor, multiplier, .. }
-                if *multiplier != 1 || predictor.has_weighted())
-        })
+        || ChannelTree::offset_sensitive_routing(tree)
+        || tree
+            .nodes()
+            .iter()
+            .any(|node| matches!(node, Node::Leaf { multiplier, .. } if *multiplier != 1))
     {
         return Ok(None);
     }
-    // All stateless predictions are bounded by 20*B/16 + 1 (Average4).
-    // With |sample| <= B, the original pre-offset residual fits i32. Without
-    // this proof a packed literal could alias a wide residual by 2^32, changing
-    // the full-population mean and reservoir median. Keep the pixel fitter then.
+    // All predictors except Average4 return an i32 value (including rounded
+    // Weighted). Average4 is bounded by (20*B + 8)/16; prove its range before
+    // recovering the signed predictor from the original sample and packed token.
     const B: i32 = (1 << 28) - 1;
-    if views.iter().flat_map(|s| s.channels).any(|channel| {
-        channel
-            .samples
-            .iter()
-            .any(|&value| !(-B..=B).contains(&value))
-    }) {
+    let uses_average4 = tree.nodes().iter().any(|node| {
+        matches!(
+            node,
+            Node::Leaf {
+                predictor: Predictor::Average4,
+                ..
+            }
+        )
+    });
+    if uses_average4
+        && views.iter().flat_map(|s| s.channels).any(|channel| {
+            channel
+                .samples
+                .iter()
+                .any(|&value| !(-B..=B).contains(&value))
+        })
+    {
         return Ok(None);
     }
     let nonempty_views: Vec<_> = views
@@ -71,23 +123,34 @@ pub(in crate::modular) fn fit_tokens(
         if tokens.len() != count
             || tokens
                 .iter()
-                .any(|t| t.is_length || t.context >= tree.leaves())
+                .any(|t| literal(t).is_none_or(|(context, _)| context >= tree.leaves()))
         {
             return Ok(None);
         }
     }
     ordered.sort_unstable_by_key(|(view, _)| view.stream_id);
     let (mut leaves, counts) = collect_leaves(tree, options)?;
-    for (_, tokens) in ordered {
-        for token in tokens {
-            let leaf = leaves[token.context]
-                .as_mut()
-                .expect("unit multiplier checked");
-            let residual = unpack(token.value).wrapping_add(leaf.baseline);
-            leaf.add(i64::from(residual), options.samples_per_leaf)?;
+    for (view, tokens) in ordered {
+        let pixels = view
+            .channels
+            .iter()
+            .flat_map(|channel| channel.samples.iter());
+        for (token, &pixel) in tokens.iter().zip(pixels) {
+            let (context, value) = literal(token).expect("literal streams validated");
+            let leaf = leaves[context].as_mut().expect("unit multiplier checked");
+            let residual = recover_residual(value, leaf.baseline, pixel);
+            leaf.add(residual, options.samples_per_leaf)?;
         }
     }
     fit_distribution(tree, &mut leaves, counts, configs).map(Some)
+}
+
+fn recover_residual(packed: u32, offset: i32, pixel: i32) -> i64 {
+    // The token stores (pixel - prediction - offset) modulo 2^32. Prediction
+    // is known to fit i32, so recover it modulo 2^32, then subtract in i64.
+    // Directly sign-extending the unpacked residual loses +/-2^32 at extremes.
+    let prediction = pixel.wrapping_sub(unpack(packed).wrapping_add(offset));
+    i64::from(pixel) - i64::from(prediction)
 }
 
 /// Only an offset-only, unit-multiplier tree replacement can use this mapping.
@@ -96,9 +159,11 @@ pub(in crate::modular) fn remap_tokens(
     before: &Tree,
     after: &Tree,
     streams: &mut [Vec<Token>],
-) -> Result<usize> {
+) -> Result<Option<usize>> {
     let invalid = || Error::Encoding("invalid offset token reuse".into());
-    let deltas = offset_deltas(before, after)?.ok_or_else(invalid)?;
+    let Some(deltas) = offset_deltas(before, after)? else {
+        return Ok(None);
+    };
     let mut count = 0usize;
     for token in streams.iter_mut().flatten() {
         if token.is_length {
@@ -110,7 +175,7 @@ pub(in crate::modular) fn remap_tokens(
             .checked_add(1)
             .ok_or(Error::Limit("offset population overflow"))?;
     }
-    Ok(count)
+    Ok(Some(count))
 }
 
 pub(in crate::modular) fn remap_literals(
@@ -136,6 +201,10 @@ pub(in crate::modular) fn remap_literals(
 
 fn offset_deltas(before: &Tree, after: &Tree) -> Result<Option<Vec<i32>>> {
     if before.nodes().len() != after.nodes().len() {
+        return Ok(None);
+    }
+    if ChannelTree::offset_sensitive_routing(before) || ChannelTree::offset_sensitive_routing(after)
+    {
         return Ok(None);
     }
     for (old, new) in before.nodes().iter().zip(after.nodes()) {
@@ -193,4 +262,33 @@ fn offset_deltas(before: &Tree, after: &Tree) -> Result<Option<Vec<i32>>> {
         }
     }
     Ok(Some(deltas))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn residual_recovery_preserves_wide_difference_at_every_signed_extreme() {
+        let values = [
+            i32::MIN,
+            i32::MIN + 1,
+            -37,
+            -1,
+            0,
+            1,
+            37,
+            i32::MAX - 1,
+            i32::MAX,
+        ];
+        for pixel in values {
+            for prediction in values {
+                let expected = i64::from(pixel) - i64::from(prediction);
+                for offset in values {
+                    let packed = pack_signed((expected - i64::from(offset)) as i32);
+                    assert_eq!(recover_residual(packed, offset, pixel), expected);
+                }
+            }
+        }
+    }
 }

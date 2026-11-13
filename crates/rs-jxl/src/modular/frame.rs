@@ -97,9 +97,10 @@ pub(super) fn encode_prepared_shared_borrowed_trial(
     };
     if options.refinement.enabled() {
         let cache_raw = options.lz77 && super::refinement::reuse_literals(&tree, options);
-        let raw_cache = std::cell::RefCell::new(None::<Vec<Vec<crate::tools::lz77::Literal>>>);
+        let raw_cache = super::refinement::LiteralCache::default();
         let raw_reused = std::cell::Cell::new(0usize);
         let (global, encoded) = super::refinement::choose(
+            Some(&raw_cache),
             &tree,
             &views,
             options,
@@ -496,6 +497,7 @@ mod tests {
             .unwrap();
         assert_eq!(receipt.snapshot().offset_raw_reused_tokens, 1024);
         assert_eq!(receipt.snapshot().offset_proposals, 1);
+        assert_eq!(receipt.snapshot().offset_token_fits, 1);
     }
 
     #[test]

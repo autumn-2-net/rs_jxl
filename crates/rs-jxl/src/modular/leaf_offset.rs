@@ -13,7 +13,7 @@ use super::tree::{Node, Tree, pack_signed};
 
 mod distribution;
 mod reuse;
-pub(super) use reuse::{fit_tokens, remap_literals, remap_tokens};
+pub(super) use reuse::{fit_literals, fit_tokens, remap_literals, remap_tokens};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum OffsetMode {
@@ -346,33 +346,63 @@ fn fit_distribution(
         costs: Vec<(i32, f64)>,
         selected: usize,
     }
-    let mut proposals = Vec::new();
-    let mut stats = FitStats::default();
-    for (context, leaf) in leaves.iter_mut().enumerate() {
-        let Some(leaf) = leaf.as_mut().filter(|leaf| leaf.count != 0) else {
-            continue;
-        };
-        stats.population = stats
-            .population
-            .checked_add(
-                usize::try_from(leaf.count)
-                    .map_err(|_| Error::Limit("offset population overflow"))?,
-            )
-            .ok_or(Error::Limit("offset population overflow"))?;
-        stats.samples += leaf.values.len();
-        if leaf.all_zero {
-            continue;
+    // Residual scores are independent; only the later signaling sweeps share
+    // state. Chunk leaves to amortize dispatch, then restore BFS order before
+    // coordinating offsets. No samples, candidate offsets or sweeps are pruned.
+    const CHUNK: usize = 64;
+    let score = |first: usize, leaves: &mut [Option<Samples>]| {
+        let mut proposals = Vec::new();
+        let mut stats = FitStats::default();
+        for (index, leaf) in leaves.iter_mut().enumerate() {
+            let Some(leaf) = leaf.as_mut().filter(|leaf| leaf.count != 0) else {
+                continue;
+            };
+            stats.population = stats
+                .population
+                .checked_add(
+                    usize::try_from(leaf.count)
+                        .map_err(|_| Error::Limit("offset population overflow"))?,
+                )
+                .ok_or(Error::Limit("offset population overflow"))?;
+            stats.samples += leaf.values.len();
+            if leaf.all_zero {
+                continue;
+            }
+            let config =
+                configs.map_or_else(HybridUintConfig::default, |configs| configs[first + index]);
+            let costs = distribution::scores(leaf, config)?;
+            debug_assert_eq!(costs[0].0, leaf.baseline);
+            stats.candidates += costs.len();
+            proposals.push(Proposal {
+                node: leaf.node,
+                costs,
+                selected: 0,
+            });
         }
-        let config = configs.map_or_else(HybridUintConfig::default, |configs| configs[context]);
-        let costs = distribution::scores(leaf, config)?;
-        debug_assert_eq!(costs[0].0, leaf.baseline);
-        stats.candidates += costs.len();
-        proposals.push(Proposal {
-            node: leaf.node,
-            costs,
-            selected: 0,
-        });
-    }
+        Ok::<_, Error>((proposals, stats))
+    };
+    let (mut proposals, mut stats) = if leaves.len() <= CHUNK
+        || crate::execution::worker_count() == 1
+    {
+        score(0, leaves)?
+    } else {
+        let mut chunks: Vec<_> = leaves.chunks_mut(CHUNK).collect();
+        let scored =
+            crate::execution::map_mut(&mut chunks, |chunk, leaves| score(chunk * CHUNK, leaves));
+        let mut proposals = Vec::new();
+        let mut stats = FitStats::default();
+        for result in scored {
+            let (part, work) = result?;
+            stats.population = stats
+                .population
+                .checked_add(work.population)
+                .ok_or(Error::Limit("offset population overflow"))?;
+            stats.samples += work.samples;
+            stats.candidates += work.candidates;
+            proposals.extend(part);
+        }
+        (proposals, stats)
+    };
     // Revisit only cached scores, not pixels: offsets share a signaling histogram.
     // Alternating sweeps reduce the one-way BFS bias without another encode.
     for sweep in 0..3 {
@@ -427,3 +457,7 @@ fn fit_distribution(
 #[cfg(test)]
 #[path = "leaf_offset_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "offset_routing_tests.rs"]
+mod routing_tests;

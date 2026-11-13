@@ -7,6 +7,8 @@ use crate::{Error, Result};
 use super::{Samples, pack_signed};
 
 const DENSE_TOKENS: usize = 4096;
+// A bounded, direct-mapped cache: collisions only repeat the original log2.
+const ENTROPY_CACHE_ENTRIES: usize = 256;
 // Baseline plus legacy centers, modes, quantiles and baseline neighbors.
 const MAX_CANDIDATES: usize = 1 + (3 + 4 + 4 + 1) * 5;
 
@@ -34,7 +36,48 @@ fn entropy_term(count: u64, n: f64) -> f64 {
     }
 }
 
+struct EntropyCache {
+    n: f64,
+    entries: Vec<(u64, f64)>,
+}
+
+impl EntropyCache {
+    fn new(n: usize) -> Result<Self> {
+        // Small leaves need fewer slots; no entropy terms are precomputed.
+        let slots = (n.min(ENTROPY_CACHE_ENTRIES - 1) + 1).next_power_of_two();
+        let mut entries = Vec::new();
+        reserve(&mut entries, slots)?;
+        entries.resize(slots, (0, 0.0));
+        Ok(Self {
+            n: n as f64,
+            entries,
+        })
+    }
+
+    fn term(&mut self, count: u64) -> f64 {
+        if count == 0 {
+            return 0.0;
+        }
+        // Mix high bits too: repeated power-of-two counts must not all collide.
+        let slot =
+            (count.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 56) as usize & (self.entries.len() - 1);
+        let entry = &mut self.entries[slot];
+        if entry.0 != count {
+            *entry = (count, entropy_term(count, self.n));
+        }
+        entry.1
+    }
+}
+
 pub(super) fn scores(samples: &mut Samples, config: HybridUintConfig) -> Result<Vec<(i32, f64)>> {
+    scores_impl::<true>(samples, config)
+}
+
+// The uncached specialization is used only by equivalence tests and the benchmark.
+fn scores_impl<const CACHE_ENTROPY: bool>(
+    samples: &mut Samples,
+    config: HybridUintConfig,
+) -> Result<Vec<(i32, f64)>> {
     if samples.values.is_empty() || samples.count == 0 {
         let mut result = Vec::new();
         reserve(&mut result, 1)?;
@@ -102,6 +145,15 @@ pub(super) fn scores(samples: &mut Samples, config: HybridUintConfig) -> Result<
     reserve(&mut result, candidates.len())?;
     let n = samples.values.len() as f64;
     let population_scale = samples.count as f64 / n;
+    let mut entropy_cache = if CACHE_ENTROPY {
+        Some(EntropyCache::new(samples.values.len())?)
+    } else {
+        None
+    };
+    let mut term = |count| match &mut entropy_cache {
+        Some(cache) => cache.term(count),
+        None => entropy_term(count, n),
+    };
     for offset in candidates {
         dense.fill(0);
         sparse.clear();
@@ -123,15 +175,15 @@ pub(super) fn scores(samples: &mut Samples, config: HybridUintConfig) -> Result<
             let mut count = 0;
             for &(token, multiplicity) in &sparse {
                 if previous != Some(token) {
-                    entropy += entropy_term(count, n);
+                    entropy += term(count);
                     previous = Some(token);
                     count = 0;
                 }
                 count += multiplicity;
             }
-            entropy + entropy_term(count, n)
+            entropy + term(count)
         } else {
-            dense.iter().map(|&count| entropy_term(count, n)).sum()
+            dense.iter().map(|&count| term(count)).sum()
         };
         result.push((offset, (extra as f64 + entropy) * population_scale));
     }
@@ -141,8 +193,167 @@ pub(super) fn scores(samples: &mut Samples, config: HybridUintConfig) -> Result<
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
+    use std::hint::black_box;
+    use std::time::{Duration, Instant};
 
     use super::*;
+
+    fn scoring_cases() -> Vec<(&'static str, Samples, HybridUintConfig)> {
+        let dense = HybridUintConfig::default();
+        let sparse = HybridUintConfig::new(15, 15, 0).unwrap();
+        let sparse_lsb = HybridUintConfig::new(15, 0, 15).unwrap();
+        [
+            ("low-cardinality", 1024, 0, dense),
+            ("large-low-cardinality", 16384, 0, dense),
+            ("high-cardinality", 1024, 1, dense),
+            ("large-high-cardinality", 8192, 1, dense),
+            ("sparse-literals", 1024, 1, sparse),
+            ("sparse-lsb", 1024, 1, sparse_lsb),
+            ("sparse-low-cardinality", 1024, 0, sparse),
+            ("singleton", 1, 0, dense),
+            ("small-dense", 7, 2, dense),
+            ("small-sparse", 7, 2, sparse),
+            ("small-high-cardinality", 31, 1, dense),
+        ]
+        .into_iter()
+        .map(|(name, n, kind, config)| {
+            let mut samples = Samples {
+                baseline: -37,
+                ..Samples::new(19)
+            };
+            let mut random = 0x1234_5678_9abc_def0u64;
+            for i in 0..n {
+                random = random.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let value = match kind {
+                    0 => [-1000, 0, 1000, 1000][i % 4],
+                    1 => i64::from(random as i32),
+                    _ => [i64::MIN, i64::MAX, -1, 0, 1, 4_294_967_296, 17][i % 7],
+                };
+                samples.add(value, n).unwrap();
+            }
+            // A larger population must not change the cache's reservoir-size n.
+            samples.count *= 7;
+            samples.sum *= 7;
+            (name, samples, config)
+        })
+        .collect()
+    }
+
+    fn assert_identical_scores(actual: &[(i32, f64)], expected: &[(i32, f64)]) {
+        assert_eq!(actual.len(), expected.len());
+        for (&(offset, bits), &(old_offset, old_bits)) in actual.iter().zip(expected) {
+            assert_eq!(offset, old_offset);
+            assert_eq!(bits.to_bits(), old_bits.to_bits(), "offset={offset}");
+        }
+    }
+
+    #[test]
+    fn cached_scores_are_bit_identical_to_uncached_scores() {
+        for (name, mut samples, config) in scoring_cases() {
+            let old = scores_impl::<false>(&mut samples, config).unwrap();
+            let new = scores(&mut samples, config).unwrap();
+            assert_eq!(new[0].0, samples.baseline, "{name}");
+            assert_identical_scores(&new, &old);
+            assert_identical_scores(&scores(&mut samples, config).unwrap(), &old);
+        }
+    }
+
+    #[test]
+    fn entropy_cache_is_lazy_bounded_and_exact_on_collisions() {
+        for (n, slots) in [
+            (1, 2),
+            (2, 4),
+            (7, 8),
+            (31, 32),
+            (255, 256),
+            (256, 256),
+            (1024, 256),
+            (16384, 256),
+            (usize::MAX, 256),
+        ] {
+            let mut cache = EntropyCache::new(n).unwrap();
+            assert!(cache.entries.len().is_power_of_two());
+            assert!(cache.entries.len() <= ENTROPY_CACHE_ENTRIES);
+            assert_eq!(cache.entries.len(), slots);
+            assert!(cache.entries.iter().all(|&entry| entry == (0, 0.0)));
+            for count in [0, 1, n as u64, 1, n as u64, 0] {
+                assert_eq!(
+                    cache.term(count).to_bits(),
+                    entropy_term(count, n as f64).to_bits()
+                );
+                let entries = cache.entries.clone();
+                assert_eq!(
+                    cache.term(count).to_bits(),
+                    entropy_term(count, n as f64).to_bits()
+                );
+                assert_eq!(cache.entries, entries);
+            }
+        }
+
+        let n = 4096;
+        let mut cache = EntropyCache::new(n).unwrap();
+        // More distinct counts than slots guarantees eviction, not just hits.
+        for count in (0..=n as u64).chain((0..=n as u64).rev()) {
+            assert_eq!(
+                cache.term(count).to_bits(),
+                entropy_term(count, n as f64).to_bits()
+            );
+        }
+        assert_eq!(cache.entries.len(), ENTROPY_CACHE_ENTRIES);
+    }
+
+    #[test]
+    #[ignore = "opt-in scoring microbenchmark; run release with --ignored --nocapture"]
+    fn cached_vs_uncached_distribution_scoring() {
+        type Scorer = fn(&mut Samples, HybridUintConfig) -> Result<Vec<(i32, f64)>>;
+        const REPEATS: usize = 5;
+
+        println!(
+            "Complete scores calls, sorted reservoirs, fresh per-call caches; median of {REPEATS}"
+        );
+        println!("fixture n candidates cache_bytes old_us new_us old/new");
+        for (name, mut samples, config) in scoring_cases() {
+            let old = scores_impl::<false>(&mut samples, config).unwrap();
+            assert_identical_scores(&scores(&mut samples, config).unwrap(), &old);
+            let n = samples.values.len();
+            let iterations = (131_072 / n).clamp(16, 2048);
+            let measure = |samples: &mut Samples, scorer: Scorer| {
+                let start = Instant::now();
+                for _ in 0..iterations {
+                    black_box(
+                        black_box(scorer)(black_box(&mut *samples), black_box(config)).unwrap(),
+                    );
+                }
+                start.elapsed()
+            };
+            for _ in 0..3 {
+                black_box(scores_impl::<false>(&mut samples, config).unwrap());
+                black_box(scores(&mut samples, config).unwrap());
+            }
+            let mut old_times = [Duration::ZERO; REPEATS];
+            let mut new_times = [Duration::ZERO; REPEATS];
+            for repeat in 0..REPEATS {
+                if repeat % 2 == 0 {
+                    old_times[repeat] = measure(&mut samples, scores_impl::<false>);
+                    new_times[repeat] = measure(&mut samples, scores);
+                } else {
+                    new_times[repeat] = measure(&mut samples, scores);
+                    old_times[repeat] = measure(&mut samples, scores_impl::<false>);
+                }
+            }
+            old_times.sort_unstable();
+            new_times.sort_unstable();
+            let old_us = old_times[REPEATS / 2].as_secs_f64() * 1e6 / iterations as f64;
+            let new_us = new_times[REPEATS / 2].as_secs_f64() * 1e6 / iterations as f64;
+            let cache_bytes =
+                EntropyCache::new(n).unwrap().entries.len() * std::mem::size_of::<(u64, f64)>();
+            println!(
+                "{name:<24} {n:>5} {:>3} {cache_bytes:>4} {old_us:>10.3} {new_us:>10.3} {:>7.3}x",
+                old.len(),
+                old_us / new_us,
+            );
+        }
+    }
 
     fn reference(samples: &Samples, config: HybridUintConfig, offset: i32) -> f64 {
         let mut counts = BTreeMap::<u32, u64>::new();
@@ -202,6 +413,8 @@ mod tests {
             }
             for config in configs {
                 let result = scores(&mut samples, config).unwrap();
+                let uncached = scores_impl::<false>(&mut samples, config).unwrap();
+                assert_identical_scores(&result, &uncached);
                 assert_eq!(result[0].0, 0);
                 let unique: BTreeSet<_> = result.iter().map(|&(offset, _)| offset).collect();
                 assert_eq!(unique.len(), result.len());

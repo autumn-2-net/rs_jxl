@@ -40,6 +40,55 @@ pub(crate) struct ChannelTree {
 }
 
 impl ChannelTree {
+    /// Conservative across static channel/group choices. Offsets can switch
+    /// gradient-LUT routing to generic wrapping properties (or back again).
+    pub(in crate::modular) fn offset_sensitive_routing(tree: &Tree) -> bool {
+        // Flags: 1 = eligible specialization; 2 = it contains a property-9
+        // decision. A static Gradient leaf alone has no routing distinction.
+        let mut pending = Vec::<(usize, bool, Option<u8>)>::new();
+        let mut index = 0;
+        'visit: loop {
+            let mut flags = match tree.nodes[index] {
+                Node::Leaf {
+                    predictor,
+                    offset,
+                    multiplier,
+                } => u8::from(predictor == Predictor::Gradient && offset == 0 && multiplier == 1),
+                Node::Split {
+                    property,
+                    threshold,
+                    greater,
+                    less_equal,
+                } => {
+                    if property <= 1
+                        || (property == 9 && (GRADIENT_MIN - 1..GRADIENT_MAX).contains(&threshold))
+                    {
+                        pending.push((less_equal, property == 9, None));
+                        index = greater;
+                        continue;
+                    }
+                    0
+                }
+            };
+            while let Some((second, both, first)) = pending.pop() {
+                if let Some(first) = first {
+                    flags = if both {
+                        if first & flags & 1 != 0 { 3 } else { 0 }
+                    } else {
+                        first | flags
+                    };
+                } else if (both && flags == 0) || (!both && flags == 3) {
+                    continue;
+                } else {
+                    pending.push((0, both, Some(flags)));
+                    index = second;
+                    continue 'visit;
+                }
+            }
+            return flags & 2 != 0;
+        }
+    }
+
     pub fn new(tree: &Tree, channel: usize, group: usize) -> Self {
         let mut result = Self {
             nodes: vec![Decision::default()],

@@ -625,6 +625,29 @@ fn literal_fit_matches_pixel_walk_for_signed_depths_offsets_and_stream_order() {
             let (cached, cs) = fit_tokens(&tree, &views, 0, &tokens, &options, Some(&configs))
                 .unwrap()
                 .expect("safe literals");
+            let mut raw = vec![vec![]];
+            for view in &views {
+                raw.push(
+                    super::super::tokens::tokenize(
+                        view.channels,
+                        &tree,
+                        &view.wp,
+                        0,
+                        view.stream_id,
+                        false,
+                    )
+                    .unwrap(),
+                );
+                raw.push(vec![]);
+            }
+            let (raw_fit, rs) = fit_literals(&tree, &views, 0, &raw, &options, Some(&configs))
+                .unwrap()
+                .expect("safe pre-LZ literals");
+            assert_eq!(format!("{pixel:?}"), format!("{raw_fit:?}"));
+            assert_eq!(
+                (ps.samples, ps.population, ps.candidates, ps.leaves),
+                (rs.samples, rs.population, rs.candidates, rs.leaves)
+            );
             assert_eq!(format!("{pixel:?}"), format!("{cached:?}"));
             assert_eq!(
                 (ps.samples, ps.population, ps.candidates, ps.leaves),
@@ -641,7 +664,7 @@ fn literal_fit_matches_pixel_walk_for_signed_depths_offsets_and_stream_order() {
                 }
             }
             let after = Tree::new(nodes).unwrap();
-            assert_eq!(remap_tokens(&tree, &after, &mut tokens).unwrap(), 306);
+            assert_eq!(remap_tokens(&tree, &after, &mut tokens).unwrap(), Some(306));
             for (view, cached) in views.iter().zip(tokens.iter().filter(|s| !s.is_empty())) {
                 let fresh = encode::group_stream(
                     view.channels,
@@ -659,14 +682,13 @@ fn literal_fit_matches_pixel_walk_for_signed_depths_offsets_and_stream_order() {
 }
 
 #[test]
-fn literal_fit_explicitly_falls_back_for_wide_weighted_and_nonunit_data() {
+fn literal_fit_falls_back_for_wide_average4_and_nonunit_data() {
     let options = OffsetOptions {
         mode: OffsetMode::Distribution,
         ..Default::default()
     };
     for (predictor, multiplier, values) in [
-        (Predictor::Left, 1, vec![i32::MIN, 0]),
-        (Predictor::Weighted, 1, vec![10, -20]),
+        (Predictor::Average4, 1, vec![i32::MIN, 0]),
         (Predictor::Zero, 2, vec![100, 102]),
     ] {
         let tree = Tree::new(vec![Node::Leaf {
@@ -687,12 +709,202 @@ fn literal_fit_explicitly_falls_back_for_wide_weighted_and_nonunit_data() {
                 .0,
         ];
         assert!(
-            fit_tokens(&tree, &[view], 0, &tokens, &options, None)
+            fit_tokens(
+                &tree,
+                std::slice::from_ref(&view),
+                0,
+                &tokens,
+                &options,
+                None
+            )
+            .unwrap()
+            .is_none()
+        );
+        let raw =
+            vec![super::super::tokens::tokenize(&channels, &tree, &view.wp, 0, 0, false).unwrap()];
+        assert!(
+            fit_literals(&tree, std::slice::from_ref(&view), 0, &raw, &options, None)
                 .unwrap()
                 .is_none()
         );
         // Falling back still uses wide means and normal multiplier eligibility.
         fit(&tree, &[stream(&channels)], 0, &options).unwrap();
+    }
+}
+
+#[test]
+fn raw_fit_rejects_misassociated_streams_and_invalid_contexts() {
+    use crate::tools::lz77::Literal;
+    let tree = Tree::new(vec![leaf(17, 1)]).unwrap();
+    let channels = [plane(vec![1000; 3])];
+    let view = stream(&channels);
+    let options = OffsetOptions {
+        mode: OffsetMode::Distribution,
+        ..Default::default()
+    };
+    let raw = super::super::tokens::tokenize(&channels, &tree, &view.wp, 0, 0, false).unwrap();
+    for invalid in [
+        vec![],
+        vec![raw[..2].to_vec()],
+        vec![raw[..2].to_vec(), raw[2..].to_vec()],
+        vec![vec![
+            Literal {
+                context: 1,
+                value: 0
+            };
+            3
+        ]],
+    ] {
+        assert!(
+            fit_literals(
+                &tree,
+                std::slice::from_ref(&view),
+                0,
+                &invalid,
+                &options,
+                None
+            )
+            .unwrap()
+            .is_none()
+        );
+    }
+    assert!(
+        fit_literals(
+            &tree,
+            std::slice::from_ref(&view),
+            0,
+            &[raw],
+            &options,
+            None
+        )
+        .unwrap()
+        .is_some()
+    );
+}
+
+#[test]
+fn raw_fit_recovers_weighted_and_wide_residuals_from_pixels() {
+    let options = OffsetOptions {
+        mode: OffsetMode::Distribution,
+        samples_per_leaf: 7,
+    };
+    for id in 0..14 {
+        let predictor = Predictor::try_from(id).unwrap();
+        for wide in [false, true] {
+            for offset in [i32::MIN, -37, i32::MAX] {
+                let tree = Tree::new(vec![Node::Leaf {
+                    predictor,
+                    offset,
+                    multiplier: 1,
+                }])
+                .unwrap();
+                let channels = [Channel {
+                    width: 19,
+                    height: 3,
+                    hshift: 0,
+                    vshift: 0,
+                    samples: (0..57)
+                        .map(|i| {
+                            if wide {
+                                [i32::MIN, i32::MAX, -1, 0, 1][i % 5]
+                            } else {
+                                ((i * 7919) % 65536) as i32 - 32768
+                            }
+                        })
+                        .collect(),
+                }];
+                let view = stream(&channels);
+                let raw = vec![
+                    super::super::tokens::tokenize(&channels, &tree, &view.wp, 0, 0, false)
+                        .unwrap(),
+                ];
+                let configs = [HybridUintConfig::new(4, 1, 2).unwrap()];
+                let views = std::slice::from_ref(&view);
+                let cached = fit_literals(&tree, views, 0, &raw, &options, Some(&configs)).unwrap();
+                if wide && predictor == Predictor::Average4 {
+                    assert!(cached.is_none());
+                    continue;
+                }
+                let (cached, cs) = cached.expect("i32 predictor is exactly recoverable");
+                let (original, os) =
+                    fit_with_configs(&tree, views, 0, &options, Some(&configs)).unwrap();
+                assert_eq!(
+                    format!("{cached:?}"),
+                    format!("{original:?}"),
+                    "{predictor:?} wide={wide} offset={offset}"
+                );
+                assert_eq!(
+                    (cs.samples, cs.population, cs.leaves, cs.candidates),
+                    (os.samples, os.population, os.leaves, os.candidates)
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn distribution_parallel_scores_preserve_order_and_signaling_sweeps() {
+    fn build(nodes: &mut Vec<Node>, first: usize, end: usize) -> usize {
+        let index = nodes.len();
+        nodes.push(leaf((first as i32 % 7) - 3, 1));
+        if end - first > 1 {
+            let mid = (first + end) / 2;
+            let less_equal = build(nodes, first, mid);
+            let greater = build(nodes, mid, end);
+            nodes[index] = Node::Split {
+                property: 0,
+                threshold: mid as i32 - 1,
+                greater,
+                less_equal,
+            };
+        }
+        index
+    }
+    let mut nodes = Vec::new();
+    build(&mut nodes, 0, 137);
+    let tree = Tree::new(nodes).unwrap();
+    let options = OffsetOptions {
+        mode: OffsetMode::Distribution,
+        samples_per_leaf: 73,
+    };
+    let configs: Vec<_> = (0..tree.leaves())
+        .map(|i| match i % 3 {
+            0 => HybridUintConfig::default(),
+            1 => HybridUintConfig::new(4, 1, 2).unwrap(),
+            _ => HybridUintConfig::new(0, 0, 0).unwrap(),
+        })
+        .collect();
+    let run = || {
+        let (mut samples, counts) = collect_leaves(&tree, &options).unwrap();
+        for (i, sample) in samples.iter_mut().enumerate() {
+            let sample = sample.as_mut().unwrap();
+            for j in 0..(173 + i % 71) {
+                let value = if i % 11 == 0 {
+                    sample.baseline as i64
+                } else {
+                    (i * 37 + j * 13 % 17) as i64 - 8192
+                };
+                sample.add(value, options.samples_per_leaf).unwrap();
+            }
+        }
+        let (proposal, stats) =
+            fit_distribution(&tree, &mut samples, counts, Some(&configs)).unwrap();
+        (
+            format!("{proposal:?}"),
+            stats.leaves,
+            stats.samples,
+            stats.population,
+            stats.candidates,
+        )
+    };
+    let expected = crate::execution::serial(run);
+    assert!(expected.1 > 0);
+    for workers in [1, 2, 4] {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(workers)
+            .build()
+            .unwrap();
+        assert_eq!(crate::execution::with_pool(&pool, run), expected);
     }
 }
 

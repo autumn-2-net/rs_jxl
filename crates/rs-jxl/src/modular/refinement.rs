@@ -2,9 +2,10 @@
 //! refitting and entropy-mode comparison; no external codec dependency.
 //!
 //! Each entropy alternative reuses the same tokens, LZ parse, transforms and
-//! tree. Literal-only Distribution trials can reuse baseline residual tokens;
-//! other leaf proposals retokenize/reparse after learning. Training/preparation
-//! are not repeated. Only actual serialized costs select a winner.
+//! tree. Distribution trials can fit and remap cached pre-LZ residual tokens;
+//! changed residuals still run the LZ parser and entropy model builder again.
+//! Other leaf proposals retokenize after learning. Training/preparation are
+//! not repeated. Only actual serialized costs select a winner.
 
 use std::cell::{Cell, RefCell};
 use std::sync::{Arc, Mutex};
@@ -146,7 +147,10 @@ pub(super) fn reuse_literals(tree: &Tree, options: &encode::ModularOptions) -> b
         )
 }
 
+pub(super) type LiteralCache = RefCell<Option<Vec<Vec<crate::tools::lz77::Literal>>>>;
+
 pub(super) fn choose<T>(
+    raw_cache: Option<&LiteralCache>,
     tree: &Tree,
     views: &[training::TrainingStream<'_>],
     options: &encode::ModularOptions,
@@ -315,6 +319,17 @@ pub(super) fn choose<T>(
                 offsets,
                 offset_configs.as_deref(),
             )?
+        } else if let Some(raw) = raw_cache
+            .and_then(|cache| std::cell::Ref::filter_map(cache.borrow(), |raw| raw.as_ref()).ok())
+        {
+            super::leaf_offset::fit_literals(
+                tree,
+                views,
+                options.previous_channels,
+                &raw,
+                offsets,
+                offset_configs.as_deref(),
+            )?
         } else {
             None
         };
@@ -340,8 +355,11 @@ pub(super) fn choose<T>(
         if let Some(refined) = refined {
             stats.offset_proposals += 1;
             if let Some(tokens) = &mut offset_tokens {
-                stats.offset_reused_tokens +=
-                    super::leaf_offset::remap_tokens(tree, &refined, tokens)?;
+                if let Some(count) = super::leaf_offset::remap_tokens(tree, &refined, tokens)? {
+                    stats.offset_reused_tokens += count;
+                } else {
+                    offset_tokens = None;
+                }
             }
             evaluate(&refined, Origin::Offsets, offset_tokens.take())?;
         }
@@ -376,9 +394,10 @@ pub(super) fn write_local(
         stream_id,
     }];
     let cache_raw = options.lz77 && reuse_literals(tree, options);
-    let raw_cache = RefCell::new(None::<Vec<Vec<crate::tools::lz77::Literal>>>);
+    let raw_cache = LiteralCache::default();
     let raw_reused = Cell::new(0);
     let best = choose(
+        Some(&raw_cache),
         tree,
         &views,
         options,
