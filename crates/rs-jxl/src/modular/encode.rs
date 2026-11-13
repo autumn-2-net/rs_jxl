@@ -422,6 +422,16 @@ pub(super) fn weighted_header(
     planes: &[Channel],
     options: &ModularOptions,
 ) -> Result<weighted::Header> {
+    weighted_header_narrow(planes, options, false)
+}
+
+/// [`weighted_header`] with the caller-selected four-lane kernel; the search
+/// order, strict `<` tie-break and pruning bound are unchanged.
+pub(super) fn weighted_header_narrow(
+    planes: &[Channel],
+    options: &ModularOptions,
+    narrow: bool,
+) -> Result<weighted::Header> {
     let _scope = crate::profile::scope("modular.weighted_header");
     let preset = if let Some(count) = options.weighted_candidates {
         let views: Vec<_> = planes
@@ -434,9 +444,9 @@ pub(super) fn weighted_header(
             })
             .collect();
         let selected = if options.parallel_weighted {
-            super::cost::select_weighted_preset_parallel(&views, count, true)?
+            super::cost::select_weighted_preset_parallel_narrow(&views, count, true, narrow)?
         } else {
-            super::cost::select_weighted_preset(&views, count, true)?
+            super::cost::select_weighted_preset_narrow(&views, count, true, narrow)?
         };
         selected.preset
     } else {
@@ -445,10 +455,41 @@ pub(super) fn weighted_header(
     weighted::Header::preset(u32::from(preset))
 }
 
+/// Metadata eligibility for the optional four-lane WP cost experiment.
+/// This is not an arithmetic proof after transforms: the weighted state must
+/// check its actual intermediates and use the wide path outside that envelope.
+/// Float input stays on the ordinary path.
+pub(super) fn wp_narrow_safe(image: &Image) -> bool {
+    let metadata = image.metadata();
+    if metadata.bit_depth.is_float() {
+        return false;
+    }
+    let mut bits = metadata.bit_depth.bits_per_sample;
+    for extra in &metadata.extra_channels {
+        if extra.bit_depth.is_float() {
+            return false;
+        }
+        bits = bits.max(extra.bit_depth.bits_per_sample);
+    }
+    bits <= 20
+}
+
+/// Opt-in gate for the four-lane WP cost kernel (`RS_JXL_WP_NARROW=1`).
+///
+/// The kernel is bit-exact against the scalar spelling (see
+/// `cost::tests::narrow_kernel_matches_scalar_cost`), but its speed effect
+/// sits under this machine's measurement noise, so it stays off by default.
+/// Keeping the switch in the binary lets one build serve both A/B sides and
+/// removes the cross-binary confound.
+fn wp_narrow_enabled() -> bool {
+    matches!(std::env::var("RS_JXL_WP_NARROW").as_deref(), Ok("1"))
+}
+
 pub(super) fn prepare(image: &Image, g: Group, options: &ModularOptions) -> Result<Prepared> {
     let _scope = crate::profile::scope("modular.prepare_group");
     let (planes, transforms) = planes(image, g, options)?;
-    let wp = weighted_header(&planes, options)?;
+    let narrow = wp_narrow_safe(image) && wp_narrow_enabled();
+    let wp = weighted_header_narrow(&planes, options, narrow)?;
     Ok(Prepared {
         planes,
         transforms,

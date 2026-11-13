@@ -481,6 +481,10 @@ struct TrainingStats {
     duplicate_properties: AtomicUsize,
     inherited_properties: AtomicUsize,
     dominated_predictors: AtomicUsize,
+    property_evals: [AtomicUsize; 32],
+    property_wins: [AtomicUsize; 32],
+    property_wins_pred: [[AtomicUsize; 32]; 14],
+    property_gap: [AtomicUsize; 4],
     #[cfg(test)]
     initial_cache_hook: Option<Box<InitialCacheHook>>,
     #[cfg(test)]

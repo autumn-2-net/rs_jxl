@@ -290,9 +290,52 @@ impl State {
     ) -> Result<(i32, i32)> {
         self.check_position(x, y, false)?;
         let rows = self.rows(y);
-        let result = self.predict_at::<true>(x, rows, [n, w, ne, nw, nn]);
-        self.update_at(value, x, y, rows);
+        let result = self.predict_at::<true, false, false>(x, rows, [n, w, ne, nw, nn]);
+        self.update_at::<false>(value, x, y, rows);
         Ok(result)
+    }
+
+    /// Raster-order variant for local cost walks: the caller advances through
+    /// consecutive raster coordinates, so the per-sample position check is
+    /// skipped. Prediction and history update are the same as the checked API.
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn predict_and_update_raster<const NARROW: bool>(
+        &mut self,
+        value: i32,
+        x: usize,
+        y: usize,
+        n: i32,
+        w: i32,
+        ne: i32,
+        nw: i32,
+        nn: i32,
+    ) -> (i32, i32) {
+        let rows = self.rows(y);
+        let result = self.predict_at::<true, false, NARROW>(x, rows, [n, w, ne, nw, nn]);
+        self.update_at_raster::<NARROW>(value, x, rows);
+        result
+    }
+
+    /// Interior version of [`Self::predict_and_update_raster`]: the caller keeps
+    /// `0 < x < width - 1`, so the boundary selects fold away entirely.
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn predict_and_update_raster_interior<const NARROW: bool>(
+        &mut self,
+        value: i32,
+        x: usize,
+        y: usize,
+        n: i32,
+        w: i32,
+        ne: i32,
+        nw: i32,
+        nn: i32,
+    ) -> (i32, i32) {
+        let rows = self.rows(y);
+        let result = self.predict_at::<true, true, NARROW>(x, rows, [n, w, ne, nw, nn]);
+        self.update_at_raster::<NARROW>(value, x, rows);
+        result
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -307,22 +350,28 @@ impl State {
         nn: i32,
     ) -> Result<(i32, i32)> {
         self.check_position(x, y, false)?;
-        let result = self.predict_at::<FLAT>(x, self.rows(y), [n, w, ne, nw, nn]);
+        let result = self.predict_at::<FLAT, false, false>(x, self.rows(y), [n, w, ne, nw, nn]);
         self.pending = true;
         Ok(result)
     }
 
+    /// `INTERIOR` promises `0 < x < width - 1`; it removes the three per-sample
+    /// boundary selects and never changes a value.
     #[inline]
-    fn predict_at<const FLAT: bool>(
+    fn predict_at<const FLAT: bool, const INTERIOR: bool, const NARROW: bool>(
         &mut self,
         x: usize,
         (cur_row, prev_row): (usize, usize),
         [n, w, ne, nw, nn]: [i32; 5],
     ) -> (i32, i32) {
         let pos_n = prev_row + x;
-        let pos_ne = if x < self.width - 1 { pos_n + 1 } else { pos_n };
-        let pos_nw = if x > 0 { pos_n - 1 } else { pos_n };
-        let te_w = if x == 0 {
+        let pos_ne = if INTERIOR || x < self.width - 1 {
+            pos_n + 1
+        } else {
+            pos_n
+        };
+        let pos_nw = if INTERIOR || x > 0 { pos_n - 1 } else { pos_n };
+        let te_w = if !INTERIOR && x == 0 {
             0
         } else {
             i64::from(self.error[cur_row + x - 1])
@@ -344,11 +393,18 @@ impl State {
         let north = self.pred_errors[pos_n];
         let northeast = self.pred_errors[pos_ne];
         let northwest = self.pred_errors[pos_nw];
-        let errors = std::array::from_fn(|i| {
-            north[i]
-                .wrapping_add(northeast[i])
-                .wrapping_add(northwest[i])
-        });
+        let errors = if NARROW {
+            // Bit-identical to the scalar spelling: `i32`/`u32` wrapping
+            // addition is the same instruction, and the caller proves the
+            // value range before selecting this kernel.
+            jxl_simd::wp::sum3_u32(&north, &northeast, &northwest)
+        } else {
+            std::array::from_fn(|i| {
+                north[i]
+                    .wrapping_add(northeast[i])
+                    .wrapping_add(northwest[i])
+            })
+        };
         let weights = weights(errors, self.header.w);
 
         let [n, w, ne, nw, nn] = [n, w, ne, nw, nn].map(|v| i64::from(v) << EXTRA_BITS);
@@ -384,28 +440,62 @@ impl State {
 
     pub fn update(&mut self, value: i32, x: usize, y: usize) -> Result<()> {
         self.check_position(x, y, true)?;
-        self.update_at(value, x, y, self.rows(y));
+        self.update_at::<false>(value, x, y, self.rows(y));
         Ok(())
     }
 
     #[inline]
-    fn update_at(&mut self, value: i32, x: usize, y: usize, (cur_row, prev_row): (usize, usize)) {
-        let value = i64::from(value) << EXTRA_BITS;
-        self.error[cur_row + x] = (self.pred - value) as i32;
-        let errors = self
-            .prediction
-            .map(|p| (((p - value).abs() + PREDICTION_ROUND) >> EXTRA_BITS) as u32);
-        self.pred_errors[cur_row + x] = errors;
-        let next = &mut self.pred_errors[prev_row + x + 1];
-        for i in 0..NUM_PREDICTORS {
-            next[i] = next[i].wrapping_add(errors[i]);
-        }
+    fn update_at<const NARROW: bool>(
+        &mut self,
+        value: i32,
+        x: usize,
+        y: usize,
+        rows: (usize, usize),
+    ) {
+        self.update_at_raster::<NARROW>(value, x, rows);
         self.pending = false;
         self.next = if x == self.width - 1 {
             y.checked_add(1).map(|next_y| (0, next_y))
         } else {
             Some((x + 1, y))
         };
+    }
+
+    /// History update shared by both prediction APIs; the callers own the
+    /// position bookkeeping.
+    #[inline]
+    fn update_at_raster<const NARROW: bool>(
+        &mut self,
+        value: i32,
+        x: usize,
+        (cur_row, prev_row): (usize, usize),
+    ) {
+        let value = i64::from(value) << EXTRA_BITS;
+        self.error[cur_row + x] = (self.pred - value) as i32;
+        // Check the actual intermediates: metadata cannot bound transformed
+        // planes, and err4's scalar twin must not overflow subtraction/rounding.
+        let errors = if NARROW
+            && i32::try_from(value).is_ok()
+            && self.prediction.iter().all(|&p| {
+                i32::try_from(p).is_ok()
+                    && (p - value).abs() <= i64::from(i32::MAX) - PREDICTION_ROUND
+            }) {
+            let lanes = self.prediction.map(|p| p as i32);
+            jxl_simd::wp::err4(&lanes, value as i32, PREDICTION_ROUND as i32, EXTRA_BITS)
+                .map(|v| v as u32)
+        } else {
+            self.prediction
+                .map(|p| (((p - value).abs() + PREDICTION_ROUND) >> EXTRA_BITS) as u32)
+        };
+        self.pred_errors[cur_row + x] = errors;
+        let next = &mut self.pred_errors[prev_row + x + 1];
+        if NARROW {
+            jxl_simd::wp::accumulate_u32(next, &errors);
+        } else {
+            for i in 0..NUM_PREDICTORS {
+                next[i] = next[i].wrapping_add(errors[i]);
+            }
+        }
     }
 }
 

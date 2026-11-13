@@ -124,6 +124,7 @@ fn same_family(a: &CandidateParams, b: &CandidateParams) -> bool {
         && a.channel_colors_pre_transform_percent == b.channel_colors_pre_transform_percent
         && a.predictor == b.predictor
         && a.max_properties == b.max_properties
+        && a.previous_property_subset == b.previous_property_subset
         && a.patches == b.patches
         && a.delta_palette == b.delta_palette
         && a.squeeze == b.squeeze

@@ -10,6 +10,13 @@ pub(crate) fn parse_threads(value: &str) -> std::result::Result<usize, String> {
     Ok(count)
 }
 
+pub(crate) fn parse_prev_props(value: &str) -> std::result::Result<u8, String> {
+    match value.parse::<u8>() {
+        Ok(subset @ (1 | 2 | 4)) => Ok(subset),
+        _ => Err("source previous-channel property subset must be 1, 2 or 4".into()),
+    }
+}
+
 pub(crate) fn parse_sample_limit(value: &str) -> std::result::Result<usize, String> {
     value
         .parse::<usize>()
@@ -37,6 +44,19 @@ mod tests {
             assert_eq!(
                 parse_threads(value).unwrap_err(),
                 "threads must be an integer in 1..=256"
+            );
+        }
+    }
+
+    #[test]
+    fn previous_property_subsets_accept_only_upstream_shapes() {
+        for (value, expected) in [("1", 1), ("2", 2), ("4", 4)] {
+            assert_eq!(parse_prev_props(value), Ok(expected));
+        }
+        for value in ["", "0", "3", "5", "abc", "1.0", " 2", "-1"] {
+            assert_eq!(
+                parse_prev_props(value).unwrap_err(),
+                "source previous-channel property subset must be 1, 2 or 4"
             );
         }
     }

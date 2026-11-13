@@ -12,6 +12,7 @@ use super::{
     PropertyColumn, PropertyValue, ResidualToken, SampleStorage, Samples, TrainOptions,
     collect_mapped, execution,
 };
+use super::split_scoring::histogram_detail_scope;
 use crate::{Error, Result};
 
 fn cache_pair14_enabled() -> bool {
@@ -174,12 +175,101 @@ impl PropertyHistogram {
         Ok(histogram)
     }
 
+    /// Allocates every predictor column without consulting `used`. Fused
+    /// callers fill marginals in the same sweep, so the constant-property check
+    /// cannot gate allocation up front; the caller invalidates constant
+    /// properties after the sweep instead of skipping allocation before it.
+    fn allocate_predictors_unconditional(
+        &mut self,
+        parents: &[ParentHistogram],
+        stride: Option<usize>,
+    ) {
+        let bins = self.used.len();
+        self.predictors = parents
+            .iter()
+            .map(|parent| BinHistogram {
+                symbols: stride.unwrap_or(parent.counts.len()),
+                counts: vec![0; bins * stride.unwrap_or(parent.counts.len())],
+                extra: vec![0; bins],
+            })
+            .collect();
+    }
+
+    /// One index sweep filling marginals and predictor histograms together.
+    /// Equivalent to `collect_values_with_stride`, minus the second walk over
+    /// `indices` that separate marginals collection used to cost.
+    pub(super) fn collect_marginals_and_predictors<T: PropertyValue>(
+        samples: &Samples<impl SampleStorage>,
+        indices: &[usize],
+        parents: &[ParentHistogram],
+        property: usize,
+        values: &[T],
+        plan: &PredictorPlan,
+        stride: Option<usize>,
+    ) -> Result<Self> {
+        let _fused_scope = histogram_detail_scope("ma.cache_fused");
+        let bins = samples.thresholds[property].len() + 1;
+        let mut histogram = Self::default();
+        histogram.used.resize(bins, 0);
+        histogram.weights.resize(bins, 0);
+        histogram.allocate_predictors_unconditional(parents, stride);
+        let active = plan.active();
+        let columns = histogram.predictors.len();
+        let two_preds = active.len() == 2
+            && active[0] < active[1]
+            && active[1] < columns
+            && columns == 2;
+        {
+            let _fill_scope = histogram_detail_scope("ma.cache_fused_fill");
+            let used = &mut histogram.used;
+            let weights = &mut histogram.weights;
+            if two_preds {
+                let (head, tail) = histogram.predictors.split_at_mut(active[1]);
+                let (first, second) = (&mut head[active[0]], &mut tail[0]);
+                let (a, b) = (
+                    &samples.residuals[active[0]][..],
+                    &samples.residuals[active[1]][..],
+                );
+                for &i in indices {
+                    let bin = values[i].index();
+                    let weight = u32::from(samples.counts[i]);
+                    used[bin] += 1;
+                    weights[bin] += weight;
+                    let residual = a[i];
+                    first.counts[bin * first.symbols + usize::from(residual.token)] += weight;
+                    first.extra[bin] += u64::from(weight) * u64::from(residual.nbits);
+                    let residual = b[i];
+                    second.counts[bin * second.symbols + usize::from(residual.token)] += weight;
+                    second.extra[bin] += u64::from(weight) * u64::from(residual.nbits);
+                }
+            } else {
+                for &i in indices {
+                    let bin = values[i].index();
+                    let weight = u32::from(samples.counts[i]);
+                    used[bin] += 1;
+                    weights[bin] += weight;
+                    for &predictor in active {
+                        let column = &mut histogram.predictors[predictor];
+                        let residual = samples.residuals[predictor][i];
+                        column.counts[bin * column.symbols + usize::from(residual.token)] +=
+                            weight;
+                        column.extra[bin] += u64::from(weight) * u64::from(residual.nbits);
+                    }
+                }
+            }
+        }
+        histogram.copy_predictors(plan)?;
+        histogram.valid = true;
+        Ok(histogram)
+    }
+
     pub(super) fn collect_marginals_values<T: PropertyValue>(
         samples: &Samples<impl SampleStorage>,
         indices: &[usize],
         property: usize,
         values: &[T],
     ) -> Self {
+        let _marginals_scope = histogram_detail_scope("ma.cache_marginals");
         let bins = samples.thresholds[property].len() + 1;
         let mut histogram = Self::default();
         collect_property_marginals(
@@ -227,6 +317,7 @@ impl PropertyHistogram {
         if !self.allocate_predictors(parents, stride) {
             return Ok(());
         }
+        let _fill_scope = histogram_detail_scope("ma.cache_fill");
         if pair14 && plan.cache_pair14_eligible(self.predictors.len()) {
             // Touch two histogram columns per pass without extra allocations.
             for predictor in (0..14).step_by(2) {
@@ -286,6 +377,7 @@ impl PropertyHistogram {
         parents: &[ParentHistogram],
         stride: Option<usize>,
     ) -> bool {
+        let _alloc_scope = histogram_detail_scope("ma.cache_alloc");
         // A subset of a constant property stays constant. Retain only its
         // partition counts; neither this node nor descendants need tokens.
         if self.used.iter().filter(|&&n| n != 0).take(2).count() < 2 {
@@ -480,6 +572,7 @@ impl PropertyHistogram {
         removed: &[usize],
         values: &[T],
     ) -> Result<()> {
+        let _sub_marginals_scope = histogram_detail_scope("ma.cache_sub_marginals");
         for &i in removed {
             self.subtract_marginal(values[i].index(), u32::from(samples.counts[i]))?;
         }
@@ -493,14 +586,68 @@ impl PropertyHistogram {
         values: &[T],
         plan: &PredictorPlan,
     ) -> Result<()> {
-        for &i in removed {
-            self.subtract_predictors(
-                samples,
-                i,
-                values[i].index(),
-                u32::from(samples.counts[i]),
-                plan,
-            )?;
+        let _sub_fill_scope = histogram_detail_scope("ma.cache_sub_fill");
+        let active = plan.active();
+        let count = self.predictors.len();
+        if active.len() == 2 && active[1] < count {
+            // Bind both live columns once instead of re-resolving the plan for
+            // every removed record; keeps record-major subtraction order.
+            let (first, second) = (active[0], active[1]);
+            let (low, high) = if first < second {
+                (first, second)
+            } else {
+                (second, first)
+            };
+            let (head, tail) = self.predictors.split_at_mut(high);
+            let (low_histogram, high_histogram) = (&mut head[low], &mut tail[0]);
+            let (low_tokens, high_tokens) =
+                (&samples.residuals[low][..], &samples.residuals[high][..]);
+            let mut columns: [(&mut BinHistogram, &[ResidualToken]); 2] = if first < second {
+                [
+                    (low_histogram, low_tokens),
+                    (high_histogram, high_tokens),
+                ]
+            } else {
+                [
+                    (high_histogram, high_tokens),
+                    (low_histogram, low_tokens),
+                ]
+            };
+            for &i in removed {
+                let bin = values[i].index();
+                let weight = u32::from(samples.counts[i]);
+                for (histogram, tokens) in columns.iter_mut() {
+                    histogram.subtract(tokens[i], bin, weight)?;
+                }
+            }
+        } else if plan.cache_pair14_eligible(count) {
+            let mut histograms = self.predictors.iter_mut();
+            let mut columns: [(&mut BinHistogram, &[ResidualToken]); 14] =
+                std::array::from_fn(|predictor| {
+                    (
+                        histograms.next().expect("14 identity cache predictors"),
+                        &samples.residuals[predictor][..],
+                    )
+                });
+            for &i in removed {
+                let bin = values[i].index();
+                let weight = u32::from(samples.counts[i]);
+                for (histogram, tokens) in &mut columns {
+                    histogram.subtract(tokens[i], bin, weight)?;
+                }
+            }
+        } else {
+            for &i in removed {
+                let bin = values[i].index();
+                let weight = u32::from(samples.counts[i]);
+                for &predictor in active.iter().filter(|&&p| p < count) {
+                    self.predictors[predictor].subtract(
+                        samples.residuals[predictor][i],
+                        bin,
+                        weight,
+                    )?;
+                }
+            }
         }
         self.copy_predictors(plan)?;
         Ok(())
@@ -544,6 +691,7 @@ impl PropertyHistogram {
     }
 
     pub(super) fn copy_predictors(&mut self, plan: &PredictorPlan) -> Result<()> {
+        let _copy_scope = histogram_detail_scope("ma.cache_copy");
         for predictor in 0..self.predictors.len() {
             let representative = plan.representative[predictor];
             if representative != predictor {

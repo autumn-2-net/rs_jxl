@@ -17,6 +17,7 @@ libsais-rs = { version = "=0.2.2", default-features = false }
 rayon.workspace = true
 brotli.workspace = true
 jxl-decoder.workspace = true
+jxl_simd = { path = "../../vendor/jxl-rs/jxl_simd" }
 moxcms.workspace = true
 
 [dev-dependencies]

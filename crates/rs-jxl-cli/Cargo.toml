@@ -14,7 +14,7 @@ name = "rs-jxl"
 path = "src/main.rs"
 
 [dependencies]
-rs-jxl = { path = "../rs-jxl" }
+rs-jxl = { path = "../rs-jxl", features = ["experimental-lz77-hotspots"] }
 rs-jxl-image = { path = "../rs-jxl-image" }
 clap = { workspace = true, features = ["derive"] }
 png.workspace = true

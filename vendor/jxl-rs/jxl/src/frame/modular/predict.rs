@@ -210,7 +210,7 @@ pub struct WeightedPredictorState<'a> {
     // Note that (at least as of June 2026) the use of unsafe code
     // that needs these invariants seems to provide meaningful speedups.
     xsize: usize,
-    pred_errors_buffer: &'a mut [[u32; NUM_PREDICTORS]],
+    pred_errors_buffer: &'a mut [[i32; NUM_PREDICTORS]],
     // Note: we store errors in positions [1..=xsize], and error[0] == 0.
     // (this is not a safety invariant)
     error: &'a mut [i32],
@@ -218,11 +218,15 @@ pub struct WeightedPredictorState<'a> {
     p1c: u8,
     p2c: u8,
     p3c: [u8; 5],
+    // True when the last `predict_and_property` call collapsed all four
+    // sub-predictions to `pred` (the run-length fast path). `update_errors`
+    // then derives one error instead of reading `prediction`.
+    prediction_uniform: bool,
 }
 
 #[derive(Debug, Default)]
 pub struct WeightedPredictorScratch {
-    pred_errors_buffer: Vec<[u32; NUM_PREDICTORS]>,
+    pred_errors_buffer: Vec<[i32; NUM_PREDICTORS]>,
     error: Vec<i32>,
 }
 
@@ -264,9 +268,12 @@ impl<'a> WeightedPredictorState<'a> {
                 wp_header.p3cd as u8,
                 wp_header.p3ce as u8,
             ],
+            prediction_uniform: false,
         }
     }
+}
 
+impl<'a> WeightedPredictorState<'a> {
     pub fn save_state(&self, wp_image: &mut Image<i32>) {
         let row_stride = self.xsize + 1;
         wp_image
@@ -281,10 +288,10 @@ impl<'a> WeightedPredictorState<'a> {
             .zip(d3.iter_mut())
             .zip(src)
         {
-            *d0 = s[0] as i32;
-            *d1 = s[1] as i32;
-            *d2 = s[2] as i32;
-            *d3 = s[3] as i32;
+            *d0 = s[0];
+            *d1 = s[1];
+            *d2 = s[2];
+            *d3 = s[3];
         }
     }
 
@@ -300,7 +307,7 @@ impl<'a> WeightedPredictorState<'a> {
             .iter_mut()
             .zip(s0.iter().zip(s1.iter().zip(s2.iter().zip(s3.iter()))))
         {
-            *d = [s0 as u32, s1 as u32, s2 as u32, s3 as u32];
+            *d = [s0, s1, s2, s3];
         }
     }
 
@@ -366,7 +373,11 @@ impl<'a> WeightedPredictorState<'a> {
             // regardless of unsigned error history. Keep all sub-predictions:
             // update_errors must still run if the decoded pixel breaks the run.
             self.pred = add_bits(data.top);
-            self.prediction = [self.pred; 4];
+            // All four sub-predictions collapse to `pred`; leave `prediction`
+            // untouched and let update_errors derive the single error from
+            // `pred`. Writing `[self.pred; 4]` here would cost a 32-byte store
+            // and four loads per pixel without adding information.
+            self.prediction_uniform = true;
             return (i64::from(data.top), 0);
         }
 
@@ -380,12 +391,16 @@ impl<'a> WeightedPredictorState<'a> {
         // SAFETY: pos_nw < xsize and prev_row <= xsize + 1.
         let err_nw = unsafe { self.pred_errors_buffer.get_unchecked(prev_row + pos_nw) };
 
-        let err0 = err_n[0].wrapping_add(err_ne[0]).wrapping_add(err_nw[0]);
-        let err1 = err_n[1].wrapping_add(err_ne[1]).wrapping_add(err_nw[1]);
-        let err2 = err_n[2].wrapping_add(err_ne[2]).wrapping_add(err_nw[2]);
-        let err3 = err_n[3].wrapping_add(err_ne[3]).wrapping_add(err_nw[3]);
+        // Four-lane wrapping sum: on x86-64 this is one SSE2 add chain instead of
+        // twelve scalar loads and eight scalar adds.
+        let [err0, err1, err2, err3] = jxl_simd::wp::sum3(err_n, err_ne, err_nw);
 
-        let [w0, w1, w2, w3] = weighted_weights::weights([err0, err1, err2, err3], self.w);
+        let [w0, w1, w2, w3] = weighted_weights::weights(
+            // The lanes are kept as i32 so they can feed a 4-wide i32 vector; the
+            // weight lookup still consumes the unsigned view (values are non-negative).
+            [err0 as u32, err1 as u32, err2 as u32, err3 as u32],
+            self.w,
+        );
         // u8 * DIVLOOKUP[i] + 4 never overflows, so all weights are >= 4.
         debug_assert!(w0 >= 4);
         debug_assert!(w1 >= 4);
@@ -456,6 +471,7 @@ impl<'a> WeightedPredictorState<'a> {
         }
         self.prediction = [p0, p1, p2, p3];
         self.pred = pred;
+        self.prediction_uniform = false;
         ((pred + PREDICTION_ROUND) >> PRED_EXTRA_BITS, p as i32)
     }
 
@@ -474,23 +490,28 @@ impl<'a> WeightedPredictorState<'a> {
         debug_assert!(cur_row + pos.0 + 1 < self.error.len());
         // SAFETY: cur_row <= xsize + 1, so the index is <= 2*xsize + 1, which is in-bounds due to
         // the safety invariant (`self.error.len() == 2*(xsize+1)`).
-        unsafe { *self.error.get_unchecked_mut(cur_row + pos.0 + 1) = (self.pred - val) as i32 };
+        let diff = self.pred - val;
+        unsafe { *self.error.get_unchecked_mut(cur_row + pos.0 + 1) = diff as i32 };
 
-        // Compute errors for all predictors
-        let err0 =
-            (((self.prediction[0] - val).abs() + PREDICTION_ROUND) >> PRED_EXTRA_BITS) as u32;
-        let err1 =
-            (((self.prediction[1] - val).abs() + PREDICTION_ROUND) >> PRED_EXTRA_BITS) as u32;
-        let err2 =
-            (((self.prediction[2] - val).abs() + PREDICTION_ROUND) >> PRED_EXTRA_BITS) as u32;
-        let err3 =
-            (((self.prediction[3] - val).abs() + PREDICTION_ROUND) >> PRED_EXTRA_BITS) as u32;
+        // Compute errors for all predictors. On the run-length fast path all four
+        // sub-predictions equal `pred`, so a single subtraction feeds every lane.
+        let errs = if self.prediction_uniform {
+            let err = ((diff.abs() + PREDICTION_ROUND) >> PRED_EXTRA_BITS) as i32;
+            [err; NUM_PREDICTORS]
+        } else {
+            [
+                (((self.prediction[0] - val).abs() + PREDICTION_ROUND) >> PRED_EXTRA_BITS) as i32,
+                (((self.prediction[1] - val).abs() + PREDICTION_ROUND) >> PRED_EXTRA_BITS) as i32,
+                (((self.prediction[2] - val).abs() + PREDICTION_ROUND) >> PRED_EXTRA_BITS) as i32,
+                (((self.prediction[3] - val).abs() + PREDICTION_ROUND) >> PRED_EXTRA_BITS) as i32,
+            ]
+        };
 
         debug_assert!(cur_row + pos.0 < self.pred_errors_buffer.len());
         // SAFETY: cur_row <= xsize + 1, so the index is < 2*xsize + 1, which is in-bounds due to
         // the safety invariant (`self.pred_errors_buffer.len() == 2*(xsize+1)`).
         unsafe {
-            *self.pred_errors_buffer.get_unchecked_mut(cur_row + pos.0) = [err0, err1, err2, err3];
+            *self.pred_errors_buffer.get_unchecked_mut(cur_row + pos.0) = errs;
         }
 
         debug_assert!(prev_row + pos.0 + 1 < self.pred_errors_buffer.len());
@@ -501,10 +522,8 @@ impl<'a> WeightedPredictorState<'a> {
                 .get_unchecked_mut(prev_row + pos.0 + 1)
         };
 
-        prev_errors[0] = prev_errors[0].wrapping_add(err0);
-        prev_errors[1] = prev_errors[1].wrapping_add(err1);
-        prev_errors[2] = prev_errors[2].wrapping_add(err2);
-        prev_errors[3] = prev_errors[3].wrapping_add(err3);
+        // Four-lane accumulation: one SSE2 add on x86-64.
+        jxl_simd::wp::accumulate(prev_errors, &errs);
     }
 }
 

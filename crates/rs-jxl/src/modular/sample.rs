@@ -221,6 +221,12 @@ pub struct SourcePolicy {
     pub num_streams: usize,
     pub learning_fraction: f32,
     pub max_previous_channels: usize,
+    /// Opt-in restriction of the standard previous-channel property set at
+    /// speed tier <= 1 (source effort 9/10). 4 (default) keeps all four
+    /// properties per previous channel (16..19), 2 keeps signed sample +
+    /// signed residual (17, 19), 1 keeps the signed residual only (19).
+    /// Set through `--source-prev-props`; only this branch consumes it.
+    pub previous_property_subset: u8,
     pub num_extra_channels: usize,
     pub is_gray: bool,
     pub tree_mode: TreeMode,
@@ -237,6 +243,7 @@ impl Default for SourcePolicy {
             num_streams: 1,
             learning_fraction: 0.5,
             max_previous_channels: 0,
+            previous_property_subset: 4,
             num_extra_channels: 0,
             is_gray: false,
             tree_mode: TreeMode::Default,
@@ -270,6 +277,11 @@ impl SamplingPolicy {
                 "invalid MA source policy tier/stream count".into(),
             ));
         }
+        if !matches!(source.previous_property_subset, 1 | 2 | 4) {
+            return Err(Error::InvalidInput(
+                "previous-channel property subset must be 1, 2 or 4".into(),
+            ));
+        }
         let mut properties = if source.responsive {
             vec![0, 1, 4, 5, 6, 7, 8, 15, 9, 10, 11, 12, 13, 14, 2, 3]
         } else {
@@ -300,7 +312,15 @@ impl SamplingPolicy {
         if source.speed_tier > 1 {
             properties.extend((0..previous_channels).map(|i| 16 + 4 * i + 3));
         } else {
-            properties.extend(16..16 + 4 * previous_channels);
+            // Compression-axis cost study: the full four-property set is the
+            // upstream default; a subset is opt-in through --source-prev-props.
+            match source.previous_property_subset {
+                1 => properties.extend((0..previous_channels).map(|i| 16 + 4 * i + 3)),
+                2 => properties.extend(
+                    (0..previous_channels).flat_map(|i| [16 + 4 * i + 1, 16 + 4 * i + 3]),
+                ),
+                _ => properties.extend(16..16 + 4 * previous_channels),
+            }
         }
         let tree_mode = match source.decoding_speed_tier {
             0 => source.tree_mode,

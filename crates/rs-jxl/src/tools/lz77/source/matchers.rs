@@ -424,6 +424,11 @@ pub(super) struct Chain<'a> {
     numzeros: usize,
     codes: DistanceCodes,
     cache: MatchCache,
+    profile_demand: bool,
+    /// Aggregated demand statistics (profile-only; no effect on matching).
+    pub(super) queries: u64,
+    pub(super) visits_total: u64,
+    pub(super) extensions_total: u64,
     #[cfg(test)]
     pub(super) last_visits: usize,
     #[cfg(test)]
@@ -470,6 +475,10 @@ impl<'a> Chain<'a> {
             numzeros: 0,
             codes: DistanceCodes::new(width, WINDOW_SIZE),
             cache: MatchCache::uncached(),
+            profile_demand: crate::profile::enabled(),
+            queries: 0,
+            visits_total: 0,
+            extensions_total: 0,
             #[cfg(test)]
             last_visits: 0,
             #[cfg(test)]
@@ -527,6 +536,19 @@ impl<'a> Chain<'a> {
         &mut self,
         position: usize,
         keep_short: bool,
+        visit: impl FnMut(Match),
+    ) {
+        if self.profile_demand {
+            self.find_matches_profiled::<PRUNE, true>(position, keep_short, visit);
+        } else {
+            self.find_matches_profiled::<PRUNE, false>(position, keep_short, visit);
+        }
+    }
+
+    fn find_matches_profiled<const PRUNE: bool, const PROFILE: bool>(
+        &mut self,
+        position: usize,
+        keep_short: bool,
         mut visit: impl FnMut(Match),
     ) {
         let slot = position & (self.window - 1);
@@ -534,6 +556,9 @@ impl<'a> Chain<'a> {
         let mut previous_slot = self.chain[slot] as usize;
         let (mut previous_distance, mut best, mut visits) = (0usize, 0usize, 0usize);
         let limit = self.maximum.min(self.values.len() - position);
+        if PROFILE {
+            self.queries = self.queries.saturating_add(1);
+        }
         loop {
             let distance = slot.wrapping_sub(previous_slot) & (self.window - 1);
             if distance < previous_distance || distance > position.min(WINDOW_SIZE) {
@@ -580,6 +605,9 @@ impl<'a> Chain<'a> {
                     {
                         self.extensions += 1;
                     }
+                    if PROFILE {
+                        self.extensions_total = self.extensions_total.saturating_add(1);
+                    }
                     length = self.cache.length_with_prefix(
                         self.values,
                         position,
@@ -624,6 +652,9 @@ impl<'a> Chain<'a> {
         #[cfg(test)]
         {
             self.last_visits = visits;
+        }
+        if PROFILE {
+            self.visits_total = self.visits_total.saturating_add(visits as u64);
         }
     }
 
@@ -1015,6 +1046,13 @@ impl<'a> Optimal<'a> {
             #[cfg(feature = "experimental-lz77")]
             chain.configure_extension(config)?;
             Ok(Self::Chain(chain))
+        }
+    }
+    /// Aggregated demand statistics for profile notes (queries / visits / extensions).
+    pub(super) fn stats(&self) -> (u64, u64, u64) {
+        match self {
+            Self::Chain(m) => (m.queries, m.visits_total, m.extensions_total),
+            Self::Buckets(_) | Self::WideBuckets(_) => (0, 0, 0),
         }
     }
     #[cfg(test)]

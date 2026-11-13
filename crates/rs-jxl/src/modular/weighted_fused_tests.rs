@@ -294,3 +294,106 @@ fn fused_shifted_stripe_warmup_and_unsampled_pixels_keep_state() {
         }
     }
 }
+
+#[test]
+fn narrow_error_updates_match_wide_at_i32_envelope_edges() {
+    let max = i64::from(i32::MAX);
+    let min = i64::from(i32::MIN);
+    for value in [0, -1, 1, i32::MIN, i32::MAX] {
+        for prediction in [
+            [0; 4],
+            [max - 3, max - 2, min + 4, min + 3],
+            [min, max, min - 1, max + 1],
+            [1 << 32, -(1 << 32), 1 << 40, -(1 << 40)],
+        ] {
+            let mut narrow = State::new(Header::default(), 1).unwrap();
+            narrow.prediction = prediction;
+            narrow.pred = prediction[0];
+            for errors in &mut narrow.pred_errors {
+                *errors = [u32::MAX, u32::MAX - 1, 1 << 31, 7];
+            }
+            let mut wide = narrow.clone();
+            let rows = narrow.rows(0);
+            narrow.update_at_raster::<true>(value, 0, rows);
+            wide.update_at_raster::<false>(value, 0, rows);
+            assert_eq!(narrow, wide, "value={value} prediction={prediction:?}");
+        }
+    }
+}
+
+fn compare_narrow_raster(samples: &[i32], width: usize, header: Header) -> State {
+    let mut narrow = State::new(header, width).unwrap();
+    let mut wide = narrow.clone();
+    for (p, &value) in samples.iter().enumerate() {
+        let (x, y) = (p % width, p / width);
+        let [n, w, ne, nw, nn] = neighbors(samples, width, x, y);
+        let expected = wide.predict(x, y, n, w, ne, nw, nn).unwrap();
+        let actual = if y >= 2 && x > 0 && x + 1 < width {
+            narrow.predict_and_update_raster_interior::<true>(value, x, y, n, w, ne, nw, nn)
+        } else {
+            narrow.predict_and_update_raster::<true>(value, x, y, n, w, ne, nw, nn)
+        };
+        wide.update(value, x, y).unwrap();
+        assert_eq!(actual, expected, "prediction/property at ({x}, {y})");
+        assert_eq!(narrow.pred, wide.pred);
+        assert_eq!(narrow.prediction, wide.prediction);
+        assert_eq!(narrow.error, wide.error, "signed history at ({x}, {y})");
+        assert_eq!(
+            narrow.pred_errors, wide.pred_errors,
+            "unsigned history at ({x}, {y})"
+        );
+    }
+    narrow
+}
+
+#[test]
+fn narrow_rasters_match_checked_wide_with_full_i32_samples() {
+    for header in headers() {
+        for width in [1, 2, 3, 9, 17] {
+            for pattern in 0..5 {
+                let mut random = 0x8e41_5a17u32;
+                let samples: Vec<_> = (0..width * 12)
+                    .map(|p| {
+                        random = random.wrapping_mul(1664525).wrapping_add(1013904223);
+                        match pattern {
+                            0 => i32::MIN,
+                            1 => i32::MAX,
+                            2 => [i32::MIN, i32::MAX, 0][p % 3],
+                            3 => (random as i32) >> 3,
+                            _ => random as i32,
+                        }
+                    })
+                    .collect();
+                compare_narrow_raster(&samples, width, header);
+            }
+        }
+    }
+}
+
+#[test]
+fn narrow_raster_matches_wide_after_repeated_squeeze_growth() {
+    let mut samples: Vec<_> = (0..256u32)
+        .map(|x| {
+            if x.count_ones() % 2 == 0 {
+                1_000_000
+            } else {
+                0
+            }
+        })
+        .collect();
+    let inverse: Vec<_> = samples.iter().map(|&v| 1_000_000 - v).collect();
+    samples.extend_from_slice(&inverse);
+    samples.extend_from_slice(&inverse);
+    let mut width = 256;
+    for _ in 0..8 {
+        let squeezed = super::super::transforms::squeeze_forward(&samples, width, 3, true).unwrap();
+        width = squeezed.residual_width;
+        samples = squeezed.residual;
+    }
+    assert_eq!(samples, [128_000_000, -128_000_000, -128_000_000]);
+    let state = compare_narrow_raster(&samples[..2], width, Header::default());
+    assert_eq!(state.prediction[1], 2_048_000_000);
+    assert_eq!(state.pred_errors[state.rows(1).0][1], 384_000_000);
+    let state = compare_narrow_raster(&samples, width, Header::default());
+    assert_eq!(state.prediction[1], -3_072_000_000);
+}

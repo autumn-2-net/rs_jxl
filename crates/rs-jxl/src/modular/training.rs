@@ -49,7 +49,9 @@ use super::ma_train::TrainOptions;
 use super::ma_train::{self, ChannelView, PropertyQuantization, Sample};
 use super::predictor::{Neighbors, Predictor, clamped_gradient, predict_one};
 use super::sample::{self, ChannelSampler, GatherOptions, SamplingPolicy, SamplingStats, TreeMode};
-use super::tree::{Properties, Tree};
+#[cfg(test)]
+use super::tree::Properties;
+use super::tree::Tree;
 use super::weighted;
 
 #[cfg(test)]
@@ -659,6 +661,15 @@ fn visit_source_samples_impl<const PAIR: bool>(
     Ok(stats)
 }
 
+/// Detail-only trace gate. Mirrors the MA histogram detail scopes: one
+/// `RS_JXL_PROFILE_DETAIL=1` switch turns on every fine-grained note, and the
+/// default path pays a single `OnceLock` read.
+fn gather_detail_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("RS_JXL_PROFILE_DETAIL").as_deref() == Ok("1"))
+        && crate::profile::enabled()
+}
+
 struct GatherTask {
     stream: usize,
     channel: usize,
@@ -687,6 +698,71 @@ struct SourceGather<'a, 'pixels> {
     budget: Option<&'a SampleBudget>,
 }
 
+/// Emits the detail-only domain line for one `collect_prepared` call.
+///
+/// The policy fingerprint hashes every input that decides which pixels are
+/// selected and which sample columns are built, so two learners sharing a
+/// fingerprint visit comparable domains. `sid`/`chmax`/`rows` name the covered
+/// region, `px` the visited population, and `dispatch` the per-wave
+/// `(tasks, chunks, estimated MB)` that decides the batch branch.
+fn note_gather_domain(
+    domain: &SourceGather<'_, '_>,
+    options: &GatherOptions,
+    tasks: &[GatherTask],
+    wave_trace: &[(usize, usize, f64)],
+    stats: &SamplingStats,
+    serial_dispatch: bool,
+    started: Option<std::time::Instant>,
+) {
+    let Some(started) = started else { return };
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    format!("{:?}", domain.policy).hash(&mut hasher);
+    format!("{:?}", domain.predictors).hash(&mut hasher);
+    format!("{:?}", options).hash(&mut hasher);
+    domain.variable_channels.hash(&mut hasher);
+    domain.sample_limit.hash(&mut hasher);
+    let fingerprint = hasher.finish();
+    let mut row_lo = usize::MAX;
+    let mut row_hi = 0usize;
+    let mut channel_max = 0usize;
+    for task in tasks {
+        row_lo = row_lo.min(task.rows.start);
+        row_hi = row_hi.max(task.rows.end);
+        channel_max = channel_max.max(task.channel + 1);
+    }
+    if tasks.is_empty() {
+        row_lo = 0;
+    }
+    let props: Vec<String> = domain
+        .policy
+        .properties
+        .iter()
+        .map(|value| value.to_string())
+        .collect();
+    let line = format!(
+        "fp={fingerprint:016x} sid={}..{}n{} tasks={} chmax={channel_max} rows={row_lo}..{row_hi} px={} selected={} preds={} props={}:{} prev={} reps={} limit={} waves={} dispatch={:?} serial={serial_dispatch} wcount={} gworkers={} ms={:.3}",
+        domain.streams.first().map_or(0, |stream| stream.stream_id),
+        domain.streams.last().map_or(0, |stream| stream.stream_id),
+        domain.streams.len(),
+        tasks.len(),
+        stats.visited_pixels,
+        stats.selected_samples,
+        domain.predictors.len(),
+        domain.policy.properties.len(),
+        props.join(","),
+        domain.policy.previous_channels,
+        domain.policy.nb_repeats,
+        domain.sample_limit,
+        wave_trace.len(),
+        wave_trace,
+        execution::worker_count(),
+        options.workers,
+        started.elapsed().as_secs_f64() * 1000.0,
+    );
+    crate::profile::note("ma.gather_domain", line);
+}
+
 impl SourceGather<'_, '_> {
     #[cfg(test)]
     fn collect(&self, options: &GatherOptions) -> Result<GatheredSamples> {
@@ -705,6 +781,14 @@ impl SourceGather<'_, '_> {
         options: &GatherOptions,
     ) -> Result<GatheredSamples<PreparedSamples>> {
         options.validate()?;
+        // Domain-level trace: one line per learner records the policy
+        // fingerprint, the covered domain and the dispatch shape. It answers
+        // whether two learners gather the same pixels twice, and why the batch
+        // branch stays closed, without touching the collected samples.
+        let detail = gather_detail_enabled();
+        let started = detail.then(std::time::Instant::now);
+        let serial_dispatch = detail.then(execution::is_serial).unwrap_or(false);
+        let mut wave_trace: Vec<(usize, usize, f64)> = Vec::new();
         let mut master =
             SourceSampleCollector::new(self.predictors, self.quantization, options.cache_hashes)?;
         let first_pixels = match self.streams.first() {
@@ -799,6 +883,13 @@ impl SourceGather<'_, '_> {
             {
                 output.waves += 1;
             }
+            if detail {
+                wave_trace.push((
+                    wave.tasks.len(),
+                    wave.chunks.len(),
+                    wave.estimated_bytes / 1_000_000.0,
+                ));
+            }
             if !execution::is_serial()
                 && wave.chunks.len() > 1
                 && wave.estimated_bytes <= options.batch_budget_bytes as f64
@@ -812,17 +903,23 @@ impl SourceGather<'_, '_> {
                 let batches: Vec<Result<_>> = {
                     let _scope = crate::profile::scope("gather.batch_collect");
                     execution::map(&wave.chunks, |range| {
+                        let _batch_new_scope = gather_detail_enabled()
+                            .then(|| crate::profile::scope("gather.batch_new"));
                         let mut batch = SourceSampleCollector::new(
                             self.predictors,
                             self.quantization,
                             options.cache_hashes,
                         )?;
+                        drop(_batch_new_scope);
+                        let _tasks_scope = gather_detail_enabled()
+                            .then(|| crate::profile::scope("gather.collect_tasks"));
                         let selected = self.collect_tasks(
                             &tasks[range.clone()],
                             local_budget.as_ref(),
                             &mut batch,
                             options.sparse,
                         )?;
+                        drop(_tasks_scope);
                         Ok((batch, selected))
                     })
                 };
@@ -838,6 +935,15 @@ impl SourceGather<'_, '_> {
                 if concat_batches {
                     let samples = master.finish_appended(prepared_batches)?;
                     debug_assert_eq!(samples.total, output.stats.selected_samples);
+                    note_gather_domain(
+                        self,
+                        options,
+                        &tasks,
+                        &wave_trace,
+                        &output.stats,
+                        serial_dispatch,
+                        started,
+                    );
                     return Ok(GatheredSamples {
                         samples,
                         stats: output.stats,
@@ -856,16 +962,28 @@ impl SourceGather<'_, '_> {
                     output.serial_tasks += wave.tasks.len();
                 }
                 let _scope = crate::profile::scope("gather.batch_collect");
+                let _tasks_scope =
+                    gather_detail_enabled().then(|| crate::profile::scope("gather.collect_tasks"));
                 output.stats.selected_samples += self.collect_tasks(
                     &tasks[wave.tasks],
                     local_budget.as_ref(),
                     &mut master,
                     options.sparse,
                 )?;
+                drop(_tasks_scope);
             }
         }
         let samples = master.finish();
         debug_assert_eq!(samples.total, output.stats.selected_samples);
+        note_gather_domain(
+            self,
+            options,
+            &tasks,
+            &wave_trace,
+            &output.stats,
+            serial_dispatch,
+            started,
+        );
         Ok(GatheredSamples {
             samples,
             stats: output.stats,
@@ -886,38 +1004,60 @@ impl SourceGather<'_, '_> {
         sparse: bool,
     ) -> Result<u64> {
         let mut selected = 0;
-        for task in tasks {
-            let stream = self.streams[task.stream];
-            let plane = &stream.channels[task.channel];
-            let area = plane
-                .width
-                .checked_mul(plane.height)
-                .ok_or(Error::Limit("MA training plane dimensions overflow"))?;
-            let fraction = sample::tree_sample_fraction(area, self.policy.nb_repeats)?;
-            collector.prepare(gather_samples::expected_samples(
-                fraction,
-                plane.width,
-                task.rows.len(),
-            )?)?;
-            visit_source_range(
-                stream,
-                task.channel,
-                self.policy,
-                self.predictors,
-                task.rows.clone(),
-                sparse,
-                || {
-                    if let Some(budget) = local_budget {
-                        budget.consume(1)?;
-                    }
-                    if let Some(budget) = self.budget {
-                        budget.consume(1)?;
-                    }
-                    selected += 1;
-                    Ok(())
-                },
-                |properties, residuals| collector.push(properties, residuals, 1),
-            )?;
+        // Amortize table rebuilds only across small, bounded task batches.
+        // push grows columns, not the table: refresh prepare between batches
+        // using actual retained rows, and keep per-task hints for heavy batches.
+        const PREPARE_TASKS: usize = 8;
+        const PREPARE_RECORDS: usize = 65_536;
+        for batch in tasks.chunks(PREPARE_TASKS) {
+            let mut expected = [0usize; PREPARE_TASKS];
+            let mut batch_expected = 0usize;
+            for (task, hint) in batch.iter().zip(&mut expected) {
+                let plane = &self.streams[task.stream].channels[task.channel];
+                let area = plane
+                    .width
+                    .checked_mul(plane.height)
+                    .ok_or(Error::Limit("MA training plane dimensions overflow"))?;
+                let fraction = sample::tree_sample_fraction(area, self.policy.nb_repeats)?;
+                *hint = gather_samples::expected_samples(fraction, plane.width, task.rows.len())?;
+                batch_expected = batch_expected.saturating_add(*hint);
+            }
+            let prepare_once = batch_expected <= PREPARE_RECORDS;
+            if prepare_once {
+                let _scope =
+                    gather_detail_enabled().then(|| crate::profile::scope("gather.task_prepare"));
+                collector.prepare(batch_expected)?;
+            }
+            for (task, hint) in batch.iter().zip(expected) {
+                if !prepare_once {
+                    let _scope = gather_detail_enabled()
+                        .then(|| crate::profile::scope("gather.task_prepare"));
+                    collector.prepare(hint)?;
+                }
+                let stream = self.streams[task.stream];
+                let _visit_scope =
+                    gather_detail_enabled().then(|| crate::profile::scope("gather.visit_source"));
+                visit_source_range(
+                    stream,
+                    task.channel,
+                    self.policy,
+                    self.predictors,
+                    task.rows.clone(),
+                    sparse,
+                    || {
+                        if let Some(budget) = local_budget {
+                            budget.consume(1)?;
+                        }
+                        if let Some(budget) = self.budget {
+                            budget.consume(1)?;
+                        }
+                        selected += 1;
+                        Ok(())
+                    },
+                    |properties, residuals| collector.push(properties, residuals, 1),
+                )?;
+                drop(_visit_scope);
+            }
         }
         Ok(selected)
     }
@@ -966,7 +1106,7 @@ fn visit_source_row<const NO_EDGE: bool>(
     channel: &Channel,
     y: usize,
     columns: std::ops::Range<usize>,
-    mut pixel: impl FnMut(usize, Neighbors) -> Result<()>,
+    mut pixel: impl FnMut(usize, i32, Neighbors) -> Result<()>,
 ) -> Result<()> {
     let width = channel.width;
     if NO_EDGE {
@@ -976,25 +1116,45 @@ fn visit_source_row<const NO_EDGE: bool>(
         let row = &channel.samples[begin..begin + width];
         let top = &channel.samples[begin - width..begin];
         let toptop = &channel.samples[begin - width - width..begin - width];
-        for x in columns {
+        let start = columns.start;
+        let end = columns.end;
+        // Every lane below is a slice already offset into its row, so the hot
+        // interior loop has no per-pixel edge tests and no per-index bounds
+        // checks. The centre lane carries the sample the edge loader re-reads.
+        let lanes = row[start..end]
+            .iter()
+            .zip(&row[start - 1..end - 1])
+            .zip(&row[start - 2..end - 2])
+            .zip(&top[start..end])
+            .zip(&top[start - 1..end - 1])
+            .zip(&top[start + 1..end + 1])
+            .zip(&toptop[start..end])
+            .zip(&top[start + 2..end + 2]);
+        for (
+            offset,
+            (((((((value, left), leftleft), top), topleft), topright), toptop), toprightright),
+        ) in lanes.enumerate()
+        {
             pixel(
-                x,
+                start + offset,
+                *value,
                 Neighbors {
-                    left: row[x - 1],
-                    top: top[x],
-                    toptop: toptop[x],
-                    topleft: top[x - 1],
-                    topright: top[x + 1],
-                    leftleft: row[x - 2],
-                    toprightright: top[x + 2],
+                    left: *left,
+                    top: *top,
+                    toptop: *toptop,
+                    topleft: *topleft,
+                    topright: *topright,
+                    leftleft: *leftleft,
+                    toprightright: *toprightright,
                 },
             )?;
         }
     } else {
         for x in columns {
+            let value = channel.samples[y * width + x];
             let neighbors = Neighbors::from_plane(&channel.samples, width, width, x, y)
                 .map_err(|e| Error::Encoding(e.to_string()))?;
-            pixel(x, neighbors)?;
+            pixel(x, value, neighbors)?;
         }
     }
     Ok(())
@@ -1125,23 +1285,22 @@ fn visit_source_range_impl<const PAIR: bool, const INTERIOR: bool>(
     let mut sampler = ChannelSampler::new(width, height, policy.nb_repeats)?;
     let warm_begin = rows.start.saturating_sub(16);
     sampler.skip_pixels(warm_begin * width)?;
-    let mut property_state = Properties::default();
+    let channel_id = channel_index as i32;
+    let stream_id = stream.stream_id as i32;
     let mut previous_gradient = 0i32;
     let mut properties = vec![0; 16 + 4 * policy.previous_channels];
     let mut residuals = [0; 14];
     for y in warm_begin..rows.end {
-        let mut pixel = |x: usize, n: Neighbors| {
-            let position = y * width + x;
-            let value = channel.samples[position];
+        let in_rows = y >= rows.start;
+        let mut pixel = |x: usize, value: i32, n: Neighbors| {
             // Draw even in warm-up rows, matching the source's operand order.
-            let selected =
-                sampler.next().expect("one sample draw per channel pixel") && y >= rows.start;
-            let (prediction, error) = if let Some(state) = &mut state {
+            let selected = sampler.next().expect("one sample draw per channel pixel") && in_rows;
+            let (prediction, error) = match state.as_mut() {
                 // State's checked raster coordinates start at zero. Shifting
                 // both parity buffers by warm_begin only renames zeroed rows;
                 // all spatial neighbors/properties retain global coordinates.
                 // The local state is discarded if collection fails later.
-                state.predict_and_update(
+                Some(state) => state.predict_and_update(
                     value,
                     x,
                     y - warm_begin,
@@ -1150,28 +1309,40 @@ fn visit_source_range_impl<const PAIR: bool, const INTERIOR: bool>(
                     n.topright,
                     n.topleft,
                     n.toptop,
-                )?
-            } else {
-                (0, 0)
+                )?,
+                None => (0, 0),
             };
+            // Same values as Properties::calculate, with one gradient instead
+            // of two and the previous-gradient reset fed by this loop's raster
+            // tracker. That tracker also advances over pixels whose properties
+            // the sparse traversal never materializes.
+            let gradient = n.left.wrapping_add(n.top).wrapping_sub(n.topleft);
             if !sparse || selected {
-                properties[..16].copy_from_slice(&property_state.calculate(
-                    n,
-                    x,
-                    y,
-                    channel_index,
-                    stream.stream_id,
+                let previous = if x == 0 { 0 } else { previous_gradient };
+                let values = [
+                    channel_id,
+                    stream_id,
+                    y as i32,
+                    x as i32,
+                    n.top.wrapping_abs(),
+                    n.left.wrapping_abs(),
+                    n.top,
+                    n.left,
+                    n.left.wrapping_sub(previous),
+                    gradient,
+                    n.left.wrapping_sub(n.topleft),
+                    n.topleft.wrapping_sub(n.top),
+                    n.top.wrapping_sub(n.topright),
+                    n.top.wrapping_sub(n.toptop),
+                    n.left.wrapping_sub(n.leftleft),
                     error,
-                ));
-                // AdvanceLearnState updates the previous *unclamped* gradient
-                // even when the other properties were not materialized.
-                properties[8] = n
-                    .left
-                    .wrapping_sub(if x == 0 { 0 } else { previous_gradient });
+                ];
+                properties[..16].copy_from_slice(&values);
             }
-            previous_gradient = n.left.wrapping_add(n.top).wrapping_sub(n.topleft);
+            previous_gradient = gradient;
             if selected {
                 before_collect()?;
+                let position = y * width + x;
                 // Reference properties are stateless; skipped samples need no loads.
                 for (i, reference) in references.iter().enumerate() {
                     let v = reference.samples[position];

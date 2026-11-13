@@ -23,6 +23,7 @@ mod wasm32;
 pub mod float16;
 pub mod jpeg_capture;
 pub mod scalar;
+pub mod wp;
 
 #[cfg(all(target_arch = "aarch64", feature = "neon"))]
 pub use aarch64::neon::NeonDescriptor;

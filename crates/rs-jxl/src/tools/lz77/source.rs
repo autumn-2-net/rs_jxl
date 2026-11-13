@@ -1383,6 +1383,21 @@ fn optimal_stream_replay(
             repeats = 0;
         }
     }
+    if crate::profile::enabled() {
+        if let Some(matcher) = matcher.as_ref() {
+            let (queries, visits, extensions) = matcher.stats();
+            crate::profile::note(
+                "lz77.source.opt_stats",
+                format_args!(
+                    "tokens={} queries={} visits={} extensions={}",
+                    input.len(),
+                    queries,
+                    visits,
+                    extensions
+                ),
+            );
+        }
+    }
     parser.advance(input.len());
     let _backtrack_profile = crate::profile::scope("lz77.source.backtrack");
     parser.backtrack(input)

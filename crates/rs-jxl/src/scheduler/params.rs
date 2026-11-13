@@ -87,6 +87,12 @@ pub struct CandidateParams {
     pub tree_mode: TreeMode,
     pub learning_fraction: f32,
     pub max_properties: u8,
+    /// Opt-in restriction of the standard previous-channel property set at
+    /// source effort 9/10 (modular speed tier <= 1): 4 keeps all four
+    /// properties per previous channel (upstream default), 2 keeps signed
+    /// sample + signed residual (17, 19), 1 keeps the signed residual only
+    /// (19). Part of candidate/cache identity; the default path is unchanged.
+    pub previous_property_subset: u8,
     pub lz77_careful_first_pass: bool,
     pub bucket_matcher: bool,
     pub precise_entropy: bool,
@@ -113,6 +119,7 @@ impl Default for CandidateParams {
             tree_mode: TreeMode::Default,
             learning_fraction: 0.5,
             max_properties: 0,
+            previous_property_subset: 4,
             lz77_careful_first_pass: false,
             bucket_matcher: false,
             precise_entropy: false,
@@ -137,6 +144,11 @@ impl CandidateParams {
         {
             return Err(Error::InvalidInput(
                 "invalid lossless candidate parameters".into(),
+            ));
+        }
+        if !matches!(self.previous_property_subset, 1 | 2 | 4) {
+            return Err(Error::InvalidInput(
+                "previous-channel property subset must be 1, 2 or 4".into(),
             ));
         }
         Ok(())
@@ -257,7 +269,13 @@ impl CandidateParams {
         if speed_tier > 1 {
             order.extend((0..previous_channels).map(|i| 16 + i as u32 * 4 + 3));
         } else {
-            order.extend((0..previous_channels * 4).map(|i| 16 + i as u32));
+            match self.previous_property_subset {
+                1 => order.extend((0..previous_channels).map(|i| 16 + i as u32 * 4 + 3)),
+                2 => order.extend(
+                    (0..previous_channels).flat_map(|i| [16 + i as u32 * 4 + 1, 16 + i as u32 * 4 + 3]),
+                ),
+                _ => order.extend((0..previous_channels * 4).map(|i| 16 + i as u32)),
+            }
         }
         match self.tree_mode {
             TreeMode::Default => {}
@@ -272,6 +290,7 @@ impl CandidateParams {
             node_threshold: u32::try_from(75 + 14 * i32::from(speed_tier))
                 .expect("validated source tier has a positive threshold"),
             previous_channels,
+            previous_property_subset: self.previous_property_subset,
         }
     }
 }
@@ -283,6 +302,8 @@ pub struct TrainingPolicy {
     pub max_property_values: u32,
     pub node_threshold: u32,
     pub previous_channels: usize,
+    /// Resolved previous-channel property subset (4 = upstream default).
+    pub previous_property_subset: u8,
 }
 impl TrainingPolicy {
     /// `enc_encoding.cc::TreeSampleFraction`, per transformed channel.

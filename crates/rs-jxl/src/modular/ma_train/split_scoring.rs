@@ -22,7 +22,7 @@ pub(super) mod pr5007;
 // Per-predictor timers can dominate small sweeps. RS_JXL_PROFILE=1 keeps
 // broad/cache timings; these detail scopes additionally require
 // RS_JXL_PROFILE_DETAIL=1, read once before the first detail scope.
-fn histogram_detail_scope(name: &'static str) -> Option<crate::profile::Scope> {
+pub(super) fn histogram_detail_scope(name: &'static str) -> Option<crate::profile::Scope> {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     let enabled =
         *ENABLED.get_or_init(|| std::env::var("RS_JXL_PROFILE_DETAIL").as_deref() == Ok("1"));
@@ -207,9 +207,11 @@ pub(super) fn evaluate_property_values<T: PropertyValue>(
     mapping: Option<&[u8; 256]>,
     scratch: &mut PropertyScratch,
 ) -> Result<Candidates> {
+    let _prop_eval_scope = histogram_detail_scope("ma.prop_eval");
     pr5007::validate_options(options)?;
     debug_assert!(cached.is_none() || mapping.is_none());
     debug_assert!(cached.is_none_or(|histogram| histogram.valid));
+    let _prologue_scope = histogram_detail_scope("ma.prop_prologue");
     scratch.score_mask.clear();
     scratch.dominated_predictors = 0;
     #[cfg(test)]
@@ -242,6 +244,8 @@ pub(super) fn evaluate_property_values<T: PropertyValue>(
     if first == last {
         return Ok([None; 6]);
     }
+    drop(_prologue_scope);
+    let _prep_binning_scope = histogram_detail_scope("ma.prop_binning");
     scratch.symmetric.prepare(
         options,
         property,
@@ -269,6 +273,7 @@ pub(super) fn evaluate_property_values<T: PropertyValue>(
         None
     };
     let coarsened = coarse_rows.is_some();
+    drop(_prep_binning_scope);
     let _binning_scope = coarsened.then(|| crate::profile::scope("ma.adaptive_histogram"));
     if !options.tree_learning.symmetric()
         && !coarsened
@@ -283,6 +288,7 @@ pub(super) fn evaluate_property_values<T: PropertyValue>(
             cached.is_some(),
         )
     {
+        let _events_scope = histogram_detail_scope("ma.prop_events");
         scratch.events.evaluate(
             samples,
             indices,
@@ -311,6 +317,7 @@ pub(super) fn evaluate_property_values<T: PropertyValue>(
             &mut scratch.lookahead_candidates,
         ));
     }
+    let _prepare_scope = histogram_detail_scope("ma.prop_prepare");
     let rows = coarse_rows.unwrap_or_else(|| {
         prepare_property_bins(
             used,
@@ -377,6 +384,7 @@ pub(super) fn evaluate_property_values<T: PropertyValue>(
             parents.len(),
             &mut scratch.score_mask,
         )?;
+    drop(_prepare_scope);
     let saved_count = if refine && cached.is_none() {
         parents.len()
     } else {
@@ -445,22 +453,27 @@ pub(super) fn evaluate_property_values<T: PropertyValue>(
                     std::mem::swap(&mut scratch.increase, &mut scratch.paired_increase);
                     std::mem::swap(&mut scratch.extra, &mut scratch.paired_extra);
                 } else {
+                    let _resize_scope = histogram_detail_scope("ma.hist_resize");
                     scratch.increase.clear();
                     scratch.increase.resize(rows * storage_stride, 0);
                     scratch.extra.clear();
                     scratch.extra.resize(rows, 0);
+                    drop(_resize_scope);
                     let tokens = &samples.residuals[predictor];
                     if paired {
+                        let _pair_fill_scope = histogram_detail_scope("ma.hist_fill_pair");
                         let other_symbols = if options.padded_histogram {
                             node_stride
                         } else {
                             parents[predictor + 1].counts.len()
                         };
                         let other_tokens = &samples.residuals[predictor + 1];
+                        let _pair_resize_scope = histogram_detail_scope("ma.hist_resize_pair");
                         scratch.paired_increase.clear();
                         scratch.paired_increase.resize(bins * other_symbols, 0);
                         scratch.paired_extra.clear();
                         scratch.paired_extra.resize(bins, 0);
+                        drop(_pair_resize_scope);
                         if let Some(mapping) = mapping {
                             collect_compact_pair(
                                 samples,
@@ -486,6 +499,7 @@ pub(super) fn evaluate_property_values<T: PropertyValue>(
                                 scratch.paired_extra[bin] += u64::from(weight) * u64::from(b.nbits);
                             }
                         }
+                        drop(_pair_fill_scope);
                     } else if options.histogram_shards
                         && !packed
                         && mapping.is_none()
@@ -505,6 +519,7 @@ pub(super) fn evaluate_property_values<T: PropertyValue>(
                         #[cfg(test)]
                         scratch.sharded_predictors.push(predictor);
                     } else {
+                        let _mapped_fill_scope = histogram_detail_scope("ma.hist_fill_mapped");
                         match (packed, mapping.is_some()) {
                             (false, false) => collect_mapped::<T, false, false>(
                                 samples,
@@ -551,9 +566,11 @@ pub(super) fn evaluate_property_values<T: PropertyValue>(
                                 &mut scratch.extra,
                             ),
                         }
+                        drop(_mapped_fill_scope);
                     }
                 }
                 if refine {
+                    let _refine_scope = histogram_detail_scope("ma.pred_refine_save");
                     let saved = &mut scratch.saved_histograms[predictor];
                     saved.symbols = storage_stride;
                     saved
@@ -579,6 +596,7 @@ pub(super) fn evaluate_property_values<T: PropertyValue>(
             // Both child populations use the nonnegative <=256 contribution
             // table. This lower bound keeps the exact f32 extra-bit order;
             // it is local to this node and must not be inherited by children.
+            let _pred_setup_scope = histogram_detail_scope("ma.pred_setup");
             if options.split_dominance
                 && !options.tree_learning.symmetric()
                 && total <= 256
@@ -616,7 +634,9 @@ pub(super) fn evaluate_property_values<T: PropertyValue>(
             scratch
                 .scoring
                 .reset(options.scoring, &parent.counts, total, indices.len())?;
+            drop(_pred_setup_scope);
             let penalty = plan.penalty[predictor];
+            let _score_middle_scope = histogram_detail_scope("ma.score_middle");
             scratch.symmetric.score_middle(
                 &scorer,
                 predictor,
@@ -629,6 +649,7 @@ pub(super) fn evaluate_property_values<T: PropertyValue>(
                 packed,
                 &scratch.property_bins,
             );
+            drop(_score_middle_scope);
             let mut extra_below = 0u64;
             let _score_scope = histogram_detail_scope("ma.histogram_score");
             if options.scoring == ScoringOptions::default()
@@ -729,6 +750,7 @@ pub(super) fn evaluate_property_values<T: PropertyValue>(
             }
         }
     }
+    let _tail_scope = histogram_detail_scope("ma.prop_tail");
     let mut result = property_candidates(
         samples,
         options,

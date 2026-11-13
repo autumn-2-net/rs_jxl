@@ -755,6 +755,35 @@ pub(super) fn train_pending_in_frontier<const REORDER: bool>(
             stats.dominated_predictors.load(Ordering::Relaxed),
         ),
     );
+    let property_evals: Vec<usize> = (0..24)
+        .map(|id| stats.property_evals[id].load(Ordering::Relaxed))
+        .collect();
+    let property_wins: Vec<usize> = (0..24)
+        .map(|id| stats.property_wins[id].load(Ordering::Relaxed))
+        .collect();
+    let wins_pred: Vec<Vec<usize>> = (0..2)
+        .map(|p| {
+            (0..20)
+                .map(|id| stats.property_wins_pred[p][id].load(Ordering::Relaxed))
+                .collect()
+        })
+        .collect();
+    crate::profile::note(
+        "ma.property_wins_pred",
+        format_args!("{wins_pred:?}"),
+    );
+    let gap = &stats.property_gap;
+    crate::profile::note(
+        "ma.property_gap",
+        format_args!(
+            "evals={property_evals:?} wins={property_wins:?} \
+             gap[le101,le105,le120,gt120]={}/{}/{}/{}",
+            gap[0].load(Ordering::Relaxed),
+            gap[1].load(Ordering::Relaxed),
+            gap[2].load(Ordering::Relaxed),
+            gap[3].load(Ordering::Relaxed),
+        ),
+    );
     Ok(nodes)
 }
 

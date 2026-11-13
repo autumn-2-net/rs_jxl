@@ -13,6 +13,9 @@ mod acceptance;
 #[path = "ma_budget_parser_tests.rs"]
 mod ma_budget_parser_tests;
 
+#[cfg(test)]
+mod source_controls_tests;
+
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};

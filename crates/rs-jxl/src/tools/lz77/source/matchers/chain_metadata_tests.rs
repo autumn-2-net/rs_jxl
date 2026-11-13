@@ -1,5 +1,37 @@
 use super::*;
 
+#[test]
+fn demand_profiling_does_not_change_matches_or_collect_when_disabled() {
+    let values: Vec<_> = (0..512)
+        .map(|i| if i % 37 < 8 { 0 } else { i % 23 })
+        .collect();
+    let mut quiet = Chain::with_window(&values, 23, 256, 97, 64).unwrap();
+    let mut profiled = Chain::with_window(&values, 23, 256, 97, 64).unwrap();
+    quiet.profile_demand = false;
+    profiled.profile_demand = true;
+    for position in 0..values.len() {
+        quiet.update(position);
+        profiled.update(position);
+        for keep_short in [false, true] {
+            let mut expected = Vec::new();
+            let mut actual = Vec::new();
+            quiet.find_matches(position, keep_short, |m| {
+                expected.push((m.length, m.distance, m.symbol))
+            });
+            profiled.find_matches(position, keep_short, |m| {
+                actual.push((m.length, m.distance, m.symbol))
+            });
+            assert_eq!(actual, expected);
+        }
+    }
+    assert_eq!(
+        (quiet.queries, quiet.visits_total, quiet.extensions_total),
+        (0, 0, 0)
+    );
+    assert_eq!(profiled.queries, 2 * values.len() as u64);
+    assert!(profiled.visits_total > 0 && profiled.extensions_total > 0);
+}
+
 // Retain the old u32 tag/sentinel comparisons and use scalar exact extension,
 // independent of the narrowed tags and the production prefix/cache filters.
 fn old_metadata_matches(

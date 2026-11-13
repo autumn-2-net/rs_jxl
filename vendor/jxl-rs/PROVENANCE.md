@@ -109,6 +109,26 @@ new ARM work. Existing upstream non-x86 source is retained unchanged.
   instead of mirroring negative inputs. Native original-color samples bypass
   this stage. This does not resolve the separately documented sRGB residuals.
 
+- Weighted-predictor four-lane errors: keep the per-sub-predictor error history
+  as `[i32; 4]` — two's-complement equivalent to the previous `[u32; 4]` wrapping
+  arithmetic — and add the four lanes with the new `jxl_simd::wp` helpers, which
+  use baseline SSE2 on x86-64 and the scalar spelling elsewhere. The weight lookup
+  still consumes the unsigned view; weight floors, signed rounding, the i64
+  prediction arithmetic and the tie-breaking order are unchanged. Native
+  intrinsics stay inside `jxl_simd`; `jxl` keeps its unsafe-code prohibition.
+  The `D` type parameter that A1 first threaded through `WeightedPredictorState`
+  only fed a `PhantomData` marker while the helpers are plain functions, so it
+  was removed: the struct keeps its lifetime parameter alone and no call site
+  changed. Declaration-only cleanup with no intended codegen change.
+- Weighted-predictor run-length fast path: when all five causal neighbours
+  collapse to the same value and the four error lanes are zero,
+  `predict_and_property` now records that the sub-predictions are uniform instead
+  of writing `[pred; 4]`. `update_errors` then derives one error from the stored
+  prediction and splats it across the lanes, skipping a 32-byte store and three
+  per-lane subtractions. Arithmetic, rounding, the error-history layout and the
+  `(pred - val) as i32` write are unchanged; the flag only selects an equivalent
+  spelling of the same four values.
+
 Update this ledger and docs/DECODER_STATUS.md for behavioral patches. Do not
 replace this directory from upstream without reviewing and replaying patches.
 

@@ -19,7 +19,7 @@ use crate::modular::{
 };
 use crate::{
     EncodeOptions, Error, Image, Result,
-    tools::lz77::{Lz77Mode, SourceConfig, SourceLz77Method},
+    tools::lz77::{Lz77Mode, SourceConfig, SourceFastPrefix, SourceLz77Method},
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -172,6 +172,7 @@ pub fn source_patch_reference_policy(
             tree_mode: params.tree_mode,
             learning_fraction: params.learning_fraction,
             max_previous_channels: usize::from(params.max_properties),
+            previous_property_subset: params.previous_property_subset,
             num_extra_channels: image.metadata().extra_channels.len(),
             is_gray: image.color_channels() == 1,
             ..Default::default()
@@ -286,6 +287,19 @@ fn project_native_metadata(
     options.modular.tree_group_splits.clear();
     // JXL_MA_CONSTANT_CHANNELS is opt-in, not a source-default optimization.
     options.modular.source_constant_channels = false;
+    // Exact MA search proofs (candidate 4, equivalent to CLI --ma-prune):
+    // property-partition reuse plus small-node dominance pruning only skip
+    // search visits; the chosen splits, budget and codestream stay identical.
+    // Forced on for every scheduler candidate; an explicit base value is
+    // overridden because these are proofs, not an approximation knob.
+    options.modular.source_property_dedup = true;
+    options.modular.source_ma_dominance = true;
+    // Candidate N3 (2026-11-11): SIMD-aligned cache-set-avoiding strides for
+    // the property histogram fill (source JXL_MA_PADDED_HISTOGRAM=1).
+    // Measured -4.6% against ma-cache2k in one pass, but two cumulative passes
+    // against ma-prune were 0.968x / 0.907x: the padded stride enlarges every
+    // cache that N1 admits, so the stacked pair is net-negative. Reverted.
+    // (Candidate N2 histogram_shards measured 0.861x and was reverted too.)
     if options.modular.source_channel_tree_final_only && speed_tier > 1 {
         options.modular.source_channel_tree = crate::modular::ma_train::ChannelTreeMode::Disabled;
     }
@@ -328,6 +342,7 @@ fn project_native_metadata(
         responsive: params.responsive,
         learning_fraction: params.learning_fraction,
         max_previous_channels: usize::from(params.max_properties),
+        previous_property_subset: params.previous_property_subset,
         num_extra_channels: image.metadata().extra_channels.len(),
         is_gray: image.color_channels() == 1,
         max_channel_size: dim,
@@ -467,6 +482,17 @@ fn project_native_metadata(
             },
             bucket_matcher: params.bucket_matcher,
             careful_first_pass: params.lz77_careful_first_pass,
+            // The frozen source default leaves the fast spatial prefix cache
+            // off. Its three-token tag is an exact necessary-condition test, so
+            // the lazy SIMD cache only skips candidates whose mandatory prefix
+            // cannot match: match order, lengths, distances, symbols and the
+            // codestream are unchanged. An explicit caller choice still wins.
+            fast_prefix: base
+                .modular
+                .source_lz77
+                .as_ref()
+                .and_then(|config| config.fast_prefix)
+                .or(Some(SourceFastPrefix::Simd)),
             literal_uint_config: match options.modular.entropy_options.uint_config {
                 UintConfigStrategy::Fixed(config) => config,
                 UintConfigStrategy::Fast | UintConfigStrategy::Best => Default::default(),

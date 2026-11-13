@@ -569,6 +569,7 @@ dependencies = [
  "brotli",
  "bytemuck",
  "jxl",
+ "jxl_simd",
  "libsais-rs",
  "moxcms",
  "png",

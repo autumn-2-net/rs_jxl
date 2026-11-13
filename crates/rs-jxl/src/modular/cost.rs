@@ -272,6 +272,7 @@ fn gradient_context(n: Neighbors, mode: Backend) -> usize {
     }
 }
 
+#[inline]
 fn wp_context(property: i32) -> usize {
     WP_CONTEXTS[(property.clamp(-500, 501) + 500) as usize] as usize
 }
@@ -557,6 +558,36 @@ pub struct WpCost {
     pub unhealthy: bool,
 }
 
+/// One raster sample of the weighted-predictor cost walk. The caller supplies
+/// the five boundary-adjusted neighbours in source order (N, W, NE, NW, NN) and
+/// guarantees consecutive raster positions, so the state's position check is
+/// skipped; every other arithmetic step matches `estimate_wp_cost`.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn wp_pixel<const INTERIOR: bool, const NARROW: bool>(
+    state: &mut weighted::State,
+    histograms: &mut [Histogram; 34],
+    extra_bits: &mut usize,
+    unhealthy: &mut bool,
+    value: i32,
+    x: usize,
+    y: usize,
+    n: i32,
+    w: i32,
+    ne: i32,
+    nw: i32,
+    nn: i32,
+) -> Result<()> {
+    let (guess, property) = if INTERIOR {
+        state.predict_and_update_raster_interior::<NARROW>(value, x, y, n, w, ne, nw, nn)
+    } else {
+        state.predict_and_update_raster::<NARROW>(value, x, y, n, w, ne, nw, nn)
+    };
+    let (residual, overflow) = value.overflowing_sub(guess);
+    *unhealthy |= overflow;
+    add_residual(&mut histograms[wp_context(property)], residual, extra_bits)
+}
+
 /// Source EstimateWPCost, with signed WP-error contexts and a fresh predictor
 /// state per channel. Finite limits below f32::MAX enable pruning only when the
 /// WHOLE image has at least 65536 samples; margin uses all channels even when
@@ -567,6 +598,20 @@ pub fn estimate_wp_cost(
     preset: u8,
     cost_limit: f32,
     selected_channel: Option<usize>,
+) -> Result<WpCost> {
+    estimate_wp_cost_narrow(channels, preset, cost_limit, selected_channel, false)
+}
+
+/// [`estimate_wp_cost`] with an optional four-lane kernel. Every update checks
+/// its actual shifted samples, predictions and rounded absolute differences,
+/// falling back to exact `i64` error arithmetic outside the `i32` envelope.
+/// `narrow` is safe for arbitrary validated channel samples, including transforms.
+pub fn estimate_wp_cost_narrow(
+    channels: &[ChannelView<'_>],
+    preset: u8,
+    cost_limit: f32,
+    selected_channel: Option<usize>,
+    narrow: bool,
 ) -> Result<WpCost> {
     let total_pixels = validate(channels)?;
     if selected_channel.is_some_and(|c| c >= channels.len()) {
@@ -585,70 +630,40 @@ pub fn estimate_wp_cost(
         {
             continue;
         }
-        let mut histograms: [Histogram; 34] = std::array::from_fn(|_| Histogram::default());
-        let mut state = weighted::State::new(header, ch.width)?;
         let mut unhealthy = false;
-        for y in 0..ch.height {
-            let row = ch.row(y);
-            let top_row = (y != 0).then(|| ch.row(y - 1));
-            let upper_row = (y > 1).then(|| ch.row(y - 2));
-            for x in 0..ch.width {
-                // Address and validate each row once, not all seven neighbors
-                // for every pixel. WP only consumes these five neighbors.
-                let left = if x != 0 {
-                    row[x - 1]
-                } else {
-                    top_row.map_or(0, |r| r[0])
-                };
-                let top = top_row.map_or(left, |r| r[x]);
-                let topleft = if x != 0 {
-                    top_row.map_or(left, |r| r[x - 1])
-                } else {
-                    left
-                };
-                let topright = if x + 1 < ch.width {
-                    top_row.map_or(top, |r| r[x + 1])
-                } else {
-                    top
-                };
-                let toptop = upper_row.map_or(top, |r| r[x]);
-                let value = row[x];
-                let (guess, property) =
-                    state.predict_and_update(value, x, y, top, left, topright, topleft, toptop)?;
-                let (residual, overflow) = value.overflowing_sub(guess);
-                unhealthy |= overflow;
-                add_residual(
-                    &mut histograms[wp_context(property)],
-                    residual,
-                    &mut extra_bits,
-                )?;
-            }
-            work.pixels += ch.width;
-            if bounded && y & 63 == 63 {
-                let mut lower_bound = f64::from(histo_cost) + extra_bits as f64;
-                for h in &histograms {
-                    lower_bound += f64::from(h.entropy(mode));
-                }
-                work.checkpoints += 1;
-                if lower_bound > f64::from(cost_limit) + margin {
-                    work.pruned_modes += 1;
-                    return Ok(WpCost {
-                        cost: f32::MAX,
-                        work,
-                        unhealthy,
-                    });
-                }
-            }
-        }
-        if unhealthy {
+        let outcome = if narrow {
+            walk_channel::<true>(
+                &ch,
+                header,
+                mode,
+                bounded,
+                cost_limit,
+                margin,
+                &mut histo_cost,
+                &mut extra_bits,
+                &mut unhealthy,
+                &mut work,
+            )?
+        } else {
+            walk_channel::<false>(
+                &ch,
+                header,
+                mode,
+                bounded,
+                cost_limit,
+                margin,
+                &mut histo_cost,
+                &mut extra_bits,
+                &mut unhealthy,
+                &mut work,
+            )?
+        };
+        if outcome != ChannelOutcome::Done {
             return Ok(WpCost {
                 cost: f32::MAX,
                 work,
-                unhealthy: true,
+                unhealthy,
             });
-        }
-        for h in &histograms {
-            histo_cost += h.entropy(mode);
         }
     }
     Ok(WpCost {
@@ -656,6 +671,145 @@ pub fn estimate_wp_cost(
         work,
         unhealthy: false,
     })
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ChannelOutcome {
+    Done,
+    Pruned,
+    Unhealthy,
+}
+
+/// One channel of the weighted-predictor cost walk. The accumulators are
+/// threaded by reference so the f32 sum keeps the source order: channels in
+/// outer order, then histograms in array order.
+#[allow(clippy::too_many_arguments)]
+fn walk_channel<const NARROW: bool>(
+    ch: &ChannelView<'_>,
+    header: weighted::Header,
+    mode: Backend,
+    bounded: bool,
+    cost_limit: f32,
+    margin: f64,
+    histo_cost: &mut f32,
+    extra_bits: &mut usize,
+    unhealthy: &mut bool,
+    work: &mut WpCostWork,
+) -> Result<ChannelOutcome> {
+    let mut histograms: [Histogram; 34] = std::array::from_fn(|_| Histogram::default());
+    let mut state = weighted::State::new(header, ch.width)?;
+    let width = ch.width;
+    for y in 0..ch.height {
+        let row = ch.row(y);
+        if y >= 2 {
+            // Both history rows exist: index them directly and peel the two
+            // edge samples so the middle of the row has no boundary tests.
+            let top = ch.row(y - 1);
+            let upper = ch.row(y - 2);
+            wp_pixel::<false, NARROW>(
+                &mut state,
+                &mut histograms,
+                extra_bits,
+                unhealthy,
+                row[0],
+                0,
+                y,
+                top[0],
+                top[0],
+                if width > 1 { top[1] } else { top[0] },
+                top[0],
+                upper[0],
+            )?;
+            let inner = width.saturating_sub(1);
+            for x in 1..inner {
+                wp_pixel::<true, NARROW>(
+                    &mut state,
+                    &mut histograms,
+                    extra_bits,
+                    unhealthy,
+                    row[x],
+                    x,
+                    y,
+                    top[x],
+                    row[x - 1],
+                    top[x + 1],
+                    top[x - 1],
+                    upper[x],
+                )?;
+            }
+            if width > 1 {
+                let x = width - 1;
+                wp_pixel::<false, NARROW>(
+                    &mut state,
+                    &mut histograms,
+                    extra_bits,
+                    unhealthy,
+                    row[x],
+                    x,
+                    y,
+                    top[x],
+                    row[x - 1],
+                    top[x],
+                    top[x - 1],
+                    upper[x],
+                )?;
+            }
+        } else {
+            // The first two rows have no full history: an absent row collapses
+            // the neighbours onto the left sample (y == 0) or onto the single
+            // row above (y == 1).
+            let top = (y == 1).then(|| ch.row(0));
+            let mut left = top.map_or(0, |r| r[0]);
+            for x in 0..width {
+                let value = row[x];
+                let top_value = top.map_or(left, |r| r[x]);
+                let topleft = if x != 0 {
+                    top.map_or(left, |r| r[x - 1])
+                } else {
+                    left
+                };
+                let topright = if x + 1 < width {
+                    top.map_or(top_value, |r| r[x + 1])
+                } else {
+                    top_value
+                };
+                wp_pixel::<false, NARROW>(
+                    &mut state,
+                    &mut histograms,
+                    extra_bits,
+                    unhealthy,
+                    value,
+                    x,
+                    y,
+                    top_value,
+                    left,
+                    topright,
+                    topleft,
+                    top_value,
+                )?;
+                left = value;
+            }
+        }
+        work.pixels += ch.width;
+        if bounded && y & 63 == 63 {
+            let mut lower_bound = f64::from(*histo_cost) + *extra_bits as f64;
+            for h in &histograms {
+                lower_bound += f64::from(h.entropy(mode));
+            }
+            work.checkpoints += 1;
+            if lower_bound > f64::from(cost_limit) + margin {
+                work.pruned_modes += 1;
+                return Ok(ChannelOutcome::Pruned);
+            }
+        }
+    }
+    if *unhealthy {
+        return Ok(ChannelOutcome::Unhealthy);
+    }
+    for h in &histograms {
+        *histo_cost += h.entropy(mode);
+    }
+    Ok(ChannelOutcome::Done)
 }
 
 #[derive(Clone, Debug)]
@@ -675,6 +829,17 @@ pub fn select_weighted_preset(
     mode_count: usize,
     bounded: bool,
 ) -> Result<WeightedPresetSelection> {
+    select_weighted_preset_narrow(channels, mode_count, bounded, false)
+}
+
+/// [`select_weighted_preset`] with the caller-selected four-lane kernel. The
+/// search order, strict `<` tie-break and pruning bound are unchanged.
+pub fn select_weighted_preset_narrow(
+    channels: &[ChannelView<'_>],
+    mode_count: usize,
+    bounded: bool,
+    narrow: bool,
+) -> Result<WeightedPresetSelection> {
     validate(channels)?;
     if !(1..=5).contains(&mode_count) {
         return Err(Error::InvalidInput(
@@ -689,7 +854,7 @@ pub fn select_weighted_preset(
     };
     for preset in 0..mode_count {
         let limit = if bounded { result.cost } else { f32::INFINITY };
-        let candidate = estimate_wp_cost(channels, preset as u8, limit, None)?;
+        let candidate = estimate_wp_cost_narrow(channels, preset as u8, limit, None, narrow)?;
         result.work.add(candidate.work)?;
         if candidate.cost < result.cost {
             result.preset = preset as u8;
@@ -726,6 +891,17 @@ pub fn select_weighted_preset_parallel(
     mode_count: usize,
     bounded: bool,
 ) -> Result<WeightedPresetSelection> {
+    select_weighted_preset_parallel_narrow(channels, mode_count, bounded, false)
+}
+
+/// [`select_weighted_preset_parallel`] with the caller-selected four-lane
+/// kernel; the selected preset and cost keep serial semantics.
+pub fn select_weighted_preset_parallel_narrow(
+    channels: &[ChannelView<'_>],
+    mode_count: usize,
+    bounded: bool,
+    narrow: bool,
+) -> Result<WeightedPresetSelection> {
     let total_pixels = validate(channels)?;
     if !(1..=5).contains(&mode_count) {
         return Err(Error::InvalidInput(
@@ -733,13 +909,13 @@ pub fn select_weighted_preset_parallel(
         ));
     }
     if !parallel_weighted_presets(total_pixels, mode_count) {
-        return select_weighted_preset(channels, mode_count, bounded);
+        return select_weighted_preset_narrow(channels, mode_count, bounded, narrow);
     }
-    let mut result = select_weighted_preset(channels, 1, bounded)?;
+    let mut result = select_weighted_preset_narrow(channels, 1, bounded, narrow)?;
     let limit = if bounded { result.cost } else { f32::INFINITY };
     let presets = &[1u8, 2, 3, 4][..mode_count - 1];
     let candidates = crate::execution::map(presets, |&preset| {
-        crate::execution::serial(|| estimate_wp_cost(channels, preset, limit, None))
+        crate::execution::serial(|| estimate_wp_cost_narrow(channels, preset, limit, None, narrow))
     });
     for (&preset, candidate) in presets.iter().zip(candidates) {
         let candidate = candidate?;
@@ -1170,6 +1346,168 @@ mod tests {
         let wp = select_weighted_preset(&ties, 5, true).unwrap();
         assert_eq!((wp.preset, wp.cost), (0, 0.0));
         assert_eq!(wp.work.pixels, 45 * 3 * 5);
+    }
+
+    #[test]
+    fn narrow_kernel_matches_scalar_cost() {
+        // The four-lane i32 kernel must be bit-identical to the scalar
+        // spelling whenever the value-range guard holds: same cost bits, same
+        // work counters, same pruning decisions.
+        for (width, height) in [(13usize, 11usize), (257, 257)] {
+            let stride = width;
+            let mut pixels = vec![0i32; width * height];
+            for y in 0..height {
+                for x in 0..width {
+                    let v = ((x * 7919 + y * 104729) % 2_000_001) as i32 - 1_000_000;
+                    pixels[y * stride + x] = v;
+                }
+            }
+            let channels = [ChannelView {
+                pixels: &pixels,
+                width,
+                height,
+                stride,
+            }];
+            for preset in 0..5u8 {
+                for limit in [f32::MAX, 1.0e9f32, 1000.0f32] {
+                    let scalar = estimate_wp_cost(&channels, preset, limit, None).unwrap();
+                    let narrow =
+                        estimate_wp_cost_narrow(&channels, preset, limit, None, true).unwrap();
+                    assert_eq!(scalar.cost.to_bits(), narrow.cost.to_bits());
+                    assert_eq!(scalar.work.pixels, narrow.work.pixels);
+                    assert_eq!(scalar.work.checkpoints, narrow.work.checkpoints);
+                    assert_eq!(scalar.work.pruned_modes, narrow.work.pruned_modes);
+                    assert_eq!(scalar.unhealthy, narrow.unhealthy);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn narrow_kernel_matches_scalar_cost_for_full_i32_samples() {
+        for (width, height) in [(1usize, 70usize), (2, 70), (3, 7), (17, 9), (1024, 64)] {
+            let stride = width + 3;
+            for pattern in 0..3 {
+                let mut pixels = vec![i32::MIN; (height - 1) * stride + width];
+                let mut random = 0x8e41_5a17u32;
+                for y in 0..height {
+                    for x in 0..width {
+                        random = random.wrapping_mul(1664525).wrapping_add(1013904223);
+                        pixels[y * stride + x] = match pattern {
+                            0 => random as i32,
+                            1 => [0, i32::MIN, i32::MAX][(y * width + x) % 3],
+                            _ => (random as i32) >> 3,
+                        };
+                    }
+                }
+                let channels = [
+                    ChannelView {
+                        pixels: &[],
+                        width: 0,
+                        height: usize::MAX,
+                        stride: 0,
+                    },
+                    ChannelView {
+                        pixels: &pixels,
+                        width,
+                        height,
+                        stride,
+                    },
+                ];
+                for preset in 0..5u8 {
+                    for limit in [f32::INFINITY, 1.0e9, 1000.0] {
+                        for selected in [None, Some(1)] {
+                            let wide =
+                                estimate_wp_cost(&channels, preset, limit, selected).unwrap();
+                            let narrow =
+                                estimate_wp_cost_narrow(&channels, preset, limit, selected, true)
+                                    .unwrap();
+                            assert_eq!(wide.cost.to_bits(), narrow.cost.to_bits());
+                            assert_eq!(wide.work, narrow.work);
+                            assert_eq!(wide.unhealthy, narrow.unhealthy);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pruned_weighted_cost_preserves_observed_residual_overflow() {
+        let mut pixels = vec![0; 1024 * 64];
+        // At x=2, the flat shortcut predicts MIN: MAX - MIN overflows.
+        pixels[1] = i32::MIN;
+        pixels[2] = i32::MAX;
+        let channels = [view(&pixels, 1024, 64)];
+        for narrow in [false, true] {
+            let cost = estimate_wp_cost_narrow(&channels, 0, -1.0e9, None, narrow).unwrap();
+            assert_eq!(cost.cost, f32::MAX);
+            assert_eq!(cost.work.pruned_modes, 1);
+            assert_eq!(cost.work.checkpoints, 1);
+            assert!(cost.unhealthy);
+        }
+    }
+
+    /// Micro-benchmark for the four-lane WP cost kernel.
+    ///
+    /// Gated behind `RS_JXL_WP_MICRO=1` so ordinary test runs stay fast. The
+    /// workload mirrors the production search (five modes, bounded policy) and
+    /// alternates the two kernels so machine drift lands on both sides.
+    ///
+    /// `RS_JXL_WP_MICRO=<size>x<rounds>` (default `512x7`); run with
+    /// `RS_JXL_WP_MICRO=1 cargo test --release -p rs-jxl --lib wp_kernel_microbench -- --nocapture`.
+    #[test]
+    fn wp_kernel_microbench() {
+        let Ok(spec) = std::env::var("RS_JXL_WP_MICRO") else {
+            return;
+        };
+        let (size, rounds) = match spec.split_once('x') {
+            Some((a, b)) => (
+                a.parse::<usize>().unwrap_or(512),
+                b.parse::<usize>().unwrap_or(7),
+            ),
+            None => (512usize, 7usize),
+        };
+        let mut pixels = vec![0i32; size * size];
+        for y in 0..size {
+            for x in 0..size {
+                pixels[y * size + x] = ((x * 7919 + y * 104729) % 2_000_001) as i32 - 1_000_000;
+            }
+        }
+        for channels_count in [1usize, 3, 4] {
+            let views: Vec<_> = (0..channels_count)
+                .map(|_| ChannelView {
+                    pixels: &pixels,
+                    width: size,
+                    height: size,
+                    stride: size,
+                })
+                .collect();
+            let mut scalar_ms = Vec::with_capacity(rounds);
+            let mut narrow_ms = Vec::with_capacity(rounds);
+            for _ in 0..rounds {
+                let t0 = std::time::Instant::now();
+                let scalar = select_weighted_preset_narrow(&views, 5, true, false).unwrap();
+                scalar_ms.push(t0.elapsed().as_secs_f64() * 1e3);
+                let t1 = std::time::Instant::now();
+                let narrow = select_weighted_preset_narrow(&views, 5, true, true).unwrap();
+                narrow_ms.push(t1.elapsed().as_secs_f64() * 1e3);
+                assert_eq!(scalar.cost.to_bits(), narrow.cost.to_bits());
+                assert_eq!(scalar.preset, narrow.preset);
+                assert_eq!(scalar.work.pixels, narrow.work.pixels);
+                assert_eq!(scalar.work.checkpoints, narrow.work.checkpoints);
+            }
+            let median = |v: &mut Vec<f64>| {
+                v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                v[v.len() / 2]
+            };
+            let (s, n) = (median(&mut scalar_ms), median(&mut narrow_ms));
+            println!(
+                "[wp-micro] ch={channels_count} size={size}x{size} rounds={rounds} \
+                 scalar={s:.1}ms narrow={n:.1}ms ratio={:.4}",
+                s / n
+            );
+        }
     }
 
     fn wp_reference(channels: &[ChannelView<'_>], preset: u8) -> f32 {

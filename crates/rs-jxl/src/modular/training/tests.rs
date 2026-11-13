@@ -244,6 +244,173 @@ fn weighted_population(
 }
 
 #[test]
+fn serial_gather_repeated_streams_bound_reservations_and_preserve_population() {
+    // Small tasks share one prepare per bounded batch; heavy batches use the
+    // original per-task hint. Neither may reserve the whole repeated domain.
+    for (width, height, stream_count, hint_tasks) in [(8, 8, 64, 8), (128, 128, 4, 1)] {
+        let channels = [Channel {
+            width,
+            height,
+            hshift: 0,
+            vshift: 0,
+            samples: vec![7; width * height],
+        }];
+        let inputs: Vec<_> = (0..stream_count).map(|id| stream(&channels, id)).collect();
+        let streams: Vec<_> = inputs.iter().collect();
+        let predictors = [Predictor::Zero];
+        let mut policy = options().sampling.unwrap();
+        policy.nb_repeats = 1.0;
+        policy.previous_channels = 0;
+        policy.properties = vec![0, 3];
+        let quantization = PropertyQuantization {
+            properties: policy.properties.clone(),
+            thresholds: vec![vec![], (0..(width as i32 - 1)).collect()],
+        };
+        let mut reference = Vec::new();
+        let stats = visit_source_samples_generic(
+            &streams,
+            &policy,
+            &predictors,
+            1,
+            usize::MAX,
+            None,
+            |sample| {
+                reference.push(sample);
+                Ok(())
+            },
+        )
+        .unwrap();
+        let expected = weighted_population(&reference, &quantization);
+        assert_eq!(expected.len(), width);
+        let selected = stream_count * width * height;
+        let hint = gather_samples::expected_samples(1.0, width, height).unwrap() * hint_tasks;
+        for cache_hashes in [false, true] {
+            for sparse in [false, true] {
+                let shared = SampleBudget::new(selected + 7);
+                let source = SourceGather {
+                    streams: &streams,
+                    policy: &policy,
+                    predictors: &predictors,
+                    variable_channels: 1,
+                    sample_limit: selected,
+                    quantization: &quantization,
+                    budget: Some(&shared),
+                };
+                let gather = GatherOptions {
+                    workers: 1,
+                    cache_hashes,
+                    sparse,
+                    ..GatherOptions::default()
+                };
+                let actual = execution::serial(|| source.collect_prepared(&gather)).unwrap();
+                assert_eq!(actual.stats, stats);
+                assert_eq!(actual.stats.selected_samples, selected as u64);
+                assert_eq!(actual.samples.total, selected as u64);
+                assert_eq!(shared.remaining.load(Ordering::Relaxed), 7);
+                let capacities = std::iter::once(actual.samples.counts.capacity())
+                    .chain(actual.samples.residuals.iter().map(Vec::capacity))
+                    .chain(actual.samples.properties.iter().map(|column| match column {
+                        gather_samples::GatherColumn::Packed(values) => values.capacity(),
+                        gather_samples::GatherColumn::Static(values) => values.capacity(),
+                    }));
+                for capacity in capacities {
+                    assert!(capacity <= 2 * hint, "capacity={capacity} hint={hint}");
+                }
+                assert_eq!(actual.samples.quantization, quantization);
+                assert_eq!(
+                    weighted_population(&actual.samples.into_samples().unwrap(), &quantization),
+                    expected
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn serial_gather_distinct_streams_grow_past_one_batch_without_losing_properties() {
+    let channels = [channel(8, 8, 7)];
+    let inputs: Vec<_> = (0..32).map(|id| stream(&channels, id)).collect();
+    let streams: Vec<_> = inputs.iter().collect();
+    let predictors = [Predictor::Zero];
+    let mut policy = options().sampling.unwrap();
+    policy.nb_repeats = 1.0;
+    policy.previous_channels = 0;
+    policy.properties = vec![1, 2, 3];
+    let quantization = PropertyQuantization {
+        properties: policy.properties.clone(),
+        thresholds: vec![(0..31).collect(), (0..7).collect(), (0..7).collect()],
+    };
+    let (raw, stats) = gather_source_raw(&streams, &policy, &predictors, 1, usize::MAX).unwrap();
+    let expected = weighted_population(&raw, &quantization);
+    for cache_hashes in [false, true] {
+        let source = SourceGather {
+            streams: &streams,
+            policy: &policy,
+            predictors: &predictors,
+            variable_channels: 1,
+            sample_limit: usize::MAX,
+            quantization: &quantization,
+            budget: None,
+        };
+        let actual = execution::serial(|| {
+            source.collect_prepared(&GatherOptions {
+                workers: 1,
+                cache_hashes,
+                ..GatherOptions::default()
+            })
+        })
+        .unwrap();
+        assert_eq!(actual.stats, stats);
+        assert_eq!(actual.samples.len(), 32 * 8 * 8);
+        assert!(actual.samples.len() > 8 * (8 * 8 + 64));
+        assert_eq!(
+            weighted_population(&actual.samples.into_samples().unwrap(), &quantization),
+            expected
+        );
+    }
+}
+
+#[test]
+fn gather_push_overshoot_grows_columns_without_losing_weighted_population() {
+    let predictors = [Predictor::Zero];
+    let quantization = PropertyQuantization {
+        properties: vec![1],
+        thresholds: vec![(0..511).collect()],
+    };
+    for cache_hashes in [false, true] {
+        let mut collector =
+            SourceSampleCollector::new(&predictors, &quantization, cache_hashes).unwrap();
+        collector.prepare(1).unwrap();
+        let mut reference = Vec::new();
+        for id in 0..512 {
+            let row = Sample {
+                properties: vec![0, id],
+                residuals: vec![id - 256],
+                weight: 1 + (id % 3) as u32,
+            };
+            collector
+                .push(&row.properties, &row.residuals, row.weight)
+                .unwrap();
+            reference.push(row);
+        }
+        let actual = collector.finish();
+        assert_eq!(actual.len(), reference.len());
+        assert_eq!(
+            actual.total,
+            reference
+                .iter()
+                .map(|row| u64::from(row.weight))
+                .sum::<u64>()
+        );
+        assert!(actual.counts.capacity() >= actual.len());
+        assert_eq!(
+            weighted_population(&actual.into_samples().unwrap(), &quantization),
+            weighted_population(&reference, &quantization)
+        );
+    }
+}
+
+#[test]
 fn prepared_source_handoff_preserves_schema_constants_and_selected_budget() {
     let mut variable = channel(64, 64, 0);
     for (i, value) in variable.samples.iter_mut().enumerate() {
@@ -653,8 +820,8 @@ fn no_edge_rows_match_generic_neighbors_and_exact_source_guards() {
                 );
             }
             let mut actual = Vec::new();
-            let mut pixel = |x, neighbors| {
-                actual.push((x, neighbors));
+            let mut pixel = |x, value, neighbors| {
+                actual.push((x, value, neighbors));
                 Ok(())
             };
             if has_no_edge_interior(width, y, 0) {
@@ -665,8 +832,9 @@ fn no_edge_rows_match_generic_neighbors_and_exact_source_guards() {
                 visit_source_row::<false>(&plane, y, 0..width, &mut pixel).unwrap();
             }
             assert_eq!(actual.len(), width);
-            for (x, &(position, neighbors)) in actual.iter().enumerate() {
+            for (x, &(position, value, neighbors)) in actual.iter().enumerate() {
                 assert_eq!(position, x);
+                assert_eq!(value, plane.samples[y * width + x]);
                 assert_eq!(
                     neighbors,
                     Neighbors::from_plane(&plane.samples, width, width, x, y).unwrap()
