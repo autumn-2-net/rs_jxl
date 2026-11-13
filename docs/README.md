@@ -48,6 +48,7 @@ platform certifications.
 | Python and the versioned C boundary | [Python API and packaging](PYTHON_API.md), [reusable contexts](PYTHON_API.md#reusable-contexts), [input copies/borrowing](PYTHON_API.md#input-copies-and-borrowing), [decode_into](PYTHON_API.md#preallocated-output), [Python interface](PYTHON_INTERFACE.md), [C ABI protocol](../crates/rs-jxl-ffi/protocol.md), [C header](../crates/rs-jxl-ffi/include/rs_jxl.h) |
 | MA limits and exact search pruning | [Tree budgets](MA_TREE_BUDGET.md), [search pruning](MA_SEARCH_PRUNING.md) |
 | Search/probe integration and execution | [Probe API](SCHEDULER_PROBE_API.md), [cooperative execution](PARALLEL_EXECUTION.md), [progressive group scheduler](PROGRESSIVE_GROUP_SCHEDULER.md), [scheduler default routes](../crates/rs-jxl/src/scheduler/DEFAULT_ROUTES.md) |
+| Opt-in native experimental portfolio and deferred corpus runner | [Portfolio scout](NATIVE_PORTFOLIO_SCOUT_20261113.md) |
 
 ## Acceptance and Validation
 

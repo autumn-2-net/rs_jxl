@@ -84,6 +84,9 @@ pub enum PaletteStage {
 mod palette_receipt;
 pub use palette_receipt::{PaletteAttempt, PaletteKernelEvidence, PaletteOutcome, PaletteReceipt};
 
+#[path = "palette_counterfactual.rs"]
+pub mod counterfactual;
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct PaletteOptions {
     /// 0 disables multichannel palettes, NOT single-channel compaction.
@@ -114,6 +117,8 @@ pub struct PaletteOptions {
     pub grouping: Option<super::palette_groups::Grouping>,
     /// Invocation-owned global AND local attempt diagnostics; None has no sink.
     pub receipt: Option<Arc<PaletteReceipt>>,
+    /// Opt-in single-decision laboratory replay. Never enabled by effort presets.
+    pub counterfactual: Option<Arc<counterfactual::Experiment>>,
 }
 
 impl Default for PaletteOptions {
@@ -133,6 +138,7 @@ impl Default for PaletteOptions {
             tools: PaletteTools::default(),
             grouping: None,
             receipt: None,
+            counterfactual: None,
         }
     }
 }
@@ -387,6 +393,20 @@ pub fn apply_palettes(
     stage: PaletteStage,
     options: &PaletteOptions,
 ) -> Result<Vec<Transform>> {
+    apply_palettes_in_stream(channels, state, bits, stage, options, 0, &[])
+}
+
+/// The native frame orchestration supplies stable stream IDs, not worker order.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn apply_palettes_in_stream(
+    channels: &mut Vec<Channel>,
+    state: &mut PaletteState,
+    bits: u8,
+    stage: PaletteStage,
+    options: &PaletteOptions,
+    stream_id: usize,
+    prefix: &[Transform],
+) -> Result<Vec<Transform>> {
     options.validate()?;
     if !(1..=32).contains(&bits) || !(0..=32).contains(&state.max_bitdepth) {
         return Err(Error::InvalidInput(
@@ -422,7 +442,16 @@ pub fn apply_palettes(
     };
     let mut candidate = channels.clone();
     let mut next = *state;
-    let transforms = try_palettes(&mut candidate, &mut next, bits, percent, options, stage)?;
+    let transforms = try_palettes(
+        &mut candidate,
+        &mut next,
+        bits,
+        percent,
+        options,
+        stage,
+        stream_id,
+        prefix,
+    )?;
     *channels = candidate;
     *state = next;
     Ok(transforms)
@@ -492,7 +521,41 @@ fn attempt(
     cost_before: f32,
     accept_without_cost: bool,
     observation: Option<(&PaletteReceipt, PaletteStage)>,
+    visit: Option<counterfactual::Visit<'_>>,
 ) -> Result<bool> {
+    use counterfactual::Choice;
+    let choice = if let Some(visit) = &visit {
+        visit.experiment.before(
+            visit.target,
+            counterfactual::Input {
+                channels,
+                state: *state,
+                prefix: visit.prefix,
+                transforms,
+                bits,
+                begin,
+                count,
+                limit,
+                ordered,
+                mode,
+                tools,
+                cost_before,
+                accept_without_cost,
+            },
+        )?
+    } else {
+        Choice::Keep
+    };
+    if choice == Choice::Skip {
+        let visit = visit.as_ref().expect("skip requires an experiment");
+        visit.experiment.record(visit.target, choice, None, false);
+        return Ok(false);
+    }
+    let forced = matches!(choice, Choice::Palette(_));
+    let mode = match choice {
+        Choice::Palette(mode) => mode,
+        _ => mode,
+    };
     let mut candidate = channels.clone();
     let mut meta = state.meta_channels;
     let mut kernel = PaletteKernelEvidence::default();
@@ -507,9 +570,12 @@ fn attempt(
         mode,
         tools,
         &mut kernel,
-        observation.is_some(),
+        observation.is_some() || visit.is_some(),
     )?;
-    let mut event = observation.map(|(_, stage)| PaletteAttempt {
+    let stage = observation
+        .map(|(_, stage)| stage)
+        .or_else(|| visit.as_ref().map(|v| v.target.stage));
+    let mut event = stage.map(|stage| PaletteAttempt {
         stage,
         mode,
         width: channels[begin].width,
@@ -527,18 +593,40 @@ fn attempt(
         cost_bypassed: accept_without_cost,
         outcome: PaletteOutcome::KernelDeclined,
     });
+    // A forced Delta trial must not silently become an Absolute fallback.
+    let unavailable = forced
+        && (transform.is_none()
+            || match mode {
+                PaletteMode::ExactDelta(_) => !kernel.exact_delta_produced,
+                PaletteMode::ExactZero(_) => !kernel.zero_mask_eligible,
+                PaletteMode::Absolute => false,
+            });
+    if unavailable {
+        let visit = visit
+            .as_ref()
+            .expect("forced candidate requires an experiment");
+        visit.experiment.record(visit.target, choice, event, true);
+        return Err(Error::Encoding(
+            "counterfactual palette kernel unavailable at fixed input".into(),
+        ));
+    }
     let Some(transform) = transform else {
+        if let Some(visit) = &visit {
+            visit
+                .experiment
+                .record(visit.target, choice, event.clone(), false);
+        }
         if let (Some((receipt, _)), Some(event)) = (observation, event) {
             receipt.record(event);
         }
         return Ok(false);
     };
-    let cost_after = if accept_without_cost {
+    let cost_after = if accept_without_cost && !forced {
         None
     } else {
         Some(estimate(&candidate)?)
     };
-    let rejected = cost_after.is_some_and(|after| after > cost_before);
+    let rejected = !forced && cost_after.is_some_and(|after| after > cost_before);
     if let Some(event) = &mut event {
         if let Transform::Palette {
             colors,
@@ -565,6 +653,11 @@ fn attempt(
             PaletteOutcome::Accepted
         };
     }
+    if let Some(visit) = &visit {
+        visit
+            .experiment
+            .record(visit.target, choice, event.clone(), false);
+    }
     if rejected {
         if let (Some((receipt, _)), Some(event)) = (observation, event) {
             receipt.record(event);
@@ -583,6 +676,7 @@ fn attempt(
     Ok(true)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn try_palettes(
     channels: &mut Vec<Channel>,
     state: &mut PaletteState,
@@ -590,8 +684,12 @@ fn try_palettes(
     percent: f32,
     options: &PaletteOptions,
     stage: PaletteStage,
+    stream_id: usize,
+    prefix: &[Transform],
 ) -> Result<Vec<Transform>> {
     let observation = options.receipt.as_deref().map(|receipt| (receipt, stage));
+    let mut cursor =
+        counterfactual::Cursor::new(stage, stream_id, prefix, options.counterfactual.as_deref());
     let mut transforms = Vec::new();
     let count = channels.len() - state.meta_channels;
     if options.direct {
@@ -611,6 +709,7 @@ fn try_palettes(
                 0.0,
                 true,
                 observation,
+                cursor.next(),
             )?;
         }
         return Ok(transforms);
@@ -643,6 +742,7 @@ fn try_palettes(
                 cost_before,
                 bypass,
                 observation,
+                cursor.next(),
             )?;
         }
         if !did_palette && count > 3 {
@@ -661,6 +761,7 @@ fn try_palettes(
                 cost_before,
                 bypass,
                 observation,
+                cursor.next(),
             )?;
         }
     }
@@ -699,6 +800,7 @@ fn try_palettes(
                 cost_before,
                 options.speed_tier >= 3,
                 observation,
+                cursor.next(),
             )? {
                 let (_, max) =
                     minmax(&channels[state.meta_channels + i]).expect("nonempty accepted indices");
@@ -1315,7 +1417,8 @@ mod tests {
                     PaletteTools::default(),
                     baseline,
                     bypass,
-                    None
+                    None,
+                    None,
                 )
                 .unwrap(),
                 accepted

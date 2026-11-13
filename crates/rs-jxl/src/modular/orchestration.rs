@@ -302,13 +302,16 @@ fn finish_stream(
         });
     }
     if local && options.palette_policy.is_some() {
-        transforms.extend(palette::apply_palettes(
+        let added = palette::apply_palettes_in_stream(
             &mut channels,
             &mut state,
             bits,
             PaletteStage::PostRct,
             policy,
-        )?);
+            stream_id,
+            &transforms,
+        )?;
+        transforms.extend(added);
     }
     if can_search
         && allow_rct
@@ -452,13 +455,16 @@ fn prepare_layout(
         }
     }
     if !grouped && options.palette_policy.is_some() {
-        transforms.extend(palette::apply_palettes(
+        let added = palette::apply_palettes_in_stream(
             &mut channels,
             &mut state,
             image.bits(),
             PaletteStage::PreRct,
             &policy,
-        )?);
+            0,
+            &transforms,
+        )?;
+        transforms.extend(added);
     } else if !grouped
         && !policy.responsive
         && let Some(limit) = options.palette_colors

@@ -21,7 +21,7 @@ pub(crate) fn encode_policy(
     patches: Option<&PatchDictionary>,
     shared: bool,
 ) -> Result<EncodedGroups> {
-    use super::palette::{PaletteStage, PaletteState, apply_palettes};
+    use super::palette::{PaletteStage, PaletteState, apply_palettes_in_stream};
     let policy = options
         .palette_policy
         .as_ref()
@@ -47,12 +47,14 @@ pub(crate) fn encode_policy(
     };
     let (mut channels, _) = encode::planes(image, full, &raw)?;
     let mut state = PaletteState::new(image.bits())?;
-    let mut transforms = apply_palettes(
+    let mut transforms = apply_palettes_in_stream(
         &mut channels,
         &mut state,
         image.bits(),
         PaletteStage::PreRct,
         policy,
+        0,
+        &[],
     )?;
     if policy.do_color
         && channels.len() - state.meta_channels >= 3
@@ -75,13 +77,16 @@ pub(crate) fn encode_policy(
                   local: bool|
      -> Result<encode::Prepared> {
         if local {
-            transforms.extend(apply_palettes(
+            let added = apply_palettes_in_stream(
                 &mut planes,
                 &mut state,
                 image.bits(),
                 PaletteStage::PostRct,
                 policy,
-            )?);
+                stream_id,
+                &transforms,
+            )?;
+            transforms.extend(added);
         }
         if policy.do_color
             && planes.len() - state.meta_channels >= 3

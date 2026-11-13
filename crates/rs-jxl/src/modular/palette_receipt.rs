@@ -181,7 +181,8 @@ mod tests {
                     PaletteTools::default(),
                     0.0,
                     bypass,
-                    Some((&receipt, PaletteStage::PostRct))
+                    Some((&receipt, PaletteStage::PostRct)),
+                    None,
                 )
                 .unwrap()
             );
