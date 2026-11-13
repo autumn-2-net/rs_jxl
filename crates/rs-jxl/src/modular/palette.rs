@@ -5,8 +5,9 @@
 //!   eligibility gates; enc_params.h defaults (1024, 95%, 80%, speed tier 3).
 //! - enc_palette.cc::FwdPalette orchestration, through apply_palette_range_with_options
 //!   and the existing transforms.rs sample kernels, including exact-zero deltas.
-//! - Cost is cost.rs::estimate_cost, the port of enc_modular_simd.cc::EstimateCost,
-//!   NOT encoded-byte trials, distinct-color ratios, or replacement entropy.
+//! - Default cost is cost.rs::estimate_cost, the port of
+//!   enc_modular_simd.cc::EstimateCost. Optional admission pilots are separate
+//!   from kernel feasibility and never recursively encode an image.
 //!
 //! Preserved details: all/all-minus-one/single order; signed palette limit picks
 //! image order; stage-specific speed inequalities; strictly-greater cost rejection;
@@ -87,6 +88,9 @@ pub use palette_receipt::{PaletteAttempt, PaletteKernelEvidence, PaletteOutcome,
 #[path = "palette_counterfactual.rs"]
 pub mod counterfactual;
 
+#[path = "palette_admission.rs"]
+pub mod admission;
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct PaletteOptions {
     /// 0 disables multichannel palettes, NOT single-channel compaction.
@@ -119,6 +123,9 @@ pub struct PaletteOptions {
     pub receipt: Option<Arc<PaletteReceipt>>,
     /// Opt-in single-decision laboratory replay. Never enabled by effort presets.
     pub counterfactual: Option<Arc<counterfactual::Experiment>>,
+    /// Disabled-by-default native downstream pilot; fresh receipt per invocation.
+    /// Shadow leaves all choices unchanged; Veto can only reject old acceptances.
+    pub admission: Option<Arc<admission::Experiment>>,
 }
 
 impl Default for PaletteOptions {
@@ -139,6 +146,7 @@ impl Default for PaletteOptions {
             grouping: None,
             receipt: None,
             counterfactual: None,
+            admission: None,
         }
     }
 }
@@ -507,7 +515,7 @@ fn minmax(channel: &Channel) -> Option<(i32, i32)> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn attempt(
+fn attempt_with_admission(
     channels: &mut Vec<Channel>,
     state: &mut PaletteState,
     transforms: &mut Vec<Transform>,
@@ -522,6 +530,7 @@ fn attempt(
     accept_without_cost: bool,
     observation: Option<(&PaletteReceipt, PaletteStage)>,
     visit: Option<counterfactual::Visit<'_>>,
+    admission: Option<admission::Visit<'_>>,
 ) -> Result<bool> {
     use counterfactual::Choice;
     let choice = if let Some(visit) = &visit {
@@ -547,6 +556,9 @@ fn attempt(
         Choice::Keep
     };
     if choice == Choice::Skip {
+        if let Some(admission) = &admission {
+            admission.unavailable(mode, true, "counterfactual forced Skip");
+        }
         let visit = visit.as_ref().expect("skip requires an experiment");
         visit.experiment.record(visit.target, choice, None, false);
         return Ok(false);
@@ -602,6 +614,9 @@ fn attempt(
                 PaletteMode::Absolute => false,
             });
     if unavailable {
+        if let Some(admission) = &admission {
+            admission.unavailable(mode, true, "counterfactual kernel unavailable");
+        }
         let visit = visit
             .as_ref()
             .expect("forced candidate requires an experiment");
@@ -611,6 +626,9 @@ fn attempt(
         ));
     }
     let Some(transform) = transform else {
+        if let Some(admission) = &admission {
+            admission.unavailable(mode, forced, "palette kernel declined");
+        }
         if let Some(visit) = &visit {
             visit
                 .experiment
@@ -626,7 +644,20 @@ fn attempt(
     } else {
         Some(estimate(&candidate)?)
     };
-    let rejected = !forced && cost_after.is_some_and(|after| after > cost_before);
+    let old_would_accept =
+        accept_without_cost || !cost_after.is_some_and(|after| after > cost_before);
+    let vetoed = admission.as_ref().is_some_and(|admission| {
+        admission.compare(
+            channels,
+            &candidate,
+            transforms,
+            &transform,
+            mode,
+            old_would_accept,
+            forced,
+        )
+    });
+    let rejected = !forced && (!old_would_accept || vetoed);
     if let Some(event) = &mut event {
         if let Transform::Palette {
             colors,
@@ -690,12 +721,19 @@ fn try_palettes(
     let observation = options.receipt.as_deref().map(|receipt| (receipt, stage));
     let mut cursor =
         counterfactual::Cursor::new(stage, stream_id, prefix, options.counterfactual.as_deref());
+    let mut admission = admission::Cursor::new(
+        options.admission.as_deref(),
+        prefix,
+        stage,
+        stream_id,
+        !options.direct && !options.force_palette && !options.zero_tokens,
+    );
     let mut transforms = Vec::new();
     let count = channels.len() - state.meta_channels;
     if options.direct {
         if options.palette_colors > 0 {
             let begin = state.meta_channels;
-            attempt(
+            attempt_with_admission(
                 channels,
                 state,
                 &mut transforms,
@@ -710,6 +748,7 @@ fn try_palettes(
                 true,
                 observation,
                 cursor.next(),
+                admission.next(),
             )?;
         }
         return Ok(transforms);
@@ -728,7 +767,7 @@ fn try_palettes(
         let begin = state.meta_channels;
         if count > 1 {
             let limit = multichannel_limit(cost_before, pixels, options)?;
-            did_palette = attempt(
+            did_palette = attempt_with_admission(
                 channels,
                 state,
                 &mut transforms,
@@ -743,11 +782,12 @@ fn try_palettes(
                 bypass,
                 observation,
                 cursor.next(),
+                admission.next(),
             )?;
         }
         if !did_palette && count > 3 {
             let limit = multichannel_limit(cost_before, pixels, options)?;
-            did_palette = attempt(
+            did_palette = attempt_with_admission(
                 channels,
                 state,
                 &mut transforms,
@@ -762,6 +802,7 @@ fn try_palettes(
                 bypass,
                 observation,
                 cursor.next(),
+                admission.next(),
             )?;
         }
     }
@@ -786,7 +827,7 @@ fn try_palettes(
                 continue;
             };
             let limit = channel_limit(pixels, min, max, percent)?;
-            if attempt(
+            if attempt_with_admission(
                 channels,
                 state,
                 &mut transforms,
@@ -801,6 +842,7 @@ fn try_palettes(
                 options.speed_tier >= 3,
                 observation,
                 cursor.next(),
+                admission.next(),
             )? {
                 let (_, max) =
                     minmax(&channels[state.meta_channels + i]).expect("nonempty accepted indices");
@@ -819,6 +861,44 @@ fn try_palettes(
         }
     }
     Ok(transforms)
+}
+
+// Keep existing primitive receipt/kernel tests on the no-experiment path.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn attempt(
+    channels: &mut Vec<Channel>,
+    state: &mut PaletteState,
+    transforms: &mut Vec<Transform>,
+    bits: u8,
+    begin: usize,
+    count: usize,
+    limit: u32,
+    ordered: bool,
+    mode: PaletteMode,
+    tools: PaletteTools,
+    cost_before: f32,
+    accept_without_cost: bool,
+    observation: Option<(&PaletteReceipt, PaletteStage)>,
+    visit: Option<counterfactual::Visit<'_>>,
+) -> Result<bool> {
+    attempt_with_admission(
+        channels,
+        state,
+        transforms,
+        bits,
+        begin,
+        count,
+        limit,
+        ordered,
+        mode,
+        tools,
+        cost_before,
+        accept_without_cost,
+        observation,
+        visit,
+        None,
+    )
 }
 
 #[cfg(test)]

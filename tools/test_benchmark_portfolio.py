@@ -165,7 +165,8 @@ class PortfolioTests(unittest.TestCase):
             self.assertEqual(len(f.calls), calls)
 
     def test_resume_rejects_config_manifest_executable_input_and_inventory_changes(self):
-        for change in ("config", "candidates", "manifest", "encoder", "decoder", "input", "inventory"):
+        for change in ("config", "candidates", "serial_probes", "preparation_cache_mib",
+                       "no_finalist_bound", "manifest", "encoder", "decoder", "input", "inventory"):
             with self.subTest(change=change), tempfile.TemporaryDirectory() as directory:
                 f = self.fixture(directory)
                 self.invoke(f)
@@ -174,6 +175,10 @@ class PortfolioTests(unittest.TestCase):
                     extra += ["--threads", "2"]
                 elif change == "candidates":
                     extra += ["--candidates", "prev2,source"]
+                elif change == "preparation_cache_mib":
+                    extra += ["--preparation-cache-mib", "0"]
+                elif change in ("serial_probes", "no_finalist_bound"):
+                    extra += ["--" + change.replace("_", "-")]
                 elif change == "manifest":
                     f.manifest.write_text(f.manifest.read_text() + " ")
                 elif change in ("encoder", "decoder"):
@@ -306,6 +311,7 @@ class PortfolioTests(unittest.TestCase):
         base = ["--manifest", "input.json", "--out", "output"]
         self.assertIsNone(bench.arguments(base).limit)
         for extra in (("--run",), ("--limit", "0"), ("--timeout", "nan"),
+                      ("--preparation-cache-mib", "-1"),
                       ("--run", "--dry-run"), ("--effort", "7"), ("--probe-side", "31"),
                       ("--probe-side", "513"), ("--candidates", ""),
                       ("--candidates", "prev2,"), ("--candidates", "prev2,prev2")):
@@ -389,6 +395,252 @@ class PortfolioTests(unittest.TestCase):
             receipt = self.receipt(2)
             del receipt["effort"], receipt["threads"]
             bench.validate_receipt(receipt, case, args)
+
+    def test_performance_controls_are_frozen_and_forwarded(self):
+        for extra in ((), ("--serial-probes", "--preparation-cache-mib", "0", "--no-finalist-bound")):
+            with self.subTest(extra=extra), tempfile.TemporaryDirectory() as directory:
+                f = self.fixture(directory)
+                args = bench.arguments(f.argv + list(extra))
+                self.assertFalse(args.run)
+                self.invoke(f, ("--run",) + extra)
+                config = bench.loads((f.root / "out/run.json").read_text())["frozen"]["identity"]["config"]
+                for key in ("serial_probes", "preparation_cache_mib", "no_finalist_bound"):
+                    self.assertEqual(config[key], getattr(args, key))
+                for command in f.calls:
+                    if "--output" not in command:
+                        continue
+                    self.assertEqual(command[command.index("--preparation-cache-mib") + 1],
+                                     str(args.preparation_cache_mib))
+                    self.assertEqual("--serial-probes" in command, args.serial_probes)
+                    self.assertEqual("--no-finalist-bound" in command, args.no_finalist_bound)
+
+    def test_optional_performance_receipt_fields_and_tampering(self):
+        with tempfile.TemporaryDirectory() as directory:
+            f = self.fixture(directory)
+            args = bench.arguments(f.argv)
+            case = dict(width=2, height=1, pixels=2)
+            receipt = self.receipt(2)
+            bench.validate_receipt(receipt, case, args)
+            receipt.update(parallel_probes=True, preparation_cache_bytes=128 << 20,
+                           bound_finalists=True, probe_workers=1,
+                           preparation_reuse=dict(hits=2, misses=3, duplicate_builds=1,
+                                                  bypasses=0, entries=2, retained_bytes=16, peak_bytes=32))
+            # Concurrent elapsed probe work is not scout wall time.
+            receipt["candidates"][1]["probe_seconds"] = 0.5
+            bench.validate_receipt(receipt, case, args)
+            for key, invalids in {
+                "parallel_probes": (False, 1, None),
+                "bound_finalists": (False, 1, None),
+                "preparation_cache_bytes": (0, float(128 << 20), True, None),
+                "probe_workers": (-1, True, 1.5, 2, None),
+                "preparation_reuse": (None, [], {}),
+            }.items():
+                for invalid in invalids:
+                    with self.subTest(key=key, invalid=invalid), self.assertRaises(ValueError):
+                        bench.validate_receipt(dict(receipt, **{key: invalid}), case, args)
+            for key in receipt["preparation_reuse"]:
+                for invalid in (-1, True, 1.5, None):
+                    with self.subTest(key=key, invalid=invalid), self.assertRaises(ValueError):
+                        reuse = dict(receipt["preparation_reuse"], **{key: invalid})
+                        bench.validate_receipt(dict(receipt, preparation_reuse=reuse), case, args)
+            reuse = dict(receipt["preparation_reuse"], retained_bytes=33)
+            with self.assertRaises(ValueError):
+                bench.validate_receipt(dict(receipt, preparation_reuse=reuse), case, args)
+            serial = bench.arguments(f.argv + ["--serial-probes"])
+            parallel_receipt = dict(receipt, parallel_probes=False, probe_encodes=2, probe_workers=2)
+            with self.assertRaisesRegex(ValueError, "probe_workers"):
+                bench.validate_receipt(parallel_receipt, case, serial)
+            bench.validate_receipt(dict(receipt, probe_encodes=0, probe_workers=0), case, args)
+
+    def test_full_bounded_contract_and_tampering(self):
+        with tempfile.TemporaryDirectory() as directory:
+            f = self.fixture(directory)
+            args = bench.arguments(f.argv)
+            case = dict(width=2, height=1, pixels=2)
+            receipt = self.receipt(2)
+            bounded = receipt["candidates"][-1]
+            bounded.update(decision="full-bounded", full_lower_bound=receipt["bytes"],
+                           full_seconds=0.1)
+            receipt["full_encodes"] = 3
+            for lower_bound in (receipt["bytes"], receipt["baseline"]["bytes"] + 100):
+                bounded["full_lower_bound"] = lower_bound
+                bench.validate_receipt(receipt, case, args)
+            for change in (dict(full_lower_bound=None), dict(full_lower_bound=-1),
+                           dict(full_lower_bound=0), dict(full_lower_bound=receipt["bytes"] - 1),
+                           dict(full_lower_bound=True), dict(full_lower_bound=10.0),
+                           dict(full_lower_bound="10"), dict(full_bytes=10),
+                           dict(full_seconds=None), dict(full_seconds=-1),
+                           dict(error="bounded"), dict(decision="full-error"),
+                           dict(name=receipt["winner"])):
+                with self.subTest(change=change):
+                    original = dict(bounded)
+                    bounded.update(change)
+                    with self.assertRaises(ValueError):
+                        bench.validate_receipt(receipt, case, args)
+                    bounded.clear()
+                    bounded.update(original)
+            del bounded["full_lower_bound"]
+            with self.assertRaises(ValueError):
+                bench.validate_receipt(receipt, case, args)
+            bounded["full_lower_bound"] = receipt["bytes"]
+            with self.assertRaises(ValueError):
+                bench.validate_receipt(receipt, case,
+                                       bench.arguments(f.argv + ["--no-finalist-bound"]))
+
+    def test_full_bounded_is_not_failure_and_resume_rechecks_bound(self):
+        with tempfile.TemporaryDirectory() as directory:
+            f = self.fixture(directory)
+            def bound(command, result):
+                if "--output" not in command:
+                    return
+                receipt = json.loads(result["stdout"])
+                receipt["candidates"][-1].update(decision="full-bounded",
+                                                full_lower_bound=receipt["bytes"] + 100,
+                                                full_seconds=0.1)
+                receipt["full_encodes"] = 3
+                result["stdout"] = json.dumps(receipt)
+            summary = self.invoke(f, ("--run",), effect=bound)
+            self.assertEqual(summary["statuses"], {"passed": 2})
+            self.assertEqual(summary["candidate_errors"], 0)
+            self.assertEqual(summary["candidate_decision_counts"]["full-bounded"], 2)
+            self.assertAlmostEqual(summary["successful"]["full_encode_seconds"], 3.2)
+            self.invoke(f, ("--resume", "--run"))
+            journal = f.root / "out/trials.jsonl"
+            lines = journal.read_text().splitlines(keepends=True)
+            row = bench.loads(lines[0])
+            row["measurement"]["candidates"][-1]["full_lower_bound"] = row["measurement"]["bytes"] - 1
+            row["encoder"]["stdout"] = bench.canonical(row["measurement"])
+            row.pop("checksum")
+            row["checksum"] = bench.digest(row)
+            journal.write_text(bench.canonical(row) + "\n" + "".join(lines[1:]))
+            with self.assertRaisesRegex(ValueError, "full-bounded"):
+                self.invoke(f, ("--resume", "--run"))
+
+    def test_winner_identity_and_complete_output_tampering(self):
+        with tempfile.TemporaryDirectory() as directory:
+            f = self.fixture(directory)
+            args = bench.arguments(f.argv)
+            case = dict(width=2, height=1, pixels=2)
+            for change in ("missing", "duplicate", "wrong-bytes", "error", "full-error",
+                           "full-rejected", "wrong-winner-decision"):
+                with self.subTest(change=change):
+                    receipt = self.receipt(2)
+                    winner = receipt["candidates"][1]
+                    if change == "missing":
+                        receipt["candidates"].remove(winner)
+                    elif change == "duplicate":
+                        receipt["candidates"].append(dict(winner))
+                    elif change == "wrong-bytes":
+                        winner["full_bytes"] += 1
+                    elif change == "error":
+                        winner["error"] = "failed full encode"
+                    elif change in ("full-error", "full-rejected"):
+                        winner["decision"] = change
+                    else:
+                        receipt["candidates"][-1].update(decision="winner", full_bytes=12,
+                                                         full_seconds=0.1)
+                    with self.assertRaises(ValueError):
+                        bench.validate_receipt(receipt, case, args)
+            for decision in ("winner", "finalist"):
+                receipt = self.receipt(2)
+                receipt["candidates"][1].update(decision=decision, full_seconds=0)
+                bench.validate_receipt(receipt, case, args)
+
+    def test_completed_winner_and_rejected_records_require_bytes_and_time(self):
+        with tempfile.TemporaryDirectory() as directory:
+            f = self.fixture(directory)
+            args = bench.arguments(f.argv)
+            case = dict(width=2, height=1, pixels=2)
+            for index in (0, 1, 2):
+                for key, invalids in (("full_bytes", (None, 0, -1, True, 10.0, "10")),
+                                      ("full_seconds", (None, -1, True, "0.1", 3.0))):
+                    for invalid in invalids:
+                        with self.subTest(index=index, key=key, invalid=invalid):
+                            receipt = self.receipt(2)
+                            receipt["candidates"][2].update(decision="full-rejected", full_bytes=12,
+                                                             full_seconds=0.1)
+                            receipt["candidates"][index][key] = invalid
+                            with self.assertRaises(ValueError):
+                                bench.validate_receipt(receipt, case, args)
+
+    def test_baseline_candidate_identity_consistency_and_bounded_tampering(self):
+        with tempfile.TemporaryDirectory() as directory:
+            f = self.fixture(directory)
+            args = bench.arguments(f.argv)
+            case = dict(width=2, height=1, pixels=2)
+            for change in ("missing", "duplicate", "bytes", "seconds", "bounded", "lower-bound",
+                           "failed-full"):
+                with self.subTest(change=change):
+                    receipt = self.receipt(2)
+                    baseline = receipt["candidates"][0]
+                    if change == "missing":
+                        receipt["candidates"].remove(baseline)
+                    elif change == "duplicate":
+                        receipt["candidates"].append(dict(baseline))
+                    elif change == "bytes":
+                        baseline["full_bytes"] += 1
+                    elif change == "seconds":
+                        baseline["full_seconds"] += 0.1
+                    elif change == "bounded":
+                        baseline.update(decision="full-bounded", full_bytes=None,
+                                        full_lower_bound=receipt["bytes"])
+                    elif change == "lower-bound":
+                        baseline["full_lower_bound"] = receipt["bytes"]
+                    else:
+                        baseline.update(decision="full-error", error="failed baseline")
+                    with self.assertRaises(ValueError):
+                        bench.validate_receipt(receipt, case, args)
+
+    def test_baseline_probe_failure_preserves_complete_fallback_and_diagnostics(self):
+        with tempfile.TemporaryDirectory() as directory:
+            f = self.fixture(directory)
+            def scout_failure(command, result):
+                if "--output" not in command:
+                    return
+                receipt = json.loads(result["stdout"])
+                receipt.update(winner="baseline", bytes=receipt["baseline"]["bytes"],
+                               bpp=receipt["baseline"]["bpp"], full_encodes=1)
+                receipt["candidates"][0].update(decision="probe-error", error="baseline crop failed")
+                receipt["candidates"][1].update(decision="budget-deferred", full_bytes=None,
+                                                 full_seconds=None)
+                Path(command[command.index("--output") + 1]).write_bytes(b"x" * receipt["bytes"])
+                result["stdout"] = json.dumps(receipt)
+            summary = self.invoke(f, ("--run",), effect=scout_failure)
+            self.assertEqual(summary["statuses"], {"passed": 2})
+            self.assertEqual(summary["candidate_error_counts"], {"probe-error": 2})
+            journal = f.root / "out/trials.jsonl"
+            lines = journal.read_text().splitlines(keepends=True)
+            for line in lines:
+                receipt = bench.loads(line)["measurement"]
+                baseline = receipt["candidates"][0]
+                self.assertEqual(baseline["decision"], "probe-error")
+                self.assertEqual(baseline["error"], "baseline crop failed")
+                self.assertEqual(baseline["full_bytes"], receipt["bytes"])
+                self.assertEqual(baseline["full_seconds"], receipt["baseline"]["seconds"])
+            resumed = self.invoke(f, ("--resume", "--run"))
+            self.assertEqual(resumed["candidate_error_counts"], {"probe-error": 2})
+            args = bench.arguments(f.argv)
+            for key in ("full_bytes", "full_seconds", "error"):
+                with self.subTest(key=key):
+                    row = bench.loads(lines[0])
+                    row["measurement"]["candidates"][0][key] = None
+                    with self.assertRaises(ValueError):
+                        bench.validate_receipt(row["measurement"], row["case"], args)
+
+    def test_resume_rechecks_complete_winner_even_with_matching_stdout_and_checksum(self):
+        with tempfile.TemporaryDirectory() as directory:
+            f = self.fixture(directory)
+            self.invoke(f, ("--run",))
+            journal = f.root / "out/trials.jsonl"
+            lines = journal.read_text().splitlines(keepends=True)
+            row = bench.loads(lines[0])
+            row["measurement"]["candidates"][1]["full_bytes"] += 1
+            row["encoder"]["stdout"] = bench.canonical(row["measurement"])
+            row.pop("checksum")
+            row["checksum"] = bench.digest(row)
+            journal.write_text(bench.canonical(row) + "\n" + "".join(lines[1:]))
+            with self.assertRaisesRegex(ValueError, "complete winner"):
+                self.invoke(f, ("--resume", "--run"))
 
     def test_empty_summary_metrics_are_defined(self):
         summary = bench.summarize([], dict(cases=[], excluded=[], duplicate_aliases=[]), "prepare-only")

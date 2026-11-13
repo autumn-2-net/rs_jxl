@@ -15,7 +15,77 @@ fn check(image: &Image, options: &Options) -> portfolio::Output {
     assert!(result.report.probe_encodes <= options.max_probe_encodes);
     assert!(result.report.full_encodes <= options.max_finalists + 1);
     assert!(result.report.seconds >= result.report.scout_seconds);
+    for trial in &result.report.candidates {
+        if let Some(lower_bound) = trial.full_lower_bound {
+            assert_eq!(trial.decision, "full-bounded");
+            assert!(trial.full_bytes.is_none());
+            assert!(trial.error.is_none());
+            assert!(trial.full_seconds.is_some());
+            assert!(lower_bound >= result.bytes.len());
+        }
+    }
     result
+}
+
+#[test]
+fn performance_switches_keep_pixels_and_work_budgets() {
+    let image = Image::new(
+        80,
+        72,
+        PixelLayout::Rgba,
+        PixelData::U16(
+            (0..80 * 72)
+                .flat_map(|i| {
+                    [
+                        (i * 37) as u16,
+                        (i / 80 * 91) as u16,
+                        (i * 7) as u16,
+                        if i % 3 == 0 { 0 } else { 65535 },
+                    ]
+                })
+                .collect(),
+        ),
+    )
+    .unwrap();
+    for (parallel_probes, preparation_cache_bytes, bound_finalists) in
+        [(false, 0, false), (true, 8 << 20, true), (true, 0, true)]
+    {
+        let result = check(
+            &image,
+            &Options {
+                threads: 4,
+                probe_side: 32,
+                max_probe_encodes: 12,
+                candidates: vec![Candidate::Prev1, Candidate::Prev2],
+                parallel_probes,
+                preparation_cache_bytes,
+                bound_finalists,
+                ..Default::default()
+            },
+        );
+        assert!(result.report.candidates.iter().all(|c| c.error.is_none()));
+        assert!(result.report.probe_workers <= 4);
+        if parallel_probes {
+            assert!(result.report.probe_workers > 1);
+        } else {
+            assert_eq!(result.report.probe_workers, 1);
+        }
+        assert!(result.report.preparation_reuse.peak_bytes <= preparation_cache_bytes);
+        if preparation_cache_bytes == 0 {
+            assert_eq!(result.report.preparation_reuse.hits, 0);
+        } else {
+            assert!(result.report.preparation_reuse.hits > 0);
+        }
+        if !bound_finalists {
+            assert!(
+                result
+                    .report
+                    .candidates
+                    .iter()
+                    .all(|c| c.full_lower_bound.is_none())
+            );
+        }
+    }
 }
 
 #[test]

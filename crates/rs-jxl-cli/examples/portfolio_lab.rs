@@ -1,4 +1,6 @@
 //! Opt-in native portfolio benchmark. No corpus traversal or automatic launch.
+//! Candidate probe_seconds sum elapsed probe work, which can overlap across
+//! concurrent roots; scout_seconds measures wall time, not that sum.
 use clap::Parser;
 use rs_jxl::scheduler::portfolio::{self, ALL, Candidate, Options};
 use std::{fs, io::Write, path::PathBuf};
@@ -6,6 +8,9 @@ use std::{fs, io::Write, path::PathBuf};
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 #[derive(Parser)]
+#[command(
+    after_help = "Candidate probe_seconds sum elapsed probe work and can exceed scout_seconds when roots run concurrently; scout_seconds is wall time."
+)]
 struct Args {
     input: Option<PathBuf>,
     #[arg(long, required_unless_present_any = ["plan_only", "list_candidates"])]
@@ -14,6 +19,15 @@ struct Args {
     effort: u8,
     #[arg(long, default_value_t = 8, value_parser = clap::value_parser!(u16).range(1..=256))]
     threads: u16,
+    /// Run independent probe roots serially instead of concurrently.
+    #[arg(long)]
+    serial_probes: bool,
+    /// Preparation cache budget in MiB; zero disables reuse.
+    #[arg(long, default_value_t = 128)]
+    preparation_cache_mib: usize,
+    /// Disable safe output-bound exits for losing full finalists.
+    #[arg(long)]
+    no_finalist_bound: bool,
     #[arg(long, default_value_t = 48)]
     max_probe_encodes: usize,
     #[arg(long, default_value_t = 2)]
@@ -60,6 +74,12 @@ fn run(args: Args) -> Result<()> {
     let options = Options {
         effort: args.effort,
         threads: usize::from(args.threads),
+        parallel_probes: !args.serial_probes,
+        preparation_cache_bytes: args
+            .preparation_cache_mib
+            .checked_mul(1 << 20)
+            .ok_or("preparation cache MiB exceeds addressable bytes")?,
+        bound_finalists: !args.no_finalist_bound,
         max_probe_encodes: args.max_probe_encodes,
         max_finalists: args.max_finalists,
         probe_side: usize::from(args.probe_side),
@@ -95,6 +115,9 @@ fn run(args: Args) -> Result<()> {
         serde_json::json!({
             "schema": 1, "plan_only": args.plan_only,
             "effort": args.effort, "threads": args.threads,
+            "parallel_probes": options.parallel_probes,
+            "preparation_cache_bytes": options.preparation_cache_bytes,
+            "bound_finalists": options.bound_finalists,
             "width": image.width(), "height": image.height(), "bits": image.bits(),
             "bytes": bytes.as_ref().map(Vec::len),
             "bpp": bytes.as_ref().map(|b| b.len() as f64 * 8.0 / pixels),
@@ -103,6 +126,16 @@ fn run(args: Args) -> Result<()> {
             "baseline": {"bytes": baseline.full_bytes, "seconds": baseline.full_seconds,
                 "bpp": baseline.full_bytes.map(|n| n as f64 * 8.0 / pixels)},
             "scout_seconds": report.scout_seconds,
+            "probe_workers": report.probe_workers,
+            "preparation_reuse": {
+                "hits": report.preparation_reuse.hits,
+                "misses": report.preparation_reuse.misses,
+                "duplicate_builds": report.preparation_reuse.duplicate_builds,
+                "bypasses": report.preparation_reuse.bypasses,
+                "entries": report.preparation_reuse.entries,
+                "retained_bytes": report.preparation_reuse.retained_bytes,
+                "peak_bytes": report.preparation_reuse.peak_bytes,
+            },
             "probe_encodes": report.probe_encodes, "probe_pixels": report.probe_pixels,
             "full_encodes": report.full_encodes, "winner": report.winner.name(),
             "features": {"samples": f.samples, "unique_fraction": f.unique_fraction,
@@ -119,6 +152,7 @@ fn run(args: Args) -> Result<()> {
                 "decision": c.decision, "reason": c.reason, "priority": c.priority,
                 "probe_bytes": c.probe_bytes, "probe_seconds": c.probe_seconds,
                 "full_bytes": c.full_bytes, "full_seconds": c.full_seconds, "error": c.error,
+                "full_lower_bound": c.full_lower_bound,
             })).collect::<Vec<_>>(),
         })
     );
@@ -142,5 +176,36 @@ mod tests {
                 .is_err()
         );
         assert!(candidate("made-up-tool").is_err());
+    }
+
+    #[test]
+    fn performance_controls_default_on_and_allow_disabling() {
+        let args = Args::try_parse_from(["lab", "input.png", "--plan-only"]).unwrap();
+        assert!(!args.serial_probes);
+        assert_eq!(args.preparation_cache_mib, 128);
+        assert!(!args.no_finalist_bound);
+        let args = Args::try_parse_from([
+            "lab",
+            "input.png",
+            "--plan-only",
+            "--serial-probes",
+            "--preparation-cache-mib",
+            "0",
+            "--no-finalist-bound",
+        ])
+        .unwrap();
+        assert!(args.serial_probes);
+        assert_eq!(args.preparation_cache_mib, 0);
+        assert!(args.no_finalist_bound);
+        assert!(
+            Args::try_parse_from([
+                "lab",
+                "input.png",
+                "--plan-only",
+                "--preparation-cache-mib",
+                "-1",
+            ])
+            .is_err()
+        );
     }
 }

@@ -78,15 +78,44 @@ claim that one whole-mode winner identifies the cause of every local decision.
 5. Permit at most one uncertainty witness, including exact crop ties. Distant patch repetitions can disappear
    in crops, so repeat/flat evidence can justify a full-image patch witness even
    on tied crop scores. Rejections and untested candidates remain distinguishable.
+   A repeated-tile Patch witness now has a reserved slot in both confirmation
+   and final selection. Tiny crop gains cannot consume its slot. Flatness alone
+   is weaker evidence: its witness cannot displace clearly better crop scores
+   outside the uncertainty band. Family diversity
+   is a near-tie preference within the uncertainty band, not a hard exclusion
+   of a stronger second candidate from the same family. Identical complete
+   crop-score vectors within a selected family are correlated evidence: prefer
+   an eligible candidate with different evidence before spending another slot
+   on that twin. Twins may still fill otherwise unused slots. Identical crop
+   byte counts do NOT prove identical output, transforms or final size.
+   These are routing
+   heuristics, not an Oracle recall guarantee.
 6. Fully encode only the admitted finalists. Retain the complete ordinary
    baseline and return the smallest complete output, with baseline winning ties.
 
 The current default experimental budgets are 48 crop encodes, two complete
 alternatives, and 128-pixel crop sides. These are configurable **search work**
-budgets, not arbitrary MA-tree or decoder limits. The same pool is reused;
-candidate calls are sequential and each uses the requested native threads.
+budgets, not arbitrary MA-tree or decoder limits. The same pool is reused.
+Crop roots run concurrently, each with a null inner runner. Roots are capped
+by the requested threads and the existing 32 MiB probe scratch estimate under
+a 1 GiB dispatch budget (not an RSS guarantee). Complete finalists remain
+sequential and use the full pool internally. `--serial-probes` restores
+sequential crop roots with internal data parallelism for comparison.
 Tiny images use bounded direct trials instead of repeatedly encoding a crop
 equal to the whole image. A zero finalist budget returns only the baseline.
+
+Preparation sharing uses image-scoped immutable caches, never shared learned
+trees, residual tokens or compressed results. The default retained budget is
+128 MiB, half for the original and half divided among crops. Keys include
+transforms and preparation options; incompatible roots/recipes bypass reuse.
+`--preparation-cache-mib 0` disables it. This is a retained-data budget, not a
+limit on all encoder allocations. Concurrent cold misses may build twice.
+
+Losing full candidates may stop when finalized disjoint output sections already
+cannot beat the incumbent. This typed `full-bounded` outcome carries a byte
+lower bound, not a fabricated output size or an error. It is not based on crop
+scores or a timeout. `--no-finalist-bound` disables this optimization. The
+baseline is always encoded completely; ties retain the incumbent.
 
 Feature weights, first-round allocation and the 1% crop uncertainty band are
 provisional heuristics, not a fitted/validated classifier. They may miss gains.
@@ -119,6 +148,15 @@ the winner, encoded probe pixels and counts. `null` means unmeasured, not zero.
 - `scout_seconds`: planning plus crop-stage work, already included in `seconds`.
 - `baseline.seconds`: ordinary complete baseline, also included in `seconds`.
 - `candidates[].full_seconds`: each full trial including the baseline entry.
+- `candidates[].probe_seconds`: summed elapsed crop work. Concurrent work
+  overlaps, so this sum is not scout wall time or CPU time.
+- `candidates[].full_lower_bound`: only set for `full-bounded`, with `full_bytes`
+  absent. Bounded attempts still count toward `full_encodes` and have timing.
+- `probe_workers`: maximum independent roots dispatched in a batch, not an
+  estimate of physical CPU utilization.
+- `preparation_reuse`: hit/miss/duplicate-build counters and summed per-scope
+  retained snapshots/peaks. Crop scopes are released before finalists; these
+  totals are not simultaneous process memory measurements.
 - `bpp`: final bytes times eight divided by original width times height.
 
 The corpus summary reports both arithmetic mean per-image bpp and the separate
@@ -145,7 +183,7 @@ python -B -m unittest discover -s tools -p test_benchmark_portfolio.py
 The example is a development entry point. Installed CLI/Python defaults are
 unchanged; this new portfolio is not yet added to the frozen C ABI.
 
-Validation in this revision: 17 native unit tests, three native integration
+Initial implementation validation: 17 native unit tests, three native integration
 tests and the CLI parser test passed. Integration tests also decode every
 supported catalog recipe directly, not merely the selected winner. The runner's
 18 tests passed with its explicit official-djxl smoke enabled: two 80x72 RGBA
@@ -153,6 +191,80 @@ fixtures at 8 and 16 bits, including nonzero RGB under zero alpha. This verifies
 wiring and small cases, not corpus compression performance or complete coverage
 of all transform activation paths. Tests used the development profile; a
 Release binary must be built before timing the deferred corpus run.
+
+## Targeted Parallelism And Selection Check
+
+This is a five-image diagnostic set, NOT the deferred full corpus or a fresh
+holdout. The originals total 5,515,650 pixels: Kodak `kodim06`, a Hacker News
+screenshot, a transparent spreadsheet icon, a 16-bit RGB circles fixture, and
+DIV2K `0533`. No originals were resized. Release effort 9 uses the same default
+48-probe/two-finalist budgets. The reference is the committed Portfolio at
+`9f71dbf407120204d009667976f920a6cbcc5163`, not ordinary e9 or official cjxl.
+
+Native time includes the baseline, all probes and all finalist attempts;
+CLI startup, file I/O and verification are excluded. One run per image was
+measured at 1/4/16 threads; 8-thread numbers sum per-image medians of two runs.
+The initial old/new run order was interleaved, but the final selection fix was
+remeasured later against that frozen old reference. There was no CPU affinity
+isolation. Small timing differences are not statistically established.
+
+| Threads | Old total s | New total s | Time reduction | Old MPix/s | New MPix/s | Old scout s | New scout s |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 50.790 | 47.118 | 7.23% | 0.109 | 0.117 | 10.107 | 9.437 |
+| 4 | 22.879 | 17.404 | 23.93% | 0.241 | 0.317 | 7.989 | 3.030 |
+| 8 | 18.304 | 13.423 | 26.66% | 0.301 | 0.411 | 7.805 | 2.163 |
+| 16 | 17.894 | 11.830 | 33.89% | 0.308 | 0.466 | 8.031 | 1.818 |
+
+These compare the combined parallelism/cache/bound/selection revision. They do
+not isolate the contribution of each change. Full-finalist time does not
+uniformly improve: at eight threads it changed from 7.276 to 7.770 seconds,
+partly because selection changes which candidates execute. Scout time is the
+clear aggregate improvement; more threads do not eliminate full encoding work.
+
+| Size metric | Old Portfolio | New Portfolio |
+| --- | ---: | ---: |
+| Total bytes | 2,044,860 | 1,999,484 |
+| Arithmetic mean image bpp | 3.121824 | 3.084036 |
+| Pixel-weighted bpp | 2.965902 | 2.900088 |
+
+The 45,376-byte reduction (2.219%) comes entirely from the screenshot:
+110,876 to 65,500 bytes, a 40.925% reduction. The other four final sizes are
+unchanged. All tested thread counts select outputs with these sizes. This is
+not a claim that other inputs cannot regress relative to the old Portfolio.
+
+An intermediate revision regressed the 16-bit fixture by 329 bytes: weak
+flatness evidence first displaced its useful candidate; after that was fixed,
+two shallow variants with identical crop-score vectors consumed both slots.
+The final weak/strong witness and correlated-evidence rules restore 40,234
+bytes. Tests retain both cases. These rules were developed on this diagnostic
+set, so their generalization still needs the separately authorized corpus run.
+Recall is still incomplete: a separately measured `source-prev2` candidate on
+the screenshot is 62,646 bytes, smaller than the selected 65,500. No full-catalog
+Oracle recall rate is claimed from this check.
+
+Final validation:
+
+- Workspace/all-target offline compilation passed.
+- 32 Portfolio and 45 Palette-focused library tests passed.
+- Four Portfolio and two Palette-admission integration tests passed.
+- Two Portfolio CLI and three Palette-admission CLI tests passed.
+- All 27 Python runner tests passed, including actual native/official-djxl
+  smoke checks for RGBA8 and RGBA16 with invisible RGB.
+- All 25 final Portfolio outputs passed official-djxl original-sample
+  comparisons, including 16-bit samples and alpha. The separate admission
+  pilot's 15 outputs also passed, but its ranking result was negative; see
+  `PALETTE_ADMISSION_20261113.md`.
+
+Reproduction artifacts are under
+`../jxl_python/out/portfolio-opt-20261113/`: the root `summary.json` retains
+the old reference measurements; `accepted/summary.json`, `accepted/rows.jsonl`
+and `accepted/identity.json` identify the final revision. `accepted/run_comparison.py`
+is the targeted driver. The earlier root/new and `final/` results are superseded
+by `accepted/`; they must not be presented as the final performance result.
+All are ignored experiment artifacts, not runtime or packaging dependencies.
+
+Ordinary e9 defaults, frozen C/Python interfaces and the deferred-corpus policy
+are unchanged. No claim is made that the new Palette pilot corrects admission.
 
 ## Deferred Corpus Run
 

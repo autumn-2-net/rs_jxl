@@ -2,6 +2,9 @@
 
 No builds or discovery. An existing encoder is required even for preparation so
 its identity can be frozen. Resume a prepared directory with --resume --run.
+Corpus cases run serially; native probe roots run concurrently by default.
+Candidate probe_seconds sum elapsed probe work and can exceed scout_seconds,
+which measures scout wall time rather than summed concurrent work.
 """
 
 import argparse
@@ -80,6 +83,12 @@ def arguments(argv=None):
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--limit", type=int, help="Explicit limit on unique PNG attempts")
     parser.add_argument("--threads", type=int, default=8)
+    parser.add_argument("--serial-probes", action="store_true",
+                        help="Run native probe roots serially; probe_seconds sums can otherwise exceed scout wall time")
+    parser.add_argument("--preparation-cache-mib", type=int, default=128,
+                        help="Native preparation cache budget in MiB (0 disables reuse)")
+    parser.add_argument("--no-finalist-bound", action="store_true",
+                        help="Disable safe output-bound exits for losing full finalists")
     parser.add_argument("--effort", type=int, choices=(8, 9, 10), default=9)
     parser.add_argument("--candidates", help="Comma-separated native candidate names; baseline is always retained")
     parser.add_argument("--max-probe-encodes", type=int, default=48)
@@ -88,6 +97,7 @@ def arguments(argv=None):
     parser.add_argument("--timeout", type=float, default=1800)
     args = parser.parse_args(argv)
     if (not 1 <= args.threads <= 256 or args.max_probe_encodes < 0
+            or args.preparation_cache_mib < 0
             or args.max_finalists < 0 or not 32 <= args.probe_side <= 512
             or (args.limit is not None and args.limit < 1)
             or not math.isfinite(args.timeout) or args.timeout <= 0):
@@ -116,7 +126,8 @@ def identity(args):
                          ("benchmark_portfolio.py", "corpus_inputs.py", "compare_cpp_port.py")],
                 config={name: getattr(args, name) for name in
                         ("threads", "effort", "max_probe_encodes", "max_finalists",
-                         "probe_side", "timeout", "skip_verify", "limit", "candidates")})
+                         "probe_side", "timeout", "skip_verify", "limit", "candidates",
+                         "serial_probes", "preparation_cache_mib", "no_finalist_bound")})
 
 
 def inventory(manifest, limit=None):
@@ -183,6 +194,11 @@ def validate_receipt(receipt, case, args, size=None):
     for key in ("effort", "threads"):
         if key in receipt and (type(receipt[key]) is not int or receipt[key] != getattr(args, key)):
             raise ValueError(f"Native receipt {key} differs from configured value")
+    for key, expected in (("parallel_probes", not args.serial_probes),
+                          ("preparation_cache_bytes", args.preparation_cache_mib << 20),
+                          ("bound_finalists", not args.no_finalist_bound)):
+        if key in receipt and (type(receipt[key]) is not type(expected) or receipt[key] != expected):
+            raise ValueError(f"Native receipt {key} differs from configured value")
     pixels = case["pixels"]
     for key in ("width", "height"):
         if type(receipt.get(key)) is not int or receipt[key] != case[key]:
@@ -194,6 +210,20 @@ def validate_receipt(receipt, case, args, size=None):
         number(receipt.get(key), key, positive=key == "seconds")
     for key in ("probe_encodes", "probe_pixels", "full_encodes"):
         number(receipt.get(key), key, integer=True)
+    if "probe_workers" in receipt:
+        number(receipt["probe_workers"], "probe_workers", integer=True)
+        if receipt["probe_workers"] > min(args.threads, receipt["probe_encodes"],
+                                          1 if args.serial_probes else args.threads):
+            raise ValueError("Native receipt probe_workers exceeds configured work budget")
+    if "preparation_reuse" in receipt:
+        reuse = receipt["preparation_reuse"]
+        if not isinstance(reuse, dict):
+            raise ValueError("Invalid receipt preparation_reuse")
+        for key in ("hits", "misses", "duplicate_builds", "bypasses", "entries",
+                    "retained_bytes", "peak_bytes"):
+            number(reuse.get(key), "preparation_reuse." + key, integer=True)
+        if reuse["retained_bytes"] > reuse["peak_bytes"]:
+            raise ValueError("Invalid receipt preparation_reuse retained/peak bytes")
     if (receipt["probe_encodes"] > args.max_probe_encodes
             or not 1 <= receipt["full_encodes"] <= 1 + args.max_finalists
             or receipt["scout_seconds"] > receipt["seconds"]):
@@ -235,6 +265,47 @@ def validate_receipt(receipt, case, args, size=None):
                 number(candidate[key], key, integer=key == "full_bytes")
         if "error" not in candidate or (candidate["error"] is not None and not isinstance(candidate["error"], str)):
             raise ValueError("Invalid candidate error")
+        if (candidate["decision"] in ("winner", "full-rejected")
+                or candidate["name"] in (receipt["winner"], "baseline")):
+            number(candidate["full_bytes"], "completed full_bytes", positive=True, integer=True)
+            number(candidate["full_seconds"], "completed full_seconds")
+            if candidate["full_seconds"] > receipt["seconds"]:
+                raise ValueError("Completed candidate time exceeds total seconds")
+        if candidate["decision"] == "winner" and candidate["name"] != receipt["winner"]:
+            raise ValueError("Candidate winner decision differs from receipt winner")
+        lower_bound = candidate.get("full_lower_bound")
+        if lower_bound is not None:
+            number(lower_bound, "full_lower_bound", integer=True)
+            if candidate["decision"] != "full-bounded":
+                raise ValueError("Candidate full_lower_bound requires full-bounded decision")
+        if candidate["decision"] == "full-bounded":
+            # A prior incumbent may have been larger than the eventual winner.
+            if (lower_bound is None or lower_bound < receipt["bytes"]
+                    or candidate["full_bytes"] is not None or candidate["full_seconds"] is None
+                    or candidate["error"] is not None or args.no_finalist_bound
+                    or candidate["name"] == receipt["winner"]):
+                raise ValueError("Invalid candidate full-bounded receipt")
+    winners = [c for c in receipt["candidates"] if c["name"] == receipt["winner"]]
+    if len(winners) != 1:
+        raise ValueError("Receipt winner must identify exactly one candidate")
+    winner = winners[0]
+    # The baseline can retain a complete output even when its later scout fails.
+    scout_failed_baseline = (winner["name"] == "baseline"
+                             and winner["decision"] == "probe-error"
+                             and winner["error"] is not None)
+    # Preserve schema-1 finalist labels when complete evidence identifies the winner.
+    if (winner["full_bytes"] != receipt["bytes"]
+            or (not scout_failed_baseline and
+                (winner["decision"] not in ("winner", "finalist") or winner["error"] is not None))):
+        raise ValueError("Inconsistent complete winner evidence")
+    baselines = [c for c in receipt["candidates"] if c["name"] == "baseline"]
+    if len(baselines) != 1:
+        raise ValueError("Receipt baseline must identify exactly one candidate")
+    ordinary = baselines[0]
+    if (ordinary["decision"] not in ("winner", "full-rejected", "probe-error")
+            or ordinary["full_bytes"] != baseline["bytes"]
+            or ordinary["full_seconds"] != baseline["seconds"]):
+        raise ValueError("Inconsistent baseline candidate evidence")
 
 
 def read_journal(path, cases, args, run_id):
@@ -374,8 +445,12 @@ def trial(index, case, args, frozen_id, env):
             row["payload_sha256"] = info["payload_sha256"]
             output, restored = directory / "chosen.jxl", directory / "restored.png"
             command = [str(args.encoder.resolve()), str(snapshot), "--output", str(output)]
-            for name in ("threads", "effort", "max_probe_encodes", "max_finalists", "probe_side"):
+            for name in ("threads", "effort", "max_probe_encodes", "max_finalists", "probe_side",
+                         "preparation_cache_mib"):
                 command.extend(["--" + name.replace("_", "-"), str(getattr(args, name))])
+            for name in ("serial_probes", "no_finalist_bound"):
+                if getattr(args, name):
+                    command.append("--" + name.replace("_", "-"))
             if args.candidates is not None:
                 command.extend(["--candidates", args.candidates])
             row["encoder"] = run_process(command, env, args.timeout)

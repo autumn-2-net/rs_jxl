@@ -238,3 +238,77 @@ held-out testing belongs after a candidate scoring method exists.
 - Eleven Python harness tests: passed, including unavailable-target versus
   independent-worker records and output validation after process failure.
 - 77 original-image outputs verified with official djxl; zero pixel failures.
+
+## Optional Native Admission Pilot
+
+`modular::palette::admission::Experiment` now provides `Shadow` and `Veto`
+modes through `PaletteOptions.admission`. Both are disabled by default.
+Use a fresh experiment per encode. An optional `counterfactual::Target`
+restricts evaluation to one stage/stream/ordinal. Shadow records estimates
+without changing decisions; Veto can reject an old acceptance but cannot
+promote an old rejection or invent another representation. Explicit forced
+counterfactual choices, direct/forced palettes and zero-token policy override
+veto. Kernel eligibility and pixel transforms themselves are unchanged.
+
+The pilot uses the original and transformed planes at the SAME attempt:
+
+- Up to 256 native training samples and a four-leaf stateless MA pilot per
+  plane, using Gradient/Left/Top/Zero. WP/history-dependent properties are not
+  approximated as if they were stateless.
+- Up to four contiguous 256-token windows per image plane; the new table is
+  scored completely within the explicit 8192-sample pilot budget.
+- Native HybridUint 420, prefix model headers/payload, tree and transform bits.
+  Data cost is extrapolated; headers are paid once, not multiplied by image size.
+- Window-local native greedy LZ, retained only when its estimated data and
+  header cost improves on literals. No LZ references cross sample gaps.
+- Selected alpha and hidden RGB participate; unselected unchanged planes cancel.
+
+These are experimental work budgets, not new limits on the encoder or format.
+An unavailable pilot leaves the existing decision unchanged and records why.
+Independent per-plane models, prefix instead of final ANS, small MA training,
+window-local LZ and sample overlap can still misrank candidates. This is NOT
+a proof of final size and is not enabled by any effort preset or Portfolio recipe.
+
+Example fixed-state validation (use a fresh output directory):
+
+```powershell
+.\target\release\examples\palette_admission_lab.exe image.png --out-dir out/palette-shadow --baseline-mode exact-delta-top --target local:23:0 --choices skip absolute exact-delta-top --admission shadow
+```
+
+The JSON includes component scores, old/new acceptance, and full-output ranking
+regret among the requested available forced alternatives. `admission_seconds`
+is summed elapsed scoring work, possibly overlapping across groups, not the
+wall-clock overhead. Total native encode time includes pilot and receipts.
+`--admission veto` is a separate experimental intervention, not a default fix.
+
+### Fixed-State Pilot Result: Not Ready For Admission
+
+Four pre-existing counterexamples were checked in Release, effort 9, eight
+threads. Forced alternatives retain the same prefix and input. Every one of
+the 15 complete outputs was decoded with official djxl and matched all original
+samples; two Absolute alternatives were explicitly kernel-unavailable.
+
+| Target | Pilot winner | Actual best requested choice | Extra bytes from pilot winner |
+| --- | --- | --- | ---: |
+| window G0 | Absolute | Delta Gradient | 296 |
+| 6826 L30 | Delta Left | Skip | 10,030 |
+| 6826 L31 | Delta Left | Skip | 11,344 |
+| 1550 L23 | Delta Top | Skip | 6,390 |
+
+The pilot chose the wrong winner at all four selected points. In particular,
+1550 still scores 752,246 bits for Skip against 301,125 for Delta, despite Delta
+making the complete output larger. A more elaborate cost model is not
+automatically an accurate one. Scoring took approximately 0.97..4.91 ms per
+available target in these runs; this is per-target cost, NOT whole-image cost
+if invoked on every Palette attempt.
+
+Do not enable Veto by default or advertise this as a corrected admission model.
+The experiment/receipts are retained to diagnose discrepancies. The next useful
+measurement is downstream cost attribution for the affected streams, including
+actual final predictor/context assignment and shared clustering, rather than
+tuning a constant penalty to these four labels. This test does not isolate
+which missing stage causes the ranking errors.
+
+Local audit artifacts: `../jxl_python/out/portfolio-opt-20261113/palette.jsonl`
+and `palette_summary.json`; the reproduction driver is `run_palette_probe.py`
+in that directory. These ignored artifacts are not package dependencies.

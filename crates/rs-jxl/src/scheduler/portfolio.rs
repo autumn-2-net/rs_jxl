@@ -12,7 +12,15 @@ use super::{
     regions::{SampleSpec, copy_sample},
     scan::{self, ScanRegion},
 };
+use crate::modular::candidate_cache::{CandidateCache, ReuseStats};
 use crate::{EncodeOptions, Error, Image, Result};
+
+#[path = "portfolio/execution.rs"]
+mod dispatch;
+#[path = "portfolio/selection.rs"]
+mod selection;
+use crate::encode::budget::TrialEncode;
+use selection::finalists;
 
 #[derive(Clone, Debug)]
 pub struct Options {
@@ -29,6 +37,13 @@ pub struct Options {
     pub uncertainty: f64,
     /// Native candidates to consider. No unbounded Cartesian product is formed.
     pub candidates: Vec<Candidate>,
+    /// Independent single-thread crop encodes share the caller's bounded pool.
+    pub parallel_probes: bool,
+    /// Retained preparation budget, divided between full-image and crop scopes.
+    /// This is not a bound on encoder scratch or process RSS. Zero disables reuse.
+    pub preparation_cache_bytes: usize,
+    /// Stop an alternative once finalized output sections cannot beat the incumbent.
+    pub bound_finalists: bool,
 }
 
 impl Default for Options {
@@ -43,6 +58,9 @@ impl Default for Options {
             probe_side: 128,
             uncertainty: 0.01,
             candidates: ALL.to_vec(),
+            parallel_probes: true,
+            preparation_cache_bytes: 128 << 20,
+            bound_finalists: true,
         }
     }
 }
@@ -86,6 +104,8 @@ pub struct Trial {
     pub probe_bytes: Vec<Option<usize>>,
     pub probe_seconds: f64,
     pub full_bytes: Option<usize>,
+    /// Proven output lower bound, not an encoded byte count or an error.
+    pub full_lower_bound: Option<usize>,
     pub full_seconds: Option<f64>,
     pub error: Option<String>,
 }
@@ -103,6 +123,9 @@ pub struct Report {
     pub probe_encodes: usize,
     pub probe_pixels: u64,
     pub full_encodes: usize,
+    pub preparation_reuse: ReuseStats,
+    /// Maximum independent crop roots dispatched in any one batch.
+    pub probe_workers: usize,
 }
 
 #[derive(Debug)]
@@ -212,6 +235,7 @@ fn plan_in_pool(
             probe_bytes: vec![None; regions.len()],
             probe_seconds: 0.0,
             full_bytes: None,
+            full_lower_bound: None,
             full_seconds: None,
             error,
         });
@@ -226,6 +250,8 @@ fn plan_in_pool(
         probe_encodes: 0,
         probe_pixels: 0,
         full_encodes: 0,
+        preparation_reuse: ReuseStats::default(),
+        probe_workers: 0,
     })
 }
 
@@ -235,45 +261,6 @@ pub fn plan(image: &Image, options: &Options) -> Result<Report> {
     options.validate(image)?;
     let pool = pool(options)?;
     plan_in_pool(image, options, pool.as_ref())
-}
-
-fn probe(
-    image: &Image,
-    region: usize,
-    trial: usize,
-    options: &Options,
-    report: &mut Report,
-    pool: Option<&rayon::ThreadPool>,
-) {
-    let start = Instant::now();
-    let result = report.candidates[trial]
-        .candidate
-        .build(image, &options.base(), options.effort)
-        .and_then(|configured| native(image, &configured, pool));
-    report.probe_encodes += 1;
-    report.probe_pixels += u64::from(image.width()) * u64::from(image.height());
-    let record = &mut report.candidates[trial];
-    record.probe_seconds += start.elapsed().as_secs_f64();
-    match result {
-        Ok(bytes) => record.probe_bytes[region] = Some(bytes.len()),
-        Err(error) => {
-            record.decision = "probe-error";
-            record.reason = "crop failure is recorded, not interpreted as a size score".into();
-            record.error = Some(error.to_string());
-        }
-    }
-}
-
-fn ratio(trial: &Trial, baseline: &Trial) -> Option<f64> {
-    let mut after = 0u64;
-    let mut before = 0u64;
-    for (a, b) in trial.probe_bytes.iter().zip(&baseline.probe_bytes) {
-        if let (Some(a), Some(b)) = (a, b) {
-            after += *a as u64;
-            before += *b as u64;
-        }
-    }
-    (before != 0).then(|| after as f64 / before as f64)
 }
 
 fn ordered(report: &Report) -> Vec<usize> {
@@ -303,79 +290,6 @@ fn ordered(report: &Report) -> Vec<usize> {
     result
 }
 
-fn finalists(report: &mut Report, options: &Options) -> Vec<usize> {
-    let mut ranked: Vec<_> = (1..report.candidates.len())
-        .filter(|&i| {
-            let t = &report.candidates[i];
-            t.error.is_none() && t.probe_bytes.iter().all(Option::is_some)
-        })
-        .collect();
-    let confident = |i: usize| {
-        let t = &report.candidates[i];
-        let wins = t
-            .probe_bytes
-            .iter()
-            .zip(&report.candidates[0].probe_bytes)
-            .filter(|(a, b)| a < b)
-            .count();
-        ratio(t, &report.candidates[0]).unwrap() < 1.0 && wins * 2 >= report.regions.len()
-    };
-    ranked.sort_by(|&a, &b| {
-        confident(b)
-            .cmp(&confident(a))
-            .then_with(|| {
-                ratio(&report.candidates[a], &report.candidates[0])
-                    .unwrap()
-                    .total_cmp(&ratio(&report.candidates[b], &report.candidates[0]).unwrap())
-            })
-            .then_with(|| {
-                report.candidates[b]
-                    .priority
-                    .total_cmp(&report.candidates[a].priority)
-            })
-            .then(a.cmp(&b))
-    });
-    let mut selected = Vec::new();
-    let mut families = BTreeSet::new();
-    let mut uncertain_used = false;
-    for i in ranked {
-        let t = &report.candidates[i];
-        let r = ratio(t, &report.candidates[0]).unwrap();
-        let wins = t
-            .probe_bytes
-            .iter()
-            .zip(&report.candidates[0].probe_bytes)
-            .filter(|(a, b)| a < b)
-            .count();
-        let confident = r < 1.0 && wins * 2 >= report.regions.len();
-        let uncertain = r <= 1.0 + options.uncertainty;
-        let patch_witness = matches!(t.candidate.family(), Family::Source | Family::Tile)
-            && (report.features.repeated_tile_fraction > 0.0
-                || report.features.flat_fraction > 0.5);
-        if selected.len() < options.max_finalists
-            && (confident || (!uncertain_used && (uncertain || patch_witness)))
-            && families.insert(t.candidate.family())
-        {
-            uncertain_used |= !confident;
-            report.candidates[i].decision = "finalist";
-            report.candidates[i].reason = if confident {
-                "confirmed crop benefit"
-            } else if patch_witness {
-                "bounded full-image patch witness; crops can miss distant repetitions"
-            } else {
-                "bounded uncertainty witness; crop score is not conclusive"
-            }
-            .into();
-            selected.push(i);
-        } else {
-            report.candidates[i].decision = "probe-rejected";
-            report.candidates[i].reason =
-                "crop ranking or family/work budget; not proof of whole-image loss".into();
-        }
-    }
-    selected
-}
-
 /// Encode one image with a bounded, opt-in native portfolio. The returned bytes
 /// are never larger than this invocation's complete ordinary baseline. This
 /// protection costs a baseline encode; it does NOT guarantee optimal routing.
@@ -384,7 +298,13 @@ pub fn encode(image: &Image, options: &Options) -> Result<Output> {
     let start = Instant::now();
     let pool = pool(options)?;
     let mut report = plan_in_pool(image, options, pool.as_ref())?;
-    let configured = Candidate::Baseline.build(image, &options.base(), options.effort)?;
+    let full_cache = (options.preparation_cache_bytes > 0)
+        .then(|| CandidateCache::scope(image, options.preparation_cache_bytes / 2));
+    let configured = Candidate::Baseline.build(
+        image,
+        &dispatch::base(options, full_cache.as_ref()),
+        options.effort,
+    )?;
     let base_start = Instant::now();
     let mut best = native(image, &configured, pool.as_ref())?;
     report.full_encodes = 1;
@@ -426,61 +346,88 @@ pub fn encode(image: &Image, options: &Options) -> Result<Output> {
                 )
             })
             .collect::<Result<Vec<_>>>()?;
-        for (r, sample) in samples.iter().enumerate() {
-            probe(sample, r, 0, options, &mut report, pool.as_ref());
-        }
-        if report.candidates[0].error.is_none() {
-            // Reserve half of remaining work for confirmation outside the first crop.
-            let first_budget = (options.max_probe_encodes - report.probe_encodes) / 2;
-            for &i in order.iter().take(first_budget) {
-                probe(&samples[0], 0, i, options, &mut report, pool.as_ref());
-            }
-            let mut survivors: Vec<_> = order
+        let caches: Vec<_> = if options.preparation_cache_bytes > 0 {
+            let per_crop = (options.preparation_cache_bytes - options.preparation_cache_bytes / 2)
+                / samples.len();
+            samples
                 .iter()
-                .copied()
-                .filter(|&i| {
-                    report.candidates[i].error.is_none()
-                        && report.candidates[i].probe_bytes[0].is_some()
-                })
-                .collect();
-            survivors.sort_by(|&a, &b| {
-                ratio(&report.candidates[a], &report.candidates[0])
-                    .unwrap()
-                    .total_cmp(&ratio(&report.candidates[b], &report.candidates[0]).unwrap())
-                    .then_with(|| {
-                        report.candidates[b]
-                            .priority
-                            .total_cmp(&report.candidates[a].priority)
-                    })
-                    .then(a.cmp(&b))
-            });
+                .map(|image| CandidateCache::scope(image, per_crop))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let baseline_tasks: Vec<_> = (0..samples.len()).map(|r| (r, 0)).collect();
+        dispatch::probes(
+            &samples,
+            &caches,
+            &baseline_tasks,
+            options,
+            &mut report,
+            pool.as_ref(),
+        )?;
+        let selected = if report.candidates[0].error.is_none() {
+            // Baselines warm compatible preparation; later batches never share
+            // trees or tokens, only immutable data with an exact preparation key.
+            let first_budget = (options.max_probe_encodes - report.probe_encodes) / 2;
+            let first: Vec<_> = order.iter().take(first_budget).map(|&i| (0, i)).collect();
+            dispatch::probes(
+                &samples,
+                &caches,
+                &first,
+                options,
+                &mut report,
+                pool.as_ref(),
+            )?;
+            let survivors = selection::confirmations(&report, &order, options);
+            let mut confirmation = Vec::new();
             for i in survivors {
-                if report.probe_encodes + samples.len() - 1 > options.max_probe_encodes {
+                if report.probe_encodes + confirmation.len() + samples.len() - 1
+                    > options.max_probe_encodes
+                {
                     break;
                 }
-                for (r, sample) in samples.iter().enumerate().skip(1) {
-                    probe(sample, r, i, options, &mut report, pool.as_ref());
-                    if report.candidates[i].error.is_some() {
-                        break;
-                    }
-                }
+                confirmation.extend((1..samples.len()).map(|r| (r, i)));
             }
+            dispatch::probes(
+                &samples,
+                &caches,
+                &confirmation,
+                options,
+                &mut report,
+                pool.as_ref(),
+            )?;
             finalists(&mut report, options)
         } else {
             Vec::new()
+        };
+        for cache in &caches {
+            dispatch::add_stats(&mut report.preparation_reuse, cache.cache.stats());
         }
+        selected
     };
     report.scout_seconds += scout_start.elapsed().as_secs_f64();
     for i in selected {
         let full_start = Instant::now();
         let result = report.candidates[i]
             .candidate
-            .build(image, &options.base(), options.effort)
-            .and_then(|configured| native(image, &configured, pool.as_ref()));
+            .build(
+                image,
+                &dispatch::base(options, full_cache.as_ref()),
+                options.effort,
+            )
+            .and_then(|configured| {
+                let bound = options.bound_finalists.then_some(best.len());
+                match pool.as_ref() {
+                    Some(pool) => {
+                        crate::encode::encode_trial_with_pool(image, &configured, bound, pool)
+                    }
+                    None => crate::encode::encode_trial_serial(image, &configured, bound),
+                }
+            });
         report.full_encodes += 1;
         report.candidates[i].full_seconds = Some(full_start.elapsed().as_secs_f64());
         match result {
-            Ok(bytes) => {
+            Ok(TrialEncode::Complete(bytes)) => {
                 report.candidates[i].full_bytes = Some(bytes.len());
                 if bytes.len() < best.len() {
                     for t in &mut report.candidates {
@@ -494,6 +441,12 @@ pub fn encode(image: &Image, options: &Options) -> Result<Output> {
                 } else {
                     report.candidates[i].decision = "full-rejected";
                 }
+            }
+            Ok(TrialEncode::Bounded { lower_bound }) => {
+                report.candidates[i].full_lower_bound = Some(lower_bound);
+                report.candidates[i].decision = "full-bounded";
+                report.candidates[i].reason =
+                    "finalized output sections already cannot beat the incumbent".into();
             }
             Err(error) => {
                 report.candidates[i].decision = "full-error";
@@ -509,6 +462,9 @@ pub fn encode(image: &Image, options: &Options) -> Result<Output> {
             t.decision = "budget-deferred";
             t.reason = "not enough experimental work budget for full confirmation".into();
         }
+    }
+    if let Some(cache) = &full_cache {
+        dispatch::add_stats(&mut report.preparation_reuse, cache.cache.stats());
     }
     report.seconds = start.elapsed().as_secs_f64();
     Ok(Output {
@@ -531,6 +487,7 @@ mod tests {
             probe_bytes: sizes.to_vec(),
             probe_seconds: 0.0,
             full_bytes: None,
+            full_lower_bound: None,
             full_seconds: None,
             error: None,
         }
@@ -562,8 +519,10 @@ mod tests {
             probe_encodes: 0,
             probe_pixels: 0,
             full_encodes: 0,
+            preparation_reuse: ReuseStats::default(),
+            probe_workers: 0,
         };
-        assert_eq!(finalists(&mut report, &Options::default()), vec![2]);
+        assert_eq!(finalists(&mut report, &Options::default()), vec![2, 3]);
         assert_eq!(report.candidates[1].decision, "queued");
         assert_eq!(report.candidates[4].decision, "probe-rejected");
     }
@@ -585,6 +544,8 @@ mod tests {
             probe_encodes: 0,
             probe_pixels: 0,
             full_encodes: 0,
+            preparation_reuse: ReuseStats::default(),
+            probe_workers: 0,
         };
         assert_eq!(ordered(&report), vec![1, 3, 2]);
     }
@@ -614,6 +575,8 @@ mod tests {
             probe_encodes: 0,
             probe_pixels: 0,
             full_encodes: 0,
+            preparation_reuse: ReuseStats::default(),
+            probe_workers: 0,
         };
         report.candidates[2].priority = 1.05;
         assert_eq!(finalists(&mut report, &Options::default()), vec![2]);
