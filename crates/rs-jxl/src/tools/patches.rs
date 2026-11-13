@@ -79,7 +79,8 @@ pub use tiles::{TilePatchOptions, TilePatchReceipt, TilePatchStats, discover_til
 #[path = "patch_source.rs"]
 mod source;
 pub use source::{
-    AddPatchPlan, FloatImageView, FloatPatchImage, FloatPatchPlan, SignedPatchImage,
+    AddPatchPlan, FloatImageView, FloatPatchImage, FloatPatchPlan, RepresentativeMode,
+    RepresentativeOptions, RepresentativeReceipt, RepresentativeStats, SignedPatchImage,
     SourcePatchConfig, compose_add, compose_float_add, discover_source, discover_source_float,
     source_enabled, source_supported, subtract_add, verify_add_replay,
 };

@@ -29,6 +29,7 @@ use super::predictor::Predictor;
 use super::transforms;
 pub use super::transforms::{PaletteGeometry, PaletteMapping, PaletteOrder, PaletteTools};
 use crate::{Error, Result};
+use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum PaletteMode {
@@ -79,6 +80,10 @@ pub enum PaletteStage {
     PostRct,
 }
 
+#[path = "palette_receipt.rs"]
+mod palette_receipt;
+pub use palette_receipt::{PaletteAttempt, PaletteKernelEvidence, PaletteOutcome, PaletteReceipt};
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct PaletteOptions {
     /// 0 disables multichannel palettes, NOT single-channel compaction.
@@ -107,6 +112,8 @@ pub struct PaletteOptions {
     /// Opt-in full-frame partial-channel transform script. Declined layouts
     /// retain the ordinary palette policy; accepted scripts own color transforms.
     pub grouping: Option<super::palette_groups::Grouping>,
+    /// Invocation-owned global AND local attempt diagnostics; None has no sink.
+    pub receipt: Option<Arc<PaletteReceipt>>,
 }
 
 impl Default for PaletteOptions {
@@ -125,6 +132,7 @@ impl Default for PaletteOptions {
             mode: PaletteMode::Absolute,
             tools: PaletteTools::default(),
             grouping: None,
+            receipt: None,
         }
     }
 }
@@ -212,6 +220,35 @@ pub fn apply_palette_range_with_options(
     mode: PaletteMode,
     tools: PaletteTools,
 ) -> Result<Option<Transform>> {
+    apply_palette_range_observed(
+        channels,
+        meta,
+        bits,
+        begin,
+        count,
+        max_colors,
+        ordered,
+        mode,
+        tools,
+        &mut PaletteKernelEvidence::default(),
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_palette_range_observed(
+    channels: &mut Vec<Channel>,
+    meta: &mut usize,
+    bits: u8,
+    begin: usize,
+    count: usize,
+    max_colors: u32,
+    ordered: bool,
+    mode: PaletteMode,
+    tools: PaletteTools,
+    evidence: &mut PaletteKernelEvidence,
+    observe: bool,
+) -> Result<Option<Transform>> {
     mode.validate()?;
     tools.order.validate()?;
     if !(1..=32).contains(&bits) {
@@ -241,6 +278,7 @@ pub fn apply_palette_range_with_options(
         .map(|c| c.samples.clone())
         .collect();
     let mut output = if let PaletteMode::ExactDelta(p) = mode {
+        evidence.exact_delta_attempted = true;
         transforms::delta_palette_forward(
             &planes,
             0,
@@ -254,12 +292,21 @@ pub fn apply_palette_range_with_options(
     } else {
         None
     };
+    evidence.exact_delta_produced = output.is_some();
     if output.is_none() {
         let mask = if let PaletteMode::ExactZero(p) = mode {
+            evidence.exact_zero_attempted = true;
             transforms::exact_zero_delta_mask(&planes, 0, count, width, height, u32::from(bits), p)?
         } else {
             None
         };
+        evidence.zero_mask_eligible = mask.is_some();
+        if observe {
+            evidence.zero_mask_matches = mask
+                .as_ref()
+                .map_or(0, |m| m.iter().filter(|&&x| x != 0).count());
+        }
+        evidence.absolute_attempted = true;
         let Some(absolute) = transforms::palette_forward_with_options(
             &planes,
             0,
@@ -274,6 +321,7 @@ pub fn apply_palette_range_with_options(
         else {
             return Ok(None);
         };
+        evidence.absolute_produced = true;
         output = Some(
             if let (PaletteMode::ExactZero(p), Some(mask)) = (mode, mask) {
                 transforms::add_exact_zero_delta(&absolute, p, &mask)?
@@ -374,7 +422,7 @@ pub fn apply_palettes(
     };
     let mut candidate = channels.clone();
     let mut next = *state;
-    let transforms = try_palettes(&mut candidate, &mut next, bits, percent, options)?;
+    let transforms = try_palettes(&mut candidate, &mut next, bits, percent, options, stage)?;
     *channels = candidate;
     *state = next;
     Ok(transforms)
@@ -443,10 +491,12 @@ fn attempt(
     tools: PaletteTools,
     cost_before: f32,
     accept_without_cost: bool,
+    observation: Option<(&PaletteReceipt, PaletteStage)>,
 ) -> Result<bool> {
     let mut candidate = channels.clone();
     let mut meta = state.meta_channels;
-    let Some(transform) = apply_palette_range_with_options(
+    let mut kernel = PaletteKernelEvidence::default();
+    let transform = apply_palette_range_observed(
         &mut candidate,
         &mut meta,
         bits,
@@ -456,11 +506,69 @@ fn attempt(
         ordered,
         mode,
         tools,
-    )?
-    else {
+        &mut kernel,
+        observation.is_some(),
+    )?;
+    let mut event = observation.map(|(_, stage)| PaletteAttempt {
+        stage,
+        mode,
+        width: channels[begin].width,
+        height: channels[begin].height,
+        begin,
+        channels: count,
+        limit,
+        kernel,
+        colors: 0,
+        deltas: 0,
+        predictor: Predictor::Zero,
+        delta_pixels: 0,
+        cost_before,
+        cost_after: None,
+        cost_bypassed: accept_without_cost,
+        outcome: PaletteOutcome::KernelDeclined,
+    });
+    let Some(transform) = transform else {
+        if let (Some((receipt, _)), Some(event)) = (observation, event) {
+            receipt.record(event);
+        }
         return Ok(false);
     };
-    if !accept_without_cost && estimate(&candidate)? > cost_before {
+    let cost_after = if accept_without_cost {
+        None
+    } else {
+        Some(estimate(&candidate)?)
+    };
+    let rejected = cost_after.is_some_and(|after| after > cost_before);
+    if let Some(event) = &mut event {
+        if let Transform::Palette {
+            colors,
+            deltas,
+            predictor,
+            ..
+        } = &transform
+        {
+            event.colors = *colors;
+            event.deltas = *deltas;
+            event.predictor = *predictor;
+            if *deltas > 0 {
+                event.delta_pixels = candidate[begin + 1]
+                    .samples
+                    .iter()
+                    .filter(|&&index| index >= 0 && (index as usize) < *deltas)
+                    .count();
+            }
+        }
+        event.cost_after = cost_after;
+        event.outcome = if rejected {
+            PaletteOutcome::CostRejected
+        } else {
+            PaletteOutcome::Accepted
+        };
+    }
+    if rejected {
+        if let (Some((receipt, _)), Some(event)) = (observation, event) {
+            receipt.record(event);
+        }
         return Ok(false);
     }
     if transforms.len() == 273 {
@@ -469,6 +577,9 @@ fn attempt(
     transforms.push(transform);
     *channels = candidate;
     state.meta_channels = meta;
+    if let (Some((receipt, _)), Some(event)) = (observation, event) {
+        receipt.record(event);
+    }
     Ok(true)
 }
 
@@ -478,7 +589,9 @@ fn try_palettes(
     bits: u8,
     percent: f32,
     options: &PaletteOptions,
+    stage: PaletteStage,
 ) -> Result<Vec<Transform>> {
+    let observation = options.receipt.as_deref().map(|receipt| (receipt, stage));
     let mut transforms = Vec::new();
     let count = channels.len() - state.meta_channels;
     if options.direct {
@@ -497,6 +610,7 @@ fn try_palettes(
                 options.tools,
                 0.0,
                 true,
+                observation,
             )?;
         }
         return Ok(transforms);
@@ -528,6 +642,7 @@ fn try_palettes(
                 options.tools,
                 cost_before,
                 bypass,
+                observation,
             )?;
         }
         if !did_palette && count > 3 {
@@ -545,6 +660,7 @@ fn try_palettes(
                 options.tools,
                 cost_before,
                 bypass,
+                observation,
             )?;
         }
     }
@@ -582,6 +698,7 @@ fn try_palettes(
                 options.tools,
                 cost_before,
                 options.speed_tier >= 3,
+                observation,
             )? {
                 let (_, max) =
                     minmax(&channels[state.meta_channels + i]).expect("nonempty accepted indices");
@@ -1197,7 +1314,8 @@ mod tests {
                     PaletteMode::Absolute,
                     PaletteTools::default(),
                     baseline,
-                    bypass
+                    bypass,
+                    None
                 )
                 .unwrap(),
                 accepted

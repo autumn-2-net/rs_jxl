@@ -125,6 +125,18 @@ struct Args {
     /// Main frame/residual (default), separately resolved reference, or both.
     #[arg(long, value_enum, requires = "previous_channels")]
     channel_target: Option<BlockTarget>,
+    /// Reference-instance ablation only: detection and grouping are unchanged.
+    #[arg(long, value_parser = ["first", "medoid", "entropy"])]
+    source_representative: Option<String>,
+    /// Per-group candidate budget; zero tests every occurrence.
+    #[arg(long, requires = "source_representative")]
+    representative_candidates: Option<usize>,
+    /// Per-group scoring occurrences; zero scores every occurrence.
+    #[arg(long, requires = "source_representative")]
+    representative_occurrences: Option<usize>,
+    /// Pixel locations per patch; zero uses every location.
+    #[arg(long, requires = "source_representative")]
+    representative_pixels: Option<usize>,
 }
 
 fn configure_channels(
@@ -264,6 +276,9 @@ fn run(args: Args) -> Result<()> {
     if args.mode != Mode::Source && block_target != BlockTarget::Residual {
         return Err("--block-target reference or both requires --mode source".into());
     }
+    if args.source_representative.is_some() && args.mode != Mode::Source {
+        return Err("--source-representative requires --mode source".into());
+    }
     if args.output.exists() {
         return Err("benchmark output already exists".into());
     }
@@ -278,12 +293,31 @@ fn run(args: Args) -> Result<()> {
     // Keep the normal source candidate's non-patch settings across all trials.
     let mut options = adapter::project_native(&params, &image, &base)?.exact_options()?;
     clear_detectors(&mut options);
+    let representative_receipt = Arc::new(rs_jxl::tools::patches::RepresentativeReceipt::default());
     if args.mode == Mode::Source {
         params.patches = Override::On;
         let source = adapter::project_native(&params, &image, &base)?.exact_options()?;
         // Only adopt the forced detector and its deferred atlas policy.
         options.source_patches = source.source_patches;
         options.source_patch_reference = source.source_patch_reference;
+        if let Some(config) = &mut options.source_patches {
+            use rs_jxl::tools::patches::RepresentativeMode;
+            config.representative.mode = match args.source_representative.as_deref() {
+                Some("medoid") => RepresentativeMode::Medoid,
+                Some("entropy") => RepresentativeMode::MinEntropy,
+                _ => RepresentativeMode::First,
+            };
+            if let Some(n) = args.representative_candidates {
+                config.representative.candidates = n;
+            }
+            if let Some(n) = args.representative_occurrences {
+                config.representative.occurrences = n;
+            }
+            if let Some(n) = args.representative_pixels {
+                config.representative.pixels = n;
+            }
+            config.representative.receipt = Some(Arc::clone(&representative_receipt));
+        }
     }
     if args.parallel_gather {
         configure_parallel_gather(&mut options, args.threads, args.gather_waves);
@@ -400,6 +434,26 @@ fn run(args: Args) -> Result<()> {
         })
     });
     let pixels = f64::from(image.width()) * f64::from(image.height());
+    let representative_work = (args.mode == Mode::Source).then(|| {
+        let work = representative_receipt.snapshot();
+        serde_json::json!({
+            "mode": args.source_representative.as_deref().unwrap_or("first"),
+            "candidates_budget": args.representative_candidates.unwrap_or(8),
+            "occurrences_budget": args.representative_occurrences.unwrap_or(16),
+            "pixels_budget": args.representative_pixels.unwrap_or(128),
+            "retained_groups": work.retained_groups, "occurrences": work.occurrences,
+            "searched_groups": work.searched_groups,
+            "variable_sample_groups": work.variable_sample_groups,
+            "changed_groups": work.changed_groups, "candidates": work.candidates,
+            "sampled_occurrences": work.sampled_occurrences, "sampled_pixels": work.sampled_pixels,
+            "selection_seconds": work.selection_seconds,
+            "baseline_proxy": work.baseline_proxy, "selected_proxy": work.selected_proxy,
+            "emitted_plans": work.emitted_plans, "atlas_pixels": work.atlas_pixels,
+            "dictionary_positions": work.dictionary_positions,
+            "float_fallback_groups": work.float_fallback_groups,
+            "scope": "integer reference-instance proposals only; full signed residual rebuilt; proxy is not actual encoded bits",
+        })
+    });
     let block_work = block_size.map(|_| {
         if args.mode == Mode::Source {
             serde_json::json!({
@@ -446,6 +500,7 @@ fn run(args: Args) -> Result<()> {
             "parallel_gather": args.parallel_gather,
             "gather_mode": if args.gather_waves { "waves" } else { "channels" },
             "channels": channels,
+            "representative_work": representative_work,
         })
     );
     Ok(())
@@ -458,6 +513,55 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn representative_options_are_explicit_and_preserve_effort() {
+        for mode in ["first", "medoid", "entropy"] {
+            let args = Args::try_parse_from([
+                "patch_lab",
+                "in.png",
+                "--output",
+                "out.jxl",
+                "--mode",
+                "source",
+                "--source-representative",
+                mode,
+                "--representative-candidates",
+                "0",
+                "--representative-occurrences",
+                "64",
+                "--representative-pixels",
+                "512",
+            ])
+            .unwrap();
+            assert_eq!(args.source_representative.as_deref(), Some(mode));
+            assert_eq!(args.representative_candidates, Some(0));
+            assert_eq!(args.effort, 9);
+            assert_eq!(args.mode, Mode::Source);
+        }
+        assert!(
+            Args::try_parse_from([
+                "patch_lab",
+                "in.png",
+                "--output",
+                "out.jxl",
+                "--representative-pixels",
+                "5",
+            ])
+            .is_err()
+        );
+        assert!(
+            Args::try_parse_from([
+                "patch_lab",
+                "in.png",
+                "--output",
+                "out.jxl",
+                "--source-representative",
+                "invalid",
+            ])
+            .is_err()
+        );
+    }
 
     #[test]
     fn argument_contract() {

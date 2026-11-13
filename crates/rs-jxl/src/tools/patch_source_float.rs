@@ -297,6 +297,12 @@ pub fn discover_source_float(
             )));
         }
     }
+    if let Some(receipt) = &config.representative.receipt {
+        receipt.emitted(
+            reference.width * reference.height,
+            packed.dictionary.positions.len(),
+        );
+    }
     Ok(Some(FloatPatchPlan {
         reference,
         residual,

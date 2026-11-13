@@ -64,6 +64,12 @@ pub use replay::verify_add_replay;
 mod detail;
 use detail::{Detail, Stage};
 
+#[path = "patch_source_representative.rs"]
+mod representative;
+pub use representative::{
+    RepresentativeMode, RepresentativeOptions, RepresentativeReceipt, RepresentativeStats,
+};
+
 /// The source outer gate, before detector overrides and seed availability.
 /// Override On does not bypass the speed/depth/groupwise gate.
 pub fn source_enabled(
@@ -123,6 +129,8 @@ pub struct SourcePatchConfig {
     /// Source fingerprint experiment: 1 (default), 2, or 4. Does not quantize
     /// the actual atlas, nor permit dropping occurrence-specific residuals.
     pub fingerprint_divisor: i32,
+    /// Opt-in reference-instance selection; does not change detection/grouping.
+    pub representative: RepresentativeOptions,
     pub limits: PatchOptions,
 }
 
@@ -139,6 +147,7 @@ impl Default for SourcePatchConfig {
             fast: true,
             min_peak: 2,
             fingerprint_divisor: 1,
+            representative: RepresentativeOptions::default(),
             limits: PatchOptions::default(),
         }
     }
@@ -539,6 +548,8 @@ struct PendingPatch {
     representative: (u32, u32),
     reference: usize,
     positions: Vec<(u32, u32)>,
+    // Corresponding detected backgrounds, retained only for integer experiments.
+    origins: Option<Vec<usize>>,
 }
 
 fn representative_samples(
@@ -611,6 +622,8 @@ fn detect_profiled<const PROFILE: bool>(
     let mut visited = zeros::<u8>(pixels)?;
     let mut stack = Vec::new();
     let mut groups = BTreeMap::<Fingerprint, PendingPatch>::new();
+    let retain_origins = config.representative.mode != RepresentativeMode::First
+        && matches!(image.samples, DetectionSamples::Integer(..));
     let mut positions = 0;
     for start in 0..pixels {
         if background[start] != usize::MAX || (config.fast && visited[start] != 0) {
@@ -743,6 +756,9 @@ fn detect_profiled<const PROFILE: bool>(
                 existing.reference = reference;
             }
             existing.positions.push(position);
+            if let Some(origins) = &mut existing.origins {
+                origins.push(reference);
+            }
             positions += 1;
         } else if groups.len() < limits.max_unique_patches {
             groups.insert(
@@ -751,6 +767,7 @@ fn detect_profiled<const PROFILE: bool>(
                     representative: position,
                     reference,
                     positions: vec![position],
+                    origins: retain_origins.then(|| vec![reference]),
                 },
             );
             positions += 1;
@@ -774,10 +791,19 @@ fn detect_profiled<const PROFILE: bool>(
     // Only retained representatives need exact samples. Fingerprint equality
     // is quantized, so retain each representative's own background origin.
     let mut info = Vec::new();
+    let mut representative_work = RepresentativeStats::default();
     for (key, mut patch) in groups {
         if patch.positions.len() < limits.min_occurrences {
             continue;
         }
+        representative::choose(
+            image,
+            &mut patch,
+            key.width,
+            key.height,
+            &config.representative,
+            &mut representative_work,
+        )?;
         patch.positions.sort_unstable();
         let samples = representative_samples(image, &patch, key.width, key.height);
         if PROFILE {
@@ -798,6 +824,9 @@ fn detect_profiled<const PROFILE: bool>(
     }
     if PROFILE {
         profile.counts.retained_groups = info.len();
+    }
+    if let Some(receipt) = &config.representative.receipt {
+        receipt.record(&representative_work);
     }
     // Source area sort leaves equal-area order unspecified; use stable key
     // order for reproducible Rust output. This does not change pixel replay.
@@ -1075,6 +1104,12 @@ pub fn discover_source(
     let replay_scope = crate::profile::scope("patch.source.verify_replay");
     verify_add_replay(image, &residual, &reference, &packed.dictionary)?;
     drop(replay_scope);
+    if let Some(receipt) = &config.representative.receipt {
+        receipt.emitted(
+            reference.width * reference.height,
+            packed.dictionary.positions.len(),
+        );
+    }
     Ok(Some(AddPatchPlan {
         reference,
         dictionary: packed.dictionary,
