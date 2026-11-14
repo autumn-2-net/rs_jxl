@@ -3,6 +3,9 @@ use crate::color::{ColorEncoding, ColorSpace};
 use crate::metadata::{BitDepth, ExtraChannelInfo, ExtraChannelType, ImageMetadata};
 use crate::{Error, Result};
 
+#[path = "image_samples.rs"]
+mod samples;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PixelLayout {
     Gray,
@@ -307,7 +310,7 @@ impl Image {
         // contain declared-format words, never differences of their bit patterns.
         // Extras retain their own depth and native subsampled dimensions.
         // Public samples remain absent from this private working representation.
-        // All encoder sample access goes through modular_sample, not pixels().
+        // Encoder sample access uses the Modular accessors, not pixels().
         Ok(Self {
             width,
             height,

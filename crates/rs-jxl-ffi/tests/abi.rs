@@ -223,6 +223,48 @@ fn unaligned_little_endian_pixels_roundtrip_and_color_info() {
 }
 
 #[test]
+fn effort_one_uses_fast_lossless_without_losing_pixels_or_color() {
+    for channels in 1..=4 {
+        for wide in [false, true] {
+            let maximum = if wide { u16::MAX } else { 255 };
+            let mut samples: Vec<u16> = (0..usize::from(channels) * 2)
+                .map(|i| ((i * 7919 + 13) % usize::from(maximum)) as u16)
+                .collect();
+            if channels % 2 == 0 {
+                // Include nonzero invisible color and partial transparency.
+                samples[usize::from(channels) - 1] = 0;
+                samples[usize::from(channels) * 2 - 1] = maximum / 2;
+            }
+            let input: Vec<u8> = if wide {
+                samples.iter().flat_map(|s| s.to_le_bytes()).collect()
+            } else {
+                samples.iter().map(|s| *s as u8).collect()
+            };
+            let dtype = if wide { "u16" } else { "u8" };
+            let mut image = spec(dtype, channels, input.len());
+            image["color_encoding"] = json!("linear_srgb");
+            for threads in [1, 2] {
+                let (meta, encoded) = ok(
+                    json!({"operation":"encode","options":{"effort":1,"threads":threads},"images":[image]}),
+                    &input,
+                );
+                assert_eq!(meta["report"]["implementation"], "fast_lossless");
+                let (meta, decoded) = ok(json!({"operation":"decode"}), &encoded);
+                assert_eq!(&decoded[..input.len()], input);
+                assert_eq!(meta["frames"][0]["dtype"], dtype);
+                assert_eq!(meta["color_encoding"]["transfer_function"], "linear");
+            }
+        }
+    }
+    let input = [3, 0, 7, 255, 41, 99];
+    let (meta, _) = ok(
+        json!({"operation":"encode","options":{"effort":1,"rct":0},"images":[spec("u8",3,input.len())]}),
+        &input,
+    );
+    assert_eq!(meta["report"]["implementation"], "modular");
+}
+
+#[test]
 fn separate_depth_channel_and_alpha_metadata() {
     let input = [3, 0, 7, 255, 41, 99];
     let mut image = spec("u8", 2, 4);

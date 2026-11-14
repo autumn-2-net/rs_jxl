@@ -164,6 +164,35 @@ fn initial_config(options: &EntropyOptions) -> HybridUintConfig {
     }
 }
 
+fn literal420_histograms(streams: &[Vec<Token>], contexts: usize) -> Result<Vec<Vec<u64>>> {
+    // HybridUint(4,2,0) maps every u32 into 0..128. One allocation avoids
+    // histogram growth and a dynamic uint configuration in the pixel loop.
+    let config = HybridUintConfig::default();
+    let mut rows = vec![[0u64; 128]; contexts];
+    for token in streams.iter().flatten() {
+        let row = rows
+            .get_mut(token.context)
+            .ok_or_else(|| Error::InvalidInput("invalid entropy token context/length".into()))?;
+        if token.is_length {
+            return Err(Error::InvalidInput(
+                "invalid entropy token context/length".into(),
+            ));
+        }
+        // The checked aggregate slice length bounds every individual count.
+        row[config.encode(token.value).token as usize] += 1;
+    }
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            let length = row
+                .iter()
+                .rposition(|&count| count != 0)
+                .map_or(0, |i| i + 1);
+            row[..length].to_vec()
+        })
+        .collect())
+}
+
 fn raw_histograms(
     streams: &[Vec<Token>],
     contexts: usize,
@@ -183,43 +212,53 @@ fn raw_histograms(
     }
     let count_profile = crate::profile::scope("entropy.raw_histograms");
     let config = initial_config(options);
-    let mut counts = vec![Vec::new(); contexts];
-    let mut token_count = 0usize;
-    for token in streams.iter().flatten() {
-        if token.context >= contexts
-            || (token.is_length
-                && (!lz77 || token.context + 1 == contexts || token.value > u32::MAX - 3))
-        {
-            return Err(Error::InvalidInput(
-                "invalid entropy token context/length".into(),
-            ));
-        }
-        let cfg = if token.is_length {
-            options.lz77_length_config
-        } else {
-            config
-        };
-        let symbol = cfg.encode(token.value).token as usize
-            + if token.is_length {
-                options.lz77_min_symbol as usize
+    let token_count = streams.iter().try_fold(0usize, |n, stream| {
+        n.checked_add(stream.len())
+            .ok_or(Error::Limit("entropy token count"))
+    })?;
+    let mut counts;
+    if !lz77
+        && contexts <= 256
+        && token_count >= 4096
+        && config == HybridUintConfig::default()
+        && (options.streaming_mode || matches!(options.uint_config, UintConfigStrategy::Fixed(_)))
+    {
+        counts = literal420_histograms(streams, contexts)?;
+    } else {
+        counts = vec![Vec::new(); contexts];
+        for token in streams.iter().flatten() {
+            if token.context >= contexts
+                || (token.is_length
+                    && (!lz77 || token.context + 1 == contexts || token.value > u32::MAX - 3))
+            {
+                return Err(Error::InvalidInput(
+                    "invalid entropy token context/length".into(),
+                ));
+            }
+            let cfg = if token.is_length {
+                options.lz77_length_config
             } else {
-                0
+                config
             };
-        if symbol >= (1 << PREFIX_LOG_ALPHA_SIZE)
-            || (lz77
-                && !token.is_length
-                && (options.streaming_mode
-                    || matches!(options.uint_config, UintConfigStrategy::Fixed(_)))
-                && symbol >= options.lz77_min_symbol as usize)
-        {
-            return Err(Error::Encoding(
-                "entropy symbol exceeds active alphabet".into(),
-            ));
+            let symbol = cfg.encode(token.value).token as usize
+                + if token.is_length {
+                    options.lz77_min_symbol as usize
+                } else {
+                    0
+                };
+            if symbol >= (1 << PREFIX_LOG_ALPHA_SIZE)
+                || (lz77
+                    && !token.is_length
+                    && (options.streaming_mode
+                        || matches!(options.uint_config, UintConfigStrategy::Fixed(_)))
+                    && symbol >= options.lz77_min_symbol as usize)
+            {
+                return Err(Error::Encoding(
+                    "entropy symbol exceeds active alphabet".into(),
+                ));
+            }
+            add_count(&mut counts[token.context], symbol)?;
         }
-        add_count(&mut counts[token.context], symbol)?;
-        token_count = token_count
-            .checked_add(1)
-            .ok_or(Error::Limit("entropy token count"))?;
     }
     if options.add_missing_symbols {
         // enc_ans.cc adds one to every bin, not just those absent in this batch.
@@ -410,14 +449,20 @@ impl Model {
         options: &EntropyOptions,
     ) -> Result<Self> {
         let num_histograms = clustered.len();
-        let search = choose_config_plan_and_histograms(
-            streams,
-            &map,
-            num_histograms,
-            lz77,
-            prefix,
-            options,
-        )?;
+        let search = if !options.add_missing_symbols
+            && !options.add_fixed_histograms
+            && (options.streaming_mode
+                || matches!(options.uint_config, UintConfigStrategy::Fixed(_)))
+        {
+            super::config_search::SearchPlan {
+                plan: super::config_search::fixed_config_plan_from_counts(
+                    &clustered, lz77, prefix, options,
+                )?,
+                counts: None,
+            }
+        } else {
+            choose_config_plan_and_histograms(streams, &map, num_histograms, lz77, prefix, options)?
+        };
         Self::from_search(clustered, map, lz77, prefix, options, search)
     }
 
@@ -937,6 +982,50 @@ impl Model {
     ) -> Result<()> {
         let _profile = crate::profile::scope("entropy.write_tokens");
         let range = self.context_range(context_offset)?;
+        if !self.lz77
+            && self.log_alpha_size >= 7
+            && self
+                .configs
+                .iter()
+                .all(|&config| config == HybridUintConfig::default())
+        {
+            let map = &self.map[range];
+            let map_literal = |token: Token| -> Result<AnsToken> {
+                let context =
+                    usize::from(*map.get(token.context).ok_or_else(|| {
+                        Error::Encoding("token context not in model batch".into())
+                    })?);
+                if token.is_length {
+                    return Err(Error::Encoding("invalid length token context".into()));
+                }
+                let encoded = HybridUintConfig::default().encode(token.value);
+                Ok(AnsToken {
+                    context,
+                    symbol: encoded.token as usize,
+                    nbits: encoded.nbits as u8,
+                    bits: encoded.bits,
+                })
+            };
+            match &self.tables {
+                Tables::Prefix(tables) => {
+                    for &token in tokens {
+                        let t = map_literal(token)?;
+                        tables[t.context]
+                            .write_symbol_with_extra(t.symbol, t.nbits, t.bits, w)
+                            .map_err(|e| Error::Encoding(e.to_string()))?;
+                    }
+                }
+                Tables::Ans(tables) => {
+                    write_mapped_tokens(
+                        tables,
+                        tokens.len(),
+                        |index| map_literal(tokens[index]),
+                        w,
+                    )?;
+                }
+            }
+            return Ok(());
+        }
         match &self.tables {
             Tables::Prefix(tables) => {
                 for t in tokens {
@@ -1000,6 +1089,10 @@ mod context_map_tests;
 #[cfg(test)]
 #[path = "stream_head_tail_tests.rs"]
 mod head_tail_tests;
+
+#[cfg(test)]
+#[path = "stream_fixed_tests.rs"]
+mod fixed_tests;
 
 #[cfg(test)]
 mod tests {

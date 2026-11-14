@@ -79,6 +79,22 @@ class PixelAssertions:
 
 
 class BindingsTests(PixelAssertions, unittest.TestCase):
+    def test_effort_one_fast_route_and_explicit_tool_fallback(self):
+        for dtype in (np.uint8, np.uint16):
+            source = _rgba(dtype)
+            for threads in (1, 4):
+                with self.subTest(dtype=dtype, threads=threads):
+                    with rs_jxl.Encoder(threads=threads) as encoder:
+                        for encode in (rs_jxl.encode, encoder.encode):
+                            data, meta = encode(source, effort=1, threads=threads,
+                                                return_info=True)
+                            self.assertEqual(meta["report"]["implementation"], "fast_lossless")
+                            self.assertPixels(rs_jxl.decode(data, threads=1), source)
+                            data, meta = encode(source, effort=1, threads=threads,
+                                                rct=0, return_info=True)
+                            self.assertEqual(meta["report"]["implementation"], "modular")
+                            self.assertPixels(rs_jxl.decode(data, threads=1), source)
+
     def test_hidden_rgb_rgba8_and_rgba16(self):
         for dtype in (np.uint8, np.uint16):
             with self.subTest(dtype=dtype):

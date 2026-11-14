@@ -261,55 +261,50 @@ impl AnsCoder {
 }
 
 struct ReverseBits {
+    // Full 56-bit chunks; only the final, in-register tail needs a width.
     chunks: Vec<u64>,
-    widths: Vec<u8>,
     bits: u64,
     width: u8,
 }
 
 impl ReverseBits {
-    fn new(token_count: usize) -> Result<Self> {
-        let mut chunks = Vec::new();
-        let mut widths = Vec::new();
-        chunks
-            .try_reserve_exact(token_count)
-            .map_err(|_| Error::Limit("ANS token chunks"))?;
-        widths
-            .try_reserve_exact(token_count)
-            .map_err(|_| Error::Limit("ANS token chunk widths"))?;
-        Ok(Self {
-            chunks,
-            widths,
+    fn new() -> Self {
+        Self {
+            chunks: Vec::new(),
             bits: 0,
             width: 0,
-        })
+        }
     }
 
-    fn add(&mut self, width: u8, bits: u32) -> Result<()> {
+    fn add(&mut self, width: u8, bits: u64) -> Result<()> {
+        debug_assert!(width <= 48);
+        debug_assert_eq!(bits >> width, 0);
         if width == 0 {
             return Ok(());
         }
-        if self.width + width > BitWriter::MAX_BITS_PER_CALL {
+        let combined_width = self.width + width;
+        if combined_width > BitWriter::MAX_BITS_PER_CALL {
+            let remainder_width = combined_width - BitWriter::MAX_BITS_PER_CALL;
+            // Split the fused field so every stored chunk is exactly 56 bits.
+            // Its low bits stay in the tail and are emitted before this chunk.
+            let chunk = (self.bits << (width - remainder_width)) | (bits >> remainder_width);
             self.chunks
                 .try_reserve(1)
                 .map_err(|_| Error::Limit("ANS token chunks"))?;
-            self.widths
-                .try_reserve(1)
-                .map_err(|_| Error::Limit("ANS token chunk widths"))?;
-            self.chunks.push(self.bits);
-            self.widths.push(self.width);
-            self.bits = 0;
-            self.width = 0;
+            self.chunks.push(chunk);
+            self.bits = bits & ((1u64 << remainder_width) - 1);
+            self.width = remainder_width;
+        } else {
+            self.bits = (self.bits << width) | bits;
+            self.width = combined_width;
         }
-        self.bits = (self.bits << width) | u64::from(bits);
-        self.width += width;
         Ok(())
     }
 
     fn write(self, writer: &mut BitWriter) -> Result<()> {
         writer.write(self.width, self.bits)?;
-        for (&width, &bits) in self.widths.iter().zip(&self.chunks).rev() {
-            writer.write(width, bits)?;
+        for &bits in self.chunks.iter().rev() {
+            writer.write(BitWriter::MAX_BITS_PER_CALL, bits)?;
         }
         Ok(())
     }
@@ -341,7 +336,7 @@ pub(crate) fn write_mapped_tokens(
             "ANS codes in one stream need a shared alphabet logarithm".into(),
         ));
     }
-    let mut out = ReverseBits::new(token_count)?;
+    let mut out = ReverseBits::new();
     let mut ans = AnsCoder {
         state: INITIAL_STATE,
     };
@@ -356,9 +351,12 @@ pub(crate) fn write_mapped_tokens(
                 "ANS token extra bits do not fit their width".into(),
             ));
         }
-        out.add(token.nbits, token.bits)?;
         let (nbits, bits) = ans.put_symbol(info, &code.reverse_map);
-        out.add(nbits, bits)?;
+        // Reverse emission places renormalization before the token's extra bits.
+        out.add(
+            token.nbits + nbits,
+            (u64::from(token.bits) << nbits) | u64::from(bits),
+        )?;
     }
     writer.write(32, u64::from(ans.state))?;
     out.write(writer)
@@ -438,6 +436,228 @@ pub(super) mod tests {
         }
         assert_eq!(state, 0x13_0000);
         assert_eq!(reader.position, end);
+    }
+
+    #[test]
+    fn fused_reverse_chunks_match_bitwise_reference_at_every_boundary() {
+        for pending in 0..=56u8 {
+            for extra_width in 0..=32u8 {
+                for renorm_width in [0, 16u8] {
+                    let mut out = ReverseBits::new();
+                    let mut fields = Vec::new();
+                    for width in [pending.min(48), pending.saturating_sub(48)] {
+                        let bits = 0x9753_a15c_03d7u64 & ((1u64 << width) - 1);
+                        out.add(width, bits).unwrap();
+                        fields.push((width, bits));
+                    }
+                    assert_eq!(out.width, pending);
+                    let extra_bits = 0xc195_a73du64 & ((1u64 << extra_width) - 1);
+                    let renorm_bits = 0x935bu64 & ((1u64 << renorm_width) - 1);
+                    out.add(
+                        extra_width + renorm_width,
+                        (extra_bits << renorm_width) | renorm_bits,
+                    )
+                    .unwrap();
+                    // Keep the unfused fields for an independent bit-at-a-time oracle.
+                    fields.push((extra_width, extra_bits));
+                    fields.push((renorm_width, renorm_bits));
+                    for width in [48, 0, 1, 48, 8] {
+                        let bits = 0x815c_03d7_a96bu64 & ((1u64 << width) - 1);
+                        out.add(width, bits).unwrap();
+                        fields.push((width, bits));
+                    }
+                    let payload_bits: usize = fields.iter().map(|&(n, _)| usize::from(n)).sum();
+                    assert_eq!(out.chunks.len(), (payload_bits - 1) / 56);
+                    assert_eq!(usize::from(out.width), (payload_bits - 1) % 56 + 1);
+                    assert!(out.chunks.iter().all(|bits| bits >> 56 == 0));
+                    // Across the boundary sweep, every extra/renorm width sees
+                    // every destination bit offset, including an unaligned state.
+                    let prefix = (pending + extra_width) % 8;
+                    let total_bits = payload_bits + usize::from(prefix);
+                    let mut expected = vec![0u8; total_bits.div_ceil(8)];
+                    let mut position = 0;
+                    for (width, bits) in std::iter::once((prefix, (1u64 << prefix) - 1))
+                        .chain(fields.iter().rev().copied())
+                    {
+                        for bit in 0..width {
+                            expected[position / 8] |= (((bits >> bit) & 1) as u8) << (position % 8);
+                            position += 1;
+                        }
+                    }
+                    let mut writer = BitWriter::new(expected.len());
+                    writer.write(prefix, (1u64 << prefix) - 1).unwrap();
+                    out.write(&mut writer).unwrap();
+                    assert_eq!(writer.bits_written(), total_bits);
+                    writer.zero_pad_to_byte().unwrap();
+                    assert_eq!(writer.into_bytes().unwrap(), expected);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn reverse_chunks_allocate_only_when_payload_exceeds_one_chunk() {
+        let mut out = ReverseBits::new();
+        for _ in 0..4096 {
+            out.add(0, 0).unwrap();
+        }
+        out.add(48, (1u64 << 48) - 1).unwrap();
+        out.add(8, 255).unwrap();
+        assert_eq!(out.chunks.capacity(), 0);
+        assert_eq!(out.width, 56);
+        out.add(1, 1).unwrap();
+        assert_eq!(out.chunks, [(1u64 << 56) - 1]);
+        assert_eq!(out.width, 1);
+        assert_eq!(out.bits, 1);
+    }
+
+    #[test]
+    fn fused_extra_widths_decode_with_and_without_renormalization() {
+        let rare = AnsCode::from_counts_with_strategy(&[4095, 1], 8, AnsHistogramStrategy::Direct0)
+            .unwrap();
+        for nbits in 0..=32 {
+            let tokens = [AnsToken {
+                context: 0,
+                symbol: 1,
+                nbits,
+                bits: (0xa15c_03d7u64 & ((1u64 << nbits) - 1)) as u32,
+            }; 64];
+            // Repeated frequency-one symbols include steps with and without
+            // renormalization, regardless of the extra-bit width.
+            for prefix in [0, 7] {
+                roundtrip(std::slice::from_ref(&rare), &tokens, prefix);
+            }
+        }
+    }
+
+    #[test]
+    fn mapped_failures_after_buffered_chunks_leave_destination_unchanged() {
+        let code =
+            AnsCode::from_counts_with_strategy(&[4095, 0, 1], 8, AnsHistogramStrategy::Direct0)
+                .unwrap();
+        let valid = AnsToken {
+            context: 0,
+            symbol: 2,
+            nbits: 32,
+            bits: 0xa15c_03d7,
+        };
+        for invalid in [
+            Some(AnsToken {
+                context: 1,
+                ..valid
+            }),
+            Some(AnsToken { symbol: 1, ..valid }),
+            Some(AnsToken {
+                symbol: usize::MAX,
+                ..valid
+            }),
+            Some(AnsToken { nbits: 33, ..valid }),
+            Some(AnsToken {
+                nbits: 255,
+                ..valid
+            }),
+            Some(AnsToken {
+                nbits: 31,
+                bits: u32::MAX,
+                ..valid
+            }),
+            None,
+        ] {
+            // No room even for the final ANS state: validation must still win.
+            let mut writer = BitWriter::new(1);
+            writer.write(3, 5).unwrap();
+            let mut calls = 0;
+            let result = write_mapped_tokens(
+                std::slice::from_ref(&code),
+                128,
+                |index| {
+                    assert_eq!(index, 127 - calls);
+                    calls += 1;
+                    if index == 0 {
+                        invalid.ok_or_else(|| Error::InvalidInput("mapping failed".into()))
+                    } else {
+                        Ok(valid)
+                    }
+                },
+                &mut writer,
+            );
+            assert!(matches!(result, Err(Error::InvalidInput(_))));
+            assert_eq!(calls, 128);
+            assert_eq!(writer.bits_written(), 3);
+            writer.zero_pad_to_byte().unwrap();
+            assert_eq!(writer.into_bytes().unwrap(), [5]);
+        }
+    }
+
+    #[test]
+    fn mapping_does_not_preallocate_from_token_count() {
+        let mut writer = BitWriter::new(1);
+        writer.write(8, 0xa5).unwrap();
+        let mut calls = 0;
+        let result = write_mapped_tokens(
+            &[],
+            usize::MAX,
+            |index| {
+                assert_eq!(index, usize::MAX - 1);
+                calls += 1;
+                Err(Error::InvalidInput("mapping failed".into()))
+            },
+            &mut writer,
+        );
+        assert!(matches!(result, Err(Error::InvalidInput(_))));
+        assert_eq!(calls, 1);
+        assert_eq!(writer.bits_written(), 8);
+        assert_eq!(writer.into_bytes().unwrap(), [0xa5]);
+    }
+
+    #[test]
+    fn packed_payload_obeys_exact_and_short_output_limits() {
+        let code = AnsCode::from_counts_with_strategy(&[4095, 1], 8, AnsHistogramStrategy::Direct0)
+            .unwrap();
+        let tokens: Vec<_> = (0..132)
+            .map(|i| {
+                let nbits = (i % 33) as u8;
+                AnsToken {
+                    context: 0,
+                    symbol: 1,
+                    nbits,
+                    bits: (0xc195_a73du64 & ((1u64 << nbits) - 1)) as u32,
+                }
+            })
+            .collect();
+        for prefix in 0..8 {
+            let mut reference = BitWriter::new(2048);
+            reference.write(prefix, (1u64 << prefix) - 1).unwrap();
+            write_tokens(std::slice::from_ref(&code), &tokens, &mut reference).unwrap();
+            let end = reference.bits_written();
+            reference.zero_pad_to_byte().unwrap();
+            let expected = reference.into_bytes().unwrap();
+            for limit in [expected.len() - 1, expected.len()] {
+                let mut writer = BitWriter::new(limit);
+                writer.write(prefix, (1u64 << prefix) - 1).unwrap();
+                let mut calls = 0;
+                let result = write_mapped_tokens(
+                    std::slice::from_ref(&code),
+                    tokens.len(),
+                    |index| {
+                        assert_eq!(index, tokens.len() - 1 - calls);
+                        calls += 1;
+                        Ok(tokens[index])
+                    },
+                    &mut writer,
+                );
+                assert_eq!(calls, tokens.len());
+                assert!(writer.bits_written() <= limit * 8);
+                if limit == expected.len() {
+                    result.unwrap();
+                    assert_eq!(writer.bits_written(), end);
+                    writer.zero_pad_to_byte().unwrap();
+                    assert_eq!(writer.into_bytes().unwrap(), expected);
+                } else {
+                    assert!(result.is_err());
+                }
+            }
+        }
     }
 
     #[test]

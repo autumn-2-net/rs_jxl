@@ -39,6 +39,23 @@ pub(crate) struct ChannelTree {
     gradient_lut: bool,
 }
 
+/// A bounded direct context map for the fixed Gradient/WP trees. This changes
+/// only traversal; the original tree and its wire context numbers are retained.
+pub(in crate::modular) struct SimpleContexts {
+    pub predictor: Predictor,
+    minimum: i32,
+    contexts: Vec<u32>,
+}
+
+impl SimpleContexts {
+    #[inline]
+    pub fn lookup(&self, value: i64) -> u32 {
+        let index =
+            (value - i64::from(self.minimum)).clamp(0, (self.contexts.len() - 1) as i64) as usize;
+        self.contexts[index]
+    }
+}
+
 impl ChannelTree {
     /// Conservative across static channel/group choices. Offsets can switch
     /// gradient-LUT routing to generic wrapping properties (or back again).
@@ -178,6 +195,65 @@ impl ChannelTree {
         } else {
             None
         }
+    }
+
+    pub fn simple_contexts(&self) -> Option<SimpleContexts> {
+        let predictor = self.leaves.first()?.predictor;
+        let property = match predictor {
+            Predictor::Gradient if self.gradient_lut => 9,
+            Predictor::Weighted => 15,
+            _ => return None,
+        };
+        if self
+            .leaves
+            .iter()
+            .any(|leaf| leaf.predictor != predictor || leaf.offset != 0 || leaf.multiplier != 1)
+        {
+            return None;
+        }
+        let mut minimum = i32::MAX;
+        let mut maximum = i32::MIN;
+        for node in &self.nodes {
+            if node.property == u32::MAX {
+                continue;
+            }
+            if node.property != property {
+                return None;
+            }
+            minimum = minimum.min(node.threshold);
+            maximum = maximum.max(node.threshold);
+        }
+        if minimum == i32::MAX {
+            minimum = 0;
+            maximum = 0;
+        } else {
+            maximum = maximum.checked_add(1)?;
+        }
+        let length = usize::try_from(i64::from(maximum) - i64::from(minimum) + 1).ok()?;
+        if length > 16384 {
+            return None;
+        }
+        let mut contexts = vec![0; length];
+        let mut pending = vec![(0usize, minimum, maximum)];
+        while let Some((index, low, high)) = pending.pop() {
+            let node = self.nodes[index];
+            if node.property == u32::MAX {
+                contexts[(low - minimum) as usize..=(high - minimum) as usize]
+                    .fill(self.leaves[node.greater as usize].context as u32);
+            } else {
+                if low <= node.threshold {
+                    pending.push((node.less_equal as usize, low, high.min(node.threshold)));
+                }
+                if high > node.threshold {
+                    pending.push((node.greater as usize, low.max(node.threshold + 1), high));
+                }
+            }
+        }
+        Some(SimpleContexts {
+            predictor,
+            minimum,
+            contexts,
+        })
     }
 
     pub fn lookup(&self, properties: &[i32]) -> Result<Leaf> {

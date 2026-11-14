@@ -30,10 +30,10 @@ impl Sample {
         best: Match,
         spatial_survivors: usize,
     ) -> Self {
-        let ring = &matcher.buckets[key];
+        let ring = matcher.buckets.get(key);
         let limit = matcher.maximum.min(matcher.values.len() - position);
         let mut sample = Self {
-            ring_entries: ring.size as usize,
+            ring_entries: ring.positions.len(),
             spatial_survivors,
             active_prefix: usize::from(matcher.prefix.cached_bytes() != 0),
             length_bin: match best.length {
@@ -46,7 +46,7 @@ impl Sample {
             },
             ..Self::default()
         };
-        for &previous in &ring.positions[..ring.size as usize] {
+        for &previous in ring.positions {
             let previous = previous as usize;
             if position - previous <= WINDOW_SIZE {
                 sample.ring_window += 1;
@@ -58,8 +58,8 @@ impl Sample {
                 }
             }
         }
-        if ring.size as usize == N {
-            let safe = position - ring.positions[ring.next as usize] as usize;
+        if let Some(oldest) = ring.oldest {
+            let safe = position - oldest as usize;
             // Count source entries, including narrow-width aliases. The SIMD
             // grouped path canonicalizes those aliases before filtering.
             sample.spatial_entries = matcher
@@ -250,7 +250,7 @@ mod tests {
                         sampled.prefix.candidate_work()
                     );
                 }
-                for (a, b) in plain.buckets.iter().zip(&sampled.buckets) {
+                for (a, b) in plain.buckets.iter().zip(sampled.buckets.iter()) {
                     assert_eq!(a.positions, b.positions);
                     assert_eq!((a.next, a.size), (b.next, b.size));
                 }

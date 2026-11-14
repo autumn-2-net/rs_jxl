@@ -1296,11 +1296,10 @@ fn visit_source_range_impl<const PAIR: bool, const INTERIOR: bool>(
             // Draw even in warm-up rows, matching the source's operand order.
             let selected = sampler.next().expect("one sample draw per channel pixel") && in_rows;
             let (prediction, error) = match state.as_mut() {
-                // State's checked raster coordinates start at zero. Shifting
-                // both parity buffers by warm_begin only renames zeroed rows;
-                // all spatial neighbors/properties retain global coordinates.
-                // The local state is discarded if collection fails later.
-                Some(state) => state.predict_and_update(
+                // The validated rectangle walks every pixel, including warm-up
+                // rows. Local history needs no per-pixel coordinate validation;
+                // shifting row parity only renames its initially zero buffers.
+                Some(state) => state.predict_and_update_raster::<false>(
                     value,
                     x,
                     y - warm_begin,
@@ -1309,7 +1308,7 @@ fn visit_source_range_impl<const PAIR: bool, const INTERIOR: bool>(
                     n.topright,
                     n.topleft,
                     n.toptop,
-                )?,
+                ),
                 None => (0, 0),
             };
             // Same values as Properties::calculate, with one gradient instead

@@ -85,6 +85,112 @@ impl<const N: usize> Ring<N> {
     }
 }
 
+const EMPTY_FAST_POSITION: u32 = u32::MAX;
+
+struct FastBucket<'a> {
+    positions: &'a [u32],
+    oldest: Option<u32>,
+}
+
+struct FastBuckets<const N: usize> {
+    single: Vec<u32>,
+    rings: Vec<Ring<N>>,
+    #[cfg(test)]
+    generic_one: bool,
+}
+
+impl<const N: usize> FastBuckets<N> {
+    fn new(count: usize) -> Result<Self> {
+        assert!(N != 0 && N <= u8::MAX as usize);
+        Ok(Self {
+            single: if N == 1 {
+                filled(count, EMPTY_FAST_POSITION)?
+            } else {
+                Vec::new()
+            },
+            rings: if N == 1 {
+                Vec::new()
+            } else {
+                filled(count, Ring::new())?
+            },
+            #[cfg(test)]
+            generic_one: false,
+        })
+    }
+
+    #[inline]
+    fn is_single(&self) -> bool {
+        #[cfg(test)]
+        if self.generic_one {
+            return false;
+        }
+        N == 1
+    }
+
+    #[inline]
+    fn get(&self, key: usize) -> FastBucket<'_> {
+        if self.is_single() {
+            let position = &self.single[key];
+            let present = *position != EMPTY_FAST_POSITION;
+            FastBucket {
+                positions: &std::slice::from_ref(position)[..usize::from(present)],
+                oldest: present.then_some(*position),
+            }
+        } else {
+            let ring = &self.rings[key];
+            FastBucket {
+                positions: &ring.positions[..ring.size as usize],
+                oldest: (ring.size as usize == N).then(|| ring.positions[ring.next as usize]),
+            }
+        }
+    }
+
+    #[inline]
+    fn insert(&mut self, key: usize, position: usize) {
+        if self.is_single() {
+            // A validated stream has at most u32::MAX entries, so its largest
+            // position is u32::MAX - 1. The sentinel cannot be a real position.
+            debug_assert!(position < EMPTY_FAST_POSITION as usize);
+            self.single[key] = position as u32;
+        } else {
+            self.rings[key].insert(position);
+        }
+    }
+
+    #[inline]
+    fn repeated(&mut self, key: usize, begin: usize, end: usize) {
+        if self.is_single() {
+            debug_assert!(begin <= end);
+            if begin != end {
+                self.insert(key, end - 1);
+            }
+        } else {
+            self.rings[key].repeated(begin, end);
+        }
+    }
+
+    // Snapshot the retained generic representation for existing state oracles.
+    #[cfg(test)]
+    fn iter(&self) -> impl Iterator<Item = Ring<N>> + '_ {
+        let count = if self.is_single() {
+            self.single.len()
+        } else {
+            self.rings.len()
+        };
+        (0..count).map(|key| {
+            if self.is_single() {
+                let mut ring = Ring::new();
+                if self.single[key] != EMPTY_FAST_POSITION {
+                    ring.insert(self.single[key] as usize);
+                }
+                ring
+            } else {
+                self.rings[key].clone()
+            }
+        })
+    }
+}
+
 fn validate_ring_input_len(len: usize) -> Result<()> {
     // Public source streams already have an i32 index limit. Also guard direct
     // matcher construction before any positions are narrowed into the rings.
@@ -151,7 +257,7 @@ fn consider_fast_match(
 pub(super) struct Fast<'a, const N: usize> {
     values: &'a [u32],
     maximum: usize,
-    buckets: Vec<Ring<N>>,
+    buckets: FastBuckets<N>,
     codes: super::distances::FastCodes,
     spatial: Vec<(usize, u32)>,
     groups: Vec<SpecialPrefixGroup>,
@@ -209,7 +315,7 @@ impl<'a, const N: usize> Fast<'a, N> {
         Ok(Self {
             values,
             maximum: config.max_match_length,
-            buckets: filled(1 << 14, Ring::new())?,
+            buckets: FastBuckets::new(1 << 14)?,
             codes,
             spatial,
             groups,
@@ -244,14 +350,14 @@ impl<'a, const N: usize> Fast<'a, N> {
         if SAMPLE {
             self.diagnostics.prepare(&mut clock);
         }
-        let ring = &self.buckets[key];
+        let ring = self.buckets.get(key);
         let mut best = Match::default();
         // Only the overwritten prefix is consumed; the unused tail may retain
         // candidates from earlier queries.
         let candidates = &mut self.candidates;
         let mut count = 0;
-        if ring.size as usize == N {
-            let safe = position - ring.positions[ring.next as usize] as usize;
+        if let Some(oldest) = ring.oldest {
+            let safe = position - oldest as usize;
             if self.ranges {
                 if self
                     .spatial
@@ -344,7 +450,7 @@ impl<'a, const N: usize> Fast<'a, N> {
         #[cfg(feature = "experimental-lz77")]
         let ring_extended = if let Some(extension) = &mut self.extension {
             let codes = &self.codes;
-            let candidates = ring.positions[..ring.size as usize]
+            let candidates = ring.positions
                 .iter()
                 .map(|&previous| position - previous as usize)
                 .filter(|&distance| distance <= WINDOW_SIZE)
@@ -357,7 +463,7 @@ impl<'a, const N: usize> Fast<'a, N> {
         #[cfg(not(feature = "experimental-lz77"))]
         let ring_extended = false;
         if !ring_extended {
-            for &previous in &ring.positions[..ring.size as usize] {
+            for &previous in ring.positions {
                 let distance = position - previous as usize;
                 if distance <= WINDOW_SIZE {
                     consider_fast_match(
@@ -378,7 +484,7 @@ impl<'a, const N: usize> Fast<'a, N> {
             let sample = seed_profile::Sample::capture(self, key, position, best, count);
             self.diagnostics.record(sample);
         }
-        self.buckets[key].insert(position);
+        self.buckets.insert(key, position);
         best
     }
 
@@ -386,7 +492,7 @@ impl<'a, const N: usize> Fast<'a, N> {
         if !self.fast_ranges.repeated() {
             for position in begin..end {
                 let key = hash(self.values, position) as usize & ((1 << 14) - 1);
-                self.buckets[key].insert(position);
+                self.buckets.insert(key, position);
             }
             return;
         }
@@ -399,10 +505,10 @@ impl<'a, const N: usize> Fast<'a, N> {
             let count = (run_end - begin).saturating_sub(2);
             let key = hash(self.values, begin) as usize & ((1 << 14) - 1);
             if count >= N {
-                self.buckets[key].repeated(begin, begin + count);
+                self.buckets.repeated(key, begin, begin + count);
                 begin += count;
             } else {
-                self.buckets[key].insert(begin);
+                self.buckets.insert(key, begin);
                 begin += 1;
             }
         }
@@ -1099,6 +1205,9 @@ impl<'a> Optimal<'a> {
 
 #[cfg(test)]
 mod fast_tests;
+
+#[cfg(test)]
+mod single_tests;
 
 #[cfg(test)]
 mod short_tests;
@@ -1938,8 +2047,8 @@ mod tests {
         assert_eq!(three.find(12).length, 4);
         three.update_range(13, 16);
         let key = hash(&values, 0) as usize & 16383;
-        assert_eq!(three.buckets[key].size, 3);
-        assert!(!three.buckets[key].positions.contains(&0));
+        assert_eq!(three.buckets.get(key).positions.len(), 3);
+        assert!(!three.buckets.get(key).positions.contains(&0));
     }
 
     #[test]

@@ -81,7 +81,7 @@ Python 把 effort 映射为 `CandidateParams.speed_tier = 10 - effort`，再投�
 
 | effort | 固定 source 后端的要点 |
 | --- | --- |
-| 1 | 先进入 tier 9。符合特定输入/参数条件时可走独立 FJXL 快速路线；否则 Modular 回退到 tier 8。不是“所有 e1 都是 FJXL” |
+| 1 | 单候选编码中，默认的普通 8/16 位 Gray/GA/RGB/RGBA 静态图优先走 FJXL；显式工具覆盖或不支持的输入回退到 Modular tier 8。不是“所有 e1 都是 FJXL” |
 | 2 | Modular 固定 Gradient 树 |
 | 3 | Modular 固定 Weighted 树 |
 | 4..9 | 默认预测器为 Best；随等级改变学习、颜色变换、熵/LZ77 等策略 |
@@ -90,8 +90,12 @@ Python 把 effort 映射为 `CandidateParams.speed_tier = 10 - effort`，再投�
 
 低 effort 的固定树不承诺采用显式 `predictor` 指定的逐像素预测器。
 FJXL 也有自己的固定工具和内部 effort，不能用 Modular 参数表解释其全部行为。
+e1 的快速路线以速度换体积，输出可能大于 e2；不要把此前 e1/e2 都走 Modular 的
+重复结果当作 e1 的压缩率承诺。额外开启 `source_search=True` 的累计搜索不在此分派修改范围内。
 确认实际路线应看 `meta["report"]["implementation"]`，其值为 `modular` 或
 `fast_lossless`；报告里的 `effective_parameters` 不是每个最终底层工具的展开列表。
+低 effort 的执行优化、e1 速度/体积取舍及单线程/8 线程实测见
+[Low-effort performance](LOW_EFFORT_PERFORMANCE_20261114.md)。
 
 ### 额外 source 搜索
 

@@ -12,6 +12,9 @@ use super::{
 };
 use crate::{Error, Result, execution, tools::lz77::Literal};
 
+#[path = "tokens_fixed.rs"]
+mod fixed;
+
 fn population(planes: &[Channel]) -> Result<usize> {
     planes.iter().try_fold(0usize, |sum, c| {
         sum.checked_add(c.samples.len())
@@ -100,6 +103,9 @@ fn channel(
         }
         return Ok(());
     }
+    if fixed::emit(channel, &plan, wp, &mut emit)? {
+        return Ok(());
+    }
     encode::visit_channel(
         planes,
         c,
@@ -161,6 +167,45 @@ pub(super) fn tokenize(
     stream_id: usize,
     parallel: bool,
 ) -> Result<Vec<Literal>> {
+    tokenize_as(
+        planes,
+        tree,
+        wp,
+        previous_channels,
+        stream_id,
+        parallel,
+        |token| token,
+    )
+}
+
+pub(super) fn tokenize_entropy(
+    planes: &[Channel],
+    tree: &Tree,
+    wp: &weighted::Header,
+    previous_channels: usize,
+    stream_id: usize,
+    parallel: bool,
+) -> Result<Vec<crate::entropy::stream::Token>> {
+    tokenize_as(
+        planes,
+        tree,
+        wp,
+        previous_channels,
+        stream_id,
+        parallel,
+        |token| crate::entropy::stream::Token::literal(token.context as usize, token.value),
+    )
+}
+
+fn tokenize_as<T: Copy + Send>(
+    planes: &[Channel],
+    tree: &Tree,
+    wp: &weighted::Header,
+    previous_channels: usize,
+    stream_id: usize,
+    parallel: bool,
+    convert: impl Fn(Literal) -> T + Sync,
+) -> Result<Vec<T>> {
     let _scope = crate::profile::scope("modular.tokenize");
     let count = population(planes)?;
     let mut tokens = Vec::new();
@@ -189,16 +234,16 @@ pub(super) fn tokenize(
                 previous_channels,
                 stream_id,
                 &mut scratch,
-                |t| tokens.push(t),
+                |t| tokens.push(convert(t)),
             )?;
         }
     } else {
         tokens.resize(
             count,
-            Literal {
+            convert(Literal {
                 context: 0,
                 value: 0,
-            },
+            }),
         );
         let mut tail = tokens.as_mut_slice();
         let mut jobs = Vec::new();
@@ -224,7 +269,7 @@ pub(super) fn tokenize(
                 stream_id,
                 &mut Scratch::default(),
                 |t| {
-                    destination[written] = t;
+                    destination[written] = convert(t);
                     written += 1;
                 },
             )?;
@@ -335,6 +380,32 @@ mod tests {
             assert_eq!(actual, expected);
             let serial = execution::serial(|| tokenize(&planes, &tree, &wp, 3, 19, true)).unwrap();
             assert_eq!(serial, expected);
+            let entropy: Vec<_> = expected
+                .iter()
+                .map(|t| crate::entropy::stream::Token::literal(t.context as usize, t.value))
+                .collect();
+            assert_eq!(
+                pool.install(|| tokenize_entropy(&planes, &tree, &wp, 3, 19, true))
+                    .unwrap(),
+                entropy
+            );
+            assert_eq!(
+                execution::serial(|| tokenize_entropy(&planes, &tree, &wp, 3, 19, true)).unwrap(),
+                entropy
+            );
+            let options = encode::ModularOptions {
+                lz77: false,
+                previous_channels: 3,
+                ..Default::default()
+            };
+            assert_eq!(
+                encode::group_stream(&planes, &tree, &options, &wp, 19).unwrap(),
+                (entropy.clone(), false)
+            );
+            assert_eq!(
+                encode::parse_group_tokens(&expected, tree.leaves(), 257, &options).unwrap(),
+                (entropy, false)
+            );
         }
     }
 
@@ -353,6 +424,10 @@ mod tests {
         .unwrap();
         let error = pool
             .install(|| tokenize(&planes, &tree, &weighted::Header::default(), 0, 0, true))
+            .unwrap_err();
+        assert!(matches!(error, Error::Encoding(_)));
+        let error = pool
+            .install(|| tokenize_entropy(&planes, &tree, &weighted::Header::default(), 0, 0, true))
             .unwrap_err();
         assert!(matches!(error, Error::Encoding(_)));
     }

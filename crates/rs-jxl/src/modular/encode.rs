@@ -510,25 +510,17 @@ pub(super) fn planes(
     g: Group,
     options: &ModularOptions,
 ) -> Result<(Vec<Channel>, Vec<Transform>)> {
+    let copy_scope = crate::profile::scope("modular.extract_planes");
     let mut channels = Vec::with_capacity(image.channel_count());
     for c in 0..image.channel_count() {
         let shift = usize::from(image.channel_shift(c));
         let scale = 1usize << shift;
-        let (full_width, _) = image.channel_dimensions(c);
         let x0 = g.x >> shift;
         let y0 = g.y >> shift;
         let width = (g.x + g.width).div_ceil(scale) - x0;
         let height = (g.y + g.height).div_ceil(scale) - y0;
         let mut samples = Vec::new();
-        samples
-            .try_reserve_exact(width * height)
-            .map_err(|_| Error::Limit("Modular channel allocation"))?;
-        for y in y0..y0 + height {
-            for x in x0..x0 + width {
-                let pixel = y * full_width + x;
-                samples.push(image.modular_sample(c, pixel));
-            }
-        }
+        image.copy_modular_rect(c, x0, y0, width, height, &mut samples)?;
         channels.push(Channel {
             width,
             height,
@@ -537,6 +529,7 @@ pub(super) fn planes(
             samples,
         });
     }
+    drop(copy_scope);
     let mut transforms = Vec::new();
     if image.color_channels() == 3 {
         let kind = if let Some(count) = options.rct_candidates {
@@ -667,9 +660,9 @@ pub(super) fn visit_channel(
                 .map_err(|e| Error::Encoding(e.to_string()))?;
             let pos = y * width + x;
             let (prediction, error) = if let Some(state) = &mut state {
-                state.predict_and_update(
+                state.predict_and_update_raster::<false>(
                     plane[pos], x, y, n.top, n.left, n.topright, n.topleft, n.toptop,
-                )?
+                )
             } else {
                 (0, 0)
             };
@@ -867,6 +860,19 @@ pub(super) fn group_stream_with_channels(
     stream_id: usize,
     parallel_channels: bool,
 ) -> Result<(Vec<Token>, bool)> {
+    if !options.lz77 {
+        // Without a match finder there is no reason to materialize raw literals
+        // and Commands before building the final entropy-token stream.
+        return super::tokens::tokenize_entropy(
+            planes,
+            tree,
+            wp,
+            options.previous_channels,
+            stream_id,
+            parallel_channels,
+        )
+        .map(|tokens| (tokens, false));
+    }
     let distance_multiplier = planes.iter().map(|c| c.width).max().unwrap_or(1);
     let raw = super::tokens::tokenize(
         planes,
@@ -885,6 +891,14 @@ pub(super) fn parse_group_tokens(
     distance_multiplier: usize,
     options: &ModularOptions,
 ) -> Result<(Vec<Token>, bool)> {
+    if !options.lz77 {
+        return Ok((
+            raw.iter()
+                .map(|t| Token::literal(t.context as usize, t.value))
+                .collect(),
+            false,
+        ));
+    }
     if options.lz77
         && let Some(config) = &options.source_lz77
     {
@@ -899,11 +913,7 @@ pub(super) fn parse_group_tokens(
         max_match_length: (1 << 20) + 2,
         ..Default::default()
     };
-    let commands = if !options.lz77 {
-        raw.iter().copied().map(Command::Literal).collect()
-    } else {
-        lz77::parse(raw, distance_multiplier, &lz_options)?
-    };
+    let commands = lz77::parse(raw, distance_multiplier, &lz_options)?;
     commands_to_tokens(commands, contexts, distance_multiplier)
 }
 

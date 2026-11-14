@@ -129,7 +129,8 @@ struct Args {
     input: Option<PathBuf>,
     #[arg(long, required_unless_present_any = ["plan_only", "list_candidates"])]
     output: Option<PathBuf>,
-    #[arg(long, default_value_t = 9, value_parser = clap::value_parser!(u8).range(8..=10))]
+    /// Direct recipes support e1..e11; portfolio search remains e8..e10.
+    #[arg(long, default_value_t = 9, value_parser = clap::value_parser!(u8).range(1..=11))]
     effort: u8,
     #[arg(long, default_value_t = 8, value_parser = clap::value_parser!(u16).range(1..=256))]
     threads: u16,
@@ -190,10 +191,40 @@ fn encode_direct(args: &Args, image: &rs_jxl::Image, recipe: Candidate) -> Resul
         base.modular.source_ma_defaults = false;
     }
     let start = Instant::now();
-    let mut configured = if let Some(profile) = args.direct_source_tools {
-        profile.build(image, &base, args.effort, recipe)?
+    // Ordinary e1 must use the same FJXL eligibility/fallback dispatch as the
+    // public native API. Explicit experiments continue to target Modular.
+    let native = if args.effort == 1
+        && recipe == Candidate::Baseline
+        && args.direct_source_tools.is_none()
+        && args.direct_ma_profile.is_none()
+        && args.direct_tree_learning.is_none()
+    {
+        Some(rs_jxl::scheduler::native::encode_native_candidate(
+            &rs_jxl::scheduler::CandidateParams::default().backend(1)?,
+            image,
+            &base,
+            Default::default(),
+        )?)
     } else {
-        recipe.build(image, &base, args.effort)?
+        None
+    };
+    let (mut configured, encoded, implementation) = if let Some(output) = native {
+        (
+            output.artifact.options,
+            Some(output.bytes),
+            output.artifact.implementation,
+        )
+    } else {
+        let configured = if let Some(profile) = args.direct_source_tools {
+            profile.build(image, &base, args.effort, recipe)?
+        } else {
+            recipe.build(image, &base, args.effort)?
+        };
+        (
+            configured,
+            None,
+            rs_jxl::scheduler::NativeImplementation::Modular,
+        )
     };
     if let Some(profile) = args.direct_ma_profile {
         profile.configure(&mut configured);
@@ -212,7 +243,10 @@ fn encode_direct(args: &Args, image: &rs_jxl::Image, recipe: Candidate) -> Resul
         reference.modular.refinement.receipt = Some(Arc::clone(&receipt));
         reference.modular.tree_learning_receipt = Some(Arc::clone(&learning_receipt));
     }
-    let bytes = rs_jxl::encode(image, &configured)?;
+    let bytes = match encoded {
+        Some(bytes) => bytes,
+        None => rs_jxl::encode(image, &configured)?,
+    };
     let seconds = start.elapsed().as_secs_f64();
     if !seconds.is_finite() || seconds <= 0.0 {
         return Err("invalid encode duration".into());
@@ -274,6 +308,7 @@ fn encode_direct(args: &Args, image: &rs_jxl::Image, recipe: Candidate) -> Resul
         "{}",
         serde_json::json!({
             "schema": 1, "direct": true, "candidate": recipe.name(),
+            "implementation": format!("{implementation:?}"),
             "effort": args.effort, "threads": args.threads,
             "width": image.width(), "height": image.height(), "bits": image.bits(),
             "bytes": bytes.len(), "bpp": bytes.len() as f64 * 8.0 / pixels,
@@ -323,6 +358,12 @@ fn run(args: Args) -> Result<()> {
         .as_deref()
         .map(candidate)
         .transpose()?;
+    if direct.is_none() && !(8..=10).contains(&args.effort) {
+        return Err(
+            "portfolio search effort must be 8..=10; use --direct-candidate for other efforts"
+                .into(),
+        );
+    }
     let input = args.input.as_ref().ok_or("input is required")?;
     if args.output.as_ref().is_some_and(|p| p.exists()) {
         return Err("output already exists".into());
@@ -430,6 +471,46 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn direct_baseline_accepts_all_source_efforts_without_relaxing_search() {
+        let image = rs_jxl::Image::new(
+            16,
+            16,
+            rs_jxl::PixelLayout::Rgb,
+            rs_jxl::PixelData::U8(vec![1; 16 * 16 * 3]),
+        )
+        .unwrap();
+        for effort in 1..=11 {
+            let level = effort.to_string();
+            let args = Args::try_parse_from([
+                "lab",
+                "image.png",
+                "--output",
+                "out.jxl",
+                "--effort",
+                &level,
+                "--direct-candidate",
+                "baseline",
+            ])
+            .unwrap();
+            assert_eq!(args.effort, effort);
+            Candidate::Baseline
+                .build(&image, &rs_jxl::EncodeOptions::default(), effort)
+                .unwrap();
+            if !(8..=10).contains(&effort) {
+                let search =
+                    Args::try_parse_from(["lab", "image.png", "--effort", &level, "--plan-only"])
+                        .unwrap();
+                assert!(
+                    run(search)
+                        .unwrap_err()
+                        .to_string()
+                        .contains("portfolio search effort")
+                );
+            }
+        }
+    }
+
     #[test]
     fn direct_tools_require_an_explicit_direct_e9_route() {
         let image = rs_jxl::Image::new(

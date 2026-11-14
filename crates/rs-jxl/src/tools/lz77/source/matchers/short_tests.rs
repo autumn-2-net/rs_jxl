@@ -174,7 +174,7 @@ fn check_fast<const N: usize>(values: &[u32]) {
                     expected.update_range(position + 1, end);
                     position = end;
                 }
-                for (a, b) in actual.buckets.iter().zip(&expected.buckets) {
+                for (a, b) in actual.buckets.iter().zip(expected.buckets.iter()) {
                     assert_eq!(a.positions, b.positions);
                     assert_eq!(a.next, b.next);
                     assert_eq!(a.size, b.size);
@@ -217,7 +217,7 @@ fn short_extension_keeps_fast_window_boundary_inclusive() {
         };
         let mut matcher = Fast::<1>::new(&values, 0, &config).unwrap();
         let key = hash(&values, position) as usize & ((1 << 14) - 1);
-        matcher.buckets[key].insert(previous);
+        matcher.buckets.insert(key, previous);
         let matched = matcher.find(position);
         if distance <= WINDOW_SIZE {
             assert_eq!(tuple(matched), (17, distance, distance as u32 - 1));

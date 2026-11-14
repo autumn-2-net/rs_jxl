@@ -14,8 +14,9 @@
 //! uses log 5..8; prefix uses 15. Like source, adaptive population trials remain
 //! limited to 256 symbols even in prefix mode; explicit fixed prefix configs
 //! can use all 32768 symbols. Length tokens are added back for alphabet sizing.
-//! Fixed/streaming policies validate and size directly from the input streams;
-//! only adaptive search allocates a transposed copy of the literal values.
+//! Fixed/streaming entry points validate and size from input streams; model
+//! construction can instead reuse already validated, uninjected raw counts.
+//! Only adaptive search allocates a transposed copy of the literal values.
 //! Adaptive histograms with at least 4096 values use enc_uint_histogram.h's
 //! refining (12,2,5) bins when every candidate is supported. This exact-work
 //! optimization is active without the source's experimental environment gate.
@@ -582,15 +583,27 @@ fn fixed_config_plan(
         alphabet_size
     };
     let mut max_symbol = statistics.max_length_symbol.unwrap_or(0);
-    for token in streams.iter().flatten().filter(|token| !token.is_length) {
-        // LSB-in-token configurations are not monotonic in the raw value.
-        let symbol = selected.encode(token.value).token as usize;
+    let mut include_literal = |value| -> Result<()> {
+        let symbol = selected.encode(value).token as usize;
         if symbol >= alphabet_size || symbol >= literal_limit {
             return Err(Error::InvalidInput(
                 "uint symbol exceeds its alphabet or LZ77 reservation".into(),
             ));
         }
         max_symbol = max_symbol.max(symbol);
+        Ok(())
+    };
+    if selected.lsb_in_token() == 0 {
+        // Without LSBs the symbol is monotonic: the validated raw maxima
+        // suffice, avoiding a second full token pass for fixed420/streaming.
+        for &maximum in &statistics.maxima[..num_histograms] {
+            include_literal(maximum)?;
+        }
+    } else {
+        for token in streams.iter().flatten().filter(|token| !token.is_length) {
+            // LSB-in-token configurations are not monotonic in the raw value.
+            include_literal(token.value)?;
+        }
     }
     crate::profile::note(
         "entropy.uint_config_search.fixed_scan",
@@ -601,6 +614,54 @@ fn fixed_config_plan(
     );
     finish_config_plan(
         vec![selected; num_histograms],
+        max_symbol,
+        lz77,
+        prefix_codes,
+        options,
+    )
+}
+
+/// Only for already validated and clustered raw histograms, counted with the
+/// unchanged fixed configuration. No injected or preexisting counts are allowed.
+pub(super) fn fixed_config_plan_from_counts(
+    counts: &[Vec<u64>],
+    lz77: bool,
+    prefix_codes: bool,
+    options: &EntropyOptions,
+) -> Result<ConfigPlan> {
+    let _profile = crate::profile::scope("entropy.uint_config_search.fixed_counts");
+    debug_assert!(!options.add_fixed_histograms && !options.add_missing_symbols);
+    debug_assert!(
+        options.streaming_mode || matches!(options.uint_config, UintConfigStrategy::Fixed(_))
+    );
+    let selected = match options.uint_config {
+        UintConfigStrategy::Fixed(config) => config,
+        _ => HybridUintConfig::default(),
+    };
+    let maximum_log = if prefix_codes {
+        PREFIX_LOG_ALPHA_SIZE
+    } else {
+        options.max_log_alpha_size
+    };
+    if selected.split_exponent() > u32::from(maximum_log) {
+        return Err(Error::InvalidInput(
+            "fixed uint config exceeds the requested entropy alphabet".into(),
+        ));
+    }
+    let mut max_symbol = 0;
+    for histogram in counts {
+        let (_, length) = super::simd::condition(histogram).ok_or(Error::Limit(
+            "config search histogram weight exceeds i32::MAX",
+        ))?;
+        max_symbol = max_symbol.max(length.saturating_sub(1));
+    }
+    if max_symbol >= 1usize << maximum_log {
+        return Err(Error::InvalidInput(
+            "uint symbol exceeds its alphabet".into(),
+        ));
+    }
+    finish_config_plan(
+        vec![selected; counts.len()],
         max_symbol,
         lz77,
         prefix_codes,

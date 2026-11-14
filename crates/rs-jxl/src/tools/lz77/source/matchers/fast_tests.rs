@@ -168,7 +168,7 @@ fn check_scratch<const N: usize>(values: &[u32], width: usize, config: &SourceCo
     }
     reused.update_range(values.len(), values.len());
     cleared.update_range(values.len(), values.len());
-    for (actual, expected) in reused.buckets.iter().zip(&cleared.buckets) {
+    for (actual, expected) in reused.buckets.iter().zip(cleared.buckets.iter()) {
         assert_eq!(actual.positions, expected.positions);
         assert_eq!((actual.next, actual.size), (expected.next, expected.size));
     }
