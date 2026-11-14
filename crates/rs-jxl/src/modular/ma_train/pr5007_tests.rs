@@ -516,3 +516,276 @@ fn experimental_options_are_rejected_without_altering_legacy_controls() {
     options.scoring.fast_entropy = true;
     assert!(validate_options(&options).is_err());
 }
+
+#[test]
+fn description_cost_composes_with_both_pr5007_modes() {
+    for mode in [TreeLearning::Cost, TreeLearning::Symmetric] {
+        let mut options = options(mode);
+        for description in [
+            DescriptionCost::Quarter,
+            DescriptionCost::Half,
+            DescriptionCost::Full,
+        ] {
+            options.scoring.description = description;
+            validate_options(&options).unwrap();
+            options.validate().unwrap();
+        }
+        options.scoring.count_log = true;
+        assert!(validate_options(&options).is_err());
+        assert!(options.validate().is_err());
+    }
+}
+
+#[test]
+fn symmetric_middle_includes_model_description_and_extras() {
+    let scorer = DefaultScorer::default();
+    for description in [
+        DescriptionCost::Disabled,
+        DescriptionCost::Half,
+        DescriptionCost::Full,
+    ] {
+        for packed in [false, true] {
+            let mut scratch = SymmetricScratch::default();
+            scratch.prepare(
+                &options(TreeLearning::Symmetric),
+                0,
+                &[-3, -1, 0, 1],
+                &[64, 0, 64, 0, 64],
+                &[64, 0, 128, 0, 64],
+                3,
+            );
+            let rows = if packed {
+                vec![64, 0, 0, 0, 64, 64, 64, 0, 0]
+            } else {
+                vec![64, 0, 0, 0, 0, 0, 0, 64, 64, 0, 0, 0, 64, 0, 0]
+            };
+            let extras = if packed {
+                vec![0, 17, 0]
+            } else {
+                vec![0, 0, 17, 0, 0]
+            };
+            scratch.score_middle(
+                &scorer,
+                description,
+                1,
+                2.0,
+                3,
+                &rows,
+                &extras,
+                3,
+                &[64, 0, 64, 0, 64],
+                packed,
+                &[0, 0, 1, 1, 2],
+            );
+            let expected = scorer.estimate_bits(&[0, 64, 64], 128)
+                + 17.0
+                + description.cost(&scorer, &[0, 64, 64], 128);
+            assert!(!scratch.candidates.is_empty());
+            for candidate in &scratch.candidates {
+                assert_eq!(candidate.middle.bits, expected);
+                assert_eq!(candidate.middle.penalty, 2.0);
+                assert_eq!(candidate.middle.predictor, 1);
+            }
+        }
+    }
+}
+
+#[test]
+fn symmetric_multibin_middle_includes_description_and_all_extras() {
+    let scorer = DefaultScorer::default();
+    let used = [64, 0, 0, 32, 0, 32, 0, 0, 64];
+    let weights = [64, 0, 0, 64, 0, 96, 0, 0, 64];
+    let mapping = [0, 0, 0, 1, 0, 2, 0, 0, 3];
+    for description in [
+        DescriptionCost::Disabled,
+        DescriptionCost::Half,
+        DescriptionCost::Full,
+    ] {
+        for packed in [false, true] {
+            let mut scratch = SymmetricScratch::default();
+            scratch.prepare(
+                &options(TreeLearning::Symmetric),
+                0,
+                &[-4, -3, -2, -1, 0, 1, 2, 3],
+                &used,
+                &weights,
+                3,
+            );
+            assert_eq!(scratch.candidates.len(), 1);
+            let candidate = &scratch.candidates[0];
+            assert_eq!((candidate.effective_low, candidate.effective_high), (0, 5));
+            assert!(!candidate.single_middle_bin);
+            let stride = 4;
+            let rows = if packed { 4 } else { used.len() };
+            let mut counts = vec![0; rows * stride];
+            let mut extras = vec![0; rows];
+            for (bin, histogram, extra) in [
+                (0, [64, 0, 0], 101),
+                (3, [0, 64, 0], 7),
+                (5, [0, 32, 64], 19),
+                (8, [64, 0, 0], 103),
+            ] {
+                let row = if packed { mapping[bin] } else { bin };
+                counts[row * stride..row * stride + 3].copy_from_slice(&histogram);
+                extras[row] = extra;
+            }
+            scratch.score_middle(
+                &scorer,
+                description,
+                1,
+                2.0,
+                3,
+                &counts,
+                &extras,
+                stride,
+                &used,
+                packed,
+                &mapping,
+            );
+            let expected = scorer.estimate_bits(&[0, 96, 64], 160)
+                + 26.0
+                + description.cost(&scorer, &[0, 96, 64], 160);
+            let middle = scratch.candidates[0].middle;
+            assert_eq!(middle.bits, expected);
+            assert_eq!(middle.penalty, 2.0);
+            assert_eq!(middle.predictor, 1);
+        }
+    }
+}
+
+#[test]
+fn duplicate_middle_reuse_preserves_predictor_winners_penalties_and_ties() {
+    let scorer = DefaultScorer::default();
+    let used = [64, 0, 64, 0, 64];
+    let mapping = [0, 0, 1, 0, 2];
+    for packed in [false, true] {
+        let mut scratch = SymmetricScratch::default();
+        scratch.prepare(
+            &options(TreeLearning::Symmetric),
+            0,
+            &[-3, -1, 0, 1],
+            &used,
+            &[64, 0, 128, 0, 64],
+            3,
+        );
+        assert_eq!(scratch.candidates.len(), 2);
+        assert_ne!(scratch.candidates[0].low_bin, scratch.candidates[1].low_bin);
+        assert_ne!(
+            scratch.candidates[0].high_bin,
+            scratch.candidates[1].high_bin
+        );
+        for candidate in &scratch.candidates {
+            assert_eq!((candidate.effective_low, candidate.effective_high), (0, 2));
+        }
+        let rows = if packed { 3 } else { used.len() };
+        let middle_row = if packed { mapping[2] } else { 2 };
+        let mut counts = vec![0; rows * 3];
+        counts[middle_row * 3..middle_row * 3 + 3].copy_from_slice(&[0, 64, 64]);
+        let base = scorer.estimate_bits(&[0, 64, 64], 128)
+            + DescriptionCost::Half.cost(&scorer, &[0, 64, 64], 128);
+        // A higher raw cost can win on penalty; a lower raw cost can lose.
+        // Exact ties must retain the earlier predictor in both duplicate intervals.
+        for (predictor, (extra, penalty, winner, winning_extra, winning_penalty)) in [
+            (17, 4.0, 0, 17, 4.0),
+            (18, 0.0, 1, 18, 0.0),
+            (16, 4.0, 1, 18, 0.0),
+            (18, 0.0, 1, 18, 0.0),
+            (15, 0.0, 4, 15, 0.0),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut extras = vec![0; rows];
+            extras[middle_row] = extra;
+            scratch.score_middle(
+                &scorer,
+                DescriptionCost::Half,
+                predictor,
+                penalty,
+                3,
+                &counts,
+                &extras,
+                3,
+                &used,
+                packed,
+                &mapping,
+            );
+            for candidate in &scratch.candidates {
+                assert_eq!(candidate.middle.bits, base + winning_extra as f32);
+                assert_eq!(candidate.middle.penalty, winning_penalty);
+                assert_eq!(candidate.middle.predictor, winner);
+            }
+        }
+    }
+}
+
+#[test]
+fn impossible_intervals_allow_binary_dominance_without_changing_candidates() {
+    let mut samples = fixture();
+    samples.thresholds[0] = vec![0, 1];
+    samples.residuals[0].fill(ResidualToken { token: 0, nbits: 0 });
+    samples.residuals[1] = samples.residuals[0].clone();
+    samples.residuals[2] = samples.residuals[0].clone();
+    let indices: Vec<_> = (0..192).collect();
+    let parents = parent_histograms(&samples, &indices);
+    let mut options = options(TreeLearning::Symmetric);
+    let mut baseline = None;
+    for dominance in [false, true] {
+        options.split_dominance = dominance;
+        let mut scratch = PropertyScratch::default();
+        let candidates = evaluate_property_cached(
+            &samples,
+            &indices,
+            &options,
+            &parents,
+            0,
+            192,
+            0,
+            None,
+            None,
+            &mut scratch,
+        )
+        .unwrap();
+        assert!(!scratch.symmetric.has_candidates());
+        assert_eq!(scratch.dominated_predictors, if dominance { 2 } else { 0 });
+        let binary: Vec<_> = candidates
+            .iter()
+            .map(|candidate| {
+                candidate.map(|split| {
+                    assert!(split.symmetric.is_none());
+                    (
+                        split.bin,
+                        split.bits,
+                        split.split_cost,
+                        split.below_predictor,
+                        split.above_predictor,
+                    )
+                })
+            })
+            .collect();
+        if let Some(expected) = &baseline {
+            assert_eq!(&binary, expected);
+        } else {
+            assert!(binary.iter().any(Option::is_some));
+            baseline = Some(binary);
+        }
+    }
+}
+
+#[test]
+fn symmetric_impossible_intervals_clear_reused_scratch() {
+    let options = options(TreeLearning::Symmetric);
+    let mut scratch = SymmetricScratch::default();
+    for (thresholds, used) in [
+        (vec![-1], vec![128, 128]),
+        (vec![0, 1], vec![64, 64, 64]),
+        (vec![-3, -1], vec![64, 64, 64]),
+        (vec![-1, 0], vec![63, 63, 63]),
+    ] {
+        scratch.prepare(&options, 0, &[-1, 0], &[64; 3], &[64; 3], 3);
+        assert!(scratch.has_candidates());
+        let weights: Vec<u32> = used.iter().map(|&n| n as u32).collect();
+        scratch.prepare(&options, 0, &thresholds, &used, &weights, 3);
+        assert!(!scratch.has_candidates());
+    }
+}

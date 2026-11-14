@@ -88,6 +88,12 @@ pub struct ScoringOptions {
 }
 
 impl ScoringOptions {
+    /// The PR5007 learner can add model description cost, but its interval
+    /// histograms do not implement the alternative entropy estimators.
+    pub(crate) fn description_only(self) -> bool {
+        !self.count_log && !self.fast_entropy && self.clipped == ClippedEntropyMode::Disabled
+    }
+
     pub fn apply(&self, options: &mut TrainOptions) {
         options.scoring = *self;
     }

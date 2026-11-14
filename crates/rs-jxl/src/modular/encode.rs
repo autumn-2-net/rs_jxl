@@ -51,7 +51,7 @@ pub struct ModularOptions {
     /// apply; this cannot increase an existing ceiling or limit fixed trees.
     pub ma_max_leaves: Option<usize>,
     pub split_threshold: f64,
-    /// PR5007 MA learning experiment, independent of effort and default off.
+    /// MA learner override; ordinary source e9 may select Symmetric automatically.
     pub tree_learning: ma_train::TreeLearning,
     pub tree_learning_receipt: Option<std::sync::Arc<ma_train::TreeLearningReceipt>>,
     pub entropy: Coding,
@@ -275,14 +275,14 @@ impl ModularOptions {
         if self.tree_learning.enabled()
             && (self.source_ma_seed.is_some()
                 || self.source_ma_search != Default::default()
-                || self.source_ma_scoring != Default::default()
+                || !self.source_ma_scoring.description_only()
                 || self.fast_context.is_some()
                 || self.block_context.is_some()
                 || self.custom_tree.is_some()
                 || self.fixed_tree.is_some())
         {
             return Err(Error::InvalidInput(
-                "PR5007 tree learning conflicts with fixed/seed trees or alternative split scoring/search".into(),
+                "PR5007 tree learning conflicts with fixed/seed trees or alternative split entropy/search; description cost is supported".into(),
             ));
         }
         if let Some(seed) = &self.source_ma_seed {

@@ -61,7 +61,7 @@ pub(crate) struct EncodeArgs {
     /// Experimental source policy: one native candidate at effort 1..=11
     #[arg(long, value_name = "N", conflicts_with = "manual_tools", value_parser = clap::value_parser!(u8).range(1..=11))]
     pub(crate) source_effort: Option<u8>,
-    /// Disable automatic e9 MA offsets/scoring; explicit refinements still apply.
+    /// Disable automatic e9 MA learner/offsets/scoring; explicit tools still apply.
     #[arg(long, requires = "source_effort")]
     pub(crate) no_source_ma_defaults: bool,
     /// Run native pixel search instead of just one source candidate

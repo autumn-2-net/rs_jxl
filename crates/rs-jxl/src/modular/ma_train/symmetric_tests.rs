@@ -126,6 +126,21 @@ fn symmetric_direct_train_commits_real_interval_and_cost_mode_stays_binary() {
 }
 
 #[test]
+fn symmetric_description_half_trains_serial_and_parallel() {
+    let (samples, mut options) = fixture([256; 3], 1);
+    options.scoring.description = DescriptionCost::Half;
+    for parallel in [false, true] {
+        options.parallel = parallel;
+        let receipt = Arc::new(TreeLearningReceipt::default());
+        options.tree_learning_receipt = Some(Arc::clone(&receipt));
+        let tree = train(&samples, &options).unwrap();
+        assert_regions(&tree, 0, 1);
+        assert_interval_boundaries(&tree, 0);
+        assert_eq!(receipt.snapshot().symmetric_splits, 1);
+    }
+}
+
+#[test]
 fn symmetric_distinct_gate_is_not_replaced_by_sample_weight() {
     for distinct in [false, true] {
         let (mut samples, mut options) = fixture([64; 3], 1);

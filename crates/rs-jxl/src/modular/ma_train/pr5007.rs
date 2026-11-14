@@ -7,7 +7,7 @@
 //! Original quantizer boundaries describe syntax; effective occupied bins
 //! describe histograms. In particular, never replace a gap boundary by its bin.
 
-use super::super::{ScoringOptions, SearchOptions, WP_PROPERTY, pack_signed};
+use super::super::{DescriptionCost, SearchOptions, WP_PROPERTY, pack_signed};
 use super::{Candidates, Cost, DefaultScorer, Split, SymmetricSplit, TrainOptions, keep_better};
 use crate::{Error, Result};
 
@@ -34,11 +34,10 @@ pub(in super::super) fn threshold(options: &TrainOptions) -> f32 {
 
 pub(in super::super) fn validate_options(options: &TrainOptions) -> Result<()> {
     if options.tree_learning.enabled()
-        && (options.search != SearchOptions::default()
-            || options.scoring != ScoringOptions::default())
+        && (options.search != SearchOptions::default() || !options.scoring.description_only())
     {
         return Err(Error::InvalidInput(
-            "PR5007 tree learning requires default MA search and scoring".into(),
+            "PR5007 tree learning requires default MA search/entropy; description cost is supported".into(),
         ));
     }
     Ok(())
@@ -78,6 +77,7 @@ struct TwoSidedCandidate {
     low_count: usize,
     below_count: usize,
     pixels_mid: u32,
+    single_middle_bin: bool,
     middle: Cost,
 }
 
@@ -111,6 +111,16 @@ impl SymmetricScratch {
             return;
         };
         let last = used.iter().rposition(|&n| n != 0).unwrap();
+        // An interval needs three occupied regions and a near-zero upper cut.
+        // Most descendants cannot have one; retain their binary fast paths.
+        if last <= first + 1
+            || thresholds[first] >= 0
+            || !thresholds[first + 1..last]
+                .iter()
+                .any(|&value| (0..=TWO_SIDED_MAX_D).contains(&value))
+        {
+            return;
+        }
         self.cumulative.clear();
         self.cumulative.resize(used.len(), 0);
         self.effective.clear();
@@ -128,6 +138,9 @@ impl SymmetricScratch {
         // These are DISTINCT prepared records, not weighted pixel counts.
         let min_required =
             TWO_SIDED_MIN_SAMPLES.max(TWO_SIDED_SAMPLES_PER_SYM.saturating_mul(global_max_symbols));
+        if count / 3 < min_required {
+            return;
+        }
         for high_bin in first..last {
             let d = thresholds[high_bin];
             if d < 0 {
@@ -174,6 +187,9 @@ impl SymmetricScratch {
                 low_count,
                 below_count,
                 pixels_mid: weights[effective_low + 1..=effective_high].iter().sum(),
+                single_middle_bin: used[effective_low + 1..effective_high]
+                    .iter()
+                    .all(|&n| n == 0),
                 middle: Cost::default(),
             });
         }
@@ -186,6 +202,7 @@ impl SymmetricScratch {
     pub(super) fn score_middle(
         &mut self,
         scorer: &DefaultScorer,
+        description: DescriptionCost,
         predictor: usize,
         penalty: f32,
         symbols: usize,
@@ -196,7 +213,30 @@ impl SymmetricScratch {
         packed: bool,
         property_bins: &[usize],
     ) {
-        for candidate in &mut self.candidates {
+        for index in 0..self.candidates.len() {
+            if index > 0 {
+                let previous = &self.candidates[index - 1];
+                let current = &self.candidates[index];
+                if (previous.effective_low, previous.effective_high)
+                    == (current.effective_low, current.effective_high)
+                {
+                    // Empty quantizer bins can give two syntax boundaries the
+                    // same population. Keep both split prices, score it once.
+                    self.candidates[index].middle = previous.middle;
+                    continue;
+                }
+            }
+            let candidate = &mut self.candidates[index];
+            if candidate.single_middle_bin {
+                let bin = candidate.effective_high;
+                let row = if packed { property_bins[bin] } else { bin };
+                let counts = &increase[row * stride..row * stride + symbols];
+                let bits = scorer.estimate_bits(counts, candidate.pixels_mid)
+                    + extra[row] as f32
+                    + description.cost(scorer, counts, candidate.pixels_mid);
+                super::update_cost(&mut candidate.middle, bits, penalty, predictor);
+                continue;
+            }
             self.middle_counts.clear();
             self.middle_counts.resize(symbols, 0);
             let mut extra_mid = 0u64;
@@ -216,8 +256,9 @@ impl SymmetricScratch {
                 }
                 extra_mid += extra[row];
             }
-            let bits =
-                scorer.estimate_bits(&self.middle_counts, candidate.pixels_mid) + extra_mid as f32;
+            let bits = scorer.estimate_bits(&self.middle_counts, candidate.pixels_mid)
+                + extra_mid as f32
+                + description.cost(scorer, &self.middle_counts, candidate.pixels_mid);
             super::update_cost(&mut candidate.middle, bits, penalty, predictor);
         }
     }

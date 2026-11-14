@@ -333,7 +333,7 @@ fn project_native_metadata(
         && requested.source_channel_tree == crate::modular::ma_train::ChannelTreeMode::Disabled
         && requested.source_ma_search == Default::default()
     {
-        use crate::modular::ma_train::DescriptionCost;
+        use crate::modular::ma_train::{DescriptionCost, TreeLearning};
         use crate::modular::refinement::{OffsetMode, OffsetOptions};
 
         options
@@ -346,6 +346,11 @@ fn project_native_metadata(
             });
         if requested.source_ma_scoring.description == DescriptionCost::Disabled {
             options.modular.source_ma_scoring.description = DescriptionCost::Half;
+        }
+        // Explicit alternative entropy estimators keep their existing learner.
+        // Symmetric includes description cost for all three child regions.
+        if requested.source_ma_scoring.description_only() {
+            options.modular.tree_learning = TreeLearning::Symmetric;
         }
     }
     // training::learn enables require_complete_search whenever sampling is

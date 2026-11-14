@@ -273,10 +273,10 @@ impl TrainOptions {
         if self.tree_learning.enabled()
             && (self.seed.is_some()
                 || self.search != SearchOptions::default()
-                || self.scoring != ScoringOptions::default())
+                || !self.scoring.description_only())
         {
             return Err(Error::InvalidInput(
-                "PR5007 tree learning requires default split search/scoring and no seed".into(),
+                "PR5007 tree learning requires default split search/entropy and no seed; description cost is supported".into(),
             ));
         }
         if let Some(seed) = &self.seed {

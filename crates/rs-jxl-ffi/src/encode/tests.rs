@@ -8,7 +8,7 @@ use std::time::Duration;
 #[test]
 fn source_ma_defaults_reaches_pixel_projection_without_changing_effort_defaults() {
     use crate::request::Options;
-    use rs_jxl::modular::ma_train::DescriptionCost;
+    use rs_jxl::modular::ma_train::{DescriptionCost, TreeLearning};
     use rs_jxl::modular::refinement::OffsetMode;
     use rs_jxl::{Image, PixelData, PixelLayout};
 
@@ -24,12 +24,14 @@ fn source_ma_defaults_reaches_pixel_projection_without_changing_effort_defaults(
         assert_eq!(base.modular.source_ma_defaults, setting.unwrap_or(true));
         let projected = super::pixel_options(&image, &options).unwrap();
         if setting == Some(false) {
+            assert_eq!(projected.modular.tree_learning, TreeLearning::Legacy);
             assert!(projected.modular.refinement.offsets.is_none());
             assert_eq!(
                 projected.modular.source_ma_scoring.description,
                 DescriptionCost::Disabled
             );
         } else {
+            assert_eq!(projected.modular.tree_learning, TreeLearning::Symmetric);
             assert_eq!(
                 projected.modular.refinement.offsets.unwrap().mode,
                 OffsetMode::DistributionSinglePass

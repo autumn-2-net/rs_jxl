@@ -2,11 +2,13 @@
 
 ## Scope
 
-The ordinary source-policy **effort 9** pixel encoder enables both:
+The ordinary source-policy **effort 9** pixel encoder enables:
 
 - `DescriptionCost::Half` during MA split selection.
 - `OffsetMode::DistributionSinglePass` after tree learning, before LZ77 and
   entropy coding.
+- `TreeLearning::Symmetric`, added after the initial measurements below; see
+  [the combined-profile experiment](SYMMETRIC_MA_DEFAULT_20261114.md).
 
 This does not change the default public effort (7), other effort mappings,
 JPEG coefficient transcoding, the decoder or the JXL format. Automatic settings
@@ -74,9 +76,13 @@ offset application must not fabricate either kind of measured gain.
 `DescriptionCost::Disabled` is not presence-aware in the Rust scoring struct;
 use `source_ma_defaults=false` to keep it explicitly disabled at e9. Half is a
 model-description penalty weight, not half precision, half the tree, or half
-effort.
+effort. Explicit alternative entropy estimators retain their original learner
+instead of automatically enabling Symmetric with an unsupported combination.
 
 ## Measurement
+
+These initial measurements predate the addition of Symmetric to source e9.
+The linked combined-profile report measures that addition separately.
 
 `tools/benchmark_offset_single_pass.py` consumes an explicit original-image
 manifest, alternates profile order deterministically, freezes the encoder,

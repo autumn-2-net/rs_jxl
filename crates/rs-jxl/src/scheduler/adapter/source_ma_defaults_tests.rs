@@ -14,7 +14,7 @@ fn project(effort: u8, base: &EncodeOptions) -> EncodeOptions {
 }
 
 #[test]
-fn ordinary_e9_alone_gets_single_pass_offsets_and_half_description() {
+fn ordinary_e9_alone_gets_symmetric_half_and_single_pass_offsets() {
     let base = EncodeOptions::default();
     assert!(base.modular.source_ma_defaults);
     assert!(base.modular.refinement.offsets.is_none());
@@ -22,6 +22,7 @@ fn ordinary_e9_alone_gets_single_pass_offsets_and_half_description() {
     for effort in [8, 9, 10] {
         let options = project(effort, &base);
         if effort == 9 {
+            assert_eq!(options.modular.tree_learning, TreeLearning::Symmetric);
             assert_eq!(
                 options.modular.refinement.offsets.unwrap().mode,
                 OffsetMode::DistributionSinglePass
@@ -31,6 +32,7 @@ fn ordinary_e9_alone_gets_single_pass_offsets_and_half_description() {
                 DescriptionCost::Half
             );
         } else {
+            assert_eq!(options.modular.tree_learning, TreeLearning::Legacy);
             assert!(options.modular.refinement.offsets.is_none());
             assert_eq!(options.modular.source_ma_scoring, ScoringOptions::default());
         }
@@ -39,6 +41,7 @@ fn ordinary_e9_alone_gets_single_pass_offsets_and_half_description() {
     disabled.modular.source_ma_defaults = false;
     let options = project(9, &disabled);
     assert!(!options.modular.source_ma_defaults);
+    assert_eq!(options.modular.tree_learning, TreeLearning::Legacy);
     assert!(options.modular.refinement.offsets.is_none());
     assert_eq!(options.modular.source_ma_scoring, ScoringOptions::default());
 }
@@ -68,6 +71,8 @@ fn explicit_offsets_and_scoring_survive_defaults_and_opt_out() {
                     ..Default::default()
                 };
                 let options = project(9, &base);
+                assert_eq!(options.modular.tree_learning, TreeLearning::Legacy);
+                options.modular.validate().unwrap();
                 let offsets = options.modular.refinement.offsets.unwrap();
                 assert_eq!(offsets.mode, mode);
                 assert_eq!(offsets.samples_per_leaf, 37);
@@ -85,6 +90,7 @@ fn automatic_profile_fills_each_missing_setting_independently() {
     let mut base = EncodeOptions::default();
     base.modular.source_ma_scoring.description = DescriptionCost::Full;
     let options = project(9, &base);
+    assert_eq!(options.modular.tree_learning, TreeLearning::Symmetric);
     assert_eq!(
         options.modular.source_ma_scoring.description,
         DescriptionCost::Full
@@ -101,6 +107,8 @@ fn automatic_profile_fills_each_missing_setting_independently() {
     base.modular.refinement.offsets = Some(OffsetOptions::default());
     let options = project(9, &base);
     assert!(options.modular.source_ma_scoring.count_log);
+    assert_eq!(options.modular.tree_learning, TreeLearning::Legacy);
+    options.modular.validate().unwrap();
     assert_eq!(
         options.modular.source_ma_scoring.description,
         DescriptionCost::Half
@@ -164,6 +172,7 @@ fn patch_reference_helpers_keep_main_profile_policy_and_explicit_settings() {
                 .as_ref()
                 .map(|offsets| (offsets.mode, offsets.samples_per_leaf)),
             options.source_ma_scoring,
+            options.tree_learning,
         )
     };
     for effort in [8, 9, 10] {

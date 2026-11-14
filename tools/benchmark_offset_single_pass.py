@@ -3,6 +3,8 @@
 Input is a manifest with a cases list containing source and cohort fields.
 Original samples, including hidden RGB, are compared with an official decoder.
 Encoded images are temporary; timings are native-call times, not CLI or IO.
+The current default may include additional tools beyond explicit MA profiles;
+compare their measurements, not equality of their compressed outputs.
 """
 import argparse
 from collections import defaultdict
@@ -109,7 +111,6 @@ def main():
                             raise ValueError(f"Input changed: {case['source']} {key}")
                     order = args.profiles.copy()
                     random.Random(20261114 + index).shuffle(order)
-                    measured = {}
                     for profile in order:
                         output, decoded = folder/(profile+".jxl"), folder/(profile+".png")
                         command = [str(binary), str(snapshot), "--output", str(output),
@@ -137,14 +138,10 @@ def main():
                         check_process(dec)
                         compare_pixels(expected, png_samples(decoded.read_bytes()))
                         row.update(case=case, profile=profile, verified=True)
-                        measured[profile] = row
                         journal.write(json.dumps(row)+"\n")
                         journal.flush()
                         records.append(row)
                         print(f"[{index+1}/{len(cases)}] {profile:17} {row['bytes']:10} {row['seconds']:.3f}s {Path(case['source']).name}", flush=True)
-                    if "default" in measured and "half-single-pass" in measured:
-                        if measured["default"]["bytes"] != measured["half-single-pass"]["bytes"]:
-                            raise ValueError("Default and explicit profile differ in size")
                 (args.out/"summary.json").write_text(json.dumps(summarize(records), indent=2), encoding="utf-8")
     print(json.dumps(summarize(records), indent=2))
 

@@ -128,15 +128,17 @@ its candidates cannot guarantee them. ma_max_leaves is an explicit resource
 ceiling, not an implicit quality reduction. Raw cjxl flags and numeric libjxl
 frame-setting IDs are not forwarded to another encoder.
 
-At effort 9, the ordinary learned-tree pixel route now defaults to Half
-description-cost scoring plus single-pass Distribution leaf offsets. Offset
-decisions precede LZ77 and entropy coding; they do not encode a second version
+At effort 9, the ordinary learned-tree pixel route now defaults to Symmetric
+MA learning, Half description-cost scoring and single-pass Distribution leaf
+offsets. Offset decisions precede LZ77 and entropy coding; they do not encode a second version
 to reject size regressions. This remains pixel-lossless, but individual files
 can grow. Other efforts and JPEG byte transcoding are unchanged. Public pixel
 effort defaults remain 7. Use `source_ma_defaults=False` (also accepted inside
-`encoder_options`) to restore the prior e9 policy. This switch is supported for
-pixel still/multiframe/layer encoding, including still source search; JPEG
-byte transcoding rejects it. See [single-pass MA](MA_SINGLE_PASS_DEFAULT_20261114.md).
+`encoder_options`) to disable all three automatic additions and restore the
+pre-profile e9 policy. This switch is supported for pixel still/multiframe/layer
+encoding, including still source search; JPEG byte transcoding rejects it.
+See [single-pass MA](MA_SINGLE_PASS_DEFAULT_20261114.md) and
+[combined Symmetric defaults](SYMMETRIC_MA_DEFAULT_20261114.md).
 
 ## Reports
 

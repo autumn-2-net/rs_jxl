@@ -2,11 +2,31 @@
 //! Candidate probe_seconds sum elapsed probe work, which can overlap across
 //! concurrent roots; scout_seconds measures wall time, not that sum.
 use clap::{Parser, ValueEnum};
-use rs_jxl::modular::{ma_train::DescriptionCost, refinement};
+use rs_jxl::modular::{
+    ma_train::{DescriptionCost, TreeLearning, TreeLearningReceipt},
+    refinement,
+};
 use rs_jxl::scheduler::portfolio::{self, ALL, Candidate, Options};
 use std::{fs, io::Write, path::PathBuf, sync::Arc, time::Instant};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum DirectTreeLearning {
+    Legacy,
+    Cost,
+    Symmetric,
+}
+
+impl From<DirectTreeLearning> for TreeLearning {
+    fn from(value: DirectTreeLearning) -> Self {
+        match value {
+            DirectTreeLearning::Legacy => Self::Legacy,
+            DirectTreeLearning::Cost => Self::Cost,
+            DirectTreeLearning::Symmetric => Self::Symmetric,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum DirectMaProfile {
@@ -83,6 +103,9 @@ struct Args {
     /// Override MA defaults for a direct benchmark only, without changing recipes.
     #[arg(long, value_enum, requires = "direct_candidate", conflicts_with_all = ["plan_only", "list_candidates"])]
     direct_ma_profile: Option<DirectMaProfile>,
+    /// Override tree learning independently of the direct MA profile.
+    #[arg(long, value_enum, requires = "direct_candidate", conflicts_with_all = ["plan_only", "list_candidates"])]
+    direct_tree_learning: Option<DirectTreeLearning>,
     #[arg(long, conflicts_with = "output")]
     plan_only: bool,
     #[arg(long, conflicts_with_all = ["output", "input"])]
@@ -109,10 +132,19 @@ fn encode_direct(args: &Args, image: &rs_jxl::Image, recipe: Candidate) -> Resul
     if let Some(profile) = args.direct_ma_profile {
         profile.configure(&mut configured);
     }
+    if let Some(mode) = args.direct_tree_learning {
+        configured.modular.tree_learning = mode.into();
+        if let Some(reference) = &mut configured.source_patch_reference {
+            reference.modular.tree_learning = mode.into();
+        }
+    }
     let receipt = Arc::new(refinement::Receipt::default());
+    let learning_receipt = Arc::new(TreeLearningReceipt::default());
     configured.modular.refinement.receipt = Some(Arc::clone(&receipt));
+    configured.modular.tree_learning_receipt = Some(Arc::clone(&learning_receipt));
     if let Some(reference) = &mut configured.source_patch_reference {
         reference.modular.refinement.receipt = Some(Arc::clone(&receipt));
+        reference.modular.tree_learning_receipt = Some(Arc::clone(&learning_receipt));
     }
     let bytes = rs_jxl::encode(image, &configured)?;
     let seconds = start.elapsed().as_secs_f64();
@@ -126,6 +158,12 @@ fn encode_direct(args: &Args, image: &rs_jxl::Image, recipe: Candidate) -> Resul
         .write_all(&bytes)?;
     let pixels = f64::from(image.width()) * f64::from(image.height());
     let work = receipt.snapshot();
+    let learning = learning_receipt.snapshot();
+    let learning_mode = match configured.modular.tree_learning {
+        TreeLearning::Legacy => "legacy",
+        TreeLearning::Cost => "cost",
+        TreeLearning::Symmetric => "symmetric",
+    };
     let offset_mode = configured
         .modular
         .refinement
@@ -176,6 +214,12 @@ fn encode_direct(args: &Args, image: &rs_jxl::Image, recipe: Candidate) -> Resul
             "seconds": seconds, "mpix_per_second": pixels / 1e6 / seconds,
             "encode_calls": 1, "preparation_cache_bytes": 0,
             "direct_ma_profile": actual_profile,
+            "direct_tree_learning": learning_mode,
+            "tree_learning": {
+                "learners": learning.learners, "records": learning.records,
+                "cost_splits": learning.cost_splits,
+                "symmetric_splits": learning.symmetric_splits,
+            },
             "source_ma_defaults": configured.modular.source_ma_defaults,
             "description_cost": format!("{:?}", configured.modular.source_ma_scoring.description),
             "refinement": refinement,
@@ -422,6 +466,51 @@ mod tests {
                 offsets
             );
         }
+    }
+
+    #[test]
+    fn direct_tree_learning_requires_direct_and_combines_with_ma_profiles() {
+        for (name, expected) in [
+            ("legacy", DirectTreeLearning::Legacy),
+            ("cost", DirectTreeLearning::Cost),
+            ("symmetric", DirectTreeLearning::Symmetric),
+        ] {
+            let base = ["lab", "input.png", "--direct-tree-learning", name];
+            assert!(Args::try_parse_from(base.into_iter().chain(["--output", "out.jxl"])).is_err());
+            assert!(Args::try_parse_from(base.into_iter().chain(["--plan-only"])).is_err());
+            for profile in [
+                "legacy",
+                "half",
+                "checked",
+                "half-checked",
+                "single-pass",
+                "half-single-pass",
+            ] {
+                let args = Args::try_parse_from(base.into_iter().chain([
+                    "--direct-candidate",
+                    "baseline",
+                    "--output",
+                    "out.jxl",
+                    "--direct-ma-profile",
+                    profile,
+                ]))
+                .unwrap();
+                assert_eq!(args.direct_tree_learning, Some(expected));
+            }
+        }
+        assert!(
+            Args::try_parse_from([
+                "lab",
+                "input.png",
+                "--direct-candidate",
+                "baseline",
+                "--output",
+                "out.jxl",
+                "--direct-tree-learning",
+                "unknown",
+            ])
+            .is_err()
+        );
     }
 
     #[test]

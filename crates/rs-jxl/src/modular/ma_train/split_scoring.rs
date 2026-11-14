@@ -275,7 +275,7 @@ pub(super) fn evaluate_property_values<T: PropertyValue>(
     let coarsened = coarse_rows.is_some();
     drop(_prep_binning_scope);
     let _binning_scope = coarsened.then(|| crate::profile::scope("ma.adaptive_histogram"));
-    if !options.tree_learning.symmetric()
+    if !scratch.symmetric.has_candidates()
         && !coarsened
         && ma_events::eligible(
             options,
@@ -598,7 +598,7 @@ pub(super) fn evaluate_property_values<T: PropertyValue>(
             // it is local to this node and must not be inherited by children.
             let _pred_setup_scope = histogram_detail_scope("ma.pred_setup");
             if options.split_dominance
-                && !options.tree_learning.symmetric()
+                && !scratch.symmetric.has_candidates()
                 && total <= 256
                 && options.scoring == ScoringOptions::default()
                 && options.search == SearchOptions::default()
@@ -639,6 +639,7 @@ pub(super) fn evaluate_property_values<T: PropertyValue>(
             let _score_middle_scope = histogram_detail_scope("ma.score_middle");
             scratch.symmetric.score_middle(
                 &scorer,
+                options.scoring.description,
                 predictor,
                 penalty,
                 symbols,
@@ -771,7 +772,12 @@ pub(super) fn evaluate_property_values<T: PropertyValue>(
             samples.global_max_symbols,
             below_costs,
             above_costs,
-            scorer.estimate_bits(&parent.counts, total) + parent.extra_bits as f32,
+            scorer.estimate_bits(&parent.counts, total)
+                + parent.extra_bits as f32
+                + options
+                    .scoring
+                    .description
+                    .cost(&scorer, &parent.counts, total),
             total,
             &mut result,
         );

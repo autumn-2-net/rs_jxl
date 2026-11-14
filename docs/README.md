@@ -208,6 +208,7 @@ rejected experiments and remaining limitations remain part of the record.
 - [Source Patch and full-pipeline hotspots on 50 images, 2026-11-13](SOURCE_PATCH_STAGE_PROFILE_20261113.md)
 - [Patch, cross-channel MA and Offset reuse follow-up, 2026-11-13](PATCH_MA_OFFSET_FOLLOWUP_20261113.md)
 - [Single-pass MA offsets and Half e9 defaults, 2026-11-14](MA_SINGLE_PASS_DEFAULT_20261114.md)
+- [Symmetric MA with Half and single-pass offsets, 2026-11-14](SYMMETRIC_MA_DEFAULT_20261114.md)
 
 ### Decoding and Reconstruction
 

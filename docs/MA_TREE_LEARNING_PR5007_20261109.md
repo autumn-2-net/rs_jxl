@@ -58,11 +58,18 @@ are not falsely represented as a single interval; its property cache is dropped.
 
 Property-partition equivalence no longer proves identical syntax cost, so that
 optional pruning is disabled for the experiment. Binary predictor-dominance and
-event-sweep shortcuts cannot prove a middle-interval winner and are not used for
-`Symmetric`. Existing predictor-equivalence proofs remain valid.
-Alternative split-scoring/search experiments and seeded/fixed trees are rejected
-when requested together. No effort tier silently enables this mode. Efforts
+event-sweep shortcuts cannot prove a middle-interval winner. Since 2026-11-14,
+they remain available when interval preparation proves there is no eligible
+middle interval in this node/property. Existing predictor-equivalence proofs
+remain valid.
+Description cost can now compose with both learners; all three child regions
+and the parent include the selected description weight. Other alternative
+entropy/search experiments and seeded/fixed trees remain rejected. Efforts
 whose source route is a fixed tree are outside this learner experiment.
+
+See [the combined-profile experiment](SYMMETRIC_MA_DEFAULT_20261114.md) for the
+comparison with Half plus single-pass Distribution Offset. The results below
+are the original experiment, not measurements against that newer default.
 
 ## Running
 
