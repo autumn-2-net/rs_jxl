@@ -55,7 +55,9 @@ pub struct ModularOptions {
     pub tree_learning: ma_train::TreeLearning,
     pub tree_learning_receipt: Option<std::sync::Arc<ma_train::TreeLearningReceipt>>,
     pub entropy: Coding,
-    /// Explicit post-training experiments; never enabled by effort alone.
+    /// Source e9 ordinary learned-tree defaults; false preserves explicit tools only.
+    pub source_ma_defaults: bool,
+    /// Post-training tools; source projection may supply e9 defaults when enabled.
     pub refinement: super::refinement::Options,
     pub lz77: bool,
     pub lz77_mode: lz77::Lz77Mode,
@@ -80,7 +82,7 @@ pub struct ModularOptions {
     pub source_ma_dominance: bool,
     /// Explicit source histogram-layout experiments; default leaves them off.
     pub source_ma_histograms: ma_train::HistogramOptions,
-    /// Optional source entropy/description-cost experiments; off by default.
+    /// Source scoring overrides; source projection may supply e9 description cost.
     pub source_ma_scoring: ma_train::ScoringOptions,
     /// Optional source statistical/quantile split proposals; off by default.
     pub source_ma_search: ma_train::SearchOptions,
@@ -151,6 +153,7 @@ impl Default for ModularOptions {
             tree_learning: Default::default(),
             tree_learning_receipt: None,
             entropy: Coding::Auto,
+            source_ma_defaults: true,
             refinement: Default::default(),
             lz77: true,
             lz77_mode: lz77::Lz77Mode::Lazy,

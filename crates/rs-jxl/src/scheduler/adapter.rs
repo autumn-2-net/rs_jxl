@@ -316,6 +316,38 @@ fn project_native_metadata(
     if options.modular.fast_context.is_some() || options.modular.source_ma_seed.is_some() {
         options.modular.fixed_tree = None;
     }
+    // Native e9 defaults only: explicit tree plans and alternative learners keep
+    // their own policy, including plans cleared by source projection above.
+    let requested = &base.modular;
+    if requested.source_ma_defaults
+        && speed_tier == 1
+        && requested.fixed_tree.is_none()
+        && requested.custom_tree.is_none()
+        && requested.fast_context.is_none()
+        && requested.block_context.is_none()
+        && requested.source_ma_seed.is_none()
+        && requested.source_ma_lookahead.is_none()
+        && !requested.tree_learning.enabled()
+        && requested.tree_groups.is_none()
+        && requested.tree_group_splits.is_empty()
+        && requested.source_channel_tree == crate::modular::ma_train::ChannelTreeMode::Disabled
+        && requested.source_ma_search == Default::default()
+    {
+        use crate::modular::ma_train::DescriptionCost;
+        use crate::modular::refinement::{OffsetMode, OffsetOptions};
+
+        options
+            .modular
+            .refinement
+            .offsets
+            .get_or_insert_with(|| OffsetOptions {
+                mode: OffsetMode::DistributionSinglePass,
+                ..Default::default()
+            });
+        if requested.source_ma_scoring.description == DescriptionCost::Disabled {
+            options.modular.source_ma_scoring.description = DescriptionCost::Half;
+        }
+    }
     // training::learn enables require_complete_search whenever sampling is
     // Some. Budget exhaustion with beneficial splits errors, never truncates.
     options.modular.max_tree_leaves = resources.max_tree_leaves;
@@ -556,3 +588,6 @@ mod direct_input_tests;
 
 #[cfg(test)]
 mod responsive_tests;
+
+#[cfg(test)]
+mod source_ma_defaults_tests;

@@ -41,6 +41,7 @@ fn candidate(options: &Options) -> Result<(CandidateParams, EncodeOptions)> {
         ..Default::default()
     };
     base.modular.ma_max_leaves = options.ma_max_leaves;
+    base.modular.source_ma_defaults = options.source_ma_defaults.unwrap_or(true);
     Ok((params, base))
 }
 

@@ -98,6 +98,11 @@ pub(super) fn encode_prepared_shared_borrowed_trial(
     if options.refinement.enabled() {
         let cache_raw = options.lz77 && super::refinement::reuse_literals(&tree, options);
         let raw_cache = super::refinement::LiteralCache::default();
+        if super::refinement::single_pass(options)
+            && super::refinement::reuse_literals(&tree, options)
+        {
+            *raw_cache.borrow_mut() = Some(shared_raw(&prepared, &tree, options)?);
+        }
         let raw_reused = std::cell::Cell::new(0usize);
         let (global, encoded) = super::refinement::choose(
             Some(&raw_cache),
@@ -105,29 +110,17 @@ pub(super) fn encode_prepared_shared_borrowed_trial(
             &views,
             options,
             |candidate| {
-                if cache_raw && std::ptr::eq(candidate, &tree) {
-                    let parallel_channels = super::tokens::shared_channel_parallel(
-                        prepared.iter().copied(),
-                        options.parallel_tokens,
-                    )?;
-                    let tokenize = |g: &Prepared| {
-                        super::tokens::tokenize(
-                            &g.planes,
-                            candidate,
-                            &g.wp,
-                            options.previous_channels,
-                            g.stream_id,
-                            parallel_channels,
-                        )
-                    };
-                    let raw = if parallel_channels {
-                        prepared
-                            .iter()
-                            .map(|g| tokenize(g))
-                            .collect::<Result<Vec<_>>>()?
-                    } else {
-                        execution::try_map(&prepared, |_, g| tokenize(g))?
-                    };
+                if super::refinement::single_pass(options)
+                    && let Some(mut raw) = raw_cache.borrow_mut().take()
+                    && let Some(count) =
+                        super::leaf_offset::remap_literals(&tree, candidate, &mut raw)?
+                {
+                    let parsed = parse_shared_raw(&prepared, candidate, options, &raw)?;
+                    raw_reused.set(raw_reused.get() + count);
+                    return Ok(parsed);
+                }
+                if cache_raw && std::ptr::eq(candidate, &tree) && raw_cache.borrow().is_none() {
+                    let raw = shared_raw(&prepared, candidate, options)?;
                     let parsed = parse_shared_raw(&prepared, candidate, options, &raw)?;
                     *raw_cache.borrow_mut() = Some(raw);
                     return Ok(parsed);
@@ -191,6 +184,30 @@ pub(super) fn encode_prepared_shared_borrowed_trial(
     )
 }
 
+fn shared_raw(
+    prepared: &[&Prepared],
+    tree: &super::tree::Tree,
+    options: &ModularOptions,
+) -> Result<Vec<Vec<crate::tools::lz77::Literal>>> {
+    let parallel_channels =
+        super::tokens::shared_channel_parallel(prepared.iter().copied(), options.parallel_tokens)?;
+    let tokenize = |g: &Prepared| {
+        super::tokens::tokenize(
+            &g.planes,
+            tree,
+            &g.wp,
+            options.previous_channels,
+            g.stream_id,
+            parallel_channels,
+        )
+    };
+    if parallel_channels {
+        prepared.iter().map(|g| tokenize(g)).collect()
+    } else {
+        execution::try_map(prepared, |_, g| tokenize(g))
+    }
+}
+
 fn shared_streams(
     prepared: &[&Prepared],
     tree: &super::tree::Tree,
@@ -199,24 +216,7 @@ fn shared_streams(
     let parallel_channels =
         super::tokens::shared_channel_parallel(prepared.iter().copied(), options.parallel_tokens)?;
     let streams = if options.lz77 && options.source_lz77.is_some() {
-        let tokenize = |g: &Prepared| {
-            super::tokens::tokenize(
-                &g.planes,
-                tree,
-                &g.wp,
-                options.previous_channels,
-                g.stream_id,
-                parallel_channels,
-            )
-        };
-        let raw = if parallel_channels {
-            prepared
-                .iter()
-                .map(|g| tokenize(g))
-                .collect::<Result<Vec<_>>>()?
-        } else {
-            execution::try_map(prepared, |_, g| tokenize(g))?
-        };
+        let raw = shared_raw(prepared, tree, options)?;
         return parse_shared_raw(prepared, tree, options, &raw);
     } else {
         let encode = |g: &Prepared| {

@@ -109,7 +109,8 @@ scheduler (e11 tournament). Same effort does not promise C++ size/speed parity.
 threads=0 explicitly selects CPU count capped at 256; threads=1 is serial.
 
 encoder_options={...} or keyword arguments accept group_size_shift, rct,
-predictor, palette_colors, patches, learning_fraction and ma_max_leaves.
+predictor, palette_colors, patches, learning_fraction, ma_max_leaves and
+source_ma_defaults.
 Aliases modular_group_size/modular_colorspace/modular_predictor/
 modular_palette_colors map to the first four respectively. iterations and
 modular_ma_tree_learning_percent map to learning_fraction=percent/100.
@@ -126,6 +127,16 @@ Duplicate controls fail. source_search rejects explicit tool overrides because
 its candidates cannot guarantee them. ma_max_leaves is an explicit resource
 ceiling, not an implicit quality reduction. Raw cjxl flags and numeric libjxl
 frame-setting IDs are not forwarded to another encoder.
+
+At effort 9, the ordinary learned-tree pixel route now defaults to Half
+description-cost scoring plus single-pass Distribution leaf offsets. Offset
+decisions precede LZ77 and entropy coding; they do not encode a second version
+to reject size regressions. This remains pixel-lossless, but individual files
+can grow. Other efforts and JPEG byte transcoding are unchanged. Public pixel
+effort defaults remain 7. Use `source_ma_defaults=False` (also accepted inside
+`encoder_options`) to restore the prior e9 policy. This switch is supported for
+pixel still/multiframe/layer encoding, including still source search; JPEG
+byte transcoding rejects it. See [single-pass MA](MA_SINGLE_PASS_DEFAULT_20261114.md).
 
 ## Reports
 

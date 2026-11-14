@@ -3,6 +3,71 @@ use rs_jxl::multiframe::Reference;
 use serde_json::json;
 
 #[test]
+fn source_ma_defaults_is_presence_aware_and_pixel_only() {
+    for operation in ["encode", "encode_multiframe", "encode_layers"] {
+        for setting in [None, Some(false), Some(true)] {
+            let mut options = json!({});
+            if let Some(value) = setting {
+                options["source_ma_defaults"] = json!(value);
+            }
+            let request: Request = serde_json::from_value(json!({
+                "operation": operation,
+                "images": [{"length": 0}],
+                "options": options,
+            }))
+            .unwrap();
+            request.validate().unwrap();
+            assert_eq!(request.options.source_ma_defaults, setting);
+        }
+    }
+    for operation in ["transcode_jpeg", "reconstruct_jpeg", "decode", "info"] {
+        for value in [false, true] {
+            let request: Request = serde_json::from_value(json!({
+                "operation": operation,
+                "options": {"source_ma_defaults": value},
+            }))
+            .unwrap();
+            assert!(
+                request
+                    .validate()
+                    .unwrap_err()
+                    .message
+                    .starts_with("option source_ma_defaults is unsupported")
+            );
+        }
+    }
+    for value in [false, true] {
+        let request: Request = serde_json::from_value(json!({
+            "operation": "encode",
+            "images": [{"length": 0}],
+            "options": {"source_ma_defaults": value, "source_search": true},
+        }))
+        .unwrap();
+        request.validate().unwrap();
+    }
+}
+
+#[test]
+fn source_ma_defaults_rejects_null_wrong_types_and_duplicates() {
+    for value in [json!(null), json!(0), json!("false"), json!([]), json!({})] {
+        assert!(
+            serde_json::from_value::<Request>(json!({
+                "operation": "encode",
+                "images": [{"length": 0}],
+                "options": {"source_ma_defaults": value},
+            }))
+            .is_err()
+        );
+    }
+    assert!(
+        serde_json::from_str::<Request>(
+            r#"{"operation":"encode","options":{"source_ma_defaults":false,"source_ma_defaults":true}}"#
+        )
+        .is_err()
+    );
+}
+
+#[test]
 fn legacy_gradient_is_explicit_and_projects_to_native_decode_options() {
     for operation in ["decode", "decode_to_png"] {
         for (wire, expected) in [

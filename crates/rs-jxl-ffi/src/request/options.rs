@@ -9,6 +9,8 @@ pub struct Options {
     pub threads: Option<usize>,
     pub effort: Option<u8>,
     pub source_search: Option<bool>,
+    #[serde(deserialize_with = "present_bool")]
+    pub source_ma_defaults: Option<bool>,
     pub strip_metadata: Option<bool>,
     pub group_size_shift: Option<u8>,
     pub rct: Option<u32>,

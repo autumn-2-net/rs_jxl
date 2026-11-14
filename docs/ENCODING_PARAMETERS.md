@@ -37,6 +37,7 @@ CLI 有一个重要区别：`rs-jxl encode input.jpg ...` 是像素路径；JPEG
 | `lossless_jpeg` | **True**，仅 `encode` | 控制 JPEG 编码输入是字节转码还是先解码再像素无损 |
 | `source_search` | **False**，用于单图或 JPEG 转码 | 额外的候选调度搜索；不等于多帧 `strategy="auto"` |
 | `encoder_options` | **None** | 像素工具的字典，键名用下节的 Rust 名称；不是任意透传通道 |
+| `source_ma_defaults` | **True**，像素编码 | e9 常规学习树默认叠加 Half 描述成本与单次 Distribution Offset；False 恢复旧策略，不影响其他 effort 和显式 Rust 设置。允许与像素 source_search 同用；JPEG 字节转码不接受此参数 |
 | `return_info` | **False** | True 返回 `(output_result, metadata)`；不同入口的报告结构不同 |
 | `strip_metadata` | **False**，像素路径 | 允许丢弃不支持的输入附加元数据；支持的色彩元数据仍保留，不是无条件删去 ICC |
 | `borrow_inputs` | **False**，像素/多帧/layers 接口 | 可选借用适合的连续缓冲区；不是端到端零复制，期间调用者不得修改输入及别名 |

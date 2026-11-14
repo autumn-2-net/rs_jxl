@@ -49,6 +49,7 @@ fn source_overrides_reach_the_typed_job_without_enabling_search() {
 #[test]
 fn source_override_flags_require_source_mode_and_validate_ranges() {
     for flags in [
+        vec!["--no-source-ma-defaults"],
         vec!["--source-group-size-shift", "2"],
         vec!["--source-max-properties", "2"],
         vec!["--source-prev-props", "1"],
@@ -87,6 +88,27 @@ fn source_override_flags_require_source_mode_and_validate_ranges() {
             .is_err()
         );
     }
+}
+
+#[test]
+fn source_ma_defaults_opt_out_keeps_explicit_refinements_and_search() {
+    assert!(args(&[]).job().unwrap().options.modular.source_ma_defaults);
+    let job = args(&[
+        "--no-source-ma-defaults",
+        "--source-refine-offsets",
+        "--source-search",
+    ])
+    .job()
+    .unwrap();
+    assert!(!job.options.modular.source_ma_defaults);
+    assert_eq!(
+        job.options.modular.refinement.offsets.unwrap().mode,
+        rs_jxl::modular::refinement::OffsetMode::Entropy
+    );
+    assert!(matches!(
+        job.source.unwrap().search,
+        rs_jxl::codec::SourceSearch::Auto
+    ));
 }
 
 #[test]

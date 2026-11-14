@@ -1,6 +1,6 @@
 //! Static leaf bias proposals, not a new predictor or decoder-side adaptation.
-//! A sampled HybridUint estimate ranks proposals; refinement::choose is the
-//! authority and compares actual serialized tree/model/residual costs.
+//! Sampled HybridUint costs rank offsets. Checked modes compare serialized
+//! output; DistributionSinglePass applies the proposal before LZ/entropy coding.
 
 use std::collections::VecDeque;
 
@@ -24,6 +24,14 @@ pub enum OffsetMode {
     /// Broader sample-distribution proposals using the baseline literal mapping.
     /// Can refit existing unit-multiplier offsets, including shallow MA plans.
     Distribution,
+    /// Fit before LZ parsing, without encoding a baseline or size fallback.
+    DistributionSinglePass,
+}
+
+impl OffsetMode {
+    pub(crate) fn is_distribution(self) -> bool {
+        matches!(self, Self::Distribution | Self::DistributionSinglePass)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -137,7 +145,7 @@ impl Samples {
         match mode {
             OffsetMode::Mean => result.push(mean),
             OffsetMode::Median => result.push(median),
-            OffsetMode::Entropy | OffsetMode::Distribution => {
+            OffsetMode::Entropy | OffsetMode::Distribution | OffsetMode::DistributionSinglePass => {
                 for center in [mean, median] {
                     for delta in [0, -1, 1, -2, 2] {
                         if let Some(offset) = center.checked_add(delta) {
@@ -240,7 +248,7 @@ pub(super) fn fit_with_configs(
             },
         )?;
     }
-    if options.mode == OffsetMode::Distribution {
+    if options.mode.is_distribution() {
         return fit_distribution(tree, &mut leaves, offset_counts, configs);
     }
     let mut nodes = tree.nodes().to_vec();
@@ -311,11 +319,12 @@ fn collect_leaves(
             } => {
                 offset_counts[UINT.encode(pack_signed(offset)).token as usize] += 1;
                 leaves.push(
-                    (multiplier == 1 && (offset == 0 || options.mode == OffsetMode::Distribution))
-                        .then(|| Samples {
+                    (multiplier == 1 && (offset == 0 || options.mode.is_distribution())).then(
+                        || Samples {
                             baseline: offset,
                             ..Samples::new(node)
-                        }),
+                        },
+                    ),
                 );
             }
         }

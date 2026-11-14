@@ -406,7 +406,11 @@ fails if unsupported by encoder. spot_color is four floats, cfa_channel integer.
 
 - encode/encode_multiframe/encode_layers: threads=1, effort=7, source_search=false,
   strip_metadata=false; optional group_size_shift,rct,predictor,palette_colors,
-  patches(bool),learning_fraction,ma_max_leaves. Effort/overrides map to native
+  patches(bool),learning_fraction,ma_max_leaves,source_ma_defaults(bool, default true).
+  source_ma_defaults=false disables automatic e9 Half description scoring and
+  single-pass Distribution offsets; other efforts and explicit Rust tools are
+  unchanged. It is allowed with pixel source_search and rejected for JPEG
+  transcoding and non-encoding operations. Null is invalid. Effort/overrides map to native
   candidates. Unsupported projections fail. source_search only for still images,
   cannot combine with explicit tool overrides (ma_max_leaves is allowed).
   encode_layers rejects source_search=true; it has no automatic strategy search.

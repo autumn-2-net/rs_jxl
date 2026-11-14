@@ -1,11 +1,12 @@
-//! Opt-in post-training trials. Native implementation of fixed-topology leaf
+//! Post-training fitting and optional trials. Native fixed-topology leaf
 //! refitting and entropy-mode comparison; no external codec dependency.
 //!
 //! Each entropy alternative reuses the same tokens, LZ parse, transforms and
 //! tree. Distribution trials can fit and remap cached pre-LZ residual tokens;
 //! changed residuals still run the LZ parser and entropy model builder again.
 //! Other leaf proposals retokenize after learning. Training/preparation are
-//! not repeated. Only actual serialized costs select a winner.
+//! not repeated. DistributionSinglePass instead fits before the only backend
+//! encode; it deliberately has no actual-size fallback.
 
 use std::cell::{Cell, RefCell};
 use std::sync::{Arc, Mutex};
@@ -45,6 +46,10 @@ pub struct Stats {
     pub refit_wins: usize,
     pub offset_proposals: usize,
     pub offset_wins: usize,
+    /// Domains fitted before the sole backend encode, without a size comparison.
+    pub offset_single_pass_domains: usize,
+    /// Proposals applied without comparison; not measured compression wins.
+    pub offset_applied: usize,
     pub offset_leaves: usize,
     pub offset_samples: usize,
     pub offset_population: usize,
@@ -67,6 +72,7 @@ pub struct Stats {
     /// excludes final candidate-output serialization, counted in write_seconds.
     pub context_map_seconds: f64,
     pub entropy_wins: usize,
+    /// Measured comparison savings only; single-pass offset savings are unknown.
     pub saved_bits: usize,
     pub refit_seconds: f64,
     pub model_seconds: f64,
@@ -96,6 +102,8 @@ impl Receipt {
         total.refit_wins += stats.refit_wins;
         total.offset_proposals += stats.offset_proposals;
         total.offset_wins += stats.offset_wins;
+        total.offset_single_pass_domains += stats.offset_single_pass_domains;
+        total.offset_applied += stats.offset_applied;
         total.offset_leaves += stats.offset_leaves;
         total.offset_samples += stats.offset_samples;
         total.offset_population += stats.offset_population;
@@ -141,13 +149,25 @@ pub(super) fn reuse_literals(tree: &Tree, options: &encode::ModularOptions) -> b
         .refinement
         .offsets
         .as_ref()
-        .is_some_and(|o| o.mode == OffsetMode::Distribution)
+        .is_some_and(|o| o.mode.is_distribution())
+        && !super::tree::ChannelTree::offset_sensitive_routing(tree)
         && tree.nodes().iter().all(
             |node| !matches!(node, super::tree::Node::Leaf { multiplier, .. } if *multiplier != 1),
         )
 }
 
 pub(super) type LiteralCache = RefCell<Option<Vec<Vec<crate::tools::lz77::Literal>>>>;
+
+pub(super) fn single_pass(options: &encode::ModularOptions) -> bool {
+    options
+        .refinement
+        .offsets
+        .as_ref()
+        .is_some_and(|o| o.mode == OffsetMode::DistributionSinglePass)
+}
+
+#[path = "refinement_single_pass.rs"]
+mod direct;
 
 pub(super) fn choose<T>(
     raw_cache: Option<&LiteralCache>,
@@ -162,6 +182,14 @@ pub(super) fn choose<T>(
         domains: 1,
         ..Default::default()
     };
+    // The original raw residuals are fitted before any LZ parse, model build or
+    // output. Callers remap/reuse them when the routing contract permits it.
+    let direct_tree = if single_pass(options) {
+        direct::fit(raw_cache, tree, views, options, &mut stats)?
+    } else {
+        None
+    };
+    let tree = direct_tree.as_ref().unwrap_or(tree);
     let mut best: Option<Trial<T>> = None;
     let mut original_bits = 0;
     let mut evaluate = |tree: &Tree,
@@ -308,7 +336,9 @@ pub(super) fn choose<T>(
             evaluate(&refined, Origin::Predictors, None)?;
         }
     }
-    if let Some(offsets) = &options.refinement.offsets {
+    if let Some(offsets) = &options.refinement.offsets
+        && !single_pass(options)
+    {
         let start = Instant::now();
         let cached_fit = if let Some(tokens) = offset_tokens.as_deref() {
             super::leaf_offset::fit_tokens(
@@ -395,6 +425,16 @@ pub(super) fn write_local(
     }];
     let cache_raw = options.lz77 && reuse_literals(tree, options);
     let raw_cache = LiteralCache::default();
+    if single_pass(options) && reuse_literals(tree, options) {
+        *raw_cache.borrow_mut() = Some(vec![super::tokens::tokenize(
+            planes,
+            tree,
+            wp,
+            options.previous_channels,
+            stream_id,
+            false,
+        )?]);
+    }
     let raw_reused = Cell::new(0);
     let best = choose(
         Some(&raw_cache),
@@ -403,7 +443,18 @@ pub(super) fn write_local(
         options,
         |candidate| {
             let width = planes.iter().map(|c| c.width).max().unwrap_or(1);
-            if cache_raw && std::ptr::eq(candidate, tree) {
+            // Consume the pre-fit cache: optional predictor trials must not
+            // apply an original-tree delta twice to an already remapped stream.
+            if single_pass(options)
+                && let Some(mut raw) = raw_cache.borrow_mut().take()
+                && let Some(count) = super::leaf_offset::remap_literals(tree, candidate, &mut raw)?
+            {
+                let parsed =
+                    encode::parse_group_tokens(&raw[0], candidate.leaves(), width, options)?;
+                raw_reused.set(raw_reused.get() + count);
+                return Ok((vec![parsed.0], parsed.1));
+            }
+            if cache_raw && std::ptr::eq(candidate, tree) && raw_cache.borrow().is_none() {
                 let raw = super::tokens::tokenize(
                     planes,
                     candidate,
@@ -445,3 +496,7 @@ pub(super) fn write_local(
 #[cfg(test)]
 #[path = "refinement_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "refinement_single_pass_tests.rs"]
+mod single_pass_tests;

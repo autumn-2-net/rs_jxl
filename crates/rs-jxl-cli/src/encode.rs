@@ -61,6 +61,9 @@ pub(crate) struct EncodeArgs {
     /// Experimental source policy: one native candidate at effort 1..=11
     #[arg(long, value_name = "N", conflicts_with = "manual_tools", value_parser = clap::value_parser!(u8).range(1..=11))]
     pub(crate) source_effort: Option<u8>,
+    /// Disable automatic e9 MA offsets/scoring; explicit refinements still apply.
+    #[arg(long, requires = "source_effort")]
+    pub(crate) no_source_ma_defaults: bool,
     /// Run native pixel search instead of just one source candidate
     #[arg(long, requires = "source_effort")]
     pub(crate) source_search: bool,
@@ -160,6 +163,7 @@ impl EncodeArgs {
         self.ma_budget.apply(&mut options.modular);
         self.ma_pruning.apply(&mut options.modular);
         options.modular.sample_limit = self.source_sample_limit;
+        options.modular.source_ma_defaults = !self.no_source_ma_defaults;
         let mut params = CandidateParams::default().backend(effort)?;
         if let Some(shift) = self.source_group_size_shift {
             params.group_size_shift = Some(shift);
@@ -198,9 +202,7 @@ impl EncodeArgs {
             params.buffering = match mode.as_str() {
                 "auto" => rs_jxl::modular::source_options::SourceBuffering::Auto,
                 "full" => rs_jxl::modular::source_options::SourceBuffering::FullFrame,
-                "above2048" => {
-                    rs_jxl::modular::source_options::SourceBuffering::StreamingAbove2048
-                }
+                "above2048" => rs_jxl::modular::source_options::SourceBuffering::StreamingAbove2048,
                 "streaming" => rs_jxl::modular::source_options::SourceBuffering::Streaming,
                 other => return Err(format!("unhandled --source-buffering {other}").into()),
             };

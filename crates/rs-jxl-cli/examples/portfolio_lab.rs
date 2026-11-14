@@ -1,11 +1,47 @@
 //! Opt-in native portfolio benchmark. No corpus traversal or automatic launch.
 //! Candidate probe_seconds sum elapsed probe work, which can overlap across
 //! concurrent roots; scout_seconds measures wall time, not that sum.
-use clap::Parser;
+use clap::{Parser, ValueEnum};
+use rs_jxl::modular::{ma_train::DescriptionCost, refinement};
 use rs_jxl::scheduler::portfolio::{self, ALL, Candidate, Options};
-use std::{fs, io::Write, path::PathBuf, time::Instant};
+use std::{fs, io::Write, path::PathBuf, sync::Arc, time::Instant};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum DirectMaProfile {
+    Legacy,
+    Half,
+    Checked,
+    HalfChecked,
+    SinglePass,
+    HalfSinglePass,
+}
+
+impl DirectMaProfile {
+    fn configure(self, options: &mut rs_jxl::EncodeOptions) {
+        options.modular.refinement.offsets = match self {
+            Self::Legacy | Self::Half => None,
+            Self::Checked | Self::HalfChecked => Some(refinement::OffsetOptions {
+                mode: refinement::OffsetMode::Distribution,
+                ..Default::default()
+            }),
+            Self::SinglePass | Self::HalfSinglePass => Some(refinement::OffsetOptions {
+                mode: refinement::OffsetMode::DistributionSinglePass,
+                ..Default::default()
+            }),
+        };
+        options.modular.source_ma_scoring.description = match self {
+            Self::Legacy | Self::Checked | Self::SinglePass => DescriptionCost::Disabled,
+            Self::Half | Self::HalfChecked | Self::HalfSinglePass => DescriptionCost::Half,
+        };
+        if let Some(reference) = &mut options.source_patch_reference {
+            reference.modular.refinement.offsets = options.modular.refinement.offsets.clone();
+            reference.modular.source_ma_scoring.description =
+                options.modular.source_ma_scoring.description;
+        }
+    }
+}
 
 #[derive(Parser)]
 #[command(
@@ -44,6 +80,9 @@ struct Args {
         "serial_probes", "preparation_cache_mib", "no_finalist_bound",
         "max_probe_encodes", "max_finalists", "probe_side", "uncertainty"])]
     direct_candidate: Option<String>,
+    /// Override MA defaults for a direct benchmark only, without changing recipes.
+    #[arg(long, value_enum, requires = "direct_candidate", conflicts_with_all = ["plan_only", "list_candidates"])]
+    direct_ma_profile: Option<DirectMaProfile>,
     #[arg(long, conflicts_with = "output")]
     plan_only: bool,
     #[arg(long, conflicts_with_all = ["output", "input"])]
@@ -58,12 +97,23 @@ fn candidate(name: &str) -> Result<Candidate> {
 }
 
 fn encode_direct(args: &Args, image: &rs_jxl::Image, recipe: Candidate) -> Result<()> {
-    let base = rs_jxl::EncodeOptions {
+    let mut base = rs_jxl::EncodeOptions {
         threads: usize::from(args.threads),
         ..Default::default()
     };
+    if args.direct_ma_profile.is_some() {
+        base.modular.source_ma_defaults = false;
+    }
     let start = Instant::now();
-    let configured = recipe.build(image, &base, args.effort)?;
+    let mut configured = recipe.build(image, &base, args.effort)?;
+    if let Some(profile) = args.direct_ma_profile {
+        profile.configure(&mut configured);
+    }
+    let receipt = Arc::new(refinement::Receipt::default());
+    configured.modular.refinement.receipt = Some(Arc::clone(&receipt));
+    if let Some(reference) = &mut configured.source_patch_reference {
+        reference.modular.refinement.receipt = Some(Arc::clone(&receipt));
+    }
     let bytes = rs_jxl::encode(image, &configured)?;
     let seconds = start.elapsed().as_secs_f64();
     if !seconds.is_finite() || seconds <= 0.0 {
@@ -75,6 +125,47 @@ fn encode_direct(args: &Args, image: &rs_jxl::Image, recipe: Candidate) -> Resul
         .open(args.output.as_ref().ok_or("output is required")?)?
         .write_all(&bytes)?;
     let pixels = f64::from(image.width()) * f64::from(image.height());
+    let work = receipt.snapshot();
+    let offset_mode = configured
+        .modular
+        .refinement
+        .offsets
+        .as_ref()
+        .map(|o| match o.mode {
+            refinement::OffsetMode::Mean => "mean",
+            refinement::OffsetMode::Median => "median",
+            refinement::OffsetMode::Entropy => "entropy",
+            refinement::OffsetMode::Distribution => "distribution",
+            refinement::OffsetMode::DistributionSinglePass => "distribution-single-pass",
+        });
+    let actual_profile = match (
+        configured.modular.source_ma_scoring.description,
+        offset_mode,
+    ) {
+        (DescriptionCost::Disabled, None) => "legacy",
+        (DescriptionCost::Half, None) => "half",
+        (DescriptionCost::Disabled, Some("distribution")) => "checked",
+        (DescriptionCost::Half, Some("distribution")) => "half-checked",
+        (DescriptionCost::Disabled, Some("distribution-single-pass")) => "single-pass",
+        (DescriptionCost::Half, Some("distribution-single-pass")) => "half-single-pass",
+        _ => "custom",
+    };
+    let refinement = serde_json::json!({
+        "offset_mode": offset_mode,
+        "offset_sample_limit": configured.modular.refinement.offsets.as_ref().map(|o| o.samples_per_leaf),
+        "domains": work.domains, "models": work.models,
+        "offset_single_pass_domains": work.offset_single_pass_domains,
+        "offset_applied": work.offset_applied,
+        "offset_proposals": work.offset_proposals, "offset_wins": work.offset_wins,
+        "offset_leaves": work.offset_leaves, "offset_samples": work.offset_samples,
+        "offset_population": work.offset_population, "offset_candidates": work.offset_candidates,
+        "offset_token_fits": work.offset_token_fits,
+        "offset_reused_tokens": work.offset_reused_tokens,
+        "offset_raw_reused_tokens": work.offset_raw_reused_tokens,
+        "saved_bits": work.saved_bits,
+        "offset_seconds": work.offset_seconds, "refit_seconds": work.refit_seconds,
+        "model_seconds": work.model_seconds, "write_seconds": work.write_seconds,
+    });
     println!(
         "{}",
         serde_json::json!({
@@ -84,6 +175,10 @@ fn encode_direct(args: &Args, image: &rs_jxl::Image, recipe: Candidate) -> Resul
             "bytes": bytes.len(), "bpp": bytes.len() as f64 * 8.0 / pixels,
             "seconds": seconds, "mpix_per_second": pixels / 1e6 / seconds,
             "encode_calls": 1, "preparation_cache_bytes": 0,
+            "direct_ma_profile": actual_profile,
+            "source_ma_defaults": configured.modular.source_ma_defaults,
+            "description_cost": format!("{:?}", configured.modular.source_ma_scoring.description),
+            "refinement": refinement,
             "timing": "recipe projection and one complete native encode, including pool setup; excludes image IO",
         })
     );
@@ -234,6 +329,7 @@ mod tests {
         assert!(Args::try_parse_from(base).is_err());
         let args = Args::try_parse_from(base.into_iter().chain(["--output", "out.jxl"])).unwrap();
         assert_eq!(args.direct_candidate.as_deref(), Some("baseline"));
+        assert!(args.direct_ma_profile.is_none());
         for extra in [
             vec!["--plan-only"],
             vec!["--list-candidates"],
@@ -249,6 +345,81 @@ mod tests {
             assert!(
                 Args::try_parse_from(base.into_iter().chain(["--output", "out.jxl"]).chain(extra))
                     .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn direct_ma_profiles_require_direct_candidate_and_accept_only_known_names() {
+        for (name, expected) in [
+            ("legacy", DirectMaProfile::Legacy),
+            ("half", DirectMaProfile::Half),
+            ("checked", DirectMaProfile::Checked),
+            ("half-checked", DirectMaProfile::HalfChecked),
+            ("single-pass", DirectMaProfile::SinglePass),
+            ("half-single-pass", DirectMaProfile::HalfSinglePass),
+        ] {
+            let base = ["lab", "input.png", "--direct-ma-profile", name];
+            assert!(Args::try_parse_from(base.into_iter().chain(["--output", "out.jxl"])).is_err());
+            assert!(Args::try_parse_from(base.into_iter().chain(["--plan-only"])).is_err());
+            let args = Args::try_parse_from(base.into_iter().chain([
+                "--direct-candidate",
+                "baseline",
+                "--output",
+                "out.jxl",
+            ]))
+            .unwrap();
+            assert_eq!(args.direct_ma_profile, Some(expected));
+        }
+        assert!(
+            Args::try_parse_from([
+                "lab",
+                "input.png",
+                "--direct-candidate",
+                "baseline",
+                "--output",
+                "out.jxl",
+                "--direct-ma-profile",
+                "unknown",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn explicit_ma_profiles_replace_recipe_offset_and_description_settings() {
+        for (profile, description, offsets) in [
+            (DirectMaProfile::Legacy, DescriptionCost::Disabled, None),
+            (DirectMaProfile::Half, DescriptionCost::Half, None),
+            (
+                DirectMaProfile::Checked,
+                DescriptionCost::Disabled,
+                Some(refinement::OffsetMode::Distribution),
+            ),
+            (
+                DirectMaProfile::HalfChecked,
+                DescriptionCost::Half,
+                Some(refinement::OffsetMode::Distribution),
+            ),
+            (
+                DirectMaProfile::SinglePass,
+                DescriptionCost::Disabled,
+                Some(refinement::OffsetMode::DistributionSinglePass),
+            ),
+            (
+                DirectMaProfile::HalfSinglePass,
+                DescriptionCost::Half,
+                Some(refinement::OffsetMode::DistributionSinglePass),
+            ),
+        ] {
+            let mut options = rs_jxl::EncodeOptions::default();
+            options.modular.source_ma_scoring.description = DescriptionCost::Full;
+            options.modular.refinement.offsets = Some(refinement::OffsetOptions::default());
+            profile.configure(&mut options);
+            assert_eq!(options.modular.source_ma_scoring.description, description);
+            assert_eq!(
+                options.modular.refinement.offsets.as_ref().map(|o| o.mode),
+                offsets
             );
         }
     }

@@ -5,7 +5,7 @@ use crate::entropy::{HybridUintConfig, stream::Token};
 use crate::tools::lz77::Literal;
 use crate::{Error, Result};
 
-use super::{FitStats, OffsetMode, OffsetOptions, collect_leaves, fit_distribution};
+use super::{FitStats, OffsetOptions, collect_leaves, fit_distribution};
 use crate::modular::{
     leaf_refit::ordered_streams,
     predictor::Predictor,
@@ -72,7 +72,7 @@ fn fit_values<T>(
         ));
     }
     ordered_streams(tree, views, previous_channels)?;
-    if options.mode != OffsetMode::Distribution
+    if !options.mode.is_distribution()
         || ChannelTree::offset_sensitive_routing(tree)
         || tree
             .nodes()

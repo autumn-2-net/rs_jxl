@@ -173,8 +173,8 @@ struct Args {
     /// Refit sampled MA leaf predictors on all pixels; retain smaller output.
     #[arg(long, conflicts_with_all = ["search", "scan_only", "fast_context"])]
     refine_leaves: bool,
-    /// Fit static MA leaf offsets, retaining only smaller serialized output.
-    #[arg(long, value_parser = ["mean", "median", "entropy", "distribution"], conflicts_with_all = ["search", "scan_only"])]
+    /// Fit static MA leaf offsets; single-pass skips the actual-size fallback.
+    #[arg(long, value_parser = ["mean", "median", "entropy", "distribution", "distribution-single-pass"], conflicts_with_all = ["search", "scan_only"])]
     leaf_offset: Option<String>,
     /// Per-leaf fitting reservoir capacity (default 1024); does not cap MA training.
     #[arg(long, requires = "leaf_offset", value_parser = clap::value_parser!(u32).range(1..))]
@@ -498,6 +498,9 @@ fn run(args: Args) -> Result<()> {
         threads: usize::from(args.threads),
         ..Default::default()
     };
+    // This ablation tool assigns every scoring/refinement control explicitly.
+    // Production defaults must not silently re-enable an omitted experiment.
+    base.modular.source_ma_defaults = false;
     args.ma_budget.apply(&mut base.modular);
     if let Some(mode) = &args.tree_learning {
         use rs_jxl::modular::ma_train::TreeLearning;
@@ -530,6 +533,7 @@ fn run(args: Args) -> Result<()> {
                         "median" => OffsetMode::Median,
                         "entropy" => OffsetMode::Entropy,
                         "distribution" => OffsetMode::Distribution,
+                        "distribution-single-pass" => OffsetMode::DistributionSinglePass,
                         _ => unreachable!("validated offset mode"),
                     },
                     samples_per_leaf: args.leaf_offset_samples.unwrap_or(1024) as usize,
@@ -938,6 +942,8 @@ fn run(args: Args) -> Result<()> {
             "offset_mode": args.leaf_offset,
             "offset_sample_limit": args.leaf_offset_samples.unwrap_or(1024),
             "offset_proposals": stats.offset_proposals, "offset_wins": stats.offset_wins,
+            "offset_single_pass_domains": stats.offset_single_pass_domains,
+            "offset_applied": stats.offset_applied,
             "offset_leaves": stats.offset_leaves, "offset_samples": stats.offset_samples,
             "offset_population": stats.offset_population,
             "offset_candidates": stats.offset_candidates, "offset_seconds": stats.offset_seconds,
@@ -1099,7 +1105,13 @@ fn leaf_offsets_are_explicit_and_validate_sampling_and_conflicts() {
             .leaf_offset
             .is_none()
     );
-    for mode in ["mean", "median", "entropy", "distribution"] {
+    for mode in [
+        "mean",
+        "median",
+        "entropy",
+        "distribution",
+        "distribution-single-pass",
+    ] {
         let args = Args::try_parse_from([
             "encoder_lab",
             "in.png",

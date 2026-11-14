@@ -299,6 +299,7 @@ fn measurement(
                 refinement::OffsetMode::Median => "median",
                 refinement::OffsetMode::Entropy => "entropy",
                 refinement::OffsetMode::Distribution => "distribution",
+                refinement::OffsetMode::DistributionSinglePass => "distribution-single-pass",
             },
             "samples_per_leaf": offsets.samples_per_leaf,
         })

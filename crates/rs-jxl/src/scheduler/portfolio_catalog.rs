@@ -437,7 +437,14 @@ mod tests {
         let actual = Candidate::Baseline.build(&image, &base, 9).unwrap();
         assert_eq!(format!("{actual:?}"), format!("{expected:?}"));
         assert_eq!(format!("{base:?}"), before);
-        assert!(actual.modular.refinement.offsets.is_none());
+        assert_eq!(
+            actual.modular.refinement.offsets.unwrap().mode,
+            OffsetMode::DistributionSinglePass
+        );
+        assert_eq!(
+            actual.modular.source_ma_scoring.description,
+            DescriptionCost::Half
+        );
         assert_eq!(actual.modular.previous_channels, 0);
     }
 
