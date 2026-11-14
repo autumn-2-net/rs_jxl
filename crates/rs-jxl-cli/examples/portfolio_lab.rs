@@ -3,7 +3,7 @@
 //! concurrent roots; scout_seconds measures wall time, not that sum.
 use clap::Parser;
 use rs_jxl::scheduler::portfolio::{self, ALL, Candidate, Options};
-use std::{fs, io::Write, path::PathBuf};
+use std::{fs, io::Write, path::PathBuf, time::Instant};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -39,6 +39,11 @@ struct Args {
     /// Explicit comma-separated subset; baseline is always retained.
     #[arg(long, value_delimiter = ',')]
     candidates: Vec<String>,
+    /// Encode one recipe once, without scout, fallback, bound or preparation cache.
+    #[arg(long, conflicts_with_all = ["plan_only", "list_candidates", "candidates",
+        "serial_probes", "preparation_cache_mib", "no_finalist_bound",
+        "max_probe_encodes", "max_finalists", "probe_side", "uncertainty"])]
+    direct_candidate: Option<String>,
     #[arg(long, conflicts_with = "output")]
     plan_only: bool,
     #[arg(long, conflicts_with_all = ["output", "input"])]
@@ -50,6 +55,39 @@ fn candidate(name: &str) -> Result<Candidate> {
         .copied()
         .find(|c| c.name() == name)
         .ok_or_else(|| format!("unknown candidate {name}; use --list-candidates").into())
+}
+
+fn encode_direct(args: &Args, image: &rs_jxl::Image, recipe: Candidate) -> Result<()> {
+    let base = rs_jxl::EncodeOptions {
+        threads: usize::from(args.threads),
+        ..Default::default()
+    };
+    let start = Instant::now();
+    let configured = recipe.build(image, &base, args.effort)?;
+    let bytes = rs_jxl::encode(image, &configured)?;
+    let seconds = start.elapsed().as_secs_f64();
+    if !seconds.is_finite() || seconds <= 0.0 {
+        return Err("invalid encode duration".into());
+    }
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(args.output.as_ref().ok_or("output is required")?)?
+        .write_all(&bytes)?;
+    let pixels = f64::from(image.width()) * f64::from(image.height());
+    println!(
+        "{}",
+        serde_json::json!({
+            "schema": 1, "direct": true, "candidate": recipe.name(),
+            "effort": args.effort, "threads": args.threads,
+            "width": image.width(), "height": image.height(), "bits": image.bits(),
+            "bytes": bytes.len(), "bpp": bytes.len() as f64 * 8.0 / pixels,
+            "seconds": seconds, "mpix_per_second": pixels / 1e6 / seconds,
+            "encode_calls": 1, "preparation_cache_bytes": 0,
+            "timing": "recipe projection and one complete native encode, including pool setup; excludes image IO",
+        })
+    );
+    Ok(())
 }
 
 fn run(args: Args) -> Result<()> {
@@ -66,11 +104,19 @@ fn run(args: Args) -> Result<()> {
         );
         return Ok(());
     }
-    let input = args.input.ok_or("input is required")?;
+    let direct = args
+        .direct_candidate
+        .as_deref()
+        .map(candidate)
+        .transpose()?;
+    let input = args.input.as_ref().ok_or("input is required")?;
     if args.output.as_ref().is_some_and(|p| p.exists()) {
         return Err("output already exists".into());
     }
     let image = rs_jxl_image::decode(&fs::read(input)?, true)?.image;
+    if let Some(recipe) = direct {
+        return encode_direct(&args, &image, recipe);
+    }
     let options = Options {
         effort: args.effort,
         threads: usize::from(args.threads),
@@ -160,7 +206,11 @@ fn run(args: Args) -> Result<()> {
 }
 
 fn main() -> Result<()> {
-    run(Args::parse())
+    let result = run(Args::parse());
+    if let Some(profile) = rs_jxl::profile::report() {
+        eprintln!("{profile}");
+    }
+    result
 }
 
 #[cfg(test)]
@@ -176,6 +226,31 @@ mod tests {
                 .is_err()
         );
         assert!(candidate("made-up-tool").is_err());
+    }
+
+    #[test]
+    fn direct_recipe_requires_output_and_rejects_ignored_scout_controls() {
+        let base = ["lab", "input.png", "--direct-candidate", "baseline"];
+        assert!(Args::try_parse_from(base).is_err());
+        let args = Args::try_parse_from(base.into_iter().chain(["--output", "out.jxl"])).unwrap();
+        assert_eq!(args.direct_candidate.as_deref(), Some("baseline"));
+        for extra in [
+            vec!["--plan-only"],
+            vec!["--list-candidates"],
+            vec!["--candidates", "prev2"],
+            vec!["--max-finalists", "2"],
+            vec!["--max-probe-encodes", "48"],
+            vec!["--probe-side", "128"],
+            vec!["--uncertainty", "0.01"],
+            vec!["--preparation-cache-mib", "0"],
+            vec!["--serial-probes"],
+            vec!["--no-finalist-bound"],
+        ] {
+            assert!(
+                Args::try_parse_from(base.into_iter().chain(["--output", "out.jxl"]).chain(extra))
+                    .is_err()
+            );
+        }
     }
 
     #[test]

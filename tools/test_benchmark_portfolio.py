@@ -107,6 +107,91 @@ class PortfolioTests(unittest.TestCase):
         self.assertTrue(all(not p.exists() for p in fixture.artifacts))
         return result
 
+    def test_atomic_write_retries_sharing_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "report.json"
+            replace = bench.os.replace
+            calls = []
+            def sharing_once(source, target):
+                calls.append(target)
+                if len(calls) == 1:
+                    raise PermissionError("reader holds destination")
+                return replace(source, target)
+            with patch.object(bench.os, "replace", side_effect=sharing_once), patch.object(bench, "sleep") as wait:
+                bench.atomic_write(path, {"ok": True})
+            self.assertEqual(bench.loads(path.read_text()), {"ok": True})
+            wait.assert_called_once_with(0.01)
+            self.assertEqual(list(Path(directory).iterdir()), [path])
+
+    def test_locked_reports_do_not_abort_checkpointing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            f = self.fixture(directory)
+            write = bench.atomic_write
+            def locked(path, value):
+                if path.name in ("progress.json", "summary.json"):
+                    raise PermissionError("report reader")
+                return write(path, value)
+            with patch.object(bench, "atomic_write", side_effect=locked), contextlib.redirect_stderr(io.StringIO()):
+                result = self.invoke(f, ("--run",))
+            self.assertEqual(result["statuses"], {"passed": 2})
+            self.assertFalse((f.root / "out/run.lock").exists())
+            self.assertEqual(len((f.root / "out/trials.jsonl").read_text().splitlines()), 2)
+            f.calls.clear()
+            self.invoke(f, ("--resume", "--run"))
+            self.assertEqual(f.calls, [])
+            self.assertEqual(bench.loads((f.root / "out/progress.json").read_text())["phase"], "complete")
+
+    def test_critical_manifest_write_failure_stays_fatal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            f = self.fixture(directory)
+            with patch.object(bench, "atomic_write", side_effect=PermissionError("manifest write")):
+                with self.assertRaises(PermissionError):
+                    self.invoke(f, ("--run",))
+            self.assertFalse((f.root / "out/run.lock").exists())
+            self.assertEqual(f.calls, [])
+
+    def test_journal_write_failure_stays_fatal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            f = self.fixture(directory)
+            open_path = Path.open
+            def fail_journal(path, mode="r", *args, **kwargs):
+                if path.name == "trials.jsonl" and mode == "a":
+                    raise OSError("journal disk failure")
+                return open_path(path, mode, *args, **kwargs)
+            with patch.object(Path, "open", fail_journal):
+                with self.assertRaisesRegex(OSError, "journal disk failure"):
+                    self.invoke(f, ("--run",))
+            self.assertEqual((f.root / "out/trials.jsonl").read_text(), "")
+            self.assertFalse((f.root / "out/run.lock").exists())
+            self.assertEqual(bench.loads((f.root / "out/progress.json").read_text())["phase"], "failed")
+
+    def test_report_serialization_failure_stays_visible(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaises(ValueError):
+                bench.write_report(Path(directory) / "summary.json", {"bad": float("nan")})
+
+    def test_stop_finishes_current_image_then_resumes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            f = self.fixture(directory)
+            def stop(command, _):
+                if "--output" in command:
+                    (f.root / "out/STOP").touch()
+            result = self.invoke(f, ("--run",), effect=stop)
+            self.assertEqual(result["completed"], 1)
+            self.assertEqual(result["statuses"], {"passed": 1})
+            self.assertEqual(f.comparisons, 1)
+            progress = bench.loads((f.root / "out/progress.json").read_text())
+            self.assertEqual(progress["phase"], "stopped")
+            self.assertIsNone(progress["active"])
+            self.assertEqual(progress["pid"], os.getpid())
+            f.calls.clear()
+            self.invoke(f, ("--resume", "--run"))
+            self.assertEqual(f.calls, [])
+            (f.root / "out/STOP").unlink()
+            result = self.invoke(f, ("--resume", "--run"))
+            self.assertEqual(result["completed"], 2)
+            self.assertEqual(f.comparisons, 1)
+
     def test_prepare_only_cases_and_inputs(self):
         for inputs in (False, True):
             with self.subTest(inputs=inputs), tempfile.TemporaryDirectory() as directory:

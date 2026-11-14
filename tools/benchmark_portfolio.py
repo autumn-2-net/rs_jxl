@@ -15,7 +15,9 @@ import json
 import math
 import os
 from pathlib import Path
+import sys
 import tempfile
+from time import sleep
 
 from compare_cpp_port import (
     check_process, clean_environment, compare_pixels, decoder_command,
@@ -53,18 +55,48 @@ def digest(value):
 
 
 def atomic_write(path, value):
+    serialized = canonical(value) + "\n"
     temporary = None
     try:
         with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", newline="\n",
                                          dir=path.parent, delete=False) as stream:
             temporary = Path(stream.name)
-            stream.write(canonical(value) + "\n")
+            stream.write(serialized)
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temporary, path)
+        delays = (0.01, 0.03, 0.1)
+        for attempt in range(len(delays) + 1):
+            try:
+                os.replace(temporary, path)
+                break
+            except OSError as error:
+                sharing = isinstance(error, PermissionError) or getattr(error, "winerror", None) in (5, 32, 33)
+                if not sharing or attempt == len(delays):
+                    raise
+                sleep(delays[attempt])
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
+
+
+_report_warnings = set()
+
+
+def write_report(path, value):
+    """Derived reports can be regenerated; manifest and journal IO stay fatal."""
+    try:
+        atomic_write(path, value)
+    except OSError as error:
+        if path not in _report_warnings:
+            _report_warnings.add(path)
+            try:
+                print(f"Warning: cannot update {path.name}: {error}; "
+                      "trials.jsonl remains the checkpoint.", file=sys.stderr, flush=True)
+            except OSError:
+                pass
+        return False
+    _report_warnings.discard(path)
+    return True
 
 
 def arguments(argv=None):
@@ -505,8 +537,9 @@ def benchmark(args):
             rows = []
         mode = "run" if args.run else "prepare-only"
         def progress(phase, active=None):
-            atomic_write(args.out / "progress.json", dict(schema=1, mode=mode, phase=phase,
+            write_report(args.out / "progress.json", dict(schema=1, mode=mode, phase=phase, pid=os.getpid(),
                          completed=len(rows), total=len(population["cases"]), active=active,
+                         active_original=population["cases"][active]["original"] if active is not None else None,
                          updated_utc=datetime.now(timezone.utc).isoformat()))
         progress("prepared")
         if args.run:
@@ -514,6 +547,8 @@ def benchmark(args):
             active = None
             try:
                 for index in range(len(rows), len(population["cases"])):
+                    if (args.out / "STOP").exists():
+                        break
                     if identity(args) != frozen:
                         raise ValueError("Executable/config identity changed during run")
                     active = index
@@ -526,18 +561,18 @@ def benchmark(args):
                         os.fsync(stream.fileno())
                     rows.append(row)
                     active = None
-                    atomic_write(args.out / "summary.json", summarize(rows, population, mode))
+                    write_report(args.out / "summary.json", summarize(rows, population, mode))
                     progress("checkpointed")
             except KeyboardInterrupt:
-                atomic_write(args.out / "summary.json", summarize(rows, population, mode))
+                write_report(args.out / "summary.json", summarize(rows, population, mode))
                 progress("interrupted", active)
                 raise
             except Exception:
                 progress("failed", active)
                 raise
         result = summarize(rows, population, mode)
-        atomic_write(args.out / "summary.json", result)
-        progress("complete" if args.run else "prepared")
+        write_report(args.out / "summary.json", result)
+        progress(("complete" if not result["pending"] else "stopped") if args.run else "prepared")
         return result
     finally:
         lock.unlink()

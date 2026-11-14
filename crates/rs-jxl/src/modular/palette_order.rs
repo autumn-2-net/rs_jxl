@@ -342,10 +342,18 @@ fn adjacency_order(frequencies: &[usize], mut pairs: Vec<u64>) -> Vec<usize> {
         let a = (pairs[begin] >> 32) as usize;
         let b = (pairs[begin] as u32) as usize;
         if a < n && b < n && a != b {
-            edges.push((a, b, end - begin));
+            edges.push((a, b, (end - begin) as u64));
         }
         begin = end;
     }
+    adjacency_weighted_order(frequencies, edges)
+}
+
+fn adjacency_weighted_order(
+    frequencies: &[usize],
+    mut edges: Vec<(usize, usize, u64)>,
+) -> Vec<usize> {
+    let n = frequencies.len();
     edges.sort_unstable_by(|a, b| b.2.cmp(&a.2).then(a.0.cmp(&b.0)).then(a.1.cmp(&b.1)));
     let mut parent: Vec<_> = (0..n).collect();
     let mut sizes = vec![1usize; n];

@@ -3,7 +3,7 @@
 
 use std::collections::BTreeSet;
 
-use super::{PaletteMap, adjacency_order};
+use super::{PaletteMap, adjacency_weighted_order};
 use crate::Result;
 
 #[path = "palette_minla.rs"]
@@ -11,6 +11,21 @@ mod minla;
 
 const MAX_COLORS: usize = 256;
 const MAX_SAMPLES: usize = 262_144;
+
+fn adjacency_from_weights(frequencies: &[usize], weights: &[u64]) -> Vec<usize> {
+    let n = frequencies.len();
+    let mut edges = Vec::new();
+    // Each undirected edge is already counted once in each matrix triangle.
+    for a in 0..n {
+        for b in a + 1..n {
+            let count = weights[a * n + b];
+            if count != 0 {
+                edges.push((a, b, count));
+            }
+        }
+    }
+    adjacency_weighted_order(frequencies, edges)
+}
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn order(
@@ -45,7 +60,6 @@ pub(super) fn order(
     let len = width * height;
     let step = len.div_ceil(MAX_SAMPLES).max(1);
     let mut weights = vec![0u64; n * n];
-    let mut pairs = Vec::new();
     let mut color = vec![0; planes.len()];
     let mut index = |pos: usize| -> Result<usize> {
         for (value, plane) in color.iter_mut().zip(planes) {
@@ -62,9 +76,6 @@ pub(super) fn order(
         weights[a * n + b] += 1;
         weights[b * n + a] += 1;
         edges += 1;
-        if !ezeng {
-            pairs.push(((a.min(b) as u64) << 32) | a.max(b) as u64);
-        }
     };
     for pos in (0..len).step_by(step) {
         let current = index(pos)?;
@@ -84,7 +95,7 @@ pub(super) fn order(
     let mut order = if ezeng {
         minla::ezeng(&weights, n)
     } else {
-        adjacency_order(frequencies, pairs)
+        adjacency_from_weights(frequencies, &weights)
     };
     drop(seed);
     let refine = crate::profile::scope("palette.order.graph.refine");
@@ -109,6 +120,85 @@ pub(super) fn order(
 mod tests {
     use super::*;
     use crate::modular::transforms::PaletteMapping;
+
+    #[test]
+    fn matrix_seed_matches_pair_seed_with_ties_and_disconnected_colors() {
+        for n in [0, 1, 2, 8, 17, 64, 256] {
+            for dense in [false, true] {
+                let frequencies: Vec<_> = (0..n).map(|i| (i * 7) % 5).collect();
+                let mut weights = vec![0; n * n];
+                let mut pairs = Vec::new();
+                for a in 0..n {
+                    for b in a + 1..n {
+                        let count = if dense || (a % 3 == 0 && b % 5 == 0) {
+                            (a * 13 + b * 17) % 7
+                        } else {
+                            0
+                        };
+                        weights[a * n + b] = count as u64;
+                        weights[b * n + a] = count as u64;
+                        pairs.extend(std::iter::repeat_n(((a as u64) << 32) | b as u64, count));
+                    }
+                }
+                let expected = super::super::adjacency_order(&frequencies, pairs);
+                let actual = adjacency_from_weights(&frequencies, &weights);
+                assert_eq!(actual, expected, "colors={n} dense={dense}");
+                let mut sorted = actual;
+                sorted.sort_unstable();
+                assert_eq!(sorted, (0..n).collect::<Vec<_>>());
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "manual seed-stage microbenchmark; not a performance assertion"]
+    fn matrix_seed_timing() {
+        use std::{hint::black_box, time::Instant};
+        for n in [16, 64, 256] {
+            let frequencies = vec![1; n];
+            let mut weights = vec![0; n * n];
+            let mut pairs = Vec::new();
+            for i in 0..MAX_SAMPLES * 2 {
+                let a = i % n;
+                let b = (a + 1 + (i / n) % (n - 1)) % n;
+                weights[a * n + b] += 1;
+                weights[b * n + a] += 1;
+                pairs.push(((a.min(b) as u64) << 32) | a.max(b) as u64);
+            }
+            assert_eq!(
+                adjacency_from_weights(&frequencies, &weights),
+                super::super::adjacency_order(&frequencies, pairs.clone()),
+            );
+            let (mut old, mut new) = (Vec::new(), Vec::new());
+            for round in 0..9 {
+                let input = pairs.clone();
+                if round % 2 == 0 {
+                    let start = Instant::now();
+                    black_box(adjacency_from_weights(&frequencies, black_box(&weights)));
+                    new.push(start.elapsed());
+                }
+                let start = Instant::now();
+                black_box(super::super::adjacency_order(
+                    &frequencies,
+                    black_box(input),
+                ));
+                old.push(start.elapsed());
+                if round % 2 != 0 {
+                    let start = Instant::now();
+                    black_box(adjacency_from_weights(&frequencies, black_box(&weights)));
+                    new.push(start.elapsed());
+                }
+            }
+            old.sort_unstable();
+            new.sort_unstable();
+            eprintln!(
+                "palette seed colors={n} pairs={} old={:?} matrix={:?}",
+                pairs.len(),
+                old[4],
+                new[4]
+            );
+        }
+    }
 
     #[test]
     fn graph_excludes_implicit_indices_and_keeps_hidden_rgb_distinct() {
