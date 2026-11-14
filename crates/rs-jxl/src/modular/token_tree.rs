@@ -47,6 +47,32 @@ pub(in crate::modular) struct SimpleContexts {
     contexts: Vec<u32>,
 }
 
+/// Compact routing for the common low-effort Weighted/Gradient learner.
+pub(in crate::modular) struct PairContexts<'a> {
+    nodes: Vec<Decision>,
+    leaves: &'a [Leaf],
+    pub gradient_lut: bool,
+}
+
+impl PairContexts<'_> {
+    #[inline]
+    pub fn lookup(&self, gradient: i32, left_delta: i32, wp_error: i32) -> Leaf {
+        let properties = [gradient, left_delta, wp_error];
+        let mut index = 0;
+        loop {
+            let node = self.nodes[index];
+            if node.property == u32::MAX {
+                return self.leaves[node.greater as usize];
+            }
+            index = if properties[node.property as usize] > node.threshold {
+                node.greater
+            } else {
+                node.less_equal
+            } as usize;
+        }
+    }
+}
+
 impl SimpleContexts {
     #[inline]
     pub fn lookup(&self, value: i64) -> u32 {
@@ -195,6 +221,39 @@ impl ChannelTree {
         } else {
             None
         }
+    }
+
+    pub fn pair_contexts(&self) -> Option<PairContexts<'_>> {
+        if self
+            .nodes
+            .iter()
+            .any(|n| !matches!(n.property, 9 | 10 | 15 | u32::MAX))
+            || self.leaves.iter().any(|leaf| {
+                !matches!(leaf.predictor, Predictor::Gradient | Predictor::Weighted)
+                    || leaf.offset != 0
+                    || leaf.multiplier != 1
+            })
+        {
+            return None;
+        }
+        let nodes = self
+            .nodes
+            .iter()
+            .map(|node| Decision {
+                property: match node.property {
+                    9 => 0,
+                    10 => 1,
+                    15 => 2,
+                    _ => u32::MAX,
+                },
+                ..*node
+            })
+            .collect();
+        Some(PairContexts {
+            nodes,
+            leaves: &self.leaves,
+            gradient_lut: self.gradient_lut,
+        })
     }
 
     pub fn simple_contexts(&self) -> Option<SimpleContexts> {

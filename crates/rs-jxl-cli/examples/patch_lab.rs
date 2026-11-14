@@ -206,21 +206,20 @@ fn configure_parallel_gather(options: &mut EncodeOptions, threads: u16, waves: b
     }
 }
 
-fn configure_blocks(
-    options: &mut EncodeOptions,
+fn configure_block_bases(
+    base: &mut EncodeOptions,
+    reference_base: &mut EncodeOptions,
     target: BlockTarget,
     block: &block_context::Options,
     reference_receipt: &Arc<block_context::Receipt>,
 ) {
     if target.residual() {
-        options.modular.block_context = Some(block.clone());
+        base.modular.block_context = Some(block.clone());
     }
     if target.reference() {
-        if let Some(reference) = options.source_patch_reference.as_mut() {
-            let mut block = block.clone();
-            block.receipt = Some(Arc::clone(reference_receipt));
-            reference.modular.block_context = Some(block);
-        }
+        let mut block = block.clone();
+        block.receipt = Some(Arc::clone(reference_receipt));
+        reference_base.modular.block_context = Some(block);
     }
 }
 
@@ -286,17 +285,43 @@ fn run(args: Args) -> Result<()> {
     let image = decoded.image;
     let mut params = CandidateParams::default().backend(args.effort)?;
     let main_params = params.clone();
-    let base = EncodeOptions {
+    let mut base = EncodeOptions {
         threads: usize::from(args.threads),
         ..Default::default()
     };
+    let mut reference_base = base.clone();
+    let block_size = args
+        .block_size
+        .as_ref()
+        .map(|s| s.parse::<usize>().unwrap());
+    let block_receipt = Arc::new(block_context::Receipt::default());
+    let reference_block_receipt = Arc::new(block_context::Receipt::default());
+    let block_plan_leaves = block_size.map(|_| {
+        args.block_leaves
+            .unwrap_or(block_context::DEFAULT_PLAN_LEAVES)
+    });
+    if let Some(tile_size) = block_size {
+        let block = block_context::Options {
+            tile_size,
+            max_plan_leaves: block_plan_leaves.unwrap(),
+            receipt: Some(Arc::clone(&block_receipt)),
+        };
+        // Suppress automatic e9 MA defaults only on the experiment's targets.
+        configure_block_bases(
+            &mut base,
+            &mut reference_base,
+            block_target,
+            &block,
+            &reference_block_receipt,
+        );
+    }
     // Keep the normal source candidate's non-patch settings across all trials.
     let mut options = adapter::project_native(&params, &image, &base)?.exact_options()?;
     clear_detectors(&mut options);
     let representative_receipt = Arc::new(rs_jxl::tools::patches::RepresentativeReceipt::default());
     if args.mode == Mode::Source {
         params.patches = Override::On;
-        let source = adapter::project_native(&params, &image, &base)?.exact_options()?;
+        let source = adapter::project_native(&params, &image, &reference_base)?.exact_options()?;
         // Only adopt the forced detector and its deferred atlas policy.
         options.source_patches = source.source_patches;
         options.source_patch_reference = source.source_patch_reference;
@@ -333,25 +358,6 @@ fn run(args: Args) -> Result<()> {
         )?;
     }
     let channels = channel_receipt(&options, &image, args.previous_channels, channel_target)?;
-    let block_size = args
-        .block_size
-        .as_ref()
-        .map(|s| s.parse::<usize>().unwrap());
-    let block_receipt = Arc::new(block_context::Receipt::default());
-    let reference_block_receipt = Arc::new(block_context::Receipt::default());
-    let block_plan_leaves = block_size.map(|_| {
-        args.block_leaves
-            .unwrap_or(block_context::DEFAULT_PLAN_LEAVES)
-    });
-    if let Some(tile_size) = block_size {
-        let block = block_context::Options {
-            tile_size,
-            max_plan_leaves: block_plan_leaves.unwrap(),
-            receipt: Some(Arc::clone(&block_receipt)),
-        };
-        // Apply AFTER source projection so the atlas policy retains its own collector.
-        configure_blocks(&mut options, block_target, &block, &reference_block_receipt);
-    }
     let receipt = Arc::new(TilePatchReceipt::default());
     let mut guard_work = None;
     let mut source_detector_enabled = None;
@@ -812,6 +818,9 @@ mod tests {
 
     #[test]
     fn block_targets_keep_projected_reference_and_residual_independent() {
+        use rs_jxl::modular::ma_train::{DescriptionCost, TreeLearning};
+        use rs_jxl::modular::refinement::OffsetMode;
+
         let image = Image::new(
             2304,
             1,
@@ -820,20 +829,13 @@ mod tests {
         )
         .unwrap();
         let params = CandidateParams::default().backend(9).unwrap();
-        let base = EncodeOptions::default();
         for target in [
             BlockTarget::Reference,
             BlockTarget::Residual,
             BlockTarget::Both,
         ] {
-            let mut options = adapter::project_native(&params, &image, &base)
-                .unwrap()
-                .exact_options()
-                .unwrap();
-            options.source_patch_reference = Some(
-                adapter::source_patch_reference_policy(&params, &image, &base, Default::default())
-                    .unwrap(),
-            );
+            let mut base = EncodeOptions::default();
+            let mut reference_base = base.clone();
             let residual = Arc::new(block_context::Receipt::default());
             let reference = Arc::new(block_context::Receipt::default());
             let block = block_context::Options {
@@ -841,7 +843,20 @@ mod tests {
                 max_plan_leaves: 1234,
                 receipt: Some(Arc::clone(&residual)),
             };
-            configure_blocks(&mut options, target, &block, &reference);
+            configure_block_bases(&mut base, &mut reference_base, target, &block, &reference);
+            let mut options = adapter::project_native(&params, &image, &base)
+                .unwrap()
+                .exact_options()
+                .unwrap();
+            options.source_patch_reference = Some(
+                adapter::source_patch_reference_policy(
+                    &params,
+                    &image,
+                    &reference_base,
+                    Default::default(),
+                )
+                .unwrap(),
+            );
             assert_eq!(options.modular.block_context.is_some(), target.residual());
             if let Some(block) = options.modular.block_context.as_ref() {
                 assert!(Arc::ptr_eq(block.receipt.as_ref().unwrap(), &residual));
@@ -856,21 +871,88 @@ mod tests {
                 assert!(Arc::ptr_eq(block.receipt.as_ref().unwrap(), &reference));
                 assert!(!Arc::ptr_eq(block.receipt.as_ref().unwrap(), &residual));
             }
+            for (modular, blocked) in [
+                (&options.modular, target.residual()),
+                (&resolved.modular, target.reference()),
+            ] {
+                if blocked {
+                    assert_eq!(modular.tree_learning, TreeLearning::Legacy);
+                    assert_eq!(modular.source_ma_scoring, Default::default());
+                    assert!(modular.refinement.offsets.is_none());
+                } else {
+                    assert_eq!(modular.tree_learning, TreeLearning::Symmetric);
+                    assert_eq!(modular.source_ma_scoring.description, DescriptionCost::Half);
+                    assert_eq!(
+                        modular.refinement.offsets.as_ref().unwrap().mode,
+                        OffsetMode::DistributionSinglePass
+                    );
+                }
+                modular.validate().unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn block_projection_preserves_explicit_conflict_validation() {
+        let image = Image::new(
+            16,
+            16,
+            rs_jxl::PixelLayout::Gray,
+            rs_jxl::PixelData::U8(vec![17; 256]),
+        )
+        .unwrap();
+        let params = CandidateParams::default().backend(9).unwrap();
+        for target in [BlockTarget::Residual, BlockTarget::Reference] {
+            for conflict in 0..3 {
+                let mut base = EncodeOptions::default();
+                match conflict {
+                    0 => base.modular.tree_learning = rs_jxl::modular::ma_train::TreeLearning::Cost,
+                    1 => {
+                        base.modular.source_ma_scoring.description =
+                            rs_jxl::modular::ma_train::DescriptionCost::Full;
+                    }
+                    _ => base.modular.refinement.offsets = Some(Default::default()),
+                }
+                let mut reference_base = base.clone();
+                configure_block_bases(
+                    &mut base,
+                    &mut reference_base,
+                    target,
+                    &Default::default(),
+                    &Arc::new(block_context::Receipt::default()),
+                );
+                if target.residual() {
+                    assert!(adapter::project_native(&params, &image, &base).is_err());
+                } else {
+                    assert!(
+                        adapter::source_patch_reference_policy(
+                            &params,
+                            &image,
+                            &reference_base,
+                            Default::default(),
+                        )
+                        .is_err()
+                    );
+                }
+            }
         }
     }
 
     #[test]
     fn gated_reference_does_not_configure_whole_frame() {
-        let mut options = EncodeOptions::default();
+        let mut base = EncodeOptions::default();
+        let mut reference_base = base.clone();
         let reference = Arc::new(block_context::Receipt::default());
-        configure_blocks(
-            &mut options,
+        configure_block_bases(
+            &mut base,
+            &mut reference_base,
             BlockTarget::Reference,
             &Default::default(),
             &reference,
         );
-        assert!(options.modular.block_context.is_none());
-        assert!(options.source_patch_reference.is_none());
+        assert!(base.modular.block_context.is_none());
+        assert!(base.source_patch_reference.is_none());
+        assert!(reference_base.modular.block_context.is_some());
         let work = targeted_block_work(&reference, false);
         assert_eq!(work["configured"], false);
         assert_eq!(work["used"], false);

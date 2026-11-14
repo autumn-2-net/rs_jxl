@@ -274,6 +274,8 @@ fn project_native_metadata(
     // ignores shared here. Keep the correct shared-tree full-frame fallback;
     // shared_tree=false alone would not implement source streaming geometry.
     options.shared_tree = route != SourceFrameRoute::IndependentFullFrame;
+    let parallel_shared_e5 =
+        speed_tier == 5 && !streaming && options.shared_tree && base.threads > 1;
     // Source responsive alone does not enable progressive passes. Never
     // inherit an unrelated base frame layout into an explicit source candidate.
     options.responsive = params.responsive;
@@ -394,6 +396,16 @@ fn project_native_metadata(
         max_channel_size: dim,
         ..Default::default()
     })?);
+    if parallel_shared_e5 {
+        // Shared domains have no outer frame-area jobs to distribute this work.
+        // Keep complete channel histories and sampling policy; only dispatch changes.
+        options.modular.source_gather.get_or_insert_with(|| {
+            crate::modular::sample::GatherOptions {
+                workers: base.threads.clamp(1, 64),
+                ..Default::default()
+            }
+        });
+    }
     // Keep sample_limit as the caller's hard error ceiling; do not silently
     // reduce the source sampling fraction to fit a midpoint target.
     options.modular.entropy_options = EntropyOptions::for_modular(ModularEntropyParams {
@@ -564,11 +576,12 @@ fn project_native_metadata(
                     },
                     chain_batch: true,
                     chain_batch_parallel_only: true,
-                    // Keep lower-tier seed/stream execution unchanged. Batch only
-                    // applies to Optc256 and still checks the installed executor.
-                    parallelism: (method == LzMethod::Optc256).then_some(
+                    // Frame-area jobs already run in parallel. Shared e5 needs
+                    // stream dispatch here; explicit caller policies still win.
+                    parallelism: (method == LzMethod::Optc256 || parallel_shared_e5).then_some(
                         crate::tools::lz77::SourceParallelism {
                             max_workers: base.threads.clamp(1, 64),
+                            fast_streams: parallel_shared_e5,
                             ..Default::default()
                         },
                     ),

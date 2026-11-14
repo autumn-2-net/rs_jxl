@@ -219,6 +219,70 @@ impl<'a> NeighborRow<'a> {
                 .unwrap_or(topright),
         })
     }
+
+    /// Visit the validated visible row, peeling the boundary-dependent loads.
+    /// The final argument identifies positions safe for the WP interior kernel.
+    #[inline(always)]
+    pub fn visit<E>(
+        &self,
+        mut pixel: impl FnMut(usize, i32, Neighbors, bool) -> Result<(), E>,
+    ) -> Result<(), E> {
+        let width = self.current.len();
+        let mut edge = |x| {
+            pixel(
+                x,
+                self.current[x],
+                self.at(x).expect("position inside validated row"),
+                false,
+            )
+        };
+        if width <= 8 || self.above_two.is_none() {
+            for x in 0..width {
+                edge(x)?;
+            }
+            return Ok(());
+        }
+        edge(0)?;
+        edge(1)?;
+        let end = width - 2;
+        let top = self
+            .above
+            .expect("two previous rows imply one previous row");
+        let toptop = self.above_two.expect("interior has two previous rows");
+        let lanes = self.current[2..end]
+            .iter()
+            .zip(&self.current[1..end - 1])
+            .zip(&self.current[..end - 2])
+            .zip(&top[2..end])
+            .zip(&top[1..end - 1])
+            .zip(&top[3..end + 1])
+            .zip(&toptop[2..end])
+            .zip(&top[4..end + 2]);
+        for (
+            offset,
+            (((((((value, left), leftleft), top), topleft), topright), toptop), toprightright),
+        ) in lanes.enumerate()
+        {
+            pixel(
+                offset + 2,
+                *value,
+                Neighbors {
+                    left: *left,
+                    top: *top,
+                    topleft: *topleft,
+                    topright: *topright,
+                    toptop: *toptop,
+                    leftleft: *leftleft,
+                    toprightright: *toprightright,
+                },
+                true,
+            )?;
+        }
+        for x in end..width {
+            pixel(x, self.current[x], self.at(x).expect("visible tail"), false)?;
+        }
+        Ok(())
+    }
 }
 
 impl Neighbors {
@@ -394,6 +458,46 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn row_visit_preserves_visible_values_neighbors_order_and_errors() {
+        for width in [1, 2, 3, 7, 8, 9, 17, 256, 257] {
+            for padding in [0, 5] {
+                let stride = width + padding;
+                let pixels: Vec<_> = (0..stride * 5)
+                    .map(|i| [i32::MIN, i32::MAX, -1, 0, 2047, -8192][i % 6])
+                    .collect();
+                for y in 0..5 {
+                    let row = NeighborRow::new(&pixels, width, stride, y).unwrap();
+                    let mut visited = 0;
+                    row.visit::<()>(|x, value, n, interior| {
+                        assert_eq!(x, visited);
+                        assert_eq!(value, pixels[y * stride + x]);
+                        assert_eq!(
+                            n,
+                            Neighbors::from_plane(&pixels, width, stride, x, y).unwrap()
+                        );
+                        assert_eq!(interior, width > 8 && y > 1 && (2..width - 2).contains(&x));
+                        visited += 1;
+                        Ok(())
+                    })
+                    .unwrap();
+                    assert_eq!(visited, width);
+                    for stop in [0, width / 2, width - 1] {
+                        let mut visits = 0;
+                        assert_eq!(
+                            row.visit(|x, _, _, _| {
+                                visits += 1;
+                                if x == stop { Err(stop) } else { Ok(()) }
+                            }),
+                            Err(stop)
+                        );
+                        assert_eq!(visits, stop + 1);
+                    }
+                }
+            }
+        }
+    }
 
     // Independent wide scalar formulas: no production helpers, no shifts,
     // and a mathematical clamp rather than the wrapping gradient implementation.

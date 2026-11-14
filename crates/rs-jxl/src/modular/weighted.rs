@@ -63,9 +63,12 @@ static SMALL_WEIGHTS: [[u32; 256]; 16] = {
 };
 
 #[inline]
-fn weights(errors: [u32; 4], max_weights: [u32; 4]) -> [u32; 4] {
+fn weights(errors: [u32; 4], max_weights: [u32; 4], small_weights: [&[u32; 256]; 4]) -> [u32; 4] {
     if (errors[0] | errors[1] | errors[2] | errors[3]) < 256 {
-        std::array::from_fn(|i| SMALL_WEIGHTS[max_weights[i] as usize][errors[i] as usize])
+        // The guard proves this narrowing exact, and u8 indices make each
+        // lookup statically in bounds. Header-dependent rows are selected once.
+        let indices = errors.map(|error| error as u8);
+        std::array::from_fn(|i| small_weights[i][usize::from(indices[i])])
     } else {
         std::array::from_fn(|i| error_weight(errors[i], max_weights[i]))
     }
@@ -168,6 +171,9 @@ impl Header {
 #[cfg_attr(test, derive(Clone, Eq, PartialEq))]
 pub struct State {
     header: Header,
+    // Header is immutable for the state's lifetime; avoid rechecking its four
+    // table-row indices on every small-error prediction.
+    small_weights: [&'static [u32; 256]; NUM_PREDICTORS],
     width: usize,
     stride: usize,
     prediction: [i64; NUM_PREDICTORS],
@@ -202,6 +208,7 @@ impl State {
             .ok_or(Error::Limit("weighted history size"))?;
         Ok(Self {
             header,
+            small_weights: header.w.map(|weight| &SMALL_WEIGHTS[weight as usize]),
             width,
             stride,
             prediction: [0; NUM_PREDICTORS],
@@ -242,6 +249,7 @@ impl State {
         }
     }
 
+    #[inline(always)]
     fn weighted_average(p: [i64; 4], mut w: [u32; 4]) -> i64 {
         let weight_sum: u32 = w.iter().sum();
         let log_weight = 31 - weight_sum.leading_zeros();
@@ -298,7 +306,7 @@ impl State {
     /// Raster-order variant for local cost walks: the caller advances through
     /// consecutive raster coordinates, so the per-sample position check is
     /// skipped. Prediction and history update are the same as the checked API.
-    #[inline]
+    #[inline(always)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn predict_and_update_raster<const NARROW: bool>(
         &mut self,
@@ -319,7 +327,7 @@ impl State {
 
     /// Interior version of [`Self::predict_and_update_raster`]: the caller keeps
     /// `0 < x < width - 1`, so the boundary selects fold away entirely.
-    #[inline]
+    #[inline(always)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn predict_and_update_raster_interior<const NARROW: bool>(
         &mut self,
@@ -357,7 +365,9 @@ impl State {
 
     /// `INTERIOR` promises `0 < x < width - 1`; it removes the three per-sample
     /// boundary selects and never changes a value.
-    #[inline]
+    // Keep arithmetic in the caller's target-feature domain, not an outlined
+    // baseline function reached from every ISA-specific channel walker.
+    #[inline(always)]
     fn predict_at<const FLAT: bool, const INTERIOR: bool, const NARROW: bool>(
         &mut self,
         x: usize,
@@ -405,7 +415,7 @@ impl State {
                     .wrapping_add(northwest[i])
             })
         };
-        let weights = weights(errors, self.header.w);
+        let weights = weights(errors, self.header.w, self.small_weights);
 
         let [n, w, ne, nw, nn] = [n, w, ne, nw, nn].map(|v| i64::from(v) << EXTRA_BITS);
         let sum_wn = te_n + te_w;
@@ -463,7 +473,7 @@ impl State {
 
     /// History update shared by both prediction APIs; the callers own the
     /// position bookkeeping.
-    #[inline]
+    #[inline(always)]
     fn update_at_raster<const NARROW: bool>(
         &mut self,
         value: i32,
@@ -508,6 +518,10 @@ mod fused_tests;
 mod flat_tests;
 
 #[cfg(test)]
+#[path = "weighted_cached_tests.rs"]
+mod cached_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -536,7 +550,8 @@ mod tests {
                         let reciprocal = (1u64 << 24) / (u64::from(input[i]) / scale + 1);
                         (4 + u64::from(limits[i]) * reciprocal / scale) as u32
                     });
-                    assert_eq!(weights(input, limits), expected);
+                    let tables = limits.map(|weight| &SMALL_WEIGHTS[weight as usize]);
+                    assert_eq!(weights(input, limits, tables), expected);
                 }
             }
         }
@@ -638,7 +653,7 @@ mod tests {
         ],
     ];
 
-    fn neighbors(samples: &[i32], width: usize, x: usize, y: usize) -> [i32; 5] {
+    pub(super) fn neighbors(samples: &[i32], width: usize, x: usize, y: usize) -> [i32; 5] {
         let pos = y * width + x;
         let w = if x > 0 {
             samples[pos - 1]
@@ -925,7 +940,11 @@ mod tests {
     // A deliberately non-ring reference: retain every pixel's predictor error
     // and derive W/WW contributions geometrically. Wider arithmetic prevents
     // accidental reliance on the production implementation's widths/helpers.
-    fn full_history_reference(samples: &[i32], width: usize, header: Header) -> Vec<(i32, i32)> {
+    pub(super) fn full_history_reference(
+        samples: &[i32],
+        width: usize,
+        header: Header,
+    ) -> Vec<(i32, i32)> {
         let mut signed = vec![0i32; samples.len()];
         let mut errors = vec![[0u32; 4]; samples.len()];
         let mut output = Vec::new();

@@ -23,6 +23,10 @@ pub mod receipt_cost;
 #[path = "receipt_cost_tests.rs"]
 mod receipt_cost_tests;
 
+#[cfg(test)]
+#[path = "encode_visitor_tests.rs"]
+mod encode_visitor_tests;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FixedTree {
     Zero,
@@ -624,6 +628,125 @@ pub(super) fn visit_channel(
     use_wp: bool,
     previous_channels: usize,
     stream_id: usize,
+    visitor: impl FnMut(usize, usize, Neighbors, i32, &[i32], i32) -> Result<()>,
+) -> Result<()> {
+    #[cfg(target_arch = "x86_64")]
+    match super::kernel_isa::selected() {
+        super::kernel_isa::Isa::Portable => {}
+        super::kernel_isa::Isa::Avx2 => {
+            // SAFETY: the shared selector returns AVX2 only when supported.
+            return unsafe {
+                visit_channel_avx2(planes, c, wp, use_wp, previous_channels, stream_id, visitor)
+            };
+        }
+        super::kernel_isa::Isa::Avx512 => {
+            // SAFETY: the shared selector verifies all four AVX512 features.
+            return unsafe {
+                visit_channel_avx512(planes, c, wp, use_wp, previous_channels, stream_id, visitor)
+            };
+        }
+    }
+    visit_channel_impl(planes, c, wp, use_wp, previous_channels, stream_id, visitor)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn visit_channel_with_history(
+    planes: &[Channel],
+    c: usize,
+    wp: &weighted::Header,
+    use_wp: bool,
+    previous_channels: usize,
+    stream_id: usize,
+    history: Option<&[[i32; 2]]>,
+    visitor: impl FnMut(usize, usize, Neighbors, i32, &[i32], i32) -> Result<()>,
+) -> Result<()> {
+    if use_wp && let Some(history) = history {
+        if history.len() != planes[c].samples.len() {
+            return Err(Error::Encoding("Weighted history length mismatch".into()));
+        }
+        visit_channel_history_impl(
+            planes,
+            c,
+            wp,
+            use_wp,
+            previous_channels,
+            stream_id,
+            Some(history),
+            visitor,
+        )
+    } else {
+        visit_channel(planes, c, wp, use_wp, previous_channels, stream_id, visitor)
+    }
+}
+
+/// # Safety
+/// The caller must verify AVX2 support before entering this channel walk.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn visit_channel_avx2(
+    planes: &[Channel],
+    c: usize,
+    wp: &weighted::Header,
+    use_wp: bool,
+    previous_channels: usize,
+    stream_id: usize,
+    visitor: impl FnMut(usize, usize, Neighbors, i32, &[i32], i32) -> Result<()>,
+) -> Result<()> {
+    visit_channel_impl(planes, c, wp, use_wp, previous_channels, stream_id, visitor)
+}
+
+/// # Safety
+/// The caller must verify AVX512F/BW/DQ/VL support before entering this walk.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,avx512f,avx512bw,avx512dq,avx512vl")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn visit_channel_avx512(
+    planes: &[Channel],
+    c: usize,
+    wp: &weighted::Header,
+    use_wp: bool,
+    previous_channels: usize,
+    stream_id: usize,
+    visitor: impl FnMut(usize, usize, Neighbors, i32, &[i32], i32) -> Result<()>,
+) -> Result<()> {
+    visit_channel_impl(planes, c, wp, use_wp, previous_channels, stream_id, visitor)
+}
+
+// Inline the complete walk into each ISA entry; retain a safe baseline oracle.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn visit_channel_impl(
+    planes: &[Channel],
+    c: usize,
+    wp: &weighted::Header,
+    use_wp: bool,
+    previous_channels: usize,
+    stream_id: usize,
+    visitor: impl FnMut(usize, usize, Neighbors, i32, &[i32], i32) -> Result<()>,
+) -> Result<()> {
+    visit_channel_history_impl(
+        planes,
+        c,
+        wp,
+        use_wp,
+        previous_channels,
+        stream_id,
+        None,
+        visitor,
+    )
+}
+
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn visit_channel_history_impl(
+    planes: &[Channel],
+    c: usize,
+    wp: &weighted::Header,
+    use_wp: bool,
+    previous_channels: usize,
+    stream_id: usize,
+    history: Option<&[[i32; 2]]>,
     mut visitor: impl FnMut(usize, usize, Neighbors, i32, &[i32], i32) -> Result<()>,
 ) -> Result<()> {
     let channel = &planes[c];
@@ -645,47 +768,73 @@ pub(super) fn visit_channel(
         .take(previous_channels)
         .collect();
     let mut props = vec![0; 16 + 4 * previous_channels];
-    let mut state = if use_wp {
+    let mut state = if use_wp && history.is_none() {
         Some(weighted::State::new(*wp, width)?)
     } else {
         None
     };
     let mut properties = Properties::default();
+    #[cfg(feature = "encoder-kernel-profile")]
+    let mut kernel_profile = super::kernel_profile::Profile::new(
+        "channel_visit",
+        ["weighted", "properties", "visitor", "unused"],
+        (stream_id as u64).wrapping_mul(131) ^ c as u64 ^ (width as u64).rotate_left(17),
+    );
     for y in 0..height {
         let neighbors = super::predictor::NeighborRow::new(plane, width, width, y)
             .map_err(|e| Error::Encoding(e.to_string()))?;
-        for x in 0..width {
-            let n = neighbors
-                .at(x)
-                .map_err(|e| Error::Encoding(e.to_string()))?;
-            let pos = y * width + x;
-            let (prediction, error) = if let Some(state) = &mut state {
-                state.predict_and_update_raster::<false>(
-                    plane[pos], x, y, n.top, n.left, n.topright, n.topleft, n.toptop,
-                )
-            } else {
-                (0, 0)
-            };
-            props[..16].copy_from_slice(&properties.calculate(n, x, y, c, stream_id, error));
-            for (i, r) in references.iter().enumerate() {
-                let v = r.samples[pos];
-                let left = if x > 0 { r.samples[pos - 1] } else { 0 };
-                let top = if y > 0 { r.samples[pos - width] } else { left };
-                let nw = if x > 0 && y > 0 {
-                    r.samples[pos - width - 1]
+        let pixel = {
+            #[inline(always)]
+            |x, value, n: Neighbors, interior| {
+                #[cfg(feature = "encoder-kernel-profile")]
+                let mut clock = kernel_profile.start();
+                let pos = y * width + x;
+                let (prediction, error) = if let Some(history) = history {
+                    let [prediction, error] = history[pos];
+                    (prediction, error)
+                } else if let Some(state) = &mut state {
+                    if interior {
+                        state.predict_and_update_raster_interior::<false>(
+                            value, x, y, n.top, n.left, n.topright, n.topleft, n.toptop,
+                        )
+                    } else {
+                        state.predict_and_update_raster::<false>(
+                            value, x, y, n.top, n.left, n.topright, n.topleft, n.toptop,
+                        )
+                    }
                 } else {
-                    left
+                    (0, 0)
                 };
-                let residual = v.wrapping_sub(super::predictor::clamped_gradient(left, top, nw));
-                props[16 + 4 * i..20 + 4 * i].copy_from_slice(&[
-                    v.wrapping_abs(),
-                    v,
-                    residual.wrapping_abs(),
-                    residual,
-                ]);
+                #[cfg(feature = "encoder-kernel-profile")]
+                kernel_profile.lap(0, &mut clock);
+                props[..16].copy_from_slice(&properties.calculate(n, x, y, c, stream_id, error));
+                for (i, r) in references.iter().enumerate() {
+                    let v = r.samples[pos];
+                    let left = if x > 0 { r.samples[pos - 1] } else { 0 };
+                    let top = if y > 0 { r.samples[pos - width] } else { left };
+                    let nw = if x > 0 && y > 0 {
+                        r.samples[pos - width - 1]
+                    } else {
+                        left
+                    };
+                    let residual =
+                        v.wrapping_sub(super::predictor::clamped_gradient(left, top, nw));
+                    props[16 + 4 * i..20 + 4 * i].copy_from_slice(&[
+                        v.wrapping_abs(),
+                        v,
+                        residual.wrapping_abs(),
+                        residual,
+                    ]);
+                }
+                #[cfg(feature = "encoder-kernel-profile")]
+                kernel_profile.lap(1, &mut clock);
+                let result = visitor(c, pos, n, prediction, &props, value);
+                #[cfg(feature = "encoder-kernel-profile")]
+                kernel_profile.lap(2, &mut clock);
+                result
             }
-            visitor(c, pos, n, prediction, &props, plane[pos])?;
-        }
+        };
+        neighbors.visit(pixel)?;
     }
     Ok(())
 }
@@ -828,17 +977,19 @@ fn learn(
     wp: &weighted::Header,
     stream_id: usize,
     bits: u8,
+    history: Option<&super::weighted_history::History<'_>>,
 ) -> Result<Tree> {
     if let Some(tree) = predefined(planes.iter(), options, bits)? {
         return Ok(tree);
     }
-    super::training::learn_local(
+    super::training::learn_local_with_history(
         &[super::training::TrainingStream {
             channels: planes,
             wp: *wp,
             stream_id,
         }],
         options,
+        history,
     )
 }
 
@@ -860,27 +1011,49 @@ pub(super) fn group_stream_with_channels(
     stream_id: usize,
     parallel_channels: bool,
 ) -> Result<(Vec<Token>, bool)> {
+    group_stream_with_history(
+        planes,
+        tree,
+        options,
+        wp,
+        stream_id,
+        parallel_channels,
+        None,
+    )
+}
+
+pub(super) fn group_stream_with_history(
+    planes: &[Channel],
+    tree: &Tree,
+    options: &ModularOptions,
+    wp: &weighted::Header,
+    stream_id: usize,
+    parallel_channels: bool,
+    history: Option<&super::weighted_history::History<'_>>,
+) -> Result<(Vec<Token>, bool)> {
     if !options.lz77 {
         // Without a match finder there is no reason to materialize raw literals
         // and Commands before building the final entropy-token stream.
-        return super::tokens::tokenize_entropy(
+        return super::tokens::tokenize_entropy_with_history(
             planes,
             tree,
             wp,
             options.previous_channels,
             stream_id,
             parallel_channels,
+            history,
         )
         .map(|tokens| (tokens, false));
     }
     let distance_multiplier = planes.iter().map(|c| c.width).max().unwrap_or(1);
-    let raw = super::tokens::tokenize(
+    let raw = super::tokens::tokenize_with_history(
         planes,
         tree,
         wp,
         options.previous_channels,
         stream_id,
         parallel_channels,
+        history,
     )?;
     parse_group_tokens(&raw, tree.leaves(), distance_multiplier, options)
 }
@@ -903,9 +1076,16 @@ pub(super) fn parse_group_tokens(
         && let Some(config) = &options.source_lz77
     {
         let _scope = crate::profile::scope("lz77.parse_local");
-        let outcome = lz77::parse_source_with_state(raw, distance_multiplier, config)?;
-        let (tokens, _) = commands_to_tokens(outcome.commands, contexts, distance_multiplier)?;
-        return Ok((tokens, outcome.enabled));
+        let (commands, enabled) =
+            lz77::SourceParseOutcome::parse_borrowed(raw, distance_multiplier, config)?;
+        let tokens = if let Some(commands) = commands {
+            commands_to_tokens(commands, contexts, distance_multiplier)?.0
+        } else {
+            raw.iter()
+                .map(|t| Token::literal(t.context as usize, t.value))
+                .collect()
+        };
+        return Ok((tokens, enabled));
     }
     // (4,0,0) length coding reserves symbols 224..255 in this stream.
     let lz_options = Lz77Options {
@@ -1068,12 +1248,21 @@ pub(crate) fn write_prepared_stream(
     // A zero-entry implicit palette has no coded metadata samples. The decoder
     // returns immediately after GroupHeader when every channel is empty.
     if planes.iter().any(|p| p.width != 0 && p.height != 0) {
-        let tree = learn(planes, options, &wp, stream_id, bits)?;
+        let history = super::weighted_history::History::new(planes, wp, options);
+        let tree = learn(planes, options, &wp, stream_id, bits, history.as_ref())?;
         if options.refinement.enabled() {
             super::refinement::write_local(&tree, planes, &wp, stream_id, options, writer)?;
             return Ok(());
         }
-        let (tokens, has_matches) = group_stream(planes, &tree, options, &wp, stream_id)?;
+        let (tokens, has_matches) = group_stream_with_history(
+            planes,
+            &tree,
+            options,
+            &wp,
+            stream_id,
+            false,
+            history.as_ref(),
+        )?;
         let streams = [tokens];
         let model = Model::build_with_options(
             &streams,

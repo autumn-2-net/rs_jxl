@@ -10,6 +10,7 @@ pub(super) fn emit(
     plane: &Channel,
     plan: &ChannelTree,
     header: &weighted::Header,
+    history: Option<&[[i32; 2]]>,
     mut emit: impl FnMut(Literal),
 ) -> Result<bool> {
     let Some(contexts) = plan.simple_contexts() else {
@@ -56,6 +57,18 @@ pub(super) fn emit(
                     value: pack_signed(residual),
                 });
             }
+        }
+    } else if let Some(history) = history {
+        if history.len() != plane.samples.len() {
+            return Err(crate::Error::Encoding(
+                "Weighted history length mismatch".into(),
+            ));
+        }
+        for (&value, &[prediction, error]) in plane.samples.iter().zip(history) {
+            emit(Literal {
+                context: contexts.lookup(i64::from(error)),
+                value: pack_signed(value.wrapping_sub(prediction)),
+            });
         }
     } else {
         emit_weighted(plane, header, |(residual, error)| {
@@ -167,7 +180,7 @@ mod tests {
     ) {
         let plan = ChannelTree::new(tree, channel, group);
         let mut actual = Vec::new();
-        assert!(emit(&planes[channel], &plan, header, |t| actual.push(t)).unwrap());
+        assert!(emit(&planes[channel], &plan, header, None, |t| actual.push(t)).unwrap());
         let mut expected = Vec::new();
         encode::visit_channel(
             planes,
@@ -395,6 +408,7 @@ mod tests {
                     &plane,
                     &ChannelTree::new(&tree, 0, 0),
                     &weighted::Header::default(),
+                    None,
                     |_| panic!("ineligible tree emitted a token")
                 )
                 .unwrap()
@@ -490,6 +504,7 @@ mod tests {
                     &plane,
                     &ChannelTree::new(&tree, 0, 0),
                     &weighted::Header::default(),
+                    None,
                     |_| panic!("invalid plane emitted a token")
                 )
                 .is_err()

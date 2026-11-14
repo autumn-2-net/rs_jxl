@@ -10,6 +10,7 @@ experimental-lz77 = []
 experimental-lz77-hotspots = []
 decoder-avx512 = ["jxl-decoder/avx512"]
 decoder-profile = ["jxl-decoder/decoder-profile"]
+encoder-kernel-profile = []
 
 [dependencies]
 bytemuck = { version = "=1.25.2", features = ["extern_crate_alloc"] }

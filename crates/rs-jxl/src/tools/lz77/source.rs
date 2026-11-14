@@ -690,12 +690,55 @@ pub struct SourceParseOutcome {
     pub enabled: bool,
 }
 
+impl SourceParseOutcome {
+    /// Internal literal-preserving route. None reuses input unchanged; enabled
+    /// remains the source gate decision, independent of command ownership.
+    pub(crate) fn parse_borrowed(
+        input: &[Literal],
+        distance_multiplier: usize,
+        config: &SourceConfig,
+    ) -> Result<(Option<Vec<Command>>, bool)> {
+        let outcome = run_borrowed(
+            &[input],
+            &[distance_multiplier],
+            config,
+            &mut Work::default(),
+        )?;
+        Ok((
+            outcome
+                .commands
+                .map(|mut streams| streams.pop().expect("one source stream")),
+            outcome.enabled,
+        ))
+    }
+}
+
 /// One shared histogram/gate decision for all streams. Empty/literal-only
 /// streams still use the shared LZ77 entropy header when enabled=true.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SourceStreamsOutcome {
     pub commands: Vec<Vec<Command>>,
     pub enabled: bool,
+}
+
+struct BorrowedStreamsOutcome {
+    commands: Option<Vec<Vec<Command>>>,
+    enabled: bool,
+}
+
+impl BorrowedStreamsOutcome {
+    fn into_owned(self, inputs: &[&[Literal]]) -> Result<SourceStreamsOutcome> {
+        Ok(SourceStreamsOutcome {
+            commands: match self.commands {
+                Some(commands) => commands,
+                None => inputs
+                    .iter()
+                    .map(|input| literals(input))
+                    .collect::<Result<_>>()?,
+            },
+            enabled: self.enabled,
+        })
+    }
 }
 
 // base/fast_math-inl.h::FastLog2f and rational_polynomial-inl.h. Inputs are
@@ -922,48 +965,76 @@ fn fast_stream<const N: usize>(
     sums: &[f32],
     saving: &mut f32,
 ) -> Result<Vec<Command>> {
+    let (commands, _) =
+        fast_stream_borrowed::<N>(input, values, width, config, penalties, sums, saving)?;
+    match commands {
+        Some(commands) => Ok(commands),
+        None => literals(input),
+    }
+}
+
+fn fast_stream_borrowed<const N: usize>(
+    input: &[Literal],
+    values: &[u32],
+    width: usize,
+    config: &SourceConfig,
+    penalties: &prices::Penalties<'_>,
+    sums: &[f32],
+    saving: &mut f32,
+) -> Result<(Option<Vec<Command>>, usize)> {
     let _profile = crate::profile::scope("lz77.source.fast_seed");
     let init_profile = crate::profile::scope("lz77.source.seed_matcher_init");
     let mut matcher = Fast::<N>::new(values, width, config)?;
     drop(init_profile);
-    let mut output = reserved(input.len())?;
+    // Defer literal commands, including the entire prefix before the first
+    // accepted match. A match-free seed never needs a command allocation.
+    let mut output: Option<Vec<Command>> = None;
+    let mut output_tokens = input.len();
+    let mut literal_begin = 0;
     let mut position = 0;
     while position < input.len() {
         if input.len() - position < MIN_MATCH {
-            output.push(Command::Literal(input[position]));
             position += 1;
             continue;
         }
         let matched = matcher.find(position);
         if matched.length < MIN_MATCH {
-            output.push(Command::Literal(input[position]));
             position += 1;
             continue;
         }
         let raw = sums[position + matched.length] - sums[position];
         let cost = static_cost_with_penalty(matched, penalties.get(input[position].context));
         let consumed = if config.method.runtime_cost_comparison() && cost > raw {
-            let count = if raw < matched.length as f32 && matched.length > MIN_MATCH {
+            if raw < matched.length as f32 && matched.length > MIN_MATCH {
                 matched.length - MIN_MATCH + 1
             } else {
                 1
-            };
-            output.extend(
-                input[position..position + count]
+            }
+        } else {
+            *saving += raw - cost;
+            if output.is_none() {
+                output = Some(reserved(input.len())?);
+            }
+            let commands = output.as_mut().expect("accepted source match");
+            commands.extend(
+                input[literal_begin..position]
                     .iter()
                     .copied()
                     .map(Command::Literal),
             );
-            count
-        } else {
-            *saving += raw - cost;
-            output.push(matched.command(input[position].context));
+            commands.push(matched.command(input[position].context));
+            // A match replaces its literals with one length and one distance token.
+            output_tokens -= matched.length - 2;
+            literal_begin = position + matched.length;
             matched.length
         };
         matcher.update_range(position + 1, position + consumed);
         position += consumed;
     }
-    Ok(output)
+    if let Some(commands) = &mut output {
+        commands.extend(input[literal_begin..].iter().copied().map(Command::Literal));
+    }
+    Ok((output, output_tokens))
 }
 
 fn careful_stream(
@@ -1493,13 +1564,19 @@ fn run(
     config: &SourceConfig,
     _work: &mut Work,
 ) -> Result<SourceStreamsOutcome> {
+    run_borrowed(inputs, widths, config, _work)?.into_owned(inputs)
+}
+
+fn run_borrowed(
+    inputs: &[&[Literal]],
+    widths: &[usize],
+    config: &SourceConfig,
+    _work: &mut Work,
+) -> Result<BorrowedStreamsOutcome> {
     let total = validate_inputs(inputs, config)?;
     if total == 0 {
-        return Ok(SourceStreamsOutcome {
-            commands: inputs
-                .iter()
-                .map(|input| literals(input))
-                .collect::<Result<_>>()?,
+        return Ok(BorrowedStreamsOutcome {
+            commands: None,
             // Empty input is rejected by the normal source gate. The existing
             // diagnostic override bypasses that gate, but no streams still
             // means an empty outer vector in enc_ans.cc::BuildAndEncodeHistograms.
@@ -1522,11 +1599,8 @@ fn run(
         SourceScoutDecision::Full
     };
     if route == SourceScoutDecision::Literal {
-        return Ok(SourceStreamsOutcome {
-            commands: inputs
-                .iter()
-                .map(|input| literals(input))
-                .collect::<Result<_>>()?,
+        return Ok(BorrowedStreamsOutcome {
+            commands: None,
             enabled: false,
         });
     }
@@ -1584,56 +1658,65 @@ fn run(
     } else {
         Some(prices::Penalties::new(&costs)?)
     };
-    let encode_seed = |index: usize, saving: &mut f32| -> Result<(Vec<Command>, f32)> {
-        let part = &parts[index];
-        let input = seed_inputs[index];
-        let data = &values[part.owner][part.begin..part.end];
-        let width = widths.get(part.owner).copied().unwrap_or(0);
-        if let Some((owner, index)) = &shared
-            && *owner == part.owner
-        {
-            let (commands, decrease, raw) = blocks::indexed_seed(input, index, config, &costs)?;
-            *saving += decrease;
-            return Ok((commands, raw));
-        }
-        let sums = seed_prices.cumulative(input, config)?;
-        let commands = if careful {
-            let commands = careful_stream(input, data, width, config, &costs, &sums, saving)?;
-            if config.quick == SourceQuickMode::DoubleFastCost
-                && let Some(receipt) = &config.quick_receipt
+    let encode_seed =
+        |index: usize, saving: &mut f32| -> Result<(Option<Vec<Command>>, f32, usize)> {
+            let part = &parts[index];
+            let input = seed_inputs[index];
+            let data = &values[part.owner][part.begin..part.end];
+            let width = widths.get(part.owner).copied().unwrap_or(0);
+            if let Some((owner, index)) = &shared
+                && *owner == part.owner
             {
-                receipt.record_careful();
+                let (commands, decrease, raw) = blocks::indexed_seed(input, index, config, &costs)?;
+                *saving += decrease;
+                let output_tokens = wire_token_count(&commands);
+                return Ok((Some(commands), raw, output_tokens));
             }
-            commands
-        } else if config.quick != SourceQuickMode::Off {
-            quick::parse(
-                input,
-                data,
-                width,
-                config,
-                seed_penalties.as_ref().expect("quick seed penalties"),
-                &sums,
-                saving,
-            )?
-        } else {
-            let penalties = seed_penalties.as_ref().expect("fast-seed penalty table");
-            match config.method.fast_capacity() {
-                Some(1) => fast_stream::<1>(input, data, width, config, penalties, &sums, saving)?,
-                Some(3) => fast_stream::<3>(input, data, width, config, penalties, &sums, saving)?,
-                Some(7) | None => {
-                    fast_stream::<7>(input, data, width, config, penalties, &sums, saving)?
+            let sums = seed_prices.cumulative(input, config)?;
+            let (commands, output_tokens) = if careful {
+                let commands = careful_stream(input, data, width, config, &costs, &sums, saving)?;
+                if config.quick == SourceQuickMode::DoubleFastCost
+                    && let Some(receipt) = &config.quick_receipt
+                {
+                    receipt.record_careful();
                 }
-                Some(15) => {
-                    fast_stream::<15>(input, data, width, config, penalties, &sums, saving)?
+                let output_tokens = wire_token_count(&commands);
+                (Some(commands), output_tokens)
+            } else if config.quick != SourceQuickMode::Off {
+                let commands = quick::parse(
+                    input,
+                    data,
+                    width,
+                    config,
+                    seed_penalties.as_ref().expect("quick seed penalties"),
+                    &sums,
+                    saving,
+                )?;
+                let output_tokens = wire_token_count(&commands);
+                (Some(commands), output_tokens)
+            } else {
+                let penalties = seed_penalties.as_ref().expect("fast-seed penalty table");
+                match config.method.fast_capacity() {
+                    Some(1) => fast_stream_borrowed::<1>(
+                        input, data, width, config, penalties, &sums, saving,
+                    )?,
+                    Some(3) => fast_stream_borrowed::<3>(
+                        input, data, width, config, penalties, &sums, saving,
+                    )?,
+                    Some(7) | None => fast_stream_borrowed::<7>(
+                        input, data, width, config, penalties, &sums, saving,
+                    )?,
+                    Some(15) => fast_stream_borrowed::<15>(
+                        input, data, width, config, penalties, &sums, saving,
+                    )?,
+                    Some(31) => fast_stream_borrowed::<31>(
+                        input, data, width, config, penalties, &sums, saving,
+                    )?,
+                    _ => unreachable!("source fast bucket capacity"),
                 }
-                Some(31) => {
-                    fast_stream::<31>(input, data, width, config, penalties, &sums, saving)?
-                }
-                _ => unreachable!("source fast bucket capacity"),
-            }
+            };
+            Ok((commands, sums[input.len()], output_tokens))
         };
-        Ok((commands, sums[input.len()]))
-    };
     let schedule = Schedule::new(&seed_inputs, config, true);
     // ApplyLZ77_LZ77 disables stream parallelism when an indexed seed owns
     // intra-stream tasks. Do not silently turn that into nested pool work.
@@ -1643,31 +1726,33 @@ fn run(
         _work.fast_tasks = if parallel_seed { schedule.tasks } else { 1 };
     }
     let mut seed = reserved(seed_inputs.len())?;
+    let mut output_tokens = 0;
     let (mut saving, mut raw) = (0.0f32, 0.0f32);
     if parallel_seed {
         let results = schedule.collect(seed_inputs.len(), |index| {
             let mut decrease = 0.0;
-            let (commands, raw) = encode_seed(index, &mut decrease)?;
-            Ok((commands, raw, decrease))
+            let (commands, raw, tokens) = encode_seed(index, &mut decrease)?;
+            Ok((commands, raw, decrease, tokens))
         })?;
         // enc_lz77.cc reduces per-stream f32 savings in input order. The
         // serial branch instead adds each match into the shared accumulator.
         for result in results {
-            let (commands, raw_cost, decrease) = result.unwrap_or_default();
+            let (commands, raw_cost, decrease, tokens) = result.unwrap_or_default();
             seed.push(commands);
+            output_tokens += tokens;
             raw += raw_cost;
             saving += decrease;
         }
     } else {
         for index in 0..seed_inputs.len() {
-            let (commands, raw_cost) = encode_seed(index, &mut saving)?;
+            let (commands, raw_cost, tokens) = encode_seed(index, &mut saving)?;
             seed.push(commands);
+            output_tokens += tokens;
             raw += raw_cost;
         }
     }
     drop(seed_penalties);
     drop(seed_prices);
-    let output_tokens: usize = seed.iter().map(|commands| wire_token_count(commands)).sum();
     let mut threshold = (if careful { seed_total } else { output_tokens }) as f32 * 0.2 + 16.0;
     if !careful && raw <= seed_total as f32 * 2.5 {
         threshold = threshold.min(raw * 0.01 + 256.0);
@@ -1678,18 +1763,26 @@ fn run(
         saving <= threshold
     };
     if config.require_global_savings && rejected {
-        return Ok(SourceStreamsOutcome {
-            commands: inputs
-                .iter()
-                .map(|input| literals(input))
-                .collect::<Result<_>>()?,
+        return Ok(BorrowedStreamsOutcome {
+            commands: None,
             enabled: false,
         });
     }
+    if !optimal && seed.iter().all(Option::is_none) {
+        return Ok(BorrowedStreamsOutcome {
+            commands: None,
+            enabled: true,
+        });
+    }
+    let seed = seed
+        .into_iter()
+        .zip(&seed_inputs)
+        .map(|(commands, input)| commands.map_or_else(|| literals(input), Ok))
+        .collect::<Result<Vec<_>>>()?;
     let mut seed = blocks::merge_seed(inputs, &parts, seed)?;
     if !optimal {
-        return Ok(SourceStreamsOutcome {
-            commands: seed,
+        return Ok(BorrowedStreamsOutcome {
+            commands: Some(seed),
             enabled: true,
         });
     }
@@ -1706,7 +1799,7 @@ fn run(
         _work.selected_cost = Some(config.match_cost);
     }
     if config.match_cost == SourceMatchCost::RangeReplay {
-        return range_replayed(
+        let outcome = range_replayed(
             inputs,
             &values,
             widths,
@@ -1714,7 +1807,11 @@ fn run(
             seed,
             replay::CACHE_LIMIT,
             _work,
-        );
+        )?;
+        return Ok(BorrowedStreamsOutcome {
+            commands: Some(outcome.commands),
+            enabled: outcome.enabled,
+        });
     }
     for pass in 0..config.match_cost.passes() {
         let costs = Costs::fitted(&seed, widths, config);
@@ -1872,8 +1969,8 @@ fn run(
     // Source ApplyLZ77_Optimal returns one vector per stream after an accepted
     // seed, without a post-DP savings/match-count gate (including mode 3 refit).
     // enc_ans.cc enables LZ77 from that nonempty OUTER vector, not its contents.
-    Ok(SourceStreamsOutcome {
-        commands: seed,
+    Ok(BorrowedStreamsOutcome {
+        commands: Some(seed),
         enabled: true,
     })
 }
@@ -2015,6 +2112,9 @@ pub fn parse_source_rle_streams_with_state(
 
 #[cfg(test)]
 mod controls_tests;
+
+#[cfg(test)]
+mod borrowed_tests;
 
 #[cfg(test)]
 mod alias_tests;

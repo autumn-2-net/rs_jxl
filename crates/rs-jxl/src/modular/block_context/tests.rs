@@ -668,14 +668,17 @@ fn ordinary_effort9_native_projection_supports_block_options_and_roundtrips() {
     use crate::scheduler::{adapter, params::CandidateParams};
     let image = rgba(35, 19, 8, false);
     let params = CandidateParams::default().backend(9).unwrap();
-    let mut opts = adapter::project_native(&params, &image, &EncodeOptions::default())
+    let mut base = EncodeOptions::default();
+    // Declare the experiment before automatic e9 learner/refinement defaults.
+    base.modular.block_context = Some(experiment(8));
+    let opts = adapter::project_native(&params, &image, &base)
         .unwrap()
         .exact_options()
         .unwrap();
-    // patch_lab installs the experiment after projection; explicit fixed trees
-    // are conflicts, never a silently ignored block experiment.
     assert!(opts.modular.fixed_tree.is_none());
-    opts.modular.block_context = Some(experiment(8));
+    assert_eq!(opts.modular.tree_learning, ma_train::TreeLearning::Legacy);
+    assert_eq!(opts.modular.source_ma_scoring, Default::default());
+    assert!(opts.modular.refinement.offsets.is_none());
     opts.modular.validate().unwrap();
     assert_roundtrip(&image, &opts);
 }

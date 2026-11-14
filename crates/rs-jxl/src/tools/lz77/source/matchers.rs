@@ -357,6 +357,15 @@ impl<'a, const N: usize> Fast<'a, N> {
         let candidates = &mut self.candidates;
         let mut count = 0;
         if let Some(oldest) = ring.oldest {
+            let prefix_cached = self.prefix.cached_bytes() != 0;
+            // Without cached tags, may_match only validates the already bounded
+            // spatial positions. Reject unequal first values before materializing
+            // candidates, reusing the query load across all spatial probes.
+            let query_first = if prefix_cached || self.spatial.is_empty() {
+                None
+            } else {
+                self.values.get(position).copied()
+            };
             let safe = position - oldest as usize;
             if self.ranges {
                 if self
@@ -364,7 +373,7 @@ impl<'a, const N: usize> Fast<'a, N> {
                     .last()
                     .is_some_and(|&(distance, _)| distance > safe)
                 {
-                    if self.prefix.cached_bytes() != 0 && self.prefix_simd {
+                    if prefix_cached && self.prefix_simd {
                         self.prefix
                             .visit_special(position, safe, MIN_MATCH, &self.groups, |distance| {
                                 candidates[count] = (distance, self.codes.symbol(distance));
@@ -382,11 +391,14 @@ impl<'a, const N: usize> Fast<'a, N> {
                             .partition_point(|&(distance, _)| distance <= position);
                         self.prefix.record_candidate_work(eligible as u64);
                         for &(distance, symbol) in &self.spatial[first..first + eligible] {
-                            if self
-                                .prefix
-                                .may_match(position, position - distance, MIN_MATCH)
-                                .expect("source spatial prefix")
-                            {
+                            let may_match = if prefix_cached {
+                                self.prefix
+                                    .may_match(position, position - distance, MIN_MATCH)
+                                    .expect("source spatial prefix")
+                            } else {
+                                query_first == Some(self.values[position - distance])
+                            };
+                            if may_match {
                                 candidates[count] = (distance, symbol);
                                 count += 1;
                             }
@@ -399,11 +411,14 @@ impl<'a, const N: usize> Fast<'a, N> {
                         continue;
                     }
                     self.prefix.record_candidate_work(1);
-                    if self
-                        .prefix
-                        .may_match(position, position - distance, MIN_MATCH)
-                        .expect("previous candidate")
-                    {
+                    let may_match = if prefix_cached {
+                        self.prefix
+                            .may_match(position, position - distance, MIN_MATCH)
+                            .expect("previous candidate")
+                    } else {
+                        query_first == Some(self.values[position - distance])
+                    };
+                    if may_match {
                         candidates[count] = (distance, symbol);
                         count += 1;
                     }

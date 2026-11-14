@@ -190,7 +190,7 @@ fn explicit_lz_tools_survive_candidates_without_overriding_wire_policy() {
 }
 
 #[test]
-fn default_pixel_lz_enables_parallel_only_batch_without_changing_lower_tier_workers() {
+fn default_pixel_lz_dispatches_shared_e5_and_preserves_explicit_workers() {
     let image = Image::new(
         32,
         32,
@@ -213,7 +213,10 @@ fn default_pixel_lz_enables_parallel_only_batch_without_changing_lower_tier_work
                 assert!(lz.chain_batch && lz.chain_batch_parallel_only);
                 assert!(lz.chain_batch_streams && lz.chain_batch_adaptive);
                 assert_eq!(lz.chain_batch_lanes, 1);
-                if lz.method == SourceLz77Method::Optc256 {
+                if effort == 5 && threads > 1 && options.shared_tree {
+                    assert_eq!(lz.parallelism.unwrap().max_workers, threads.min(64));
+                    assert!(lz.parallelism.unwrap().fast_streams);
+                } else if lz.method == SourceLz77Method::Optc256 {
                     assert_eq!(lz.parallelism.unwrap().max_workers, threads.min(64));
                     assert!(!lz.parallelism.unwrap().fast_streams);
                 } else {
@@ -245,6 +248,81 @@ fn default_pixel_lz_enables_parallel_only_batch_without_changing_lower_tier_work
             lz.match_extension,
             crate::tools::lz77::MatchExtension::Scalar
         );
+    }
+}
+
+#[test]
+fn e5_shared_workers_leave_streaming_and_explicit_policies_unchanged() {
+    use crate::modular::sample::GatherOptions;
+    for (width, height, buffering, responsive, shared) in [
+        (768, 512, SourceBuffering::Auto, false, true),
+        (1024, 1024, SourceBuffering::Auto, false, false),
+        (1024, 1024, SourceBuffering::FullFrame, false, true),
+        (768, 512, SourceBuffering::FullFrame, true, false),
+    ] {
+        let image = Image::new(
+            width,
+            height,
+            PixelLayout::Rgb,
+            PixelData::U8(vec![19; width as usize * height as usize * 3]),
+        )
+        .unwrap();
+        for threads in [1, 8] {
+            let base = EncodeOptions {
+                threads,
+                ..Default::default()
+            };
+            let mut params = CandidateParams::default().backend(5).unwrap();
+            params.buffering = buffering;
+            params.responsive = responsive;
+            let options = project_native(&params, &image, &base)
+                .unwrap()
+                .exact_options()
+                .unwrap();
+            let enabled = shared && threads > 1;
+            assert_eq!(options.modular.source_gather.is_some(), enabled);
+            if let Some(gather) = options.modular.source_gather.as_ref() {
+                assert_eq!(gather.workers, threads);
+                assert_eq!(gather.stripes, 1);
+                assert!(!gather.sparse);
+            }
+            let lz = options.modular.source_lz77.as_ref().unwrap();
+            assert_eq!(lz.parallelism.is_some(), enabled);
+            if let Some(limits) = lz.parallelism {
+                assert_eq!(limits.max_workers, threads);
+                assert!(limits.fast_streams);
+            }
+            let explicit = EncodeOptions {
+                modular: crate::ModularOptions {
+                    source_gather: Some(GatherOptions {
+                        workers: 2,
+                        sparse: true,
+                        stripes: 2,
+                        ..Default::default()
+                    }),
+                    source_lz77: Some(SourceConfig::default()),
+                    ..Default::default()
+                },
+                ..base
+            };
+            let options = project_native(&params, &image, &explicit)
+                .unwrap()
+                .exact_options()
+                .unwrap();
+            let gather = options.modular.source_gather.as_ref().unwrap();
+            assert_eq!(gather.workers, 2);
+            assert_eq!(gather.stripes, 2);
+            assert!(gather.sparse);
+            assert!(
+                options
+                    .modular
+                    .source_lz77
+                    .as_ref()
+                    .unwrap()
+                    .parallelism
+                    .is_none()
+            );
+        }
     }
 }
 

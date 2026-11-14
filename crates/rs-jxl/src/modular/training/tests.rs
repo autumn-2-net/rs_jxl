@@ -65,6 +65,9 @@ fn stream(channels: &[Channel], stream_id: usize) -> TrainingStream<'_> {
     }
 }
 
+#[path = "weighted_history_tests.rs"]
+mod weighted_history_tests;
+
 fn gather_source_raw(
     streams: &[&TrainingStream<'_>],
     policy: &SamplingPolicy,
@@ -591,11 +594,131 @@ fn sparse_gather_preserves_generic_samples_with_references_and_wp_presets() {
                             });
                             Ok(())
                         },
+                        |_, _| {},
                     )
                     .unwrap();
                 }
                 assert_eq!(charges, expected.len());
                 assert_sample_sequences(&actual, &expected);
+            }
+        }
+    }
+}
+
+#[test]
+fn dispatched_gather_matches_portable_for_wide_samples_stripes_and_presets() {
+    let mut kernels = vec![1];
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx2") {
+            kernels.push(2);
+        }
+        if std::is_x86_feature_detected!("avx2")
+            && std::is_x86_feature_detected!("avx512f")
+            && std::is_x86_feature_detected!("avx512bw")
+            && std::is_x86_feature_detected!("avx512dq")
+            && std::is_x86_feature_detected!("avx512vl")
+        {
+            kernels.push(3);
+        }
+    }
+    for width in [1, 2, 17, 257] {
+        let channels = [deep_channel(width, 19), channel(width, 19, -31)];
+        let mut input = stream(&channels, 197);
+        let mut policy = options().sampling.unwrap();
+        policy.nb_repeats = 0.125;
+        policy.properties = (0..24).collect();
+        for preset in 0..5 {
+            input.wp = weighted::Header::preset(preset).unwrap();
+            for mode in [Predictor::Best, Predictor::Variable] {
+                let predictors = encode::predictors(mode);
+                for previous in [0, 2] {
+                    policy.previous_channels = previous;
+                    for rows in [0..19, 17..19] {
+                        let run = |kernel| {
+                            let mut samples = Vec::new();
+                            let mut charges = 0;
+                            let before = || {
+                                charges += 1;
+                                Ok(())
+                            };
+                            let collect = |properties: &[i32], residuals: &[i32]| {
+                                samples.push(Sample {
+                                    properties: properties.to_vec(),
+                                    residuals: residuals.to_vec(),
+                                    weight: 1,
+                                });
+                                Ok(())
+                            };
+                            match kernel {
+                                1 => visit_source_range(
+                                    &input,
+                                    1,
+                                    &policy,
+                                    &predictors,
+                                    rows.clone(),
+                                    true,
+                                    before,
+                                    collect,
+                                    |_, _| {},
+                                ),
+                                #[cfg(target_arch = "x86_64")]
+                                2 => {
+                                    // SAFETY: kernels only contains supported ISAs.
+                                    unsafe {
+                                        visit_source_range_avx2(
+                                            &input,
+                                            1,
+                                            &policy,
+                                            &predictors,
+                                            rows.clone(),
+                                            true,
+                                            before,
+                                            collect,
+                                            |_, _| {},
+                                        )
+                                    }
+                                }
+                                #[cfg(target_arch = "x86_64")]
+                                3 => {
+                                    // SAFETY: every AVX512 feature was checked above.
+                                    unsafe {
+                                        visit_source_range_avx512(
+                                            &input,
+                                            1,
+                                            &policy,
+                                            &predictors,
+                                            rows.clone(),
+                                            true,
+                                            before,
+                                            collect,
+                                            |_, _| {},
+                                        )
+                                    }
+                                }
+                                _ => visit_source_range_portable(
+                                    &input,
+                                    1,
+                                    &policy,
+                                    &predictors,
+                                    rows.clone(),
+                                    true,
+                                    before,
+                                    collect,
+                                    |_, _| {},
+                                ),
+                            }
+                            .unwrap();
+                            (samples, charges)
+                        };
+                        let (expected, expected_charges) = run(0);
+                        for &kernel in &kernels {
+                            let (actual, charges) = run(kernel);
+                            assert_eq!(charges, expected_charges);
+                            assert_sample_sequences(&actual, &expected);
+                        }
+                    }
+                }
             }
         }
     }
@@ -674,6 +797,7 @@ fn gather_stripe_warmup_matches_source_window_and_excludes_budget_charges() {
                             });
                             Ok(())
                         },
+                        |_, _| {},
                     )
                     .unwrap();
                     assert_sample_sequences(&actual, &expected);
@@ -697,7 +821,8 @@ fn gather_stripe_warmup_matches_source_window_and_excludes_budget_charges() {
             |_, _| {
                 collected += 1;
                 Ok(())
-            }
+            },
+            |_, _| {},
         ),
         Err(Error::Limit(_))
     ));
@@ -715,7 +840,8 @@ fn gather_stripe_warmup_matches_source_window_and_excludes_budget_charges() {
                 called = true;
                 Ok(())
             },
-            |_, _| Ok(())
+            |_, _| Ok(()),
+            |_, _| {},
         )
         .is_err()
     );
@@ -820,7 +946,11 @@ fn no_edge_rows_match_generic_neighbors_and_exact_source_guards() {
                 );
             }
             let mut actual = Vec::new();
-            let mut pixel = |x, value, neighbors| {
+            let mut pixel = |x, value, neighbors, interior| {
+                assert_eq!(
+                    interior,
+                    has_no_edge_interior(width, y, 0) && (2..width - 2).contains(&x)
+                );
                 actual.push((x, value, neighbors));
                 Ok(())
             };

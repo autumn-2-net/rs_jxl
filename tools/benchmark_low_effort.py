@@ -64,6 +64,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", action="append", required=True, help="NAME=portfolio_lab.exe")
     parser.add_argument("--cjxl", action="append", default=[], help="Optional NAME=official-cjxl.exe")
+    parser.add_argument("--isa", action="append", default=[],
+                        help="Optional NAME=portable|avx2|avx512 for a native binary")
+    parser.add_argument("--wp-reuse", action="append", default=[],
+                        help="Optional NAME=on|off for a native binary's group-local WP cache")
     parser.add_argument("--image", action="append", type=Path, required=True)
     parser.add_argument("--decoder", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
@@ -82,6 +86,20 @@ def main():
         if not name or name in binaries:
             parser.error("Binary names must be nonempty and unique")
         binaries[name] = Path(path).resolve(strict=True)
+    isa_overrides = {}
+    for value in args.isa:
+        name, isa = value.split("=", 1)
+        if (name not in binaries or name in official or name in isa_overrides
+                or isa not in {"portable", "avx2", "avx512"}):
+            parser.error("ISA override requires a unique native binary name and valid ISA")
+        isa_overrides[name] = isa
+    reuse_overrides = {}
+    for value in args.wp_reuse:
+        pair = value.split("=", 1)
+        if (len(pair) != 2 or pair[0] not in binaries or pair[0] in official
+                or pair[0] in reuse_overrides or pair[1] not in {"on", "off"}):
+            parser.error("WP reuse override requires a unique native binary name and on|off")
+        reuse_overrides[pair[0]] = pair[1]
     for values in (args.image, args.efforts, args.threads):
         if len(set(values)) != len(values):
             parser.error("Duplicate image/effort/thread entries")
@@ -112,8 +130,13 @@ def main():
                                     names.reverse()
                                 for name in names:
                                     output, decoded = scratch / "output.jxl", scratch / "decoded.png"
+                                    run_env = dict(env)
+                                    if name in isa_overrides:
+                                        run_env["RS_JXL_MODULAR_ISA"] = isa_overrides[name]
+                                    if name in reuse_overrides:
+                                        run_env["RS_JXL_WP_REUSE"] = "1" if reuse_overrides[name] == "on" else "0"
                                     process = port.run_process(encoder_command(binaries[name], name in official,
-                                        snapshot, output, effort, threads), env, 180)
+                                        snapshot, output, effort, threads), run_env, 180)
                                     port.check_process(process)
                                     if name in official:
                                         receipt = dict(parse_cjxl_stats(process["stderr"], expected.width,
@@ -134,6 +157,8 @@ def main():
                                     port.check_process(oracle)
                                     port.compare_pixels(expected, port.png_samples(decoded.read_bytes()))
                                     row = dict(binary=name, source=str(image), effort=effort, threads=threads,
+                                               requested_isa=isa_overrides.get(name),
+                                               requested_wp_reuse=reuse_overrides.get(name),
                                                repeat=repeat, receipt=receipt, verified=True,
                                                encoder_process=process, decoder_process=oracle,
                                                stages=profile_rows(process["stderr"]))

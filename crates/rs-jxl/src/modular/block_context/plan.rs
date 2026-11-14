@@ -52,14 +52,16 @@ impl Plan {
 }
 
 pub(super) struct Candidate {
-    histograms: Histograms,
+    histograms: Box<Histograms>,
     pub(super) plan: Plan,
     bits: f64,
     pub(super) coarsened_views: usize,
 }
 
-fn empty_histograms() -> Histograms {
-    std::array::from_fn(|_| Histogram::default())
+// Keep array initialization and its debug temporaries off recursive frames.
+#[inline(never)]
+fn empty_histograms() -> Box<Histograms> {
+    Box::new(std::array::from_fn(|_| Histogram::default()))
 }
 
 fn best(histograms: &Histograms) -> (Predictor, f64) {
@@ -73,7 +75,7 @@ fn best(histograms: &Histograms) -> (Predictor, f64) {
     best
 }
 
-fn leaf(histograms: Histograms, coarsened_views: usize) -> Candidate {
+fn leaf(histograms: Box<Histograms>, coarsened_views: usize) -> Candidate {
     let (predictor, bits) = best(&histograms);
     Candidate {
         histograms,
@@ -85,7 +87,7 @@ fn leaf(histograms: Histograms, coarsened_views: usize) -> Candidate {
 
 fn combine(property: usize, threshold: i32, lower: Candidate, upper: Candidate) -> Candidate {
     let mut histograms = lower.histograms;
-    for (to, from) in histograms.iter_mut().zip(&upper.histograms) {
+    for (to, from) in histograms.iter_mut().zip(upper.histograms.iter()) {
         to.merge(from);
     }
     let (predictor, single_bits) = best(&histograms);
@@ -125,10 +127,10 @@ mod tests {
         let mut low = empty_histograms();
         let mut high = empty_histograms();
         for _ in 0..2048 {
-            for histogram in &mut low {
+            for histogram in low.iter_mut() {
                 histogram.add(0, false);
             }
-            for histogram in &mut high {
+            for histogram in high.iter_mut() {
                 histogram.add(128, false);
             }
         }
@@ -190,6 +192,22 @@ fn divide(limit: usize, lower: usize, total: usize) -> usize {
     ((limit as u128 * lower as u128 / total as u128) as usize).clamp(1, limit - 1)
 }
 
+#[inline(never)]
+fn spatial_leaf(view: &ChannelView<'_>, rect: Rect, coarsened: bool) -> Result<Candidate> {
+    let mut histograms = empty_histograms();
+    gather(view, rect, &mut histograms)?;
+    Ok(leaf(histograms, usize::from(coarsened)))
+}
+
+#[inline(never)]
+fn domain_leaf(views: &[&ChannelView<'_>]) -> Result<Candidate> {
+    let mut histograms = empty_histograms();
+    for view in views {
+        gather(view, Rect::whole(view), &mut histograms)?;
+    }
+    Ok(leaf(histograms, views.len()))
+}
+
 fn spatial(view: &ChannelView<'_>, rect: Rect, limit: usize, tile: usize) -> Result<Candidate> {
     let (nx, ny) = rect.tiles(tile);
     // x/y properties are i32 casts. Disable a wrapped axis to coarsen the plan
@@ -197,9 +215,7 @@ fn spatial(view: &ChannelView<'_>, rect: Rect, limit: usize, tile: usize) -> Res
     let split_x = nx > 1 && view.width <= i32::MAX as usize + 1;
     let split_y = ny > 1 && view.height <= i32::MAX as usize + 1;
     if limit == 1 || !(split_x || split_y) {
-        let mut histograms = empty_histograms();
-        gather(view, rect, &mut histograms)?;
-        return Ok(leaf(histograms, usize::from(nx > 1 || ny > 1)));
+        return spatial_leaf(view, rect, nx > 1 || ny > 1);
     }
     let horizontal = split_x && (!split_y || nx >= ny);
     let mut lower = rect;
@@ -232,17 +248,13 @@ fn spatial(view: &ChannelView<'_>, rect: Rect, limit: usize, tile: usize) -> Res
 }
 
 /// Views are ordered by original (stream, channel), never dense relabelings.
-/// Histograms exist along the traversal stack, not once per input tile.
+/// Boxed histograms live with active candidates, not once per input tile.
 pub(super) fn domain(views: &[&ChannelView<'_>], limit: usize, tile: usize) -> Result<Candidate> {
     if views.len() == 1 {
         return spatial(views[0], Rect::whole(views[0]), limit, tile);
     }
     if views.is_empty() || limit == 1 {
-        let mut histograms = empty_histograms();
-        for view in views {
-            gather(view, Rect::whole(view), &mut histograms)?;
-        }
-        return Ok(leaf(histograms, views.len()));
+        return domain_leaf(views);
     }
     let groups = 1 + views
         .windows(2)
@@ -285,3 +297,7 @@ fn fork(
         (lower(), upper())
     }
 }
+
+#[cfg(test)]
+#[path = "plan/stack_tests.rs"]
+mod stack_tests;

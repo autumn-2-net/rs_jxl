@@ -14,6 +14,9 @@ pub mod fixed;
 pub(crate) mod frame;
 pub(crate) mod global;
 pub mod group;
+mod kernel_isa;
+#[cfg(feature = "encoder-kernel-profile")]
+mod kernel_profile;
 pub mod layout;
 mod leaf_offset;
 mod leaf_refit;
@@ -34,5 +37,6 @@ pub mod transforms;
 pub mod tree;
 pub mod tree_groups;
 pub mod weighted;
+mod weighted_history;
 
 pub use orchestration::{GroupwiseDecision, GroupwiseFallback, groupwise_decision};

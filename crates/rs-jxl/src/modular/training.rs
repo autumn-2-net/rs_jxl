@@ -99,9 +99,18 @@ pub(super) fn learn(streams: &[TrainingStream<'_>], options: &ModularOptions) ->
 
 /// ModularGenericCompress writes a local tree, including in a global stream
 /// without a shared tree. Its decoder bound uses transformed local samples.
+#[cfg(test)]
 pub(super) fn learn_local(
     streams: &[TrainingStream<'_>],
     options: &ModularOptions,
+) -> Result<Tree> {
+    learn_local_with_history(streams, options, None)
+}
+
+pub(super) fn learn_local_with_history(
+    streams: &[TrainingStream<'_>],
+    options: &ModularOptions,
+    history: Option<&super::weighted_history::History<'_>>,
 ) -> Result<Tree> {
     let samples =
         streams
@@ -117,7 +126,25 @@ pub(super) fn learn_local(
             .tree_leaf_limit()
             .min(ma_train::local_tree_leaf_limit(samples)),
     );
-    learn(streams, &local)
+    if let Some(history) = history {
+        if let Some(gather) = options.source_gather.as_ref() {
+            gather.validate()?;
+        }
+        let tree = learn_impl(
+            streams,
+            &local,
+            None,
+            true,
+            options.source_gather.as_ref(),
+            &[history],
+        )?;
+        if tree.leaves() > local.tree_leaf_limit() {
+            return Err(Error::Limit("merged MA tree exceeds leaf budget"));
+        }
+        Ok(tree)
+    } else {
+        learn(streams, &local)
+    }
 }
 
 /// Explicit source gather policy passed through local and grouped learning.
@@ -126,6 +153,23 @@ pub(super) fn learn_with_gather(
     streams: &[TrainingStream<'_>],
     options: &ModularOptions,
     gather: Option<&GatherOptions>,
+) -> Result<Tree> {
+    learn_with_gather_and_histories(streams, options, gather, &[])
+}
+
+pub(super) fn learn_with_histories(
+    streams: &[TrainingStream<'_>],
+    options: &ModularOptions,
+    histories: &[&super::weighted_history::History<'_>],
+) -> Result<Tree> {
+    learn_with_gather_and_histories(streams, options, options.source_gather.as_ref(), histories)
+}
+
+fn learn_with_gather_and_histories(
+    streams: &[TrainingStream<'_>],
+    options: &ModularOptions,
+    gather: Option<&GatherOptions>,
+    histories: &[&super::weighted_history::History<'_>],
 ) -> Result<Tree> {
     if let Some(gather) = gather {
         gather.validate()?;
@@ -152,7 +196,7 @@ pub(super) fn learn_with_gather(
             super::tree_groups::learn(streams, options, &options.tree_group_splits, grouping)?
         }
     } else {
-        learn_with_budget_and_gather(streams, options, None, true, gather)?
+        learn_impl(streams, options, None, true, gather, histories)?
     };
     if (options.max_merged_tree_leaves.is_some() || options.ma_max_leaves.is_some())
         && tree.leaves() > options.tree_leaf_limit()
@@ -177,6 +221,17 @@ pub(super) fn learn_with_budget_and_gather(
     budget: Option<&SampleBudget>,
     parallel_search: bool,
     gather: Option<&GatherOptions>,
+) -> Result<Tree> {
+    learn_impl(streams, options, budget, parallel_search, gather, &[])
+}
+
+fn learn_impl(
+    streams: &[TrainingStream<'_>],
+    options: &ModularOptions,
+    budget: Option<&SampleBudget>,
+    parallel_search: bool,
+    gather: Option<&GatherOptions>,
+    histories: &[&super::weighted_history::History<'_>],
 ) -> Result<Tree> {
     options.validate()?;
     let _learn_scope = crate::profile::scope("ma.learn");
@@ -395,7 +450,10 @@ pub(super) fn learn_with_budget_and_gather(
             quantization: &quantization,
             budget,
         }
-        .collect_prepared(gather.filter(|_| parallel_search).unwrap_or(&serial_gather))?;
+        .collect_prepared_with_histories(
+            gather.filter(|_| parallel_search).unwrap_or(&serial_gather),
+            histories,
+        )?;
         let samples = gathered.samples;
         let stats = gathered.stats;
         debug_assert_eq!(samples.total, stats.selected_samples);
@@ -776,11 +834,44 @@ impl SourceGather<'_, '_> {
         })
     }
 
+    #[cfg(test)]
     fn collect_prepared(
         &self,
         options: &GatherOptions,
     ) -> Result<GatheredSamples<PreparedSamples>> {
+        self.collect_prepared_with_history(options, None)
+    }
+
+    #[cfg(test)]
+    fn collect_prepared_with_history(
+        &self,
+        options: &GatherOptions,
+        history: Option<&super::weighted_history::History<'_>>,
+    ) -> Result<GatheredSamples<PreparedSamples>> {
+        self.collect_prepared_with_histories(options, history.as_slice())
+    }
+
+    fn collect_prepared_with_histories(
+        &self,
+        options: &GatherOptions,
+        histories: &[&super::weighted_history::History<'_>],
+    ) -> Result<GatheredSamples<PreparedSamples>> {
         options.validate()?;
+        // Stream ordering can differ from the writer's ordering. Bind once by
+        // immutable plane/header identity, never by a coincident stream index.
+        let histories: Vec<_> = if histories.is_empty() {
+            Vec::new()
+        } else {
+            self.streams
+                .iter()
+                .map(|stream| {
+                    histories
+                        .iter()
+                        .copied()
+                        .find(|cache| cache.matches(stream.channels, &stream.wp))
+                })
+                .collect()
+        };
         // Domain-level trace: one line per learner records the policy
         // fingerprint, the covered domain and the dispatch shape. It answers
         // whether two learners gather the same pixels twice, and why the batch
@@ -918,6 +1009,7 @@ impl SourceGather<'_, '_> {
                             local_budget.as_ref(),
                             &mut batch,
                             options.sparse,
+                            &histories,
                         )?;
                         drop(_tasks_scope);
                         Ok((batch, selected))
@@ -969,6 +1061,7 @@ impl SourceGather<'_, '_> {
                     local_budget.as_ref(),
                     &mut master,
                     options.sparse,
+                    &histories,
                 )?;
                 drop(_tasks_scope);
             }
@@ -1002,6 +1095,7 @@ impl SourceGather<'_, '_> {
         local_budget: Option<&SampleBudget>,
         collector: &mut SourceSampleCollector,
         sparse: bool,
+        histories: &[Option<&super::weighted_history::History<'_>>],
     ) -> Result<u64> {
         let mut selected = 0;
         // Amortize table rebuilds only across small, bounded task batches.
@@ -1035,6 +1129,12 @@ impl SourceGather<'_, '_> {
                     collector.prepare(hint)?;
                 }
                 let stream = self.streams[task.stream];
+                let history = histories
+                    .get(task.stream)
+                    .copied()
+                    .flatten()
+                    .filter(|_| task.rows == (0..stream.channels[task.channel].height));
+                let mut captured = history.and_then(|cache| cache.start(task.channel));
                 let _visit_scope =
                     gather_detail_enabled().then(|| crate::profile::scope("gather.visit_source"));
                 visit_source_range(
@@ -1055,7 +1155,15 @@ impl SourceGather<'_, '_> {
                         Ok(())
                     },
                     |properties, residuals| collector.push(properties, residuals, 1),
+                    |prediction, error| {
+                        if let Some(values) = &mut captured {
+                            values.push([prediction, error]);
+                        }
+                    },
                 )?;
+                if let (Some(history), Some(values)) = (history, captured) {
+                    history.finish(task.channel, values);
+                }
                 drop(_visit_scope);
             }
         }
@@ -1101,12 +1209,12 @@ fn has_no_edge_interior(width: usize, y: usize, previous_channels: usize) -> boo
     y > 1 && width > 8 && previous_channels == 0
 }
 
-#[inline]
+#[inline(always)]
 fn visit_source_row<const NO_EDGE: bool>(
     channel: &Channel,
     y: usize,
     columns: std::ops::Range<usize>,
-    mut pixel: impl FnMut(usize, i32, Neighbors) -> Result<()>,
+    pixel: &mut impl FnMut(usize, i32, Neighbors, bool) -> Result<()>,
 ) -> Result<()> {
     let width = channel.width;
     if NO_EDGE {
@@ -1147,6 +1255,7 @@ fn visit_source_row<const NO_EDGE: bool>(
                     leftleft: *leftleft,
                     toprightright: *toprightright,
                 },
+                true,
             )?;
         }
     } else {
@@ -1154,7 +1263,7 @@ fn visit_source_row<const NO_EDGE: bool>(
             let value = channel.samples[y * width + x];
             let neighbors = Neighbors::from_plane(&channel.samples, width, width, x, y)
                 .map_err(|e| Error::Encoding(e.to_string()))?;
-            pixel(x, value, neighbors)?;
+            pixel(x, value, neighbors, false)?;
         }
     }
     Ok(())
@@ -1186,6 +1295,7 @@ fn visit_source_channel_impl<const PAIR: bool, const INTERIOR: bool>(
                 weight: 1,
             })
         },
+        |_, _| {},
     )
 }
 
@@ -1199,6 +1309,123 @@ fn visit_source_range(
     sparse: bool,
     before_collect: impl FnMut() -> Result<()>,
     collect: impl FnMut(&[i32], &[i32]) -> Result<()>,
+    capture: impl FnMut(i32, i32),
+) -> Result<()> {
+    #[cfg(target_arch = "x86_64")]
+    match super::kernel_isa::selected() {
+        super::kernel_isa::Isa::Avx2 => {
+            // SAFETY: selection checks CPU and OS support once per process.
+            return unsafe {
+                visit_source_range_avx2(
+                    stream,
+                    channel_index,
+                    policy,
+                    predictors,
+                    rows,
+                    sparse,
+                    before_collect,
+                    collect,
+                    capture,
+                )
+            };
+        }
+        super::kernel_isa::Isa::Avx512 => {
+            // SAFETY: selection checks every feature required by this wrapper.
+            return unsafe {
+                visit_source_range_avx512(
+                    stream,
+                    channel_index,
+                    policy,
+                    predictors,
+                    rows,
+                    sparse,
+                    before_collect,
+                    collect,
+                    capture,
+                )
+            };
+        }
+        super::kernel_isa::Isa::Portable => {}
+    }
+    visit_source_range_portable(
+        stream,
+        channel_index,
+        policy,
+        predictors,
+        rows,
+        sparse,
+        before_collect,
+        collect,
+        capture,
+    )
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn visit_source_range_avx2(
+    stream: &TrainingStream<'_>,
+    channel_index: usize,
+    policy: &SamplingPolicy,
+    predictors: &[Predictor],
+    rows: std::ops::Range<usize>,
+    sparse: bool,
+    before_collect: impl FnMut() -> Result<()>,
+    collect: impl FnMut(&[i32], &[i32]) -> Result<()>,
+    capture: impl FnMut(i32, i32),
+) -> Result<()> {
+    visit_source_range_portable(
+        stream,
+        channel_index,
+        policy,
+        predictors,
+        rows,
+        sparse,
+        before_collect,
+        collect,
+        capture,
+    )
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,avx512f,avx512bw,avx512dq,avx512vl")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn visit_source_range_avx512(
+    stream: &TrainingStream<'_>,
+    channel_index: usize,
+    policy: &SamplingPolicy,
+    predictors: &[Predictor],
+    rows: std::ops::Range<usize>,
+    sparse: bool,
+    before_collect: impl FnMut() -> Result<()>,
+    collect: impl FnMut(&[i32], &[i32]) -> Result<()>,
+    capture: impl FnMut(i32, i32),
+) -> Result<()> {
+    visit_source_range_portable(
+        stream,
+        channel_index,
+        policy,
+        predictors,
+        rows,
+        sparse,
+        before_collect,
+        collect,
+        capture,
+    )
+}
+
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn visit_source_range_portable(
+    stream: &TrainingStream<'_>,
+    channel_index: usize,
+    policy: &SamplingPolicy,
+    predictors: &[Predictor],
+    rows: std::ops::Range<usize>,
+    sparse: bool,
+    before_collect: impl FnMut() -> Result<()>,
+    collect: impl FnMut(&[i32], &[i32]) -> Result<()>,
+    capture: impl FnMut(i32, i32),
 ) -> Result<()> {
     if uses_predictor_pair(predictors) {
         visit_source_range_impl::<true, true>(
@@ -1210,6 +1437,7 @@ fn visit_source_range(
             sparse,
             before_collect,
             collect,
+            capture,
         )
     } else {
         visit_source_range_impl::<false, true>(
@@ -1221,12 +1449,14 @@ fn visit_source_range(
             sparse,
             before_collect,
             collect,
+            capture,
         )
     }
 }
 
 // INTERIOR=false is a test-only traversal oracle. The warm-up changes learning
 // state only; pixel coding never calls this path with a truncated history.
+#[inline(always)]
 #[allow(clippy::too_many_arguments)]
 fn visit_source_range_impl<const PAIR: bool, const INTERIOR: bool>(
     stream: &TrainingStream<'_>,
@@ -1237,6 +1467,7 @@ fn visit_source_range_impl<const PAIR: bool, const INTERIOR: bool>(
     sparse: bool,
     mut before_collect: impl FnMut() -> Result<()>,
     mut collect: impl FnMut(&[i32], &[i32]) -> Result<()>,
+    mut capture: impl FnMut(i32, i32),
 ) -> Result<()> {
     let channel = &stream.channels[channel_index];
     let width = channel.width;
@@ -1290,98 +1521,144 @@ fn visit_source_range_impl<const PAIR: bool, const INTERIOR: bool>(
     let mut previous_gradient = 0i32;
     let mut properties = vec![0; 16 + 4 * policy.previous_channels];
     let mut residuals = [0; 14];
+    #[cfg(feature = "encoder-kernel-profile")]
+    let mut kernel_profile = super::kernel_profile::Profile::new(
+        "gather",
+        [
+            "rng_weighted",
+            "properties",
+            "reference_residual",
+            "collector",
+        ],
+        (stream_id as u64).wrapping_mul(131)
+            ^ channel_index as u64
+            ^ (width as u64).rotate_left(17)
+            ^ (rows.start as u64).rotate_left(7),
+    );
     for y in warm_begin..rows.end {
         let in_rows = y >= rows.start;
-        let mut pixel = |x: usize, value: i32, n: Neighbors| {
-            // Draw even in warm-up rows, matching the source's operand order.
-            let selected = sampler.next().expect("one sample draw per channel pixel") && in_rows;
-            let (prediction, error) = match state.as_mut() {
-                // The validated rectangle walks every pixel, including warm-up
-                // rows. Local history needs no per-pixel coordinate validation;
-                // shifting row parity only renames its initially zero buffers.
-                Some(state) => state.predict_and_update_raster::<false>(
-                    value,
-                    x,
-                    y - warm_begin,
-                    n.top,
-                    n.left,
-                    n.topright,
-                    n.topleft,
-                    n.toptop,
-                ),
-                None => (0, 0),
-            };
-            // Same values as Properties::calculate, with one gradient instead
-            // of two and the previous-gradient reset fed by this loop's raster
-            // tracker. That tracker also advances over pixels whose properties
-            // the sparse traversal never materializes.
-            let gradient = n.left.wrapping_add(n.top).wrapping_sub(n.topleft);
-            if !sparse || selected {
-                let previous = if x == 0 { 0 } else { previous_gradient };
-                let values = [
-                    channel_id,
-                    stream_id,
-                    y as i32,
-                    x as i32,
-                    n.top.wrapping_abs(),
-                    n.left.wrapping_abs(),
-                    n.top,
-                    n.left,
-                    n.left.wrapping_sub(previous),
-                    gradient,
-                    n.left.wrapping_sub(n.topleft),
-                    n.topleft.wrapping_sub(n.top),
-                    n.top.wrapping_sub(n.topright),
-                    n.top.wrapping_sub(n.toptop),
-                    n.left.wrapping_sub(n.leftleft),
-                    error,
-                ];
-                properties[..16].copy_from_slice(&values);
-            }
-            previous_gradient = gradient;
-            if selected {
-                before_collect()?;
-                let position = y * width + x;
-                // Reference properties are stateless; skipped samples need no loads.
-                for (i, reference) in references.iter().enumerate() {
-                    let v = reference.samples[position];
-                    let left = if x > 0 {
-                        reference.samples[position - 1]
-                    } else {
-                        0
-                    };
-                    let top = if y > 0 {
-                        reference.samples[position - width]
-                    } else {
-                        left
-                    };
-                    let nw = if x > 0 && y > 0 {
-                        reference.samples[position - width - 1]
-                    } else {
-                        left
-                    };
-                    let residual = v.wrapping_sub(clamped_gradient(left, top, nw));
-                    properties[16 + 4 * i..20 + 4 * i].copy_from_slice(&[
-                        v.wrapping_abs(),
-                        v,
-                        residual.wrapping_abs(),
-                        residual,
-                    ]);
-                }
-                if PAIR {
-                    debug_assert!(uses_predictor_pair(predictors));
-                    residuals[0] = value.wrapping_sub(prediction);
-                    residuals[1] = value.wrapping_sub(clamped_gradient(n.left, n.top, n.topleft));
-                } else {
-                    for (residual, &predictor) in residuals.iter_mut().zip(predictors) {
-                        let guess = predict_one(predictor, n, Some(i64::from(prediction)))
-                            .map_err(|e| Error::Encoding(e.to_string()))?;
-                        *residual = (i64::from(value) - guess) as i32;
+        let mut pixel = {
+            #[inline(always)]
+            |x: usize, value: i32, n: Neighbors, interior: bool| {
+                #[cfg(feature = "encoder-kernel-profile")]
+                let mut clock = kernel_profile.start();
+                // Draw even in warm-up rows, matching the source's operand order.
+                let selected =
+                    sampler.next().expect("one sample draw per channel pixel") && in_rows;
+                let (prediction, error) = match state.as_mut() {
+                    // The validated rectangle walks every pixel, including warm-up
+                    // rows. Local history needs no per-pixel coordinate validation;
+                    // shifting row parity only renames its initially zero buffers.
+                    Some(state) => {
+                        if interior {
+                            state.predict_and_update_raster_interior::<false>(
+                                value,
+                                x,
+                                y - warm_begin,
+                                n.top,
+                                n.left,
+                                n.topright,
+                                n.topleft,
+                                n.toptop,
+                            )
+                        } else {
+                            state.predict_and_update_raster::<false>(
+                                value,
+                                x,
+                                y - warm_begin,
+                                n.top,
+                                n.left,
+                                n.topright,
+                                n.topleft,
+                                n.toptop,
+                            )
+                        }
                     }
+                    None => (0, 0),
+                };
+                capture(prediction, error);
+                #[cfg(feature = "encoder-kernel-profile")]
+                kernel_profile.lap(0, &mut clock);
+                // Same values as Properties::calculate, with one gradient instead
+                // of two and the previous-gradient reset fed by this loop's raster
+                // tracker. That tracker also advances over pixels whose properties
+                // the sparse traversal never materializes.
+                let gradient = n.left.wrapping_add(n.top).wrapping_sub(n.topleft);
+                if !sparse || selected {
+                    let previous = if x == 0 { 0 } else { previous_gradient };
+                    let values = [
+                        channel_id,
+                        stream_id,
+                        y as i32,
+                        x as i32,
+                        n.top.wrapping_abs(),
+                        n.left.wrapping_abs(),
+                        n.top,
+                        n.left,
+                        n.left.wrapping_sub(previous),
+                        gradient,
+                        n.left.wrapping_sub(n.topleft),
+                        n.topleft.wrapping_sub(n.top),
+                        n.top.wrapping_sub(n.topright),
+                        n.top.wrapping_sub(n.toptop),
+                        n.left.wrapping_sub(n.leftleft),
+                        error,
+                    ];
+                    properties[..16].copy_from_slice(&values);
                 }
-                collect(&properties, &residuals[..predictors.len()])?;
+                previous_gradient = gradient;
+                #[cfg(feature = "encoder-kernel-profile")]
+                kernel_profile.lap(1, &mut clock);
+                if selected {
+                    before_collect()?;
+                    let position = y * width + x;
+                    // Reference properties are stateless; skipped samples need no loads.
+                    for (i, reference) in references.iter().enumerate() {
+                        let v = reference.samples[position];
+                        let left = if x > 0 {
+                            reference.samples[position - 1]
+                        } else {
+                            0
+                        };
+                        let top = if y > 0 {
+                            reference.samples[position - width]
+                        } else {
+                            left
+                        };
+                        let nw = if x > 0 && y > 0 {
+                            reference.samples[position - width - 1]
+                        } else {
+                            left
+                        };
+                        let residual = v.wrapping_sub(clamped_gradient(left, top, nw));
+                        properties[16 + 4 * i..20 + 4 * i].copy_from_slice(&[
+                            v.wrapping_abs(),
+                            v,
+                            residual.wrapping_abs(),
+                            residual,
+                        ]);
+                    }
+                    if PAIR {
+                        debug_assert!(uses_predictor_pair(predictors));
+                        residuals[0] = value.wrapping_sub(prediction);
+                        residuals[1] =
+                            value.wrapping_sub(clamped_gradient(n.left, n.top, n.topleft));
+                    } else {
+                        for (residual, &predictor) in residuals.iter_mut().zip(predictors) {
+                            let guess = predict_one(predictor, n, Some(i64::from(prediction)))
+                                .map_err(|e| Error::Encoding(e.to_string()))?;
+                            *residual = (i64::from(value) - guess) as i32;
+                        }
+                    }
+                    #[cfg(feature = "encoder-kernel-profile")]
+                    kernel_profile.lap(2, &mut clock);
+                    let result = collect(&properties, &residuals[..predictors.len()]);
+                    #[cfg(feature = "encoder-kernel-profile")]
+                    kernel_profile.lap(3, &mut clock);
+                    result?;
+                }
+                Ok(())
             }
-            Ok(())
         };
         if INTERIOR && has_no_edge_interior(width, y, policy.previous_channels) {
             visit_source_row::<false>(channel, y, 0..2, &mut pixel)?;

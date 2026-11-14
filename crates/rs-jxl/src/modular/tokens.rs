@@ -15,6 +15,9 @@ use crate::{Error, Result, execution, tools::lz77::Literal};
 #[path = "tokens_fixed.rs"]
 mod fixed;
 
+#[path = "tokens_pair.rs"]
+mod pair;
+
 fn population(planes: &[Channel]) -> Result<usize> {
     planes.iter().try_fold(0usize, |sum, c| {
         sum.checked_add(c.samples.len())
@@ -59,6 +62,7 @@ fn channel(
     previous_channels: usize,
     stream_id: usize,
     scratch: &mut Scratch,
+    history: Option<&[[i32; 2]]>,
     mut emit: impl FnMut(Literal),
 ) -> Result<()> {
     let channel = &planes[c];
@@ -103,18 +107,27 @@ fn channel(
         }
         return Ok(());
     }
-    if fixed::emit(channel, &plan, wp, &mut emit)? {
+    if fixed::emit(channel, &plan, wp, history, &mut emit)? {
         return Ok(());
     }
-    encode::visit_channel(
+    if pair::emit(channel, &plan, history, &mut emit)? {
+        return Ok(());
+    }
+    let mut column = 0;
+    encode::visit_channel_with_history(
         planes,
         c,
         wp,
         plan.weighted,
         previous_channels.min(plan.previous_channels),
         stream_id,
+        history,
         |_, pos, neighbors, wp_pred, props, value| {
-            let x = pos % channel.width;
+            let x = column;
+            column += 1;
+            if column == channel.width {
+                column = 0;
+            }
             if x == 0 {
                 for &predictor in &plan.predictors {
                     let row = &mut scratch.rows[predictor as usize];
@@ -167,6 +180,26 @@ pub(super) fn tokenize(
     stream_id: usize,
     parallel: bool,
 ) -> Result<Vec<Literal>> {
+    tokenize_with_history(
+        planes,
+        tree,
+        wp,
+        previous_channels,
+        stream_id,
+        parallel,
+        None,
+    )
+}
+
+pub(super) fn tokenize_with_history(
+    planes: &[Channel],
+    tree: &Tree,
+    wp: &weighted::Header,
+    previous_channels: usize,
+    stream_id: usize,
+    parallel: bool,
+    history: Option<&super::weighted_history::History<'_>>,
+) -> Result<Vec<Literal>> {
     tokenize_as(
         planes,
         tree,
@@ -174,10 +207,12 @@ pub(super) fn tokenize(
         previous_channels,
         stream_id,
         parallel,
+        history,
         |token| token,
     )
 }
 
+#[cfg(test)]
 pub(super) fn tokenize_entropy(
     planes: &[Channel],
     tree: &Tree,
@@ -186,6 +221,26 @@ pub(super) fn tokenize_entropy(
     stream_id: usize,
     parallel: bool,
 ) -> Result<Vec<crate::entropy::stream::Token>> {
+    tokenize_entropy_with_history(
+        planes,
+        tree,
+        wp,
+        previous_channels,
+        stream_id,
+        parallel,
+        None,
+    )
+}
+
+pub(super) fn tokenize_entropy_with_history(
+    planes: &[Channel],
+    tree: &Tree,
+    wp: &weighted::Header,
+    previous_channels: usize,
+    stream_id: usize,
+    parallel: bool,
+    history: Option<&super::weighted_history::History<'_>>,
+) -> Result<Vec<crate::entropy::stream::Token>> {
     tokenize_as(
         planes,
         tree,
@@ -193,6 +248,7 @@ pub(super) fn tokenize_entropy(
         previous_channels,
         stream_id,
         parallel,
+        history,
         |token| crate::entropy::stream::Token::literal(token.context as usize, token.value),
     )
 }
@@ -204,9 +260,11 @@ fn tokenize_as<T: Copy + Send>(
     previous_channels: usize,
     stream_id: usize,
     parallel: bool,
+    history: Option<&super::weighted_history::History<'_>>,
     convert: impl Fn(Literal) -> T + Sync,
 ) -> Result<Vec<T>> {
     let _scope = crate::profile::scope("modular.tokenize");
+    let history = history.filter(|cache| cache.matches(planes, wp));
     let count = population(planes)?;
     let mut tokens = Vec::new();
     tokens
@@ -234,6 +292,7 @@ fn tokenize_as<T: Copy + Send>(
                 previous_channels,
                 stream_id,
                 &mut scratch,
+                history.and_then(|cache| cache.channel(c)),
                 |t| tokens.push(convert(t)),
             )?;
         }
@@ -268,6 +327,7 @@ fn tokenize_as<T: Copy + Send>(
                 previous_channels,
                 stream_id,
                 &mut Scratch::default(),
+                history.and_then(|cache| cache.channel(*c)),
                 |t| {
                     destination[written] = convert(t);
                     written += 1;
@@ -516,5 +576,92 @@ mod tests {
                     .unwrap()
             );
         }
+    }
+
+    #[test]
+    fn mixed_gradient_weighted_rows_preserve_wide_offsets_and_contexts() {
+        for width in [1, 2, 8, 9, 17, 257] {
+            let planes = [Channel {
+                width,
+                height: 5,
+                hshift: 0,
+                vshift: 0,
+                samples: (0..width * 5)
+                    .map(|i| [i32::MIN, i32::MAX, -1, 0, 27, -591][i % 6])
+                    .collect(),
+            }];
+            for property in [2, 3, 8, 9, 15] {
+                let tree = Tree::new(vec![
+                    Node::Split {
+                        property,
+                        threshold: 0,
+                        greater: 1,
+                        less_equal: 2,
+                    },
+                    Node::Leaf {
+                        predictor: Predictor::Weighted,
+                        offset: 11,
+                        multiplier: 1,
+                    },
+                    Node::Leaf {
+                        predictor: Predictor::Gradient,
+                        offset: -27,
+                        multiplier: 1,
+                    },
+                ])
+                .unwrap();
+                for preset in 0..5 {
+                    let wp = weighted::Header::preset(preset).unwrap();
+                    assert_eq!(
+                        tokenize(&planes, &tree, &wp, 0, 19, false).unwrap(),
+                        scalar(&planes, &tree, &wp)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mixed_gradient_rows_divide_before_narrowing_and_reject_remainders() {
+        let planes = [Channel {
+            width: 17,
+            height: 5,
+            hshift: 0,
+            vshift: 0,
+            samples: (0..85)
+                .map(|i| [i32::MIN, i32::MAX - 1, 0, -2, 14][i % 5])
+                .collect(),
+        }];
+        let wp = weighted::Header::default();
+        let tree = |threshold, offset| {
+            Tree::new(vec![
+                Node::Split {
+                    property: 3,
+                    threshold,
+                    greater: 1,
+                    less_equal: 2,
+                },
+                Node::Leaf {
+                    predictor: Predictor::Weighted,
+                    offset: 11,
+                    multiplier: 1,
+                },
+                Node::Leaf {
+                    predictor: Predictor::Gradient,
+                    offset,
+                    multiplier: 2,
+                },
+            ])
+            .unwrap()
+        };
+        let valid = tree(8, -26);
+        assert_eq!(
+            tokenize(&planes, &valid, &wp, 0, 19, false).unwrap(),
+            scalar(&planes, &valid, &wp)
+        );
+        assert!(matches!(
+            tokenize(&planes, &tree(8, -27), &wp, 0, 19, false),
+            Err(Error::Encoding(_))
+        ));
     }
 }

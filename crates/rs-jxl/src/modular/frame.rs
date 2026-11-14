@@ -4,6 +4,7 @@
 use super::{
     encode::{self, Group, ModularOptions, Prepared},
     group, training, weighted,
+    weighted_history::{CACHE_BYTES, History},
 };
 use crate::encode::budget::{self, SectionBudget, TrialEncode, complete_or_return};
 use crate::execution;
@@ -88,12 +89,41 @@ pub(super) fn encode_prepared_shared_borrowed_trial(
             stream_id: g.stream_id,
         })
         .collect();
-    let tree = if let Some(tree) =
-        encode::predefined(prepared.iter().flat_map(|g| g.planes.iter()), options, bits)?
-    {
+    let predefined =
+        encode::predefined(prepared.iter().flat_map(|g| g.planes.iter()), options, bits)?;
+    let histories: Vec<_> = if predefined.is_none() && !options.refinement.enabled() {
+        let mut remaining = CACHE_BYTES;
+        prepared
+            .iter()
+            .map(|g| {
+                let history = History::new(&g.planes, g.wp, options)?;
+                remaining = remaining.checked_sub(history.bytes())?;
+                Some(history)
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    if crate::profile::enabled() {
+        crate::profile::note(
+            "modular.shared_history",
+            format_args!(
+                "streams={} cached={} reserved_bytes={}",
+                prepared.len(),
+                histories.iter().flatten().count(),
+                histories
+                    .iter()
+                    .flatten()
+                    .map(History::bytes)
+                    .sum::<usize>(),
+            ),
+        );
+    }
+    let tree = if let Some(tree) = predefined {
         tree
     } else {
-        training::learn(&views, options)?
+        let cached: Vec<_> = histories.iter().filter_map(Option::as_ref).collect();
+        training::learn_with_histories(&views, options, &cached)?
     };
     if options.refinement.enabled() {
         let cache_raw = options.lz77 && super::refinement::reuse_literals(&tree, options);
@@ -101,7 +131,7 @@ pub(super) fn encode_prepared_shared_borrowed_trial(
         if super::refinement::single_pass(options)
             && super::refinement::reuse_literals(&tree, options)
         {
-            *raw_cache.borrow_mut() = Some(shared_raw(&prepared, &tree, options)?);
+            *raw_cache.borrow_mut() = Some(shared_raw(&prepared, &tree, options, &[])?);
         }
         let raw_reused = std::cell::Cell::new(0usize);
         let (global, encoded) = super::refinement::choose(
@@ -120,7 +150,7 @@ pub(super) fn encode_prepared_shared_borrowed_trial(
                     return Ok(parsed);
                 }
                 if cache_raw && std::ptr::eq(candidate, &tree) && raw_cache.borrow().is_none() {
-                    let raw = shared_raw(&prepared, candidate, options)?;
+                    let raw = shared_raw(&prepared, candidate, options, &[])?;
                     let parsed = parse_shared_raw(&prepared, candidate, options, &raw)?;
                     *raw_cache.borrow_mut() = Some(raw);
                     return Ok(parsed);
@@ -132,7 +162,7 @@ pub(super) fn encode_prepared_shared_borrowed_trial(
                     raw_reused.set(raw_reused.get() + count);
                     return Ok(parsed);
                 }
-                shared_streams(&prepared, candidate, options)
+                shared_streams(&prepared, candidate, options, &[])
             },
             |tree, model, streams, scratch| {
                 let output = write_shared(
@@ -171,7 +201,7 @@ pub(super) fn encode_prepared_shared_borrowed_trial(
         }
         return Ok(TrialEncode::Complete((global, selected)));
     }
-    let (streams, lz77) = shared_streams(&prepared, &tree, options)?;
+    let (streams, lz77) = shared_streams(&prepared, &tree, options, &histories)?;
     let model = Model::build_with_options(
         &streams,
         tree.leaves() + usize::from(lz77),
@@ -188,23 +218,29 @@ fn shared_raw(
     prepared: &[&Prepared],
     tree: &super::tree::Tree,
     options: &ModularOptions,
+    histories: &[Option<History<'_>>],
 ) -> Result<Vec<Vec<crate::tools::lz77::Literal>>> {
     let parallel_channels =
         super::tokens::shared_channel_parallel(prepared.iter().copied(), options.parallel_tokens)?;
-    let tokenize = |g: &Prepared| {
-        super::tokens::tokenize(
+    let tokenize = |index: usize, g: &Prepared| {
+        super::tokens::tokenize_with_history(
             &g.planes,
             tree,
             &g.wp,
             options.previous_channels,
             g.stream_id,
             parallel_channels,
+            histories.get(index).and_then(Option::as_ref),
         )
     };
     if parallel_channels {
-        prepared.iter().map(|g| tokenize(g)).collect()
+        prepared
+            .iter()
+            .enumerate()
+            .map(|(i, g)| tokenize(i, g))
+            .collect()
     } else {
-        execution::try_map(prepared, |_, g| tokenize(g))
+        execution::try_map(prepared, |i, g| tokenize(i, g))
     }
 }
 
@@ -212,30 +248,33 @@ fn shared_streams(
     prepared: &[&Prepared],
     tree: &super::tree::Tree,
     options: &ModularOptions,
+    histories: &[Option<History<'_>>],
 ) -> Result<(Vec<Vec<crate::entropy::stream::Token>>, bool)> {
     let parallel_channels =
         super::tokens::shared_channel_parallel(prepared.iter().copied(), options.parallel_tokens)?;
     let streams = if options.lz77 && options.source_lz77.is_some() {
-        let raw = shared_raw(prepared, tree, options)?;
+        let raw = shared_raw(prepared, tree, options, histories)?;
         return parse_shared_raw(prepared, tree, options, &raw);
     } else {
-        let encode = |g: &Prepared| {
-            encode::group_stream_with_channels(
+        let encode = |index: usize, g: &Prepared| {
+            encode::group_stream_with_history(
                 &g.planes,
                 tree,
                 options,
                 &g.wp,
                 g.stream_id,
                 parallel_channels,
+                histories.get(index).and_then(Option::as_ref),
             )
         };
         if parallel_channels {
             prepared
                 .iter()
-                .map(|g| encode(g))
+                .enumerate()
+                .map(|(i, g)| encode(i, g))
                 .collect::<Result<Vec<_>>>()?
         } else {
-            execution::try_map(prepared, |_, g| encode(g))?
+            execution::try_map(prepared, |i, g| encode(i, g))?
         }
     };
     let lz77 = streams.iter().any(|s| s.1);
@@ -347,10 +386,16 @@ pub(super) fn encode_prepared_independent(
     }
     group::write_header(&mut writer, &g.transforms, &g.wp, false)?;
     if g.planes.iter().any(|c| !c.samples.is_empty()) {
-        let tree = if let Some(tree) = encode::predefined(g.planes.iter(), options, bits)? {
+        let predefined = encode::predefined(g.planes.iter(), options, bits)?;
+        let history = if predefined.is_none() {
+            super::weighted_history::History::new(&g.planes, g.wp, options)
+        } else {
+            None
+        };
+        let tree = if let Some(tree) = predefined {
             tree
         } else {
-            training::learn_local(
+            training::learn_local_with_history(
                 &[training::TrainingStream {
                     channels: &g.planes,
                     wp: g.wp,
@@ -363,6 +408,7 @@ pub(super) fn encode_prepared_independent(
                     },
                 }],
                 options,
+                history.as_ref(),
             )?
         };
         if options.refinement.enabled() {
@@ -377,8 +423,15 @@ pub(super) fn encode_prepared_independent(
             writer.zero_pad_to_byte()?;
             return Ok(writer.into_bytes()?);
         }
-        let (tokens, has_matches) =
-            encode::group_stream(&g.planes, &tree, options, &g.wp, g.stream_id)?;
+        let (tokens, has_matches) = encode::group_stream_with_history(
+            &g.planes,
+            &tree,
+            options,
+            &g.wp,
+            g.stream_id,
+            false,
+            history.as_ref(),
+        )?;
         let streams = [tokens];
         let model = Model::build_with_options(
             &streams,
@@ -458,7 +511,7 @@ mod tests {
         let baseline = parse_shared_raw(&prepared, &before, &options, &raw).unwrap();
         assert_eq!(
             baseline,
-            shared_streams(&prepared, &before, &options).unwrap()
+            shared_streams(&prepared, &before, &options, &[]).unwrap()
         );
         assert_eq!(
             super::super::leaf_offset::remap_literals(&before, &after, &mut raw).unwrap(),
@@ -467,7 +520,7 @@ mod tests {
         let repacked = parse_shared_raw(&prepared, &after, &options, &raw).unwrap();
         assert_eq!(
             repacked,
-            shared_streams(&prepared, &after, &options).unwrap()
+            shared_streams(&prepared, &after, &options, &[]).unwrap()
         );
         assert!(repacked.0[0].is_empty() && repacked.0[3].is_empty());
 

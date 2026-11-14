@@ -254,6 +254,65 @@ fn match_tuple(matched: Match) -> (usize, usize, u32) {
 }
 
 #[test]
+fn uncached_spatial_rejection_preserves_order_aliases_and_lazy_work() {
+    let values: Vec<_> = (0..128).map(|i| (i % 7) as u32).collect();
+    let position = 89;
+    let poison = (usize::MAX, u32::MAX);
+    for width in [1, 2, 37] {
+        for range_search in [false, true] {
+            for prefix_filter in [FilterPolicy::Disabled, FilterPolicy::Lazy] {
+                let config = SourceConfig {
+                    range_search,
+                    prefix_filter,
+                    max_match_length: 17,
+                    ..SourceConfig::default()
+                };
+                let mut matcher = Fast::<1>::new(&values, width, &config).unwrap();
+                let key = hash(&values, position) as usize & 16383;
+                matcher.buckets.insert(key, position - 1);
+                let eligible: Vec<_> = matcher
+                    .spatial
+                    .iter()
+                    .copied()
+                    .filter(|&(distance, _)| distance > 1 && distance <= position)
+                    .collect();
+                let survivors: Vec<_> = eligible
+                    .iter()
+                    .copied()
+                    .filter(|&(distance, _)| values[position] == values[position - distance])
+                    .collect();
+                assert!(survivors.len() < eligible.len());
+                let mut expected = Match::default();
+                for &(distance, symbol) in &eligible {
+                    reference_consider(&values, position, 17, distance, symbol, &mut expected);
+                }
+                reference_consider(
+                    &values,
+                    position,
+                    17,
+                    1,
+                    matcher.codes.symbol(1),
+                    &mut expected,
+                );
+                matcher.candidates.fill(poison);
+                assert_eq!(matcher.find_impl::<false>(position), expected);
+                assert_eq!(&matcher.candidates[..survivors.len()], survivors.as_slice());
+                assert_eq!(matcher.candidates[survivors.len()], poison);
+                assert_eq!(matcher.prefix.cached_bytes(), 0);
+                assert_eq!(
+                    matcher.prefix.candidate_work(),
+                    if prefix_filter == FilterPolicy::Lazy {
+                        eligible.len() as u64
+                    } else {
+                        0
+                    }
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn mandatory_prefix_rejection_does_not_resolve_distance_symbols() {
     for ranges in [SourceFastRanges::Disabled, SourceFastRanges::Both] {
         for mismatch in 0..MIN_MATCH {
