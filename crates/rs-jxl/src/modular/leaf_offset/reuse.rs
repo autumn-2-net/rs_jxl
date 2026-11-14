@@ -104,27 +104,28 @@ fn fit_values<T>(
     {
         return Ok(None);
     }
-    let nonempty_views: Vec<_> = views
+    let nonempty_views = views
         .iter()
-        .filter(|s| s.channels.iter().any(|c| !c.samples.is_empty()))
-        .collect();
-    let nonempty_tokens: Vec<_> = streams.iter().filter(|s| !s.is_empty()).collect();
-    if nonempty_views.len() != nonempty_tokens.len() {
-        return Ok(None);
-    }
+        .filter(|s| s.channels.iter().any(|c| !c.samples.is_empty()));
+    let mut nonempty_tokens = streams.iter().filter(|s| !s.is_empty());
     // Frame streams can include an empty global entry. Associate before sorting
     // so reservoir updates still follow the pixel fitter's stream-ID order.
-    let mut ordered: Vec<_> = nonempty_views.into_iter().zip(nonempty_tokens).collect();
+    let mut ordered = Vec::new();
+    for view in nonempty_views {
+        let Some(tokens) = nonempty_tokens.next() else {
+            return Ok(None);
+        };
+        ordered.push((view, tokens));
+    }
+    if nonempty_tokens.next().is_some() {
+        return Ok(None);
+    }
     for (view, tokens) in &ordered {
         let count = view.channels.iter().try_fold(0usize, |sum, channel| {
             sum.checked_add(channel.samples.len())
                 .ok_or(Error::Limit("offset population overflow"))
         })?;
-        if tokens.len() != count
-            || tokens
-                .iter()
-                .any(|t| literal(t).is_none_or(|(context, _)| context >= tree.leaves()))
-        {
+        if tokens.len() != count {
             return Ok(None);
         }
     }
@@ -136,8 +137,14 @@ fn fit_values<T>(
             .iter()
             .flat_map(|channel| channel.samples.iter());
         for (token, &pixel) in tokens.iter().zip(pixels) {
-            let (context, value) = literal(token).expect("literal streams validated");
-            let leaf = leaves[context].as_mut().expect("unit multiplier checked");
+            // Validate while collecting, without another full literal scan.
+            // Partial samples are local and discarded if reuse is unsafe.
+            let Some((context, value)) = literal(token) else {
+                return Ok(None);
+            };
+            let Some(leaf) = leaves.get_mut(context).and_then(Option::as_mut) else {
+                return Ok(None);
+            };
             let residual = recover_residual(value, leaf.baseline, pixel);
             leaf.add(residual, options.samples_per_leaf)?;
         }

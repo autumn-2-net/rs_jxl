@@ -653,9 +653,7 @@ pub(super) fn evaluate_property_values<T: PropertyValue>(
             drop(_score_middle_scope);
             let mut extra_below = 0u64;
             let _score_scope = histogram_detail_scope("ma.histogram_score");
-            if options.scoring == ScoringOptions::default()
-                && (scratch.score_mask.is_empty() || coarsened)
-            {
+            if options.scoring.description_only() && (scratch.score_mask.is_empty() || coarsened) {
                 let mut weight_below = 0;
                 let count = if reuse_splits {
                     scratch.splits.len()
@@ -681,32 +679,67 @@ pub(super) fn evaluate_property_values<T: PropertyValue>(
                         totals: (total - weight_below, weight_below),
                     })
                 });
-                scorer.split_sweep(
-                    &mut scratch.counts_above,
-                    &mut scratch.counts_below,
-                    increase,
-                    stride,
-                    total,
-                    sparse,
-                    splits,
-                    |split, rbits, lbits| {
-                        extra_below += extra[split.row];
-                        // Keep the same f32 extra-bit and strict tie order as
-                        // the configurable per-threshold scoring path below.
-                        update_cost(
-                            &mut below_costs[split.bin],
-                            lbits + extra_below as f32,
-                            penalty,
-                            predictor,
-                        );
-                        update_cost(
-                            &mut above_costs[split.bin],
-                            (rbits + parent.extra_bits as f32) - extra_below as f32,
-                            penalty,
-                            predictor,
-                        );
-                    },
-                );
+                let description = options.scoring.description;
+                if description == DescriptionCost::Disabled {
+                    // Keep the score-only callback free of description state.
+                    scorer.split_sweep(
+                        &mut scratch.counts_above,
+                        &mut scratch.counts_below,
+                        increase,
+                        stride,
+                        total,
+                        sparse,
+                        splits,
+                        |split, rbits, lbits| {
+                            extra_below += extra[split.row];
+                            update_cost(
+                                &mut below_costs[split.bin],
+                                lbits + extra_below as f32,
+                                penalty,
+                                predictor,
+                            );
+                            update_cost(
+                                &mut above_costs[split.bin],
+                                (rbits + parent.extra_bits as f32) - extra_below as f32,
+                                penalty,
+                                predictor,
+                            );
+                        },
+                    );
+                } else {
+                    scorer.split_sweep_with_active(
+                        &mut scratch.counts_above,
+                        &mut scratch.counts_below,
+                        increase,
+                        stride,
+                        total,
+                        sparse,
+                        splits,
+                        |split, rbits, lbits, active| {
+                            extra_below += extra[split.row];
+                            // Match the configurable path: extra bits first,
+                            // then the description penalty on each side.
+                            let below_bits = lbits
+                                + extra_below as f32
+                                + description.cost_for_active(&scorer, active.1, split.totals.1);
+                            let above_bits = (rbits + parent.extra_bits as f32)
+                                - extra_below as f32
+                                + description.cost_for_active(&scorer, active.0, split.totals.0);
+                            update_cost(
+                                &mut below_costs[split.bin],
+                                below_bits,
+                                penalty,
+                                predictor,
+                            );
+                            update_cost(
+                                &mut above_costs[split.bin],
+                                above_bits,
+                                penalty,
+                                predictor,
+                            );
+                        },
+                    );
+                }
                 continue;
             }
             for split in &scratch.splits {

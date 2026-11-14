@@ -12,6 +12,9 @@ use crate::{Result, input, io, options};
 
 #[derive(Debug, Args)]
 #[command(
+    group = clap::ArgGroup::new("source_patch_mode")
+        .args(["source_effort", "source_patches"])
+        .multiple(true),
     after_long_help = "JPEG input is pixel-lossless relative to zune-jpeg's \
 decoded samples only; original JPEG bytes cannot be reconstructed.\n\
 PNG sRGB/gAMA/cHRM/iCCP and JPEG ICC color metadata are preserved. \
@@ -64,6 +67,9 @@ pub(crate) struct EncodeArgs {
     /// Disable automatic e9 MA learner/offsets/scoring; explicit tools still apply.
     #[arg(long, requires = "source_effort")]
     pub(crate) no_source_ma_defaults: bool,
+    /// Disable automatic parallel gather for Source Add patches; explicit gathers still apply.
+    #[arg(long, requires = "source_patch_mode")]
+    pub(crate) no_source_patch_parallel_gather: bool,
     /// Run native pixel search instead of just one source candidate
     #[arg(long, requires = "source_effort")]
     pub(crate) source_search: bool,
@@ -149,6 +155,7 @@ impl EncodeArgs {
     pub(crate) fn job(&self) -> Result<EncodeJob> {
         let mut options = EncodeOptions {
             threads: self.threads,
+            source_patch_parallel_gather: !self.no_source_patch_parallel_gather,
             ..EncodeOptions::default()
         };
         let Some(effort) = self.source_effort else {

@@ -38,6 +38,7 @@ fn candidate(options: &Options) -> Result<(CandidateParams, EncodeOptions)> {
     params.validate().map_err(message)?;
     let mut base = EncodeOptions {
         threads: options.threads.unwrap_or(1),
+        source_patch_parallel_gather: options.source_patch_parallel_gather.unwrap_or(true),
         ..Default::default()
     };
     base.modular.ma_max_leaves = options.ma_max_leaves;

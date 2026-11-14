@@ -406,8 +406,15 @@ fails if unsupported by encoder. spot_color is four floats, cfa_channel integer.
 
 - encode/encode_multiframe/encode_layers: threads=1, effort=7, source_search=false,
   strip_metadata=false; optional group_size_shift,rct,predictor,palette_colors,
-  patches(bool),learning_fraction,ma_max_leaves,source_ma_defaults(bool, default true).
-  source_ma_defaults=false disables automatic e9 Half description scoring and
+  patches(bool),learning_fraction,ma_max_leaves,source_ma_defaults(bool, default true),
+  source_patch_parallel_gather(bool, default true).
+  source_patch_parallel_gather enables channel-parallel sparse MA gathering only
+  after a real Source Add patch plan, with source sampling and threads > 1.
+  Main and atlas frames retain explicit gather settings independently; no-patch
+  fallback and single-thread calls are unchanged. False opts out. This pixel
+  encoding option is allowed with source_search but rejected for JPEG transcoding
+  and non-encoding operations even when false; null is invalid.
+  source_ma_defaults=false disables automatic e9 Symmetric learning, Half description scoring and
   single-pass Distribution offsets; other efforts and explicit Rust tools are
   unchanged. It is allowed with pixel source_search and rejected for JPEG
   transcoding and non-encoding operations. Null is invalid. Effort/overrides map to native

@@ -843,6 +843,68 @@ fn raw_fit_recovers_weighted_and_wide_residuals_from_pixels() {
 }
 
 #[test]
+fn single_pass_reuse_rejects_late_invalid_tokens_without_changing_inputs() {
+    use crate::entropy::stream::Token;
+
+    let tree = Tree::new(vec![leaf(-37, 1)]).unwrap();
+    let channels = [plane((0..129).map(|i| i * 17 - 1000).collect())];
+    let view = stream(&channels);
+    let views = std::slice::from_ref(&view);
+    let options = OffsetOptions {
+        mode: OffsetMode::DistributionSinglePass,
+        samples_per_leaf: 7,
+    };
+    let raw = super::super::tokens::tokenize(&channels, &tree, &view.wp, 0, 0, false).unwrap();
+    let mut invalid_raw = raw.clone();
+    invalid_raw.last_mut().unwrap().context = u32::MAX;
+    let streams = [vec![], invalid_raw, vec![]];
+    let unchanged = streams.clone();
+    assert!(
+        fit_literals(&tree, views, 0, &streams, &options, None)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(streams, unchanged);
+
+    let tokens: Vec<_> = raw
+        .iter()
+        .map(|t| Token::literal(t.context as usize, t.value))
+        .collect();
+    for length_token in [false, true] {
+        let mut invalid = tokens.clone();
+        let last = invalid.last_mut().unwrap();
+        if length_token {
+            last.is_length = true;
+        } else {
+            last.context = usize::MAX;
+        }
+        let streams = [vec![], invalid, vec![]];
+        let unchanged = streams.clone();
+        assert!(
+            fit_tokens(&tree, views, 0, &streams, &options, None)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(streams, unchanged);
+    }
+
+    let (expected, es) = fit_with_configs(&tree, views, 0, &options, None).unwrap();
+    let (actual, actual_stats) = fit_literals(&tree, views, 0, &[raw], &options, None)
+        .unwrap()
+        .expect("valid literals still use the cached fitter");
+    assert_eq!(format!("{actual:?}"), format!("{expected:?}"));
+    assert_eq!(
+        (
+            actual_stats.samples,
+            actual_stats.population,
+            actual_stats.candidates,
+            actual_stats.leaves
+        ),
+        (es.samples, es.population, es.candidates, es.leaves)
+    );
+}
+
+#[test]
 fn distribution_parallel_scores_preserve_order_and_signaling_sweeps() {
     fn build(nodes: &mut Vec<Node>, first: usize, end: usize) -> usize {
         let index = nodes.len();

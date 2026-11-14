@@ -7,6 +7,14 @@ use super::{
     cached_source_entropy, inverse_total, split_delta,
 };
 
+/// Give scalar description scoring an FMA codegen context instead of CRT fmaf
+/// calls in portable builds. Keep the source polynomial and real division.
+#[inline]
+#[target_feature(enable = "fma")]
+pub(super) unsafe fn scalar_fast_log2_fma(value: f32) -> f32 {
+    super::fast_log2::<true>(value)
+}
+
 macro_rules! default_kernel {
     ($feature:literal, $lanes:literal, $int:ty, $float:ty, $fma:literal) => {
         #[inline]
@@ -119,6 +127,56 @@ macro_rules! default_kernel {
             splits: impl Iterator<Item = HistogramSplit>,
             mut emit: impl FnMut(HistogramSplit, f32, f32),
         ) {
+            // SAFETY: propagated CPU and checked slice/block layout.
+            unsafe {
+                sweep_impl::<false>(
+                    scorer,
+                    above,
+                    below,
+                    deltas,
+                    stride,
+                    population,
+                    sparse,
+                    splits,
+                    |split, r, l, _| emit(split, r, l),
+                )
+            }
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        #[target_feature(enable = $feature)]
+        pub(in super::super) unsafe fn count_sweep(
+            scorer: &DefaultScorer,
+            above: &mut [u32],
+            below: &mut [u32],
+            deltas: &[u32],
+            stride: usize,
+            population: u32,
+            sparse: Option<&[usize]>,
+            splits: impl Iterator<Item = HistogramSplit>,
+            emit: impl FnMut(HistogramSplit, f32, f32, (usize, usize)),
+        ) {
+            // SAFETY: same checked layout as the score-only sweep.
+            unsafe {
+                sweep_impl::<true>(
+                    scorer, above, below, deltas, stride, population, sparse, splits, emit,
+                )
+            }
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        #[target_feature(enable = $feature)]
+        unsafe fn sweep_impl<const ACTIVE: bool>(
+            scorer: &DefaultScorer,
+            above: &mut [u32],
+            below: &mut [u32],
+            deltas: &[u32],
+            stride: usize,
+            population: u32,
+            sparse: Option<&[usize]>,
+            splits: impl Iterator<Item = HistogramSplit>,
+            mut emit: impl FnMut(HistogramSplit, f32, f32, (usize, usize)),
+        ) {
             // Transfers preserve combined weighted mass. If it fits the
             // existing table, both sides fit for every subsequent split.
             if population <= super::super::SMALL_HISTOGRAM_TOTAL {
@@ -126,11 +184,11 @@ macro_rules! default_kernel {
                 // the specialized sweep still bounds every row and gather.
                 unsafe {
                     if let Some(blocks) = sparse {
-                        small_sweep::<true>(
+                        small_sweep::<true, ACTIVE>(
                             scorer, above, below, deltas, stride, blocks, splits, emit,
                         );
                     } else {
-                        small_sweep::<false>(
+                        small_sweep::<false, ACTIVE>(
                             scorer,
                             above,
                             below,
@@ -153,10 +211,17 @@ macro_rules! default_kernel {
                     let delta = split_delta(deltas, stride, above.len(), split.row);
                     // SAFETY: same target features; wrapper checked lengths
                     // and block addresses, and delta is a bounded row slice.
-                    let (r, l) = unsafe {
-                        move_dispatch::<true>(scorer, above, below, delta, split.totals, blocks)
+                    let ((r, l), active) = unsafe {
+                        move_dispatch_with_active::<true, ACTIVE>(
+                            scorer,
+                            above,
+                            below,
+                            delta,
+                            split.totals,
+                            blocks,
+                        )
                     };
-                    emit(split, r, l);
+                    emit(split, r, l, active);
                 }
             } else {
                 for split in splits {
@@ -164,17 +229,24 @@ macro_rules! default_kernel {
                     debug_assert!(split.totals.1 <= i32::MAX as u32);
                     let delta = split_delta(deltas, stride, above.len(), split.row);
                     // SAFETY: same checked layout; dense mode ignores blocks.
-                    let (r, l) = unsafe {
-                        move_dispatch::<false>(scorer, above, below, delta, split.totals, &[])
+                    let ((r, l), active) = unsafe {
+                        move_dispatch_with_active::<false, ACTIVE>(
+                            scorer,
+                            above,
+                            below,
+                            delta,
+                            split.totals,
+                            &[],
+                        )
                     };
-                    emit(split, r, l);
+                    emit(split, r, l, active);
                 }
             }
         }
 
         #[allow(clippy::too_many_arguments)]
         #[target_feature(enable = $feature)]
-        unsafe fn small_sweep<const SPARSE: bool>(
+        unsafe fn small_sweep<const SPARSE: bool, const ACTIVE: bool>(
             scorer: &DefaultScorer,
             above: &mut [u32],
             below: &mut [u32],
@@ -182,7 +254,7 @@ macro_rules! default_kernel {
             stride: usize,
             blocks: &[usize],
             splits: impl Iterator<Item = HistogramSplit>,
-            mut emit: impl FnMut(HistogramSplit, f32, f32),
+            mut emit: impl FnMut(HistogramSplit, f32, f32, (usize, usize)),
         ) {
             let end = above.len() / $lanes * $lanes;
             let tail_end = if !SPARSE || blocks.last() == Some(&end) {
@@ -213,15 +285,24 @@ macro_rules! default_kernel {
                     > u64::from(super::super::SMALL_HISTOGRAM_TOTAL)
                 {
                     // SAFETY: same features and checked row/block layout.
-                    let (r, l) = unsafe {
-                        move_dispatch::<SPARSE>(scorer, above, below, delta, split.totals, blocks)
+                    let ((r, l), active) = unsafe {
+                        move_dispatch_with_active::<SPARSE, ACTIVE>(
+                            scorer,
+                            above,
+                            below,
+                            delta,
+                            split.totals,
+                            blocks,
+                        )
                     };
-                    emit(split, r, l);
+                    emit(split, r, l, active);
                     continue;
                 }
                 let row_r = row(split.totals.0);
                 let row_l = row(split.totals.1);
                 let (mut br, mut bl) = (zero(), zero());
+                let (mut ar, mut al) = (splat_i(0), splat_i(0));
+                let (mut active_r, mut active_l) = ([0u32; $lanes], [0u32; $lanes]);
                 let mut lanes_r = [0.0; $lanes];
                 let mut lanes_l = [0.0; $lanes];
                 // SAFETY: checked sparse addresses and matching slices bound
@@ -238,19 +319,39 @@ macro_rules! default_kernel {
                         let l = add_i(load(below.as_ptr().add(i).cast()), d);
                         store_i(above.as_mut_ptr().add(i).cast(), r);
                         store_i(below.as_mut_ptr().add(i).cast(), l);
+                        if ACTIVE {
+                            ar = sub_i(ar, gt_i(r, splat_i(0)));
+                            al = sub_i(al, gt_i(l, splat_i(0)));
+                        }
                         br = sub(br, gather_entropy(row_r, r));
                         bl = sub(bl, gather_entropy(row_l, l));
                     }
                     store_f(lanes_r.as_mut_ptr(), br);
                     store_f(lanes_l.as_mut_ptr(), bl);
+                    if ACTIVE {
+                        store_i(active_r.as_mut_ptr().cast(), ar);
+                        store_i(active_l.as_mut_ptr().cast(), al);
+                    }
                 }
                 for i in end..tail_end {
                     above[i] = above[i].wrapping_sub(delta[i]);
                     below[i] = below[i].wrapping_add(delta[i]);
                     lanes_r[i - end] -= row_r[above[i] as usize];
                     lanes_l[i - end] -= row_l[below[i] as usize];
+                    if ACTIVE {
+                        active_r[i - end] += u32::from(above[i] != 0);
+                        active_l[i - end] += u32::from(below[i] != 0);
+                    }
                 }
-                emit(split, reduce_default(lanes_r), reduce_default(lanes_l));
+                emit(
+                    split,
+                    reduce_default(lanes_r),
+                    reduce_default(lanes_l),
+                    (
+                        active_r.iter().map(|&n| n as usize).sum(),
+                        active_l.iter().map(|&n| n as usize).sum(),
+                    ),
+                );
             }
         }
 
@@ -264,27 +365,72 @@ macro_rules! default_kernel {
             totals: (u32, u32),
             blocks: &[usize],
         ) -> (f32, f32) {
+            // SAFETY: same CPU/slice contract; counting compiles away.
+            unsafe {
+                move_dispatch_with_active::<SPARSE, false>(
+                    scorer, above, below, delta, totals, blocks,
+                )
+                .0
+            }
+        }
+
+        #[inline]
+        #[target_feature(enable = $feature)]
+        unsafe fn move_dispatch_with_active<const SPARSE: bool, const ACTIVE: bool>(
+            scorer: &DefaultScorer,
+            above: &mut [u32],
+            below: &mut [u32],
+            delta: &[u32],
+            totals: (u32, u32),
+            blocks: &[usize],
+        ) -> ((f32, f32), (usize, usize)) {
             // SAFETY: caller checks equal lengths and runtime feature.
             // Each side specializes independently, outside the bin loop.
-            unsafe {
+            let mut active = (0, 0);
+            let bits = unsafe {
                 match (
                     !scorer.small_row(totals.0).is_empty(),
                     !scorer.small_row(totals.1).is_empty(),
                 ) {
-                    (true, true) => default_move_impl::<true, true, SPARSE>(
-                        scorer, above, below, delta, totals, blocks,
+                    (true, true) => default_move_impl::<true, true, SPARSE, ACTIVE>(
+                        scorer,
+                        above,
+                        below,
+                        delta,
+                        totals,
+                        blocks,
+                        &mut active,
                     ),
-                    (true, false) => default_move_impl::<true, false, SPARSE>(
-                        scorer, above, below, delta, totals, blocks,
+                    (true, false) => default_move_impl::<true, false, SPARSE, ACTIVE>(
+                        scorer,
+                        above,
+                        below,
+                        delta,
+                        totals,
+                        blocks,
+                        &mut active,
                     ),
-                    (false, true) => default_move_impl::<false, true, SPARSE>(
-                        scorer, above, below, delta, totals, blocks,
+                    (false, true) => default_move_impl::<false, true, SPARSE, ACTIVE>(
+                        scorer,
+                        above,
+                        below,
+                        delta,
+                        totals,
+                        blocks,
+                        &mut active,
                     ),
-                    (false, false) => default_move_impl::<false, false, SPARSE>(
-                        scorer, above, below, delta, totals, blocks,
+                    (false, false) => default_move_impl::<false, false, SPARSE, ACTIVE>(
+                        scorer,
+                        above,
+                        below,
+                        delta,
+                        totals,
+                        blocks,
+                        &mut active,
                     ),
                 }
-            }
+            };
+            (bits, active)
         }
 
         #[target_feature(enable = $feature)]
@@ -292,6 +438,7 @@ macro_rules! default_kernel {
             const CACHE_R: bool,
             const CACHE_L: bool,
             const SPARSE: bool,
+            const ACTIVE: bool,
         >(
             scorer: &DefaultScorer,
             above: &mut [u32],
@@ -299,6 +446,7 @@ macro_rules! default_kernel {
             delta: &[u32],
             totals: (u32, u32),
             blocks: &[usize],
+            active: &mut (usize, usize),
         ) -> (f32, f32) {
             let row_r = scorer.small_row(totals.0);
             let row_l = scorer.small_row(totals.1);
@@ -307,6 +455,10 @@ macro_rules! default_kernel {
             let (vr, vl) = (splat(ir), splat(il));
             let (tr, tl) = (splat_i(totals.0 as i32), splat_i(totals.1 as i32));
             let (mut br, mut bl) = (zero(), zero());
+            // Only nonzero bins contribute, so each lane is bounded by the
+            // caller-validated total <= i32::MAX, even for very sparse slices.
+            let (mut ar, mut al) = (splat_i(0), splat_i(0));
+            let (mut active_r, mut active_l) = ([0u32; $lanes], [0u32; $lanes]);
             let end = above.len() / $lanes * $lanes;
             let tail_end = if !SPARSE || blocks.last() == Some(&end) {
                 above.len()
@@ -338,6 +490,10 @@ macro_rules! default_kernel {
                     let l = add_i(load(below.as_ptr().add(i).cast()), d);
                     store_i(above.as_mut_ptr().add(i).cast(), r);
                     store_i(below.as_mut_ptr().add(i).cast(), l);
+                    if ACTIVE {
+                        ar = sub_i(ar, gt_i(r, splat_i(0)));
+                        al = sub_i(al, gt_i(l, splat_i(0)));
+                    }
                     br = sub(br, default_entropy::<CACHE_R>(row_r, r, vr, tr));
                     bl = sub(bl, default_entropy::<CACHE_L>(row_l, l, vl, tl));
                 }
@@ -348,11 +504,20 @@ macro_rules! default_kernel {
                     let l = add_i(load_tail(below.as_ptr().add(end), mask), d);
                     store_tail(above.as_mut_ptr().add(end), mask, r);
                     store_tail(below.as_mut_ptr().add(end), mask, l);
+                    if ACTIVE {
+                        // Disabled load lanes are zero and must not count.
+                        ar = sub_i(ar, gt_i(r, splat_i(0)));
+                        al = sub_i(al, gt_i(l, splat_i(0)));
+                    }
                     br = sub(br, default_entropy::<CACHE_R>(row_r, r, vr, tr));
                     bl = sub(bl, default_entropy::<CACHE_L>(row_l, l, vl, tl));
                 }
                 store_f(lanes_r.as_mut_ptr(), br);
                 store_f(lanes_l.as_mut_ptr(), bl);
+                if ACTIVE {
+                    store_i(active_r.as_mut_ptr().cast(), ar);
+                    store_i(active_l.as_mut_ptr().cast(), al);
+                }
             }
             if !vector_tail {
                 for i in end..tail_end {
@@ -362,7 +527,17 @@ macro_rules! default_kernel {
                         cached_source_entropy::<$fma>(row_r, above[i], totals.0, ir);
                     lanes_l[i - end] -=
                         cached_source_entropy::<$fma>(row_l, below[i], totals.1, il);
+                    if ACTIVE {
+                        active_r[i - end] += u32::from(above[i] != 0);
+                        active_l[i - end] += u32::from(below[i] != 0);
+                    }
                 }
+            }
+            if ACTIVE {
+                *active = (
+                    active_r.iter().map(|&n| n as usize).sum(),
+                    active_l.iter().map(|&n| n as usize).sum(),
+                );
             }
             (reduce_default(lanes_r), reduce_default(lanes_l))
         }
@@ -609,11 +784,12 @@ pub(super) mod sse2 {
     use std::arch::x86_64::{
         _mm_add_epi32 as add_i, _mm_add_ps as add, _mm_andnot_ps as andnot_f,
         _mm_castps_si128 as cast_i, _mm_castsi128_ps as cast_f, _mm_cmpeq_epi32 as eq_i,
-        _mm_cvtepi32_ps as convert, _mm_div_ps as div, _mm_loadu_si128 as load, _mm_max_ps as max,
-        _mm_min_ps as min, _mm_mul_ps as mul, _mm_set1_epi32 as splat_i, _mm_set1_ps as splat,
-        _mm_setzero_ps as zero, _mm_setzero_si128 as zero_i, _mm_slli_epi32 as shl_i,
-        _mm_srai_epi32 as sar_i, _mm_storeu_ps as store_f, _mm_storeu_si128 as store_i,
-        _mm_sub_epi32 as sub_i, _mm_sub_ps as sub,
+        _mm_cmpgt_epi32 as gt_i, _mm_cvtepi32_ps as convert, _mm_div_ps as div,
+        _mm_loadu_si128 as load, _mm_max_ps as max, _mm_min_ps as min, _mm_mul_ps as mul,
+        _mm_set1_epi32 as splat_i, _mm_set1_ps as splat, _mm_setzero_ps as zero,
+        _mm_setzero_si128 as zero_i, _mm_slli_epi32 as shl_i, _mm_srai_epi32 as sar_i,
+        _mm_storeu_ps as store_f, _mm_storeu_si128 as store_i, _mm_sub_epi32 as sub_i,
+        _mm_sub_ps as sub,
     };
 
     #[inline]
@@ -698,12 +874,12 @@ pub(super) mod avx2 {
     use std::arch::x86_64::{
         _mm256_add_epi32 as add_i, _mm256_add_ps as add, _mm256_andnot_ps as andnot_f,
         _mm256_castps_si256 as cast_i, _mm256_castsi256_ps as cast_f, _mm256_cmpeq_epi32 as eq_i,
-        _mm256_cvtepi32_ps as convert, _mm256_div_ps as div, _mm256_loadu_si256 as load,
-        _mm256_max_ps as max, _mm256_min_ps as min, _mm256_mul_ps as mul,
-        _mm256_set1_epi32 as splat_i, _mm256_set1_ps as splat, _mm256_setzero_ps as zero,
-        _mm256_setzero_si256 as zero_i, _mm256_slli_epi32 as shl_i, _mm256_srai_epi32 as sar_i,
-        _mm256_storeu_ps as store_f, _mm256_storeu_si256 as store_i, _mm256_sub_epi32 as sub_i,
-        _mm256_sub_ps as sub,
+        _mm256_cmpgt_epi32 as gt_i, _mm256_cvtepi32_ps as convert, _mm256_div_ps as div,
+        _mm256_loadu_si256 as load, _mm256_max_ps as max, _mm256_min_ps as min,
+        _mm256_mul_ps as mul, _mm256_set1_epi32 as splat_i, _mm256_set1_ps as splat,
+        _mm256_setzero_ps as zero, _mm256_setzero_si256 as zero_i, _mm256_slli_epi32 as shl_i,
+        _mm256_srai_epi32 as sar_i, _mm256_storeu_ps as store_f, _mm256_storeu_si256 as store_i,
+        _mm256_sub_epi32 as sub_i, _mm256_sub_ps as sub,
     };
 
     #[inline]
@@ -781,11 +957,11 @@ pub(super) mod avx2_fma {
     use std::arch::x86_64::{
         _mm256_add_epi32 as add_i, _mm256_add_ps as add, _mm256_andnot_ps as andnot_f,
         _mm256_castps_si256 as cast_i, _mm256_castsi256_ps as cast_f, _mm256_cmpeq_epi32 as eq_i,
-        _mm256_cvtepi32_ps as convert, _mm256_div_ps as div, _mm256_loadu_si256 as load,
-        _mm256_max_ps as max, _mm256_mul_ps as mul, _mm256_set1_epi32 as splat_i,
-        _mm256_set1_ps as splat, _mm256_setzero_ps as zero, _mm256_slli_epi32 as shl_i,
-        _mm256_srai_epi32 as sar_i, _mm256_storeu_ps as store_f, _mm256_storeu_si256 as store_i,
-        _mm256_sub_epi32 as sub_i, _mm256_sub_ps as sub,
+        _mm256_cmpgt_epi32 as gt_i, _mm256_cvtepi32_ps as convert, _mm256_div_ps as div,
+        _mm256_loadu_si256 as load, _mm256_max_ps as max, _mm256_mul_ps as mul,
+        _mm256_set1_epi32 as splat_i, _mm256_set1_ps as splat, _mm256_setzero_ps as zero,
+        _mm256_slli_epi32 as shl_i, _mm256_srai_epi32 as sar_i, _mm256_storeu_ps as store_f,
+        _mm256_storeu_si256 as store_i, _mm256_sub_epi32 as sub_i, _mm256_sub_ps as sub,
     };
 
     #[inline]
@@ -807,11 +983,11 @@ pub(super) mod avx2_rcp {
     use std::arch::x86_64::{
         _mm256_add_epi32 as add_i, _mm256_add_ps as add, _mm256_andnot_ps as andnot_f,
         _mm256_castps_si256 as cast_i, _mm256_castsi256_ps as cast_f, _mm256_cmpeq_epi32 as eq_i,
-        _mm256_cvtepi32_ps as convert, _mm256_loadu_si256 as load, _mm256_max_ps as max,
-        _mm256_mul_ps as mul, _mm256_set1_epi32 as splat_i, _mm256_set1_ps as splat,
-        _mm256_setzero_ps as zero, _mm256_slli_epi32 as shl_i, _mm256_srai_epi32 as sar_i,
-        _mm256_storeu_ps as store_f, _mm256_storeu_si256 as store_i, _mm256_sub_epi32 as sub_i,
-        _mm256_sub_ps as sub,
+        _mm256_cmpgt_epi32 as gt_i, _mm256_cvtepi32_ps as convert, _mm256_loadu_si256 as load,
+        _mm256_max_ps as max, _mm256_mul_ps as mul, _mm256_set1_epi32 as splat_i,
+        _mm256_set1_ps as splat, _mm256_setzero_ps as zero, _mm256_slli_epi32 as shl_i,
+        _mm256_srai_epi32 as sar_i, _mm256_storeu_ps as store_f, _mm256_storeu_si256 as store_i,
+        _mm256_sub_epi32 as sub_i, _mm256_sub_ps as sub,
     };
 
     #[inline]

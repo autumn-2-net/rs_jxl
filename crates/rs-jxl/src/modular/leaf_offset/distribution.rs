@@ -27,6 +27,40 @@ fn neighborhood(candidates: &mut Vec<i32>, center: i32) {
     }
 }
 
+fn wrapped_values(sorted: &[i64]) -> Result<Vec<i32>> {
+    let mut wrapped = Vec::new();
+    reserve(&mut wrapped, sorted.len())?;
+    wrapped.extend(sorted.iter().map(|&value| value as i32));
+    // Narrowing preserves signed order only when the whole range fits i32.
+    if sorted
+        .first()
+        .is_some_and(|&value| value < i64::from(i32::MIN))
+        || sorted
+            .last()
+            .is_some_and(|&value| value > i64::from(i32::MAX))
+    {
+        wrapped.sort_unstable();
+    }
+    Ok(wrapped)
+}
+
+fn top_modes(groups: &[(i32, u64)]) -> [(i32, u64); 4] {
+    let mut modes = [(0, 0); 4];
+    for (index, &group) in groups.iter().enumerate() {
+        let len = index.min(modes.len());
+        let position = modes[..len]
+            .iter()
+            .position(|mode| group.1 > mode.1 || (group.1 == mode.1 && group.0 < mode.0))
+            .unwrap_or(len);
+        if position < modes.len() {
+            let last = modes.len() - 1;
+            modes.copy_within(position..last, position + 1);
+            modes[position] = group;
+        }
+    }
+    modes
+}
+
 fn entropy_term(count: u64, n: f64) -> f64 {
     if count == 0 {
         0.0
@@ -88,10 +122,7 @@ fn scores_impl<const CACHE_ENTROPY: bool>(
     let mean = samples.mean();
     samples.values.sort_unstable();
     let median = samples.values[(samples.values.len() - 1) / 2] as i32;
-    let mut wrapped = Vec::new();
-    reserve(&mut wrapped, samples.values.len())?;
-    wrapped.extend(samples.values.iter().map(|&value| value as i32));
-    wrapped.sort_unstable();
+    let wrapped = wrapped_values(&samples.values)?;
     let mut groups: Vec<(i32, u64)> = Vec::new();
     reserve(&mut groups, wrapped.len())?;
     for value in wrapped {
@@ -111,11 +142,8 @@ fn scores_impl<const CACHE_ENTROPY: bool>(
     if samples.baseline != 0 {
         neighborhood(&mut candidates, samples.baseline);
     }
-    let mut modes = Vec::new();
-    reserve(&mut modes, groups.len())?;
-    modes.extend_from_slice(&groups);
-    modes.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    for &(value, _) in modes.iter().take(4) {
+    let modes = top_modes(&groups);
+    for &(value, _) in modes.iter().take(groups.len().min(4)) {
         neighborhood(&mut candidates, value);
     }
     for numerator in [1u128, 2, 6, 7] {
@@ -197,6 +225,67 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::*;
+
+    #[test]
+    fn top_four_modes_match_full_sort_including_signed_ties() {
+        for len in [0, 1, 2, 3, 4, 5, 17, 1024, 8192] {
+            for kind in 0..3 {
+                let mut groups: Vec<_> = (0..len)
+                    .map(|i| {
+                        let value = match i {
+                            0 => i32::MIN,
+                            1 => i32::MAX,
+                            _ => i as i32 - len as i32 / 2,
+                        };
+                        let count = match kind {
+                            0 => 7,
+                            1 => (i * 7919 % 31 + 1) as u64,
+                            _ => (len - i) as u64,
+                        };
+                        (value, count)
+                    })
+                    .collect();
+                for reverse in [false, true] {
+                    if reverse {
+                        groups.reverse();
+                    }
+                    let actual = top_modes(&groups);
+                    let mut expected = groups.clone();
+                    expected.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+                    assert_eq!(&actual[..len.min(4)], &expected[..len.min(4)]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn wrapped_value_order_matches_full_sort_at_narrow_and_wide_boundaries() {
+        let narrow = [i32::MIN, -37, -1, 0, 0, 1, i32::MAX].map(i64::from);
+        let wide = [
+            i64::MIN,
+            i64::MAX,
+            i64::from(i32::MIN) - 1,
+            i64::from(i32::MAX) + 1,
+            -4_294_967_297,
+            4_294_967_296,
+        ];
+        for values in [&[][..], &narrow[..], &wide[..]] {
+            let mut sorted = values.to_vec();
+            sorted.sort_unstable();
+            let mut expected: Vec<_> = sorted.iter().map(|&value| value as i32).collect();
+            expected.sort_unstable();
+            assert_eq!(wrapped_values(&sorted).unwrap(), expected);
+        }
+        // Adding either extreme exercises both endpoint guards separately.
+        for value in wide {
+            let mut sorted = narrow.to_vec();
+            sorted.push(value);
+            sorted.sort_unstable();
+            let mut expected: Vec<_> = sorted.iter().map(|&value| value as i32).collect();
+            expected.sort_unstable();
+            assert_eq!(wrapped_values(&sorted).unwrap(), expected);
+        }
+    }
 
     fn scoring_cases() -> Vec<(&'static str, Samples, HybridUintConfig)> {
         let dense = HybridUintConfig::default();

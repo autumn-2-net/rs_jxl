@@ -110,7 +110,7 @@ threads=0 explicitly selects CPU count capped at 256; threads=1 is serial.
 
 encoder_options={...} or keyword arguments accept group_size_shift, rct,
 predictor, palette_colors, patches, learning_fraction, ma_max_leaves and
-source_ma_defaults.
+source_ma_defaults and source_patch_parallel_gather.
 Aliases modular_group_size/modular_colorspace/modular_predictor/
 modular_palette_colors map to the first four respectively. iterations and
 modular_ma_tree_learning_percent map to learning_fraction=percent/100.
@@ -139,6 +139,17 @@ pre-profile e9 policy. This switch is supported for pixel still/multiframe/layer
 encoding, including still source search; JPEG byte transcoding rejects it.
 See [single-pass MA](MA_SINGLE_PASS_DEFAULT_20261114.md) and
 [combined Symmetric defaults](SYMMETRIC_MA_DEFAULT_20261114.md).
+
+Source Add patches default to channel-parallel sparse MA gathering only after
+the detector actually produces a reference/residual plan and `threads > 1`.
+The reference and residual frames use the existing worker pool and gather
+budget; explicit Rust gather settings win independently on each frame. No-plan
+fallback, single-thread calls, and other patch types keep their existing path.
+Use `source_patch_parallel_gather=False` to opt out (also in `encoder_options`).
+It is accepted for pixel still/multiframe/layer encoding and still source search,
+not JPEG byte transcoding. This does not force patch detection. Parallel sample
+deduplication can change the learned tree and file size; decoded samples remain
+lossless. See [staged source tools](SOURCE_TOOLS_20261114.md).
 
 ## Reports
 

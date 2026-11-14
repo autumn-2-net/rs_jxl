@@ -25,12 +25,12 @@ mod native_fast;
 mod native_tectonic;
 pub mod params;
 pub mod pilot;
+pub mod policy;
 pub mod portfolio;
 #[path = "portfolio_catalog.rs"]
 mod portfolio_catalog;
 #[path = "portfolio_features.rs"]
 mod portfolio_features;
-pub mod policy;
 pub mod prefix_screen;
 pub mod probe;
 pub mod progressive;
@@ -39,6 +39,7 @@ pub mod regions;
 pub mod scan;
 pub mod search;
 pub mod small_probe;
+pub mod source_tools;
 pub mod tectonic;
 pub mod worker_pool;
 

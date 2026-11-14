@@ -49,6 +49,7 @@ platform certifications.
 | MA limits and exact search pruning | [Tree budgets](MA_TREE_BUDGET.md), [search pruning](MA_SEARCH_PRUNING.md) |
 | Search/probe integration and execution | [Probe API](SCHEDULER_PROBE_API.md), [cooperative execution](PARALLEL_EXECUTION.md), [progressive group scheduler](PROGRESSIVE_GROUP_SCHEDULER.md), [scheduler default routes](../crates/rs-jxl/src/scheduler/DEFAULT_ROUTES.md) |
 | Opt-in native experimental portfolio and deferred corpus runner | [Portfolio scout](NATIVE_PORTFOLIO_SCOUT_20261113.md) |
+| Default Source Patch gathering and staged Sparse/prev1/ScreenedRuns experiments | [Source tool integration](SOURCE_TOOLS_20261114.md) |
 
 ## Acceptance and Validation
 
@@ -209,6 +210,7 @@ rejected experiments and remaining limitations remain part of the record.
 - [Patch, cross-channel MA and Offset reuse follow-up, 2026-11-13](PATCH_MA_OFFSET_FOLLOWUP_20261113.md)
 - [Single-pass MA offsets and Half e9 defaults, 2026-11-14](MA_SINGLE_PASS_DEFAULT_20261114.md)
 - [Symmetric MA with Half and single-pass offsets, 2026-11-14](SYMMETRIC_MA_DEFAULT_20261114.md)
+- [Fused MA description scoring and ISA measurements, 2026-11-14](MA_FUSED_SCORING_20261114.md)
 
 ### Decoding and Reconstruction
 

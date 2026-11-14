@@ -33,6 +33,13 @@ pub struct EncodeOptions {
     pub source_patches: Option<crate::tools::patches::SourcePatchConfig>,
     /// Resolve source atlas parameters after its dimensions are known.
     pub source_patch_reference: Option<crate::modular::source_options::SourcePatchReferencePolicy>,
+    /// Enabled by default: channel-parallel sparse MA gathering only after Source Add
+    /// detection produces an atlas/residual and `threads > 1`. Uses the caller's
+    /// pool with at most `min(threads, 64)` gather workers. Each frame must already
+    /// have source sampling; explicit main/reference `source_gather` settings win
+    /// independently. False disables only this default, for ablation. Does not
+    /// enable detection or affect no-patch, Tile/Replace, or single-thread paths.
+    pub source_patch_parallel_gather: bool,
     /// Whole-frame palette before group splitting; local palettes remain the fallback.
     pub global_palette: bool,
     /// Apply the source whole-frame squeeze plan before DC/AC partitioning.
@@ -53,6 +60,7 @@ impl Default for EncodeOptions {
             tile_patches: None,
             source_patches: None,
             source_patch_reference: None,
+            source_patch_parallel_gather: true,
             global_palette: false,
             responsive: false,
             passes: Default::default(),
@@ -474,6 +482,46 @@ fn prepare_patch_plan(image: &Image, options: &EncodeOptions) -> Result<Option<P
     }
 }
 
+/// Called only for an actual patch plan, never preparation or full-frame fallback.
+fn patch_frame_options(
+    options: &EncodeOptions,
+    reference: &Image,
+) -> Result<(EncodeOptions, EncodeOptions)> {
+    let mut atlas_options = options.clone();
+    let mut residual_options = options.clone();
+    if options.source_patches.is_some() {
+        atlas_options.modular.predictor = crate::modular::predictor::Predictor::Gradient;
+        atlas_options.modular.squeeze.clear();
+        atlas_options.responsive = false;
+        atlas_options.passes = Default::default();
+        if let Some(policy) = &options.source_patch_reference {
+            let resolved = policy.resolve(reference)?;
+            atlas_options.modular = resolved.modular;
+            atlas_options.group_size_shift = resolved.group_size_shift;
+            atlas_options.shared_tree = true;
+            atlas_options.global_palette = true;
+        }
+        // Resolve first: the atlas has its own sampling and explicit gather policy.
+        if options.source_patch_parallel_gather && options.threads > 1 {
+            for modular in [&mut residual_options.modular, &mut atlas_options.modular] {
+                if modular.sampling.is_some() && modular.source_gather.is_none() {
+                    modular.source_gather = Some(crate::modular::sample::GatherOptions {
+                        mode: crate::modular::sample::GatherMode::Channels,
+                        workers: options.threads.min(64),
+                        sparse: true,
+                        ..Default::default()
+                    });
+                }
+            }
+        }
+    }
+    atlas_options.patches = None;
+    atlas_options.tile_patches = None;
+    atlas_options.source_patches = None;
+    atlas_options.source_patch_reference = None;
+    Ok((atlas_options, residual_options))
+}
+
 fn encode_logical_frame_from_plan(
     canvas: FrameCanvas<'_>,
     frame: &crate::frame::Frame<'_>,
@@ -501,24 +549,7 @@ fn encode_logical_frame_from_plan(
             save_before_color_transform: true,
             ..Default::default()
         };
-        let mut atlas_options = options.clone();
-        if options.source_patches.is_some() {
-            atlas_options.modular.predictor = crate::modular::predictor::Predictor::Gradient;
-            atlas_options.modular.squeeze.clear();
-            atlas_options.responsive = false;
-            atlas_options.passes = Default::default();
-            if let Some(policy) = &options.source_patch_reference {
-                let resolved = policy.resolve(&reference)?;
-                atlas_options.modular = resolved.modular;
-                atlas_options.group_size_shift = resolved.group_size_shift;
-                atlas_options.shared_tree = true;
-                atlas_options.global_palette = true;
-            }
-        }
-        atlas_options.patches = None;
-        atlas_options.tile_patches = None;
-        atlas_options.source_patches = None;
-        atlas_options.source_patch_reference = None;
+        let (atlas_options, residual_options) = patch_frame_options(options, &reference)?;
         let reference_scope = crate::profile::scope("encode.patch_reference");
         stream.extend(complete_or_return!(encode_frame_trial(
             canvas,
@@ -534,7 +565,7 @@ fn encode_logical_frame_from_plan(
         stream.extend(complete_or_return!(encode_frame_trial(
             canvas,
             &residual,
-            options,
+            &residual_options,
             &frame.options,
             last,
             Some(&dictionary),
@@ -812,6 +843,10 @@ pub fn encode_frames_to(
     output.write_all(&encode_frames(canvas, frames, options)?)?;
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "source_patch_parallel_gather_tests.rs"]
+mod source_patch_parallel_gather_tests;
 
 #[cfg(test)]
 mod tests {

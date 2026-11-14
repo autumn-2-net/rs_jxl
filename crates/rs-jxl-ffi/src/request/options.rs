@@ -11,6 +11,8 @@ pub struct Options {
     pub source_search: Option<bool>,
     #[serde(deserialize_with = "present_bool")]
     pub source_ma_defaults: Option<bool>,
+    #[serde(deserialize_with = "present_bool")]
+    pub source_patch_parallel_gather: Option<bool>,
     pub strip_metadata: Option<bool>,
     pub group_size_shift: Option<u8>,
     pub rct: Option<u32>,

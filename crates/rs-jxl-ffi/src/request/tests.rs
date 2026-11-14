@@ -3,6 +3,91 @@ use rs_jxl::multiframe::Reference;
 use serde_json::json;
 
 #[test]
+fn source_patch_parallel_gather_is_presence_aware_and_pixel_only() {
+    for operation in ["encode", "encode_multiframe", "encode_layers"] {
+        for setting in [None, Some(false), Some(true)] {
+            let mut options = json!({"source_ma_defaults": false});
+            if let Some(value) = setting {
+                options["source_patch_parallel_gather"] = json!(value);
+            }
+            let request: Request = serde_json::from_value(json!({
+                "operation": operation,
+                "images": [{"length": 0}],
+                "options": options,
+            }))
+            .unwrap();
+            request.validate_typed().unwrap();
+            assert_eq!(request.options.source_patch_parallel_gather, setting);
+            assert_eq!(request.options.source_ma_defaults, Some(false));
+        }
+    }
+    for operation in [
+        "transcode_jpeg",
+        "reconstruct_jpeg",
+        "decode",
+        "decode_to_png",
+        "info",
+        "read_image",
+        "analyze_multiframe",
+    ] {
+        for value in [false, true] {
+            let mut wire = json!({
+                "operation": operation,
+                "options": {"source_patch_parallel_gather": value},
+            });
+            if operation == "analyze_multiframe" {
+                wire["images"] = json!([{"length": 0}]);
+            }
+            let request: Request = serde_json::from_value(wire).unwrap();
+            assert!(
+                request
+                    .validate()
+                    .unwrap_err()
+                    .message
+                    .starts_with("option source_patch_parallel_gather is unsupported")
+            );
+        }
+    }
+    for value in [false, true] {
+        let request: Request = serde_json::from_value(json!({
+            "operation": "encode",
+            "images": [{"length": 0}],
+            "options": {"source_patch_parallel_gather": value, "source_search": true},
+        }))
+        .unwrap();
+        request.validate_typed().unwrap();
+    }
+}
+
+#[test]
+fn source_patch_parallel_gather_rejects_null_wrong_types_and_duplicates() {
+    for value in [
+        json!(null),
+        json!(0),
+        json!(1),
+        json!(1.0),
+        json!("false"),
+        json!([]),
+        json!({}),
+    ] {
+        assert!(
+            serde_json::from_value::<Request>(json!({
+                "operation": "encode",
+                "images": [{"length": 0}],
+                "options": {"source_patch_parallel_gather": value},
+            }))
+            .is_err()
+        );
+    }
+    assert!(
+        serde_json::from_str::<Request>(
+            r#"{"operation":"encode","options":{"source_patch_parallel_gather":false,"source_patch_parallel_gather":true}}"#
+        )
+        .is_err()
+    );
+}
+
+#[test]
 fn source_ma_defaults_is_presence_aware_and_pixel_only() {
     for operation in ["encode", "encode_multiframe", "encode_layers"] {
         for setting in [None, Some(false), Some(true)] {

@@ -258,11 +258,12 @@ impl DefaultScorer {
 
     /// Source FastLog2f for positive finite description-penalty operands.
     pub(crate) fn log2(&self, value: f32) -> f32 {
+        #[cfg(target_arch = "x86_64")]
         if self.backend.uses_fma() {
-            fast_log2::<true>(value)
-        } else {
-            fast_log2::<false>(value)
+            // SAFETY: all FMA profiles require runtime CPU/OS FMA detection.
+            return unsafe { x86::scalar_fast_log2_fma(value) };
         }
+        fast_log2::<false>(value)
     }
 
     /// Lane width used by the source-order histogram compactor. Removing zero
@@ -554,6 +555,122 @@ impl DefaultScorer {
                 self.move_and_score(above, below, delta, split.totals)
             };
             emit(split, bits.0, bits.1);
+        }
+    }
+
+    /// Description-only counterpart to `split_sweep`. Emits post-move active
+    /// bin counts (above, below), excluding zero padding and omitted sparse
+    /// blocks. The caller must prove omitted blocks stay zero, as for the
+    /// score-only sweep. Native SSE2/AVX2 and scalar paths count during scoring;
+    /// the optional AVX512 profile retains its scoring kernel and scans counts.
+    /// No histogram allocations or copies are needed.
+    ///
+    /// Keep description penalties separate from entropy in the callback: add
+    /// token extra bits first, then the penalty, matching the trainer's f32 order.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn split_sweep_with_active(
+        &self,
+        above: &mut [u32],
+        below: &mut [u32],
+        deltas: &[u32],
+        stride: usize,
+        population: u32,
+        sparse: Option<&[usize]>,
+        splits: impl Iterator<Item = HistogramSplit>,
+        mut emit: impl FnMut(HistogramSplit, f32, f32, (usize, usize)),
+    ) {
+        assert_eq!(above.len(), below.len(), "MA histogram length mismatch");
+        assert!(stride != 0 && stride >= above.len(), "MA delta stride");
+        assert_eq!(deltas.len() % stride, 0, "MA delta rows");
+        if let Some(blocks) = sparse {
+            let lanes = self.lanes();
+            assert!(blocks.iter().all(|&b| b < above.len() && b % lanes == 0));
+            assert!(blocks.windows(2).all(|b| b[0] < b[1]));
+        }
+        #[cfg(target_arch = "x86_64")]
+        match self.backend {
+            DefaultBackend::Avx2Fma => {
+                // SAFETY: detected features and checked slice/block layout;
+                // the native sweep checks every delta row before access.
+                unsafe {
+                    x86::avx2_fma::count_sweep(
+                        self, above, below, deltas, stride, population, sparse, splits, emit,
+                    )
+                };
+                return;
+            }
+            DefaultBackend::Avx2 => {
+                // SAFETY: same checked layout and detected AVX2.
+                unsafe {
+                    x86::avx2::count_sweep(
+                        self, above, below, deltas, stride, population, sparse, splits, emit,
+                    )
+                };
+                return;
+            }
+            DefaultBackend::Sse2 => {
+                // SAFETY: same checked layout and detected SSE2.
+                unsafe {
+                    x86::sse2::count_sweep(
+                        self, above, below, deltas, stride, population, sparse, splits, emit,
+                    )
+                };
+                return;
+            }
+            DefaultBackend::Avx2Rcp => {
+                // SAFETY: detected AVX2/FMA. Counting leaves the opt-in
+                // reciprocal profile's existing entropy arithmetic unchanged.
+                unsafe {
+                    x86::avx2_rcp::count_sweep(
+                        self, above, below, deltas, stride, population, sparse, splits, emit,
+                    )
+                };
+                return;
+            }
+            DefaultBackend::Avx512Fma8 => {
+                // Preserve the experimental dense kernel's arithmetic/profile;
+                // do not select AVX512 or silently substitute AVX2 for it here.
+                for split in splits {
+                    let delta = split_delta(deltas, stride, above.len(), split.row);
+                    let (r, l) = if let Some(blocks) = sparse {
+                        self.move_and_score_sparse(above, below, delta, split.totals, blocks)
+                    } else {
+                        self.move_and_score(above, below, delta, split.totals)
+                    };
+                    emit(
+                        split,
+                        r,
+                        l,
+                        (
+                            above.iter().filter(|&&n| n != 0).count(),
+                            below.iter().filter(|&&n| n != 0).count(),
+                        ),
+                    );
+                }
+                return;
+            }
+            DefaultBackend::Scalar => {}
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = population;
+        for split in splits {
+            let totals = split.totals;
+            debug_assert!(totals.0 <= MAX_HISTOGRAM_TOTAL && totals.1 <= MAX_HISTOGRAM_TOTAL);
+            let delta = split_delta(deltas, stride, above.len(), split.row);
+            let (row_r, row_l) = (self.small_row(totals.0), self.small_row(totals.1));
+            let (ir, il) = (inverse_total(totals.0), inverse_total(totals.1));
+            let (mut br, mut bl) = (0.0, 0.0);
+            let (mut ar, mut al) = (0, 0);
+            for block in 0..sparse.map_or(above.len(), |blocks| blocks.len()) {
+                let i = sparse.map_or(block, |blocks| blocks[block]);
+                above[i] = above[i].wrapping_sub(delta[i]);
+                below[i] = below[i].wrapping_add(delta[i]);
+                br -= cached_source_entropy::<false>(row_r, above[i], totals.0, ir);
+                bl -= cached_source_entropy::<false>(row_l, below[i], totals.1, il);
+                ar += usize::from(above[i] != 0);
+                al += usize::from(below[i] != 0);
+            }
+            emit(split, br, bl, (ar, al));
         }
     }
 
@@ -989,3 +1106,7 @@ mod rcp_tests;
 #[cfg(test)]
 #[path = "ma_simd_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "ma_simd_active_tests.rs"]
+mod active_tests;

@@ -121,6 +121,93 @@ fn fma_horner_matches_independent_f32_and_native_lane_oracles() {
 }
 
 #[test]
+fn default_scalar_log_dispatch_matches_description_edge_oracles() {
+    let mut values = vec![1.0];
+    let mut add_count = |count: u32| {
+        if count != 0 {
+            values.push(count as f32);
+        }
+        // Match DescriptionCost's conversion-before-addition order.
+        values.push(count as f32 + 1.0);
+    };
+    for count in [
+        0,
+        1,
+        2,
+        3,
+        127,
+        128,
+        129,
+        255,
+        256,
+        257,
+        4095,
+        4096,
+        4097,
+        65535,
+        65536,
+        65537,
+        MAX_HISTOGRAM_TOTAL - 1,
+        MAX_HISTOGRAM_TOTAL,
+    ] {
+        add_count(count);
+    }
+    // Include the onset of integer-to-f32 rounding at 2^24 and each subsequent
+    // precision transition, as well as small exact count boundaries.
+    for exponent in 0..=31 {
+        for offset in -2i64..=2 {
+            let count = (1i64 << exponent) + offset;
+            if (1..=i64::from(MAX_HISTOGRAM_TOTAL)).contains(&count) {
+                add_count(count as u32);
+            }
+        }
+    }
+    let upper = MAX_HISTOGRAM_TOTAL as f32 + 1.0;
+    for exponent in 0..=31 {
+        let power = ((1u64 << exponent) as f32).to_bits();
+        let breakpoint = 0x3f2aaaabu32 + (exponent << 23);
+        for center in [power, breakpoint] {
+            for bits in center - 2..=center + 2 {
+                let value = f32::from_bits(bits);
+                if (1.0..=upper).contains(&value) {
+                    values.push(value);
+                }
+            }
+        }
+    }
+    values.sort_unstable_by(f32::total_cmp);
+    values.dedup_by_key(|value| value.to_bits());
+
+    #[allow(unused_mut)]
+    let mut profiles = default_profiles();
+    #[cfg(target_arch = "x86_64")]
+    if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+        profiles.push((DefaultScorer::with_backend(DefaultBackend::Avx2Rcp), 8));
+    }
+    for (scorer, _) in profiles {
+        for &value in &values {
+            let expected = if scorer.backend.uses_fma() {
+                fma_log_oracle(value)
+            } else {
+                fast_log2::<false>(value)
+            };
+            assert_eq!(
+                scorer.log2(value).to_bits(),
+                expected.to_bits(),
+                "profile {:?}, operand {value:?}",
+                scorer.backend,
+            );
+            #[cfg(target_arch = "x86_64")]
+            if scorer.backend.uses_fma() {
+                // SAFETY: profiles above include FMA only after CPU/OS checks.
+                let native = unsafe { x86::scalar_fast_log2_fma(value) };
+                assert_eq!(native.to_bits(), expected.to_bits());
+            }
+        }
+    }
+}
+
+#[test]
 fn default_runtime_dispatch_and_profile_specific_tables() {
     let expected = DefaultBackend::Scalar;
     #[cfg(target_arch = "x86_64")]

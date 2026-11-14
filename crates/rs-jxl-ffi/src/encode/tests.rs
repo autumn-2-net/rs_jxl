@@ -6,6 +6,37 @@ use serde_json::json;
 use std::time::Duration;
 
 #[test]
+fn source_patch_parallel_gather_reaches_pixel_projection_and_preserves_other_options() {
+    use crate::request::Options;
+    use rs_jxl::{Image, PixelData, PixelLayout};
+
+    let image = Image::new(16, 16, PixelLayout::Gray, PixelData::U8(vec![7; 256])).unwrap();
+    for setting in [None, Some(false), Some(true)] {
+        for threads in [1, 2] {
+            let options = Options {
+                effort: Some(9),
+                threads: Some(threads),
+                source_patch_parallel_gather: setting,
+                source_ma_defaults: Some(false),
+                ma_max_leaves: Some(32),
+                ..Default::default()
+            };
+            let (params, base) = super::candidate(&options).unwrap();
+            assert_eq!(params.speed_tier, 1);
+            assert_eq!(base.source_patch_parallel_gather, setting.unwrap_or(true));
+            let projected = super::pixel_options(&image, &options).unwrap();
+            assert_eq!(
+                projected.source_patch_parallel_gather,
+                setting.unwrap_or(true)
+            );
+            assert_eq!(projected.threads, threads);
+            assert!(!projected.modular.source_ma_defaults);
+            assert_eq!(projected.modular.ma_max_leaves, Some(32));
+        }
+    }
+}
+
+#[test]
 fn source_ma_defaults_reaches_pixel_projection_without_changing_effort_defaults() {
     use crate::request::Options;
     use rs_jxl::modular::ma_train::{DescriptionCost, TreeLearning};

@@ -7,9 +7,67 @@ use rs_jxl::modular::{
     refinement,
 };
 use rs_jxl::scheduler::portfolio::{self, ALL, Candidate, Options};
+use rs_jxl::scheduler::{CandidateParams, params::Override, source_tools};
 use std::{fs, io::Write, path::PathBuf, sync::Arc, time::Instant};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum DirectSourceTools {
+    Baseline,
+    Patch,
+    Sparse,
+    Prev1,
+    Screened,
+    SparseOnly,
+    Prev1Only,
+    ScreenedOnly,
+}
+
+impl DirectSourceTools {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Baseline => "baseline",
+            Self::Patch => "patch",
+            Self::Sparse => "sparse",
+            Self::Prev1 => "prev1",
+            Self::Screened => "screened",
+            Self::SparseOnly => "sparse-only",
+            Self::Prev1Only => "prev1-only",
+            Self::ScreenedOnly => "screened-only",
+        }
+    }
+
+    fn build(
+        self,
+        image: &rs_jxl::Image,
+        base: &rs_jxl::EncodeOptions,
+        effort: u8,
+        recipe: Candidate,
+    ) -> Result<rs_jxl::EncodeOptions> {
+        if !matches!(recipe, Candidate::Baseline | Candidate::Source) {
+            return Err("source tool ablation requires baseline or source recipe".into());
+        }
+        let mut base = base.clone();
+        base.source_patch_parallel_gather = matches!(
+            self,
+            Self::Patch | Self::Sparse | Self::Prev1 | Self::Screened
+        );
+        let mut params = CandidateParams::default().backend(effort)?;
+        if recipe == Candidate::Source {
+            params.patches = Override::On;
+        }
+        Ok(source_tools::Options {
+            sparse_lz77: matches!(
+                self,
+                Self::Sparse | Self::Prev1 | Self::Screened | Self::SparseOnly
+            ),
+            previous_channel: matches!(self, Self::Prev1 | Self::Screened | Self::Prev1Only),
+            screened_runs: matches!(self, Self::Screened | Self::ScreenedOnly),
+        }
+        .build(&params, image, &base)?)
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum DirectTreeLearning {
@@ -106,6 +164,10 @@ struct Args {
     /// Override tree learning independently of the direct MA profile.
     #[arg(long, value_enum, requires = "direct_candidate", conflicts_with_all = ["plan_only", "list_candidates"])]
     direct_tree_learning: Option<DirectTreeLearning>,
+    /// Cumulative/isolated e9 tools; one encode, never a best-of tournament.
+    #[arg(long, value_enum, requires = "direct_candidate",
+        conflicts_with_all = ["plan_only", "list_candidates", "direct_ma_profile", "direct_tree_learning"])]
+    direct_source_tools: Option<DirectSourceTools>,
     #[arg(long, conflicts_with = "output")]
     plan_only: bool,
     #[arg(long, conflicts_with_all = ["output", "input"])]
@@ -128,7 +190,11 @@ fn encode_direct(args: &Args, image: &rs_jxl::Image, recipe: Candidate) -> Resul
         base.modular.source_ma_defaults = false;
     }
     let start = Instant::now();
-    let mut configured = recipe.build(image, &base, args.effort)?;
+    let mut configured = if let Some(profile) = args.direct_source_tools {
+        profile.build(image, &base, args.effort, recipe)?
+    } else {
+        recipe.build(image, &base, args.effort)?
+    };
     if let Some(profile) = args.direct_ma_profile {
         profile.configure(&mut configured);
     }
@@ -221,6 +287,15 @@ fn encode_direct(args: &Args, image: &rs_jxl::Image, recipe: Candidate) -> Resul
                 "symmetric_splits": learning.symmetric_splits,
             },
             "source_ma_defaults": configured.modular.source_ma_defaults,
+            "source_tools": {
+                "profile": args.direct_source_tools.map(DirectSourceTools::name),
+                "patch_parallel_gather": configured.source_patch_parallel_gather,
+                "previous_channels": configured.modular.previous_channels,
+                "max_previous_channels": args.direct_source_tools.map(|p| u8::from(matches!(p,
+                    DirectSourceTools::Prev1 | DirectSourceTools::Screened | DirectSourceTools::Prev1Only))),
+                "lz_quick": configured.modular.source_lz77.as_ref().map(|c| format!("{:?}", c.quick)),
+                "palette_order": configured.modular.palette_policy.as_ref().map(|p| format!("{:?}", p.tools.order)),
+            },
             "description_cost": format!("{:?}", configured.modular.source_ma_scoring.description),
             "refinement": refinement,
             "timing": "recipe projection and one complete native encode, including pool setup; excludes image IO",
@@ -355,6 +430,69 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn direct_tools_require_an_explicit_direct_e9_route() {
+        let image = rs_jxl::Image::new(
+            16,
+            16,
+            rs_jxl::PixelLayout::Rgb,
+            rs_jxl::PixelData::U8(vec![1; 16 * 16 * 3]),
+        )
+        .unwrap();
+        for profile in DirectSourceTools::value_variants() {
+            let words = [
+                "lab",
+                "image.png",
+                "--output",
+                "out.jxl",
+                "--direct-source-tools",
+                profile.name(),
+            ];
+            assert!(Args::try_parse_from(words).is_err());
+            let args =
+                Args::try_parse_from(words.into_iter().chain(["--direct-candidate", "baseline"]))
+                    .unwrap();
+            assert_eq!(args.direct_source_tools, Some(*profile));
+            let options = profile
+                .build(
+                    &image,
+                    &rs_jxl::EncodeOptions::default(),
+                    9,
+                    Candidate::Baseline,
+                )
+                .unwrap();
+            assert_eq!(
+                options.source_patch_parallel_gather,
+                matches!(
+                    profile,
+                    DirectSourceTools::Patch
+                        | DirectSourceTools::Sparse
+                        | DirectSourceTools::Prev1
+                        | DirectSourceTools::Screened
+                )
+            );
+            assert!(
+                profile
+                    .build(
+                        &image,
+                        &rs_jxl::EncodeOptions::default(),
+                        8,
+                        Candidate::Baseline
+                    )
+                    .is_err()
+            );
+            assert!(
+                profile
+                    .build(
+                        &image,
+                        &rs_jxl::EncodeOptions::default(),
+                        9,
+                        Candidate::Prev1
+                    )
+                    .is_err()
+            );
+        }
+    }
     #[test]
     fn parsing_requires_explicit_output_or_analysis() {
         assert!(Args::try_parse_from(["lab", "input.png"]).is_err());

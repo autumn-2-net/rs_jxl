@@ -50,6 +50,7 @@ fn source_overrides_reach_the_typed_job_without_enabling_search() {
 fn source_override_flags_require_source_mode_and_validate_ranges() {
     for flags in [
         vec!["--no-source-ma-defaults"],
+        vec!["--no-source-patch-parallel-gather"],
         vec!["--source-group-size-shift", "2"],
         vec!["--source-max-properties", "2"],
         vec!["--source-prev-props", "1"],
@@ -87,6 +88,47 @@ fn source_override_flags_require_source_mode_and_validate_ranges() {
             ])
             .is_err()
         );
+    }
+}
+
+#[test]
+fn source_patch_parallel_gather_opt_out_reaches_source_and_manual_jobs() {
+    assert!(
+        args(&[])
+            .job()
+            .unwrap()
+            .options
+            .source_patch_parallel_gather
+    );
+    for flags in [
+        vec!["--no-source-patch-parallel-gather"],
+        vec!["--no-source-patch-parallel-gather", "--source-search"],
+    ] {
+        let job = args(&flags).job().unwrap();
+        assert!(!job.options.source_patch_parallel_gather);
+        assert!(job.options.modular.source_ma_defaults);
+        assert!(job.source.is_some());
+    }
+    for opt_out in [false, true] {
+        let mut argv = vec![
+            "rs-jxl",
+            "encode",
+            "-",
+            "-",
+            "--source-patches",
+            "--threads",
+            "2",
+        ];
+        if opt_out {
+            argv.push("--no-source-patch-parallel-gather");
+        }
+        let job = expect_encode(Cli::try_parse_from(argv).unwrap().command)
+            .job()
+            .unwrap();
+        assert_eq!(job.options.source_patch_parallel_gather, !opt_out);
+        assert!(job.options.source_patches.is_some());
+        assert_eq!(job.options.threads, 2);
+        assert!(job.source.is_none());
     }
 }
 
