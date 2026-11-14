@@ -33,7 +33,7 @@ fn signed_atlas_recipe_reselects_lz_groups_and_properties_without_external_sampl
         patches: Override::On,
         predictor: Some(Predictor::Zero),
         learning_fraction: 0.2,
-        max_properties: 3,
+        max_properties: Some(3),
         delta_palette: DeltaPalette::ExactLeft,
         lz77_careful_first_pass: true,
         bucket_matcher: true,

@@ -110,7 +110,9 @@ fn native_projection_selects_frame_areas_without_starting_patch_detection() {
             assert_eq!(sampling.max_channel_size, 128);
             assert_eq!(
                 sampling.properties,
-                vec![0, 1, 15, 9, 10, 11, 12, 13, 14, 2, 3, 4, 5, 6, 7, 8]
+                vec![
+                    0, 1, 15, 9, 10, 11, 12, 13, 14, 2, 3, 4, 5, 6, 7, 8, 16, 17, 18, 19
+                ]
             );
             assert_eq!(options.modular.rct_candidates, Some(19));
             assert_eq!(options.modular.weighted_candidates, Some(5));

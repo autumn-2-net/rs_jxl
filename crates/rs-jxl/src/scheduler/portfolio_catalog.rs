@@ -197,7 +197,9 @@ impl Candidate {
         }
         let mut params = CandidateParams::default().backend(effort)?;
         let mut template = base.clone();
-        params.max_properties = self.previous_channels();
+        if self.previous_channels() != 0 {
+            params.max_properties = Some(self.previous_channels());
+        }
         if self.family() == Family::Source {
             params.patches = Override::On;
         }
@@ -445,7 +447,7 @@ mod tests {
             actual.modular.source_ma_scoring.description,
             DescriptionCost::Half
         );
-        assert_eq!(actual.modular.previous_channels, 0);
+        assert_eq!(actual.modular.previous_channels, 1);
     }
 
     #[test]

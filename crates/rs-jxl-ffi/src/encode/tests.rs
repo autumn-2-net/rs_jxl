@@ -6,6 +6,39 @@ use serde_json::json;
 use std::time::Duration;
 
 #[test]
+fn source_tool_defaults_reaches_pixel_projection_independently() {
+    use crate::request::Options;
+    use rs_jxl::{Image, PixelData, PixelLayout};
+
+    let image = Image::new(16, 16, PixelLayout::Gray, PixelData::U8(vec![7; 256])).unwrap();
+    for effort in [7, 9, 10] {
+        for setting in [None, Some(false), Some(true)] {
+            for other in [false, true] {
+                let options = Options {
+                    effort: Some(effort),
+                    source_tool_defaults: setting,
+                    source_ma_defaults: Some(other),
+                    source_patch_parallel_gather: Some(other),
+                    ..Default::default()
+                };
+                let (params, base) = super::candidate(&options).unwrap();
+                assert_eq!(params.max_properties, None);
+                assert_eq!(base.modular.source_tool_defaults, setting.unwrap_or(true));
+                assert_eq!(base.modular.source_ma_defaults, other);
+                assert_eq!(base.source_patch_parallel_gather, other);
+                let projected = super::pixel_options(&image, &options).unwrap();
+                assert_eq!(
+                    projected.modular.source_tool_defaults,
+                    setting.unwrap_or(true)
+                );
+                assert_eq!(projected.modular.source_ma_defaults, other);
+                assert_eq!(projected.source_patch_parallel_gather, other);
+            }
+        }
+    }
+}
+
+#[test]
 fn source_patch_parallel_gather_reaches_pixel_projection_and_preserves_other_options() {
     use crate::request::Options;
     use rs_jxl::{Image, PixelData, PixelLayout};

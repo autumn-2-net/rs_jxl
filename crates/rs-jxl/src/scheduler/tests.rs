@@ -69,7 +69,7 @@ fn source_plan_constants_and_lz_decisions() {
     assert_eq!(plan[0].params.palette_colors, 70000);
     assert_eq!(plan[0].params.group_size_shift, Some(3));
     assert_eq!(plan[0].params.lz_method(), LzMethod::Optc256);
-    assert_eq!(plan[8].params.max_properties, 2);
+    assert_eq!(plan[8].params.max_properties, Some(2));
     assert_eq!(plan[8].params.predictor, Some(Predictor::Variable));
     assert_eq!(plan[14].name, "raw-top");
     assert_eq!(

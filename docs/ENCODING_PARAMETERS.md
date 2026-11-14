@@ -38,6 +38,7 @@ CLI 有一个重要区别：`rs-jxl encode input.jpg ...` 是像素路径；JPEG
 | `source_search` | **False**，用于单图或 JPEG 转码 | 额外的候选调度搜索；不等于多帧 `strategy="auto"` |
 | `encoder_options` | **None** | 像素工具的字典，键名用下节的 Rust 名称；不是任意透传通道 |
 | `source_ma_defaults` | **True**，像素编码 | e9 常规学习树默认叠加 Symmetric、Half 描述成本与单次 Distribution Offset；False 恢复旧策略，不影响其他 effort 和显式 Rust 设置。允许与像素 source_search 同用；JPEG 字节转码不接受此参数 |
+| `source_tool_defaults` | **True**，像素编码 | 普通 e9 默认开启 Sparse LZ77、跨通道 MA prev1 和 Palette ScreenedRuns，不限于 Patch。False 只关闭这三项自动默认值，不影响 MA 默认组合、Patch 并行采样及 Rust 显式设置。支持单图、多帧、图层和单图 source search；JPEG 字节转码及非编码操作不接受此参数，null 或非布尔值报错 |
 | `source_patch_parallel_gather` | **True**，像素编码 | 实际检出 Source Add Patch 且 threads > 1 时，对参考图和残差图启用 Channels 稀疏并行采样；无 Patch 回退和单线程不变。False 关闭自动启用，Rust 显式 gather 设置仍有效；JPEG 字节转码不接受此参数 |
 | `return_info` | **False** | True 返回 `(output_result, metadata)`；不同入口的报告结构不同 |
 | `strip_metadata` | **False**，像素路径 | 允许丢弃不支持的输入附加元数据；支持的色彩元数据仍保留，不是无条件删去 ICC |
@@ -409,6 +410,16 @@ Rust 可通过 `ModularOptions.source_lz77` 进一步控制 source 匹配与解�
 不允许只改一边。可用实现与限制见 [LZ77 移植记录](LZ77_PORT_STATUS.md)。
 
 ### CLI 与 Python 不同
+
+`source_tool_defaults=False` 可以通过 Python 关键字或 `encoder_options` 传入，
+JSON 省略时为 true。它不改变像素编码的默认 effort=7，也不改变其他 effort 的工具默认值。
+Rust 对应 `base.modular.source_tool_defaults`。
+
+CLI 关闭示例：`rs-jxl encode in.png out.jxl --source-effort 9 --no-source-tool-defaults`。
+此开关要求指定 `--source-effort`，也可与 `--source-search` 同用。
+`--source-max-properties N` 区分省略和显式零：省略为自动（仅 e9 默认 prev1），
+`0` 明确关闭跨通道 MA，非零值按可用变换通道数裁剪。
+即使关闭三项自动默认值，显式通道数量仍有效；Python/JSON 尚未单独暴露此数量。
 
 CLI `encode --source-effort 9` 对应 source 候选；加 `--source-search` 才是额外搜索。
 不指定 source effort 的 CLI `encode` 使用手动 `Tools`，**不是默认 Python e7**。

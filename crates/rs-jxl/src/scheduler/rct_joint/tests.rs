@@ -196,8 +196,8 @@ fn hidden_rgba16_and_extra_plane_roundtrip_with_full_cost_accounting() {
     assert_eq!(&decoded.frames[0].pixels, image.pixels());
     assert_eq!(decoded.frames[0].extra_planes.last(), Some(&extra));
     assert_eq!(result.trials.len(), 7);
-    assert_eq!(result.trials[1].reused_from, Some(0));
-    assert_eq!(result.trials[1].seconds, 0.0);
+    assert_eq!(result.trials[2].reused_from, Some(0));
+    assert_eq!(result.trials[2].seconds, 0.0);
     assert_eq!(
         result.trials[result.winner_trial].bytes,
         Some(result.encoded.len())
@@ -259,9 +259,12 @@ fn backend_consumes_first_and_second_previous_channel_values_not_just_a_flag() {
     .unwrap();
     for previous in 1..=2u8 {
         let mut params = CandidateParams::default().backend(9).unwrap();
-        params.max_properties = previous;
+        params.max_properties = Some(previous);
         params.rct = Some(0);
-        let mut options = adapter::project_native(&params, &image, &EncodeOptions::default())
+        let mut base = EncodeOptions::default();
+        // This fixture installs an explicit tree after projecting channel features.
+        base.modular.source_ma_defaults = false;
+        let mut options = adapter::project_native(&params, &image, &base)
             .unwrap()
             .exact_options()
             .unwrap();

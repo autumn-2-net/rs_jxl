@@ -451,7 +451,7 @@ fn run(args: Args) -> Result<()> {
     }
     params.probe_lz77 = args.lz;
     if let Some(count) = args.previous_channels {
-        params.max_properties = count;
+        params.max_properties = Some(count);
     }
     if let Some(cap) = args.palette_group_colors {
         params.palette_colors = cap;
@@ -465,7 +465,7 @@ fn run(args: Args) -> Result<()> {
         params.buffering = rs_jxl::scheduler::params::SourceBuffering::FullFrame;
     }
     if args.context_cross_channel {
-        params.max_properties = params.max_properties.max(1);
+        params.max_properties = Some(params.max_properties.unwrap_or(0).max(1));
     }
     if let Some(rct) = args.rct {
         params.rct = Some(u32::from(rct));

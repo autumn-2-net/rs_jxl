@@ -39,7 +39,7 @@ fn source_overrides_reach_the_typed_job_without_enabling_search() {
     ));
     let params = source.params;
     assert_eq!(params.group_size_shift, Some(3));
-    assert_eq!(params.max_properties, 2);
+    assert_eq!(params.max_properties, Some(2));
     assert_eq!(params.previous_property_subset, 2);
     assert_eq!(params.buffering, SourceBuffering::FullFrame);
     assert!(params.responsive && params.precise_entropy);
@@ -50,6 +50,7 @@ fn source_overrides_reach_the_typed_job_without_enabling_search() {
 fn source_override_flags_require_source_mode_and_validate_ranges() {
     for flags in [
         vec!["--no-source-ma-defaults"],
+        vec!["--no-source-tool-defaults"],
         vec!["--no-source-patch-parallel-gather"],
         vec!["--source-group-size-shift", "2"],
         vec!["--source-max-properties", "2"],
@@ -133,6 +134,57 @@ fn source_patch_parallel_gather_opt_out_reaches_source_and_manual_jobs() {
 }
 
 #[test]
+fn source_tool_defaults_opt_out_is_independent_and_search_compatible() {
+    let default = args(&[]).job().unwrap();
+    assert!(default.options.modular.source_tool_defaults);
+    assert_eq!(default.source.unwrap().params.max_properties, None);
+    for search in [false, true] {
+        let mut flags = vec!["--no-source-tool-defaults", "--source-max-properties", "2"];
+        if search {
+            flags.push("--source-search");
+        }
+        let job = args(&flags).job().unwrap();
+        assert!(!job.options.modular.source_tool_defaults);
+        assert!(job.options.modular.source_ma_defaults);
+        assert!(job.options.source_patch_parallel_gather);
+        let source = job.source.unwrap();
+        assert_eq!(source.params.max_properties, Some(2));
+        assert_eq!(
+            matches!(source.search, rs_jxl::codec::SourceSearch::Auto),
+            search
+        );
+    }
+    let job = args(&[
+        "--no-source-ma-defaults",
+        "--no-source-patch-parallel-gather",
+    ])
+    .job()
+    .unwrap();
+    assert!(job.options.modular.source_tool_defaults);
+}
+
+#[test]
+fn source_max_properties_distinguishes_auto_explicit_off_and_count() {
+    for (flags, expected) in [
+        (vec![], None),
+        (vec!["--source-max-properties", "0"], Some(0)),
+        (vec!["--source-max-properties", "1"], Some(1)),
+        (vec!["--source-max-properties", "16"], Some(16)),
+    ] {
+        assert_eq!(
+            args(&flags)
+                .job()
+                .unwrap()
+                .source
+                .unwrap()
+                .params
+                .max_properties,
+            expected
+        );
+    }
+}
+
+#[test]
 fn source_ma_defaults_opt_out_keeps_explicit_refinements_and_search() {
     assert!(args(&[]).job().unwrap().options.modular.source_ma_defaults);
     let job = args(&[
@@ -170,7 +222,7 @@ fn previous_property_subsets_reach_main_and_reference_sampling() {
     for effort in [8, 9, 10] {
         for subset in [1, 2, 4] {
             let params = CandidateParams {
-                max_properties: 2,
+                max_properties: Some(2),
                 previous_property_subset: subset,
                 ..CandidateParams::default().backend(effort).unwrap()
             };

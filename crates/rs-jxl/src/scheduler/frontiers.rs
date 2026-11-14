@@ -312,7 +312,7 @@ where
         p.channel_colors_pre_transform_percent = 0.0;
         p.patches = super::super::params::Override::Off;
         p.predictor = Some(Predictor::Variable);
-        p.max_properties = 2;
+        p.max_properties = Some(2);
         p.learning_fraction = 0.1;
         p.rct = Some(rct);
         Ok(p)

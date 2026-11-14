@@ -149,7 +149,7 @@ fn configure_channels(
 ) -> Result<()> {
     if target.residual() {
         let mut params = params.clone();
-        params.max_properties = previous;
+        params.max_properties = Some(previous);
         let projected = adapter::project_native(&params, image, base)?.exact_options()?;
         options.modular.previous_channels = projected.modular.previous_channels;
         options.modular.sampling = projected.modular.sampling;

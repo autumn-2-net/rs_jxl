@@ -463,17 +463,19 @@ fn run(
     let screen = screen_rcts(image, settings)?;
     let mut ordinary = CandidateParams::default().backend(9)?;
     ordinary.patches = Override::Off;
+    ordinary.max_properties =
+        Some(ordinary.previous_channel_budget(base.modular.source_tool_defaults) as u8);
     let mut planned = vec![(RctJointTrialKind::NativeE9Baseline, ordinary.clone())];
     for previous in 0..=2 {
         let mut params = ordinary.clone();
-        params.max_properties = previous;
+        params.max_properties = Some(previous);
         planned.push((RctJointTrialKind::AutoRctControl, params));
     }
     for &rct in &screen.shortlisted_rcts {
         for previous in 0..=2 {
             let mut params = ordinary.clone();
             params.rct = Some(rct);
-            params.max_properties = previous;
+            params.max_properties = Some(previous);
             planned.push((RctJointTrialKind::ShortlistedRct, params));
         }
     }

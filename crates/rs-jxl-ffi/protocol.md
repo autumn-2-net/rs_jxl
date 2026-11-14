@@ -407,7 +407,19 @@ fails if unsupported by encoder. spot_color is four floats, cfa_channel integer.
 - encode/encode_multiframe/encode_layers: threads=1, effort=7, source_search=false,
   strip_metadata=false; optional group_size_shift,rct,predictor,palette_colors,
   patches(bool),learning_fraction,ma_max_leaves,source_ma_defaults(bool, default true),
-  source_patch_parallel_gather(bool, default true).
+  source_tool_defaults(bool, default true),source_patch_parallel_gather(bool, default true).
+  source_tool_defaults enables ordinary pixel-lossless e9 Sparse LZ77, prev1
+  previous-channel MA features and Palette ScreenedRuns; these are not lab-only.
+  False disables only these automatic tool additions, preserving source_ma_defaults,
+  source_patch_parallel_gather and explicit Rust tool overrides. Other efforts keep
+  their existing tool defaults. The native base.modular.source_tool_defaults carries
+  this value for still, multiframe and layer encoding, including still source_search.
+  Omission means true; explicit false remains distinct. Null, non-booleans and
+  duplicate keys fail. JPEG transcoding and all nonpixel operations reject either
+  boolean value. max_properties is not separately exposed by this JSON API.
+  CLI: encode --source-effort 9 --no-source-tool-defaults; the opt-out requires
+  --source-effort. --source-max-properties N supplies an explicit count (0 disables);
+  omission leaves automatic prev1 at e9. Explicit counts survive the coarse opt-out.
   source_patch_parallel_gather enables channel-parallel sparse MA gathering only
   after a real Source Add patch plan, with source sampling and threads > 1.
   Main and atlas frames retain explicit gather settings independently; no-patch

@@ -50,7 +50,8 @@ Source-prefixed transform, refinement, buffering and LZ77 switches override \
 the requested source candidate. With --source-search they describe its starting \
 candidate, not a promise that every trial or the winner retains those settings. \
 --source-prev-props restricts previous-channel MA features only when \
---source-max-properties is nonzero; it does not enable cross-channel MA itself.\n\
+previous-channel MA is enabled (automatic at e9, or explicit nonzero \
+--source-max-properties); --source-max-properties 0 disables it.\n\
 Use '-' for stdin/stdout. Diagnostics always go to stderr. \
 Existing output is not replaced unless --force is supplied."
 )]
@@ -67,6 +68,9 @@ pub(crate) struct EncodeArgs {
     /// Disable automatic e9 MA learner/offsets/scoring; explicit tools still apply.
     #[arg(long, requires = "source_effort")]
     pub(crate) no_source_ma_defaults: bool,
+    /// Disable automatic e9 Sparse LZ77, prev1 and Palette ScreenedRuns defaults.
+    #[arg(long, requires = "source_effort")]
+    pub(crate) no_source_tool_defaults: bool,
     /// Disable automatic parallel gather for Source Add patches; explicit gathers still apply.
     #[arg(long, requires = "source_patch_mode")]
     pub(crate) no_source_patch_parallel_gather: bool,
@@ -113,8 +117,8 @@ pub(crate) struct EncodeArgs {
     /// Opt-in lossless precise entropy: forces the Tortoise entropy tier.
     #[arg(long, requires = "source_effort")]
     pub(crate) source_precise_entropy: bool,
-    /// Opt-in previous-channel MA properties (0..=16; the effective count is
-    /// clamped by the transformed channel count).
+    /// Previous-channel MA properties (0..=16; 0 explicitly disables them).
+    /// Omitted means automatic (prev1 at e9); counts are clamped by channel count.
     #[arg(long, value_name = "N", requires = "source_effort",
           value_parser = clap::value_parser!(u8).range(0..=16))]
     pub(crate) source_max_properties: Option<u8>,
@@ -171,6 +175,7 @@ impl EncodeArgs {
         self.ma_pruning.apply(&mut options.modular);
         options.modular.sample_limit = self.source_sample_limit;
         options.modular.source_ma_defaults = !self.no_source_ma_defaults;
+        options.modular.source_tool_defaults = !self.no_source_tool_defaults;
         let mut params = CandidateParams::default().backend(effort)?;
         if let Some(shift) = self.source_group_size_shift {
             params.group_size_shift = Some(shift);
@@ -194,7 +199,7 @@ impl EncodeArgs {
             params.precise_entropy = true;
         }
         if let Some(max_properties) = self.source_max_properties {
-            params.max_properties = max_properties;
+            params.max_properties = Some(max_properties);
         }
         if let Some(subset) = self.source_prev_props {
             params.previous_property_subset = subset;

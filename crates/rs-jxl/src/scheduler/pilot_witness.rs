@@ -30,7 +30,7 @@ pub(crate) fn candidates(
         raw.channel_colors_percent = 0.0;
         raw.channel_colors_pre_transform_percent = 0.0;
         raw.learning_fraction = 0.1;
-        raw.max_properties = 0;
+        raw.max_properties = Some(0);
         raw.patches = super::super::params::Override::Off;
         result.push(raw);
     }

@@ -38,7 +38,8 @@ def encoder(effort, count, source_search, encoder_options, overrides) -> dict:
     aliases = {"modular_group_size": "group_size_shift", "modular_colorspace": "rct",
                "modular_predictor": "predictor", "modular_palette_colors": "palette_colors"}
     for name, value in overrides.items():
-        if value is None:
+        # Preserve explicit null for this presence-aware native boolean.
+        if value is None and name != "source_tool_defaults":
             continue
         key = aliases.get(name, name)
         if name in ("iterations", "modular_ma_tree_learning_percent"):

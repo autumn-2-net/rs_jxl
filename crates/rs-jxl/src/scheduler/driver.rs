@@ -810,7 +810,7 @@ where
         deeper.learning_fraction = deeper.learning_fraction.max(0.5);
         deeper.lz77_careful_first_pass = true;
         if geometry {
-            deeper.max_properties = self.image.channel_count().saturating_sub(1).min(4) as u8;
+            deeper.max_properties = Some(self.image.channel_count().saturating_sub(1).min(4) as u8);
             deeper.group_size_shift = Some(3);
         }
         Ok(deeper)

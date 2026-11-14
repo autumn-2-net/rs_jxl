@@ -110,7 +110,7 @@ threads=0 explicitly selects CPU count capped at 256; threads=1 is serial.
 
 encoder_options={...} or keyword arguments accept group_size_shift, rct,
 predictor, palette_colors, patches, learning_fraction, ma_max_leaves and
-source_ma_defaults and source_patch_parallel_gather.
+source_ma_defaults, source_tool_defaults and source_patch_parallel_gather.
 Aliases modular_group_size/modular_colorspace/modular_predictor/
 modular_palette_colors map to the first four respectively. iterations and
 modular_ma_tree_learning_percent map to learning_fraction=percent/100.
@@ -139,6 +139,24 @@ pre-profile e9 policy. This switch is supported for pixel still/multiframe/layer
 encoding, including still source search; JPEG byte transcoding rejects it.
 See [single-pass MA](MA_SINGLE_PASS_DEFAULT_20261114.md) and
 [combined Symmetric defaults](SYMMETRIC_MA_DEFAULT_20261114.md).
+
+Ordinary pixel-lossless effort 9 also defaults to Sparse LZ77, prev1
+previous-channel MA features and Palette ScreenedRuns. These are normal source
+defaults, not lab-only settings; public pixel effort still defaults to 7.
+Use `source_tool_defaults=False` or
+`encoder_options={"source_tool_defaults": False}` to disable these automatic
+tool additions. This does not disable `source_ma_defaults` or
+`source_patch_parallel_gather`, and explicit Rust tool overrides remain effective.
+The boolean applies to still, multiframe and layer encoding, including still
+`source_search=True`. Explicit null and non-booleans fail; JPEG byte transcoding
+and nonpixel operations reject either boolean value. Other efforts retain their
+existing tool defaults. Python does not expose a separate `source_max_properties`.
+
+CLI equivalent: `rs-jxl encode in.png out.jxl --source-effort 9
+--no-source-tool-defaults` (the opt-out requires `--source-effort`). CLI
+`--source-max-properties N` is explicit: omitted means auto (prev1 only at e9),
+`0` disables previous-channel properties, and nonzero selects a count clamped
+by transformed channels. Explicit counts remain effective with the coarse opt-out.
 
 Source Add patches default to channel-parallel sparse MA gathering only after
 the detector actually produces a reference/residual plan and `threads > 1`.

@@ -700,7 +700,7 @@ mod tests {
                 ..cross.clone()
             },
             CandidateParams {
-                max_properties: 0,
+                max_properties: Some(0),
                 ..cross.clone()
             },
             CandidateParams {

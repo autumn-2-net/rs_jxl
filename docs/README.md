@@ -50,6 +50,7 @@ platform certifications.
 | Search/probe integration and execution | [Probe API](SCHEDULER_PROBE_API.md), [cooperative execution](PARALLEL_EXECUTION.md), [progressive group scheduler](PROGRESSIVE_GROUP_SCHEDULER.md), [scheduler default routes](../crates/rs-jxl/src/scheduler/DEFAULT_ROUTES.md) |
 | Opt-in native experimental portfolio and deferred corpus runner | [Portfolio scout](NATIVE_PORTFOLIO_SCOUT_20261113.md) |
 | Default Source Patch gathering and staged Sparse/prev1/ScreenedRuns experiments | [Source tool integration](SOURCE_TOOLS_20261114.md) |
+| Ordinary pixel e9 Sparse/prev1/ScreenedRuns defaults and OLD/NEW measurements | [Source tool defaults](SOURCE_TOOL_DEFAULTS_20261114.md) |
 
 ## Acceptance and Validation
 

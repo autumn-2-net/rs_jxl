@@ -57,6 +57,9 @@ pub struct ModularOptions {
     pub entropy: Coding,
     /// Source e9 ordinary learned-tree defaults; false preserves explicit tools only.
     pub source_ma_defaults: bool,
+    /// Ordinary pixel e9 Sparse/prev1/ScreenedRuns defaults. Explicit source
+    /// tool settings win; false restores the earlier defaults for ablation.
+    pub source_tool_defaults: bool,
     /// Post-training tools; source projection may supply e9 defaults when enabled.
     pub refinement: super::refinement::Options,
     pub lz77: bool,
@@ -154,6 +157,7 @@ impl Default for ModularOptions {
             tree_learning_receipt: None,
             entropy: Coding::Auto,
             source_ma_defaults: true,
+            source_tool_defaults: true,
             refinement: Default::default(),
             lz77: true,
             lz77_mode: lz77::Lz77Mode::Lazy,

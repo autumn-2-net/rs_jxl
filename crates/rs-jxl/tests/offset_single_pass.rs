@@ -99,7 +99,7 @@ fn direct_offsets_compose_with_shared_streams_and_explicit_predictor_refit() {
                 let mut params = CandidateParams::default().backend(9).unwrap();
                 params.buffering = buffering;
                 params.group_size_shift = Some(0);
-                params.max_properties = previous;
+                params.max_properties = Some(previous);
                 let options = project_native(&params, &image, &base)
                     .unwrap()
                     .exact_options()

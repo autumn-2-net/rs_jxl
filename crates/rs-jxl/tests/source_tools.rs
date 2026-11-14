@@ -1,5 +1,5 @@
 use rs_jxl::decode::{DecodeOptions, decode};
-use rs_jxl::scheduler::{CandidateParams, source_tools};
+use rs_jxl::scheduler::{CandidateParams, adapter, source_tools};
 use rs_jxl::{EncodeOptions, Image, PixelData, PixelLayout, encode};
 
 #[test]
@@ -33,14 +33,21 @@ fn composed_e9_tools_preserve_integer_pixels_including_invisible_color() {
                     threads,
                     ..Default::default()
                 };
-                for mask in 0..8 {
+                for mask in 0..=8 {
                     let tools = source_tools::Options {
                         sparse_lz77: mask & 1 != 0,
                         previous_channel: mask & 2 != 0,
                         screened_runs: mask & 4 != 0,
                     };
                     let params = CandidateParams::default().backend(9).unwrap();
-                    let options = tools.build(&params, &image, &base).unwrap();
+                    let options = if mask == 8 {
+                        adapter::project_native(&params, &image, &base)
+                            .unwrap()
+                            .exact_options()
+                            .unwrap()
+                    } else {
+                        tools.build(&params, &image, &base).unwrap()
+                    };
                     let bytes = encode(&image, &options).unwrap();
                     let decoded = decode(&bytes, &DecodeOptions::default()).unwrap();
                     assert!(decoded.complete);

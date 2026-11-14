@@ -151,6 +151,8 @@ pub fn source_patch_reference_policy(
     resources: NativeResourcePolicy,
 ) -> Result<SourcePatchReferencePolicy> {
     let mut reference = params.clone();
+    reference.max_properties =
+        Some(params.previous_channel_budget(base.modular.source_tool_defaults) as u8);
     // RoundtripPatchFrame receives the post-frame-fallback speed, but resets
     // responsive to 0 before selecting the atlas's predictor/transforms/tree.
     reference.speed_tier = params.modular_speed_tier();
@@ -171,7 +173,8 @@ pub fn source_patch_reference_policy(
             predictor: Predictor::Gradient,
             tree_mode: params.tree_mode,
             learning_fraction: params.learning_fraction,
-            max_previous_channels: usize::from(params.max_properties),
+            max_previous_channels: params
+                .previous_channel_budget(base.modular.source_tool_defaults),
             previous_property_subset: params.previous_property_subset,
             num_extra_channels: image.metadata().extra_channels.len(),
             is_gray: image.color_channels() == 1,
@@ -225,6 +228,12 @@ fn project_native_metadata(
     base: &EncodeOptions,
     resources: NativeResourcePolicy,
 ) -> Result<NativeProjection> {
+    // Resolve auto before deriving both the tree property list and sampling.
+    // Explicit zero must remain distinguishable from the e9 prev1 default.
+    let mut resolved_params = params.clone();
+    resolved_params.max_properties =
+        Some(params.previous_channel_budget(base.modular.source_tool_defaults) as u8);
+    let params = &resolved_params;
     params.validate()?;
     image.metadata().validate()?;
     let resource_policy = resources;
@@ -378,7 +387,7 @@ fn project_native_metadata(
         num_streams: streams,
         responsive: params.responsive,
         learning_fraction: params.learning_fraction,
-        max_previous_channels: usize::from(params.max_properties),
+        max_previous_channels: params.previous_channel_budget(base.modular.source_tool_defaults),
         previous_property_subset: params.previous_property_subset,
         num_extra_channels: image.metadata().extra_channels.len(),
         is_gray: image.color_channels() == 1,
@@ -403,12 +412,16 @@ fn project_native_metadata(
     // all-channel palette fields, including when only channel compaction is on.
     options.modular.palette_colors = None;
     options.modular.palette_predictor = None;
-    let palette_tools = options
+    let mut palette_tools = options
         .modular
         .palette_policy
         .as_ref()
         .map(|p| p.tools)
         .unwrap_or_default();
+    if speed_tier == 1 && base.modular.source_tool_defaults && base.modular.palette_policy.is_none()
+    {
+        palette_tools.order = crate::modular::palette::PaletteOrder::ScreenedRuns;
+    }
     let palette_grouping = options
         .modular
         .palette_policy
@@ -544,6 +557,11 @@ fn project_native_metadata(
                 .source_lz77
                 .clone()
                 .unwrap_or_else(|| SourceConfig {
+                    quick: if speed_tier == 1 && base.modular.source_tool_defaults {
+                        crate::tools::lz77::SourceQuickMode::Sparse
+                    } else {
+                        crate::tools::lz77::SourceQuickMode::Off
+                    },
                     chain_batch: true,
                     chain_batch_parallel_only: true,
                     // Keep lower-tier seed/stream execution unchanged. Batch only
@@ -596,3 +614,6 @@ mod responsive_tests;
 
 #[cfg(test)]
 mod source_ma_defaults_tests;
+
+#[cfg(test)]
+mod source_tool_defaults_tests;

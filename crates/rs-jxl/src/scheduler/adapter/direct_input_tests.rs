@@ -138,7 +138,7 @@ fn float_extras_do_not_switch_integer_patch_color_and_atlas_is_metadata_only() {
     let image = base.with_metadata(metadata, extras.to_vec()).unwrap();
     assert!(crate::scheduler::scan::validate_source_input(&image).is_err());
     let params = CandidateParams {
-        max_properties: 4,
+        max_properties: Some(4),
         ..Default::default()
     };
     let options = project_native(&params, &image, &EncodeOptions::default())
@@ -213,7 +213,7 @@ fn float_patch_color_preserves_declared_words_and_resolves_atlas_geometry() {
         group_size_shift: Some(0),
         patches: Override::On,
         predictor: Some(Predictor::Zero),
-        max_properties: 3,
+        max_properties: Some(3),
         learning_fraction: 0.2,
         ..Default::default()
     };

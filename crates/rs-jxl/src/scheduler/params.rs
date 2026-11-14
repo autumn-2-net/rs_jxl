@@ -86,7 +86,9 @@ pub struct CandidateParams {
     /// weighted-predictor parameter search. Part of candidate/cache identity.
     pub tree_mode: TreeMode,
     pub learning_fraction: f32,
-    pub max_properties: u8,
+    /// None selects the native effort default (prev1 at e9, prev0 otherwise).
+    /// Some(0) explicitly disables cross-channel properties.
+    pub max_properties: Option<u8>,
     /// Opt-in restriction of the standard previous-channel property set at
     /// source effort 9/10 (modular speed tier <= 1): 4 keeps all four
     /// properties per previous channel (upstream default), 2 keeps signed
@@ -118,7 +120,7 @@ impl Default for CandidateParams {
             predictor: None,
             tree_mode: TreeMode::Default,
             learning_fraction: 0.5,
-            max_properties: 0,
+            max_properties: None,
             previous_property_subset: 4,
             lz77_careful_first_pass: false,
             bucket_matcher: false,
@@ -265,14 +267,17 @@ impl CandidateParams {
             _ => (3, 32, 0.3),
         };
         order.truncate(count);
-        let previous_channels = usize::from(self.max_properties).min(channels.saturating_sub(1));
+        let previous_channels = self
+            .previous_channel_budget(true)
+            .min(channels.saturating_sub(1));
         if speed_tier > 1 {
             order.extend((0..previous_channels).map(|i| 16 + i as u32 * 4 + 3));
         } else {
             match self.previous_property_subset {
                 1 => order.extend((0..previous_channels).map(|i| 16 + i as u32 * 4 + 3)),
                 2 => order.extend(
-                    (0..previous_channels).flat_map(|i| [16 + i as u32 * 4 + 1, 16 + i as u32 * 4 + 3]),
+                    (0..previous_channels)
+                        .flat_map(|i| [16 + i as u32 * 4 + 1, 16 + i as u32 * 4 + 3]),
                 ),
                 _ => order.extend((0..previous_channels * 4).map(|i| 16 + i as u32)),
             }
@@ -292,6 +297,13 @@ impl CandidateParams {
             previous_channels,
             previous_property_subset: self.previous_property_subset,
         }
+    }
+
+    pub(crate) fn previous_channel_budget(&self, native_defaults: bool) -> usize {
+        usize::from(
+            self.max_properties
+                .unwrap_or(u8::from(native_defaults && self.modular_speed_tier() == 1)),
+        )
     }
 }
 
@@ -370,7 +382,7 @@ pub fn lossless_probe_plan(input: &CandidateParams, options: PlanOptions) -> Vec
         }
     }
     p.predictor = Some(Predictor::Variable);
-    p.max_properties = 2;
+    p.max_properties = Some(2);
     for (rct, name) in [(0, "raw-cross-channel"), (6, "ycocg-cross-channel")] {
         p.rct = Some(rct);
         result.push(Candidate::new(name, p.clone()));
@@ -385,7 +397,7 @@ pub fn lossless_probe_plan(input: &CandidateParams, options: PlanOptions) -> Vec
             result.push(Candidate::new(name, p.clone()));
         }
     }
-    p.max_properties = 0;
+    p.max_properties = Some(0);
     for (rct, names) in [
         (0, ["raw-select", "raw-left"]),
         (6, ["ycocg-select", "ycocg-left"]),
@@ -438,7 +450,7 @@ mod tectonic_tests {
         let mut params = CandidateParams {
             speed_tier: -1,
             responsive: true,
-            max_properties: 2,
+            max_properties: Some(2),
             ..Default::default()
         };
         assert_eq!(params.resolved_predictor(), Predictor::Zero);

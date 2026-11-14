@@ -30,7 +30,7 @@ pub fn winner_neighborhood(winner: &CandidateParams, channels: usize) -> Candida
     } else {
         p.group_size_shift = Some(2);
         p.learning_fraction = 0.1;
-        p.max_properties = channels.saturating_sub(1).min(2) as u8;
+        p.max_properties = Some(channels.saturating_sub(1).min(2) as u8);
     }
     p
 }
@@ -392,7 +392,7 @@ impl PixelSearch {
                 let mut p = self.best_before(*stage)?.request.params.clone();
                 p.speed_tier = 0;
                 p.learning_fraction = p.learning_fraction.max(0.5);
-                p.max_properties = self.channels.saturating_sub(1).min(4) as u8;
+                p.max_properties = Some(self.channels.saturating_sub(1).min(4) as u8);
                 p.group_size_shift = Some(3);
                 p.lz77_careful_first_pass = true;
                 (*stage, p)

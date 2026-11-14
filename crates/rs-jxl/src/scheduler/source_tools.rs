@@ -1,4 +1,4 @@
-//! Single-encode experiments on top of the ordinary native e9 policy.
+//! Single-encode ablations of the three native e9 tool defaults.
 //!
 //! Unlike the portfolio scout, these switches do not run probes or retain a
 //! second encoded result. Explicit composition may trade individual file sizes
@@ -20,9 +20,10 @@ pub struct Options {
 }
 
 impl Options {
-    /// Build one native e9 plan. Untouched fields retain ordinary projection
-    /// and caller overrides. Enabling `previous_channel` explicitly selects
-    /// prev1, including for a deferred Source Patch atlas. No pixels are encoded.
+    /// Build one native e9 plan with the automatic tool bundle disabled, then
+    /// apply these flags. Other defaults and explicit caller overrides survive.
+    /// `previous_channel` selects prev1 including for the deferred Patch atlas.
+    /// No pixels are encoded; ordinary callers use `adapter::project_native`.
     pub fn build(
         self,
         params: &CandidateParams,
@@ -36,9 +37,12 @@ impl Options {
         }
         let mut params = params.clone();
         if self.previous_channel {
-            params.max_properties = 1;
+            params.max_properties = Some(1);
         }
-        let mut options = adapter::project_native(&params, image, base)?.exact_options()?;
+        // This is an explicit ablation recipe, not the ordinary default entry.
+        let mut base = base.clone();
+        base.modular.source_tool_defaults = false;
+        let mut options = adapter::project_native(&params, image, &base)?.exact_options()?;
         self.configure(&mut options.modular);
         if let Some(reference) = &mut options.source_patch_reference {
             self.configure(&mut reference.modular);
@@ -168,7 +172,7 @@ mod tests {
     fn disabled_tools_preserve_explicit_settings_and_lower_efforts_are_rejected() {
         let image = image();
         let mut params = CandidateParams::default().backend(9).unwrap();
-        params.max_properties = 2;
+        params.max_properties = Some(2);
         let options = Options::default()
             .build(&params, &image, &EncodeOptions::default())
             .unwrap();

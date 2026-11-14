@@ -1,5 +1,11 @@
 # Source Tools Integration (2026-11-14)
 
+Historical experiment report: the three optional tools below were subsequently
+enabled as ordinary pixel e9 defaults. See
+[ordinary e9 defaults and OLD/NEW measurements](SOURCE_TOOL_DEFAULTS_20261114.md).
+The measurements here describe the earlier opt-in compositions, not the current
+default behavior.
+
 ## Scope
 
 Integrate Source Add's channel-parallel sparse MA gathering after a real patch
@@ -58,8 +64,9 @@ let bytes = rs_jxl::encode(&image, &options)?;
 ```
 
 This experiment API requires e9. It leaves JPEG and lower-effort policy alone.
-An enabled switch explicitly chooses that tool; disabled switches preserve the
-underlying projected choice. No private JXL decoder features are introduced.
+An enabled switch explicitly chooses that tool. The ablation helper suppresses
+the new automatic tool defaults, so disabled switches preserve the pre-default
+projection (and explicit caller overrides). No private JXL decoder features are introduced.
 For a forced Source Add experiment set `params.patches = Override::On` before
 building. The ordinary recipe keeps automatic patch policy, rather than forcing
 patch detection on every image.

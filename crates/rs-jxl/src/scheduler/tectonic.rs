@@ -221,7 +221,7 @@ pub fn initial_candidates(input: &CandidateParams) -> Result<[CandidateParams; 2
     validate_input(input)?;
     let first = CandidateParams {
         speed_tier: 0,
-        max_properties: 4,
+        max_properties: Some(4),
         learning_fraction: 1.0,
         group_size_shift: Some(3),
         palette_colors: 0,
@@ -260,7 +260,7 @@ fn less_palette(input: &CandidateParams) -> Vec<CandidateParams> {
     let mut all = Vec::with_capacity(24);
     let mut p = CandidateParams {
         speed_tier: 0,
-        max_properties: 4,
+        max_properties: Some(4),
         learning_fraction: 1.0,
         group_size_shift: Some(0),
         channel_colors_percent: 0.0,
@@ -367,7 +367,7 @@ fn more_palette(input: &CandidateParams) -> Vec<CandidateParams> {
     let mut all = Vec::with_capacity(20);
     let mut p = CandidateParams {
         speed_tier: 0,
-        max_properties: 4,
+        max_properties: Some(4),
         learning_fraction: 1.0,
         group_size_shift: Some(0),
         palette_colors: 70000,
@@ -545,7 +545,7 @@ mod tests {
                 |&(group, palette, channel, pre, predictor, fraction, mode, patches)| {
                     CandidateParams {
                         speed_tier: 0,
-                        max_properties: 4,
+                        max_properties: Some(4),
                         group_size_shift: Some(group),
                         palette_colors: palette,
                         channel_colors_percent: f32::from(channel),
@@ -658,7 +658,7 @@ mod tests {
             channel_colors_pre_transform_percent: 33.0,
             predictor: Some(Predictor::Gradient),
             learning_fraction: 0.37,
-            max_properties: 1,
+            max_properties: Some(1),
             patches: Override::On,
             tree_mode: TreeMode::WeightedOnly,
             delta_palette: DeltaPalette::ExactTop,
@@ -900,7 +900,7 @@ mod tests {
         for predictor in [Predictor::Variable, Predictor::Zero] {
             let params = CandidateParams {
                 speed_tier: 0,
-                max_properties: 4,
+                max_properties: Some(4),
                 predictor: Some(predictor),
                 tree_mode: TreeMode::NoWeighted,
                 ..Default::default()
