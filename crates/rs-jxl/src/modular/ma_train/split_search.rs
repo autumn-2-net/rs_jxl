@@ -278,7 +278,9 @@ pub(super) fn find_best_split_collect(
             }
         })
     };
+    let plan_scope = histogram_detail_scope("ma.predictor_plan");
     let plan = PredictorPlan::new(samples, indices, options, parents, parent_predictor);
+    drop(plan_scope);
     stats
         .equivalent_predictors
         .fetch_add(parents.len() - plan.active_count, Ordering::Relaxed);
@@ -395,7 +397,35 @@ pub(super) fn find_best_split_collect(
     }
     drop(_race_scope);
     let mut winners = [None; 6];
-    let candidates: Vec<Result<(Candidates, bool, Vec<Split>)>> = {
+    let mut property_mins = if stats.profile_properties {
+        Vec::with_capacity(options.properties.len())
+    } else {
+        Vec::new()
+    };
+    {
+        let mut reduce =
+            |property: usize,
+             (candidates, redundant, alternatives): (Candidates, bool, Vec<Split>)| {
+                for candidate in alternatives {
+                    super::lookahead::retain_best(shortlist, candidate, width);
+                }
+                if stats.profile_properties {
+                    let min_cost = candidates
+                        .iter()
+                        .flatten()
+                        .map(|candidate| candidate.cost())
+                        .fold(f32::INFINITY, f32::min);
+                    property_mins.push((property, min_cost));
+                }
+                if options.property_dedup {
+                    working_redundant[property] = u8::from(redundant);
+                }
+                for (best, candidate) in winners.iter_mut().zip(candidates) {
+                    if let Some(candidate) = candidate {
+                        keep_better(best, candidate);
+                    }
+                }
+            };
         let _dispatch_scope = histogram_detail_scope("ma.sweep_dispatch");
         let cache_stride = working_cache.as_ref().and_then(|cache| cache.stride);
         let collection_stride = histogram_stride(
@@ -414,7 +444,9 @@ pub(super) fn find_best_split_collect(
                         seen: Option<&mut Vec<SeenProperty>>| {
             scratch.lookahead_width = width;
             scratch.lookahead_candidates.clear();
-            if options.property_dedup && working_redundant[property] != 0 {
+            if options.property_dedup
+                && redundant_properties.get(property).copied().unwrap_or(0) != 0
+            {
                 stats.inherited_properties.fetch_add(1, Ordering::Relaxed);
                 return Ok(([None; 6], true, Vec::new()));
             }
@@ -440,7 +472,13 @@ pub(super) fn find_best_split_collect(
                             histogram.subtract_marginals_values(samples, removed, values)?;
                         } else if !options.histogram_shards {
                             ***histogram = PropertyHistogram::collect_marginals_and_predictors(
-                                samples, indices, parents, property, values, &plan, cache_stride,
+                                samples,
+                                indices,
+                                parents,
+                                property,
+                                values,
+                                &plan,
+                                cache_stride,
                             )?;
                             fused_fill = true;
                         } else {
@@ -617,26 +655,31 @@ pub(super) fn find_best_split_collect(
             scratch_pool
                 .dispatch_slots
                 .store(execution::worker_count(), Ordering::Relaxed);
-            execution::map_with_state(
+            let candidates = execution::map_with_state(
                 options.properties.len(),
                 || scratch_pool.acquire(),
                 |lease, property| evaluate(&mut lease.scratch, property, None),
-            )
-        } else if !options.property_dedup {
+            );
+            // Reduce in property order, independent of worker completion order.
+            let _reduce_scope = histogram_detail_scope("ma.sweep_reduce");
+            for (property, candidates) in candidates.into_iter().enumerate() {
+                reduce(property, candidates?);
+            }
+        } else {
             // Tiny serial nodes dominate the tree count. Reduce their results
-            // immediately instead of allocating a vector of four-way candidates.
+            // immediately, retaining the same ordered duplicate-property proofs.
             let mut lease = scratch_pool.acquire();
+            let mut seen = Vec::new();
             let mut first_error = None;
             for property in 0..options.properties.len() {
-                match evaluate(&mut lease.scratch, property, None) {
-                    Ok((candidates, _, alternatives)) => {
-                        for candidate in alternatives {
-                            super::lookahead::retain_best(shortlist, candidate, width);
-                        }
-                        for (best, candidate) in winners.iter_mut().zip(candidates) {
-                            if let Some(candidate) = candidate {
-                                keep_better(best, candidate);
-                            }
+                match evaluate(
+                    &mut lease.scratch,
+                    property,
+                    options.property_dedup.then_some(&mut seen),
+                ) {
+                    Ok(candidates) => {
+                        if first_error.is_none() {
+                            reduce(property, candidates);
                         }
                     }
                     Err(error) => {
@@ -649,79 +692,50 @@ pub(super) fn find_best_split_collect(
             if let Some(error) = first_error {
                 return Err(error);
             }
-            Vec::new()
-        } else {
-            let mut lease = scratch_pool.acquire();
-            let mut seen = Vec::new();
-            (0..options.properties.len())
-                .map(|property| evaluate(&mut lease.scratch, property, Some(&mut seen)))
-                .collect()
         }
-    };
-    // Indexed collection followed by strict ordered reduction preserves ties
-    // independently of Rayon completion order. No worker mutates samples.
-    let _reduce_scope = histogram_detail_scope("ma.sweep_reduce");
-    let mut property_mins = Vec::with_capacity(candidates.len());
-    for (property, candidates) in candidates.into_iter().enumerate() {
-        let (candidates, redundant, alternatives) = candidates?;
-        for candidate in alternatives {
-            super::lookahead::retain_best(shortlist, candidate, width);
-        }
-        let min_cost = candidates
+    }
+    let choose_scope = histogram_detail_scope("ma.choose_split");
+    let decision = choose_split(winners, base_bits, options);
+    drop(choose_scope);
+    // These diagnostics never participate in scoring or resource accounting.
+    if stats.profile_properties {
+        let _scope = histogram_detail_scope("ma.property_diagnostics");
+        let global_min = winners
             .iter()
             .flatten()
             .map(|candidate| candidate.cost())
             .fold(f32::INFINITY, f32::min);
-        property_mins.push((property, min_cost));
-        if options.property_dedup {
-            working_redundant[property] = u8::from(redundant);
+        for &(property, min_cost) in &property_mins {
+            let id = options.properties[property];
+            if id >= 32 {
+                continue;
+            }
+            stats.property_evals[id].fetch_add(1, Ordering::Relaxed);
+            if min_cost.is_finite() && global_min.is_finite() && global_min > 0.0 {
+                let gap = min_cost / global_min;
+                let bucket = if gap <= 1.01 {
+                    0
+                } else if gap <= 1.05 {
+                    1
+                } else if gap <= 1.2 {
+                    2
+                } else {
+                    3
+                };
+                stats.property_gap[bucket].fetch_add(1, Ordering::Relaxed);
+            }
         }
-        for (best, candidate) in winners.iter_mut().zip(candidates) {
-            if let Some(candidate) = candidate {
-                keep_better(best, candidate);
+        if let Some(split) = &decision {
+            let id = options.properties[split.property];
+            if id < 32 {
+                stats.property_wins[id].fetch_add(1, Ordering::Relaxed);
+                let pred = split.below_predictor;
+                if pred < 14 {
+                    stats.property_wins_pred[pred][id].fetch_add(1, Ordering::Relaxed);
+                }
             }
         }
     }
-    let decision = choose_split(winners, base_bits, options);
-    // Property-level instrument: per-property evaluation/win counts and the
-    // ratio of each property's best candidate to the node's best candidate.
-    // Cheap atomics; only printed through the opt-in profile note.
-    let global_min = winners
-        .iter()
-        .flatten()
-        .map(|candidate| candidate.cost())
-        .fold(f32::INFINITY, f32::min);
-    for &(property, min_cost) in &property_mins {
-        let id = options.properties[property];
-        if id >= 32 {
-            continue;
-        }
-        stats.property_evals[id].fetch_add(1, Ordering::Relaxed);
-        if min_cost.is_finite() && global_min.is_finite() && global_min > 0.0 {
-            let gap = min_cost / global_min;
-            let bucket = if gap <= 1.01 {
-                0
-            } else if gap <= 1.05 {
-                1
-            } else if gap <= 1.2 {
-                2
-            } else {
-                3
-            };
-            stats.property_gap[bucket].fetch_add(1, Ordering::Relaxed);
-        }
-    }
-    if let Some(split) = &decision {
-        let id = options.properties[split.property];
-        if id < 32 {
-            stats.property_wins[id].fetch_add(1, Ordering::Relaxed);
-            let pred = split.below_predictor;
-            if pred < 14 {
-                stats.property_wins_pred[pred][id].fetch_add(1, Ordering::Relaxed);
-            }
-        }
-    }
-    drop(_reduce_scope);
     *cache = working_cache;
     *redundant_properties = working_redundant;
     Ok(decision)

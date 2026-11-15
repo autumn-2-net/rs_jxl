@@ -3103,6 +3103,182 @@ fn serial_candidate_reduction_drains_multiple_errors_in_property_order() {
     assert_eq!(scratch.idle.lock().unwrap().len(), 1);
 }
 
+fn assert_reduced_cache(
+    cache: &HistogramCache,
+    samples: &TreeSamples,
+    indices: &[usize],
+    mask: &[u8],
+) {
+    let parents = parent_histograms(samples, indices);
+    for (property, actual) in cache.properties.iter().enumerate() {
+        if mask.get(property).copied().unwrap_or(0) != 0 {
+            assert!(!actual.valid);
+            continue;
+        }
+        let expected = PropertyHistogram::collect(samples, indices, &parents, property);
+        assert_eq!(actual.used, expected.used);
+        assert_eq!(actual.weights, expected.weights);
+        assert_eq!(actual.predictors.len(), expected.predictors.len());
+        for (actual, expected) in actual.predictors.iter().zip(&expected.predictors) {
+            assert_eq!(actual.counts, expected.counts);
+            assert_eq!(actual.extra, expected.extra);
+        }
+    }
+}
+
+#[test]
+fn property_diagnostics_are_opt_in_and_preserve_serial_dedup_shortlists() {
+    for records in [128, 8192] {
+        let (samples, mut options) = property_dedup_fixture(records, 3);
+        options.parallel = false;
+        let indices: Vec<_> = (0..records).collect();
+        let parents = parent_histograms(&samples, &indices);
+        for dedup in [false, true] {
+            options.property_dedup = dedup;
+            for width in [0, 2, 4] {
+                let scratch = ScratchPool::new(1);
+                let mut expected: Option<(Option<Split>, Vec<Split>, Vec<u8>)> = None;
+                for profile_properties in [false, true] {
+                    let stats = TrainingStats {
+                        profile_properties,
+                        ..Default::default()
+                    };
+                    let budget = HistogramBudget::new(expected_cache_bytes(&samples, &parents));
+                    let mut cache = None;
+                    let mut mask = Vec::new();
+                    // Reuse the proof mask and scratch without stale shortlist entries.
+                    for repeat in 0..2 {
+                        let mut shortlist = Vec::new();
+                        let decision = split_search::find_best_split_collect(
+                            &samples,
+                            &indices,
+                            0,
+                            &options,
+                            &mut None,
+                            &mut cache,
+                            &budget,
+                            &stats,
+                            &scratch,
+                            &[],
+                            &mut mask,
+                            width,
+                            &mut shortlist,
+                        )
+                        .unwrap();
+                        assert_eq!(cache.is_some(), records >= 8192);
+                        if let Some(cache) = &cache {
+                            assert_reduced_cache(cache, &samples, &indices, &mask);
+                        }
+                        if let Some((winner, candidates, proofs)) = &expected {
+                            assert_same_candidates([decision], [*winner]);
+                            assert_eq!(shortlist.len(), candidates.len());
+                            for (actual, expected) in shortlist.iter().zip(candidates) {
+                                assert_same_candidates([Some(*actual)], [Some(*expected)]);
+                            }
+                            assert_eq!(&mask, proofs);
+                        } else {
+                            expected = Some((decision, shortlist, mask.clone()));
+                        }
+                        let evals: usize = stats
+                            .property_evals
+                            .iter()
+                            .map(|c| c.load(Ordering::Relaxed))
+                            .sum();
+                        let wins: usize = stats
+                            .property_wins
+                            .iter()
+                            .map(|c| c.load(Ordering::Relaxed))
+                            .sum();
+                        let pred_wins: usize = stats
+                            .property_wins_pred
+                            .iter()
+                            .flatten()
+                            .map(|c| c.load(Ordering::Relaxed))
+                            .sum();
+                        let gaps: usize = stats
+                            .property_gap
+                            .iter()
+                            .map(|c| c.load(Ordering::Relaxed))
+                            .sum();
+                        if profile_properties {
+                            assert_eq!(evals, (repeat + 1) * options.properties.len());
+                            assert_eq!(wins, (repeat + 1) * usize::from(decision.is_some()));
+                            assert_eq!(pred_wins, wins);
+                            assert!(gaps > 0);
+                        } else {
+                            assert_eq!((evals, wins, pred_wins, gaps), (0, 0, 0, 0));
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn serial_dedup_reduction_drains_errors_without_publishing_proofs() {
+    let (samples, mut options) = property_dedup_fixture(8192, 3);
+    options.parallel = false;
+    options.property_dedup = true;
+    let indices: Vec<_> = (0..samples.counts.len()).collect();
+    let parents = parent_histograms(&samples, &indices);
+    for stage in [InitialCacheStage::Filled, InitialCacheStage::Scored] {
+        let budget = HistogramBudget::new(expected_cache_bytes(&samples, &parents));
+        let scratch = ScratchPool::new(1);
+        let visited = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&visited);
+        let stats = TrainingStats {
+            initial_cache_hook: Some(Box::new(move |property, current| {
+                if current == stage {
+                    recorded.lock().unwrap().push(property);
+                    if property == 1 || property == 3 {
+                        return Err(Error::Encoding(format!("failed property {property}")));
+                    }
+                }
+                Ok(())
+            })),
+            ..Default::default()
+        };
+        let mut cache = None;
+        let mut mask = vec![0; options.properties.len()];
+        let result = find_best_split_with_properties(
+            &samples,
+            &indices,
+            0,
+            &options,
+            &mut None,
+            &mut cache,
+            &budget,
+            &stats,
+            &scratch,
+            &[],
+            &mut mask,
+        );
+        assert!(matches!(result, Err(Error::Encoding(message)) if message == "failed property 1"));
+        assert_eq!(*visited.lock().unwrap(), [0, 1, 3, 5]);
+        assert_eq!(mask, vec![0; options.properties.len()]);
+        assert!(cache.is_none());
+        assert_eq!(budget.used.load(Ordering::Relaxed), 0);
+        assert_eq!(scratch.idle.lock().unwrap().len(), 1);
+        find_best_split_with_properties(
+            &samples,
+            &indices,
+            0,
+            &options,
+            &mut None,
+            &mut cache,
+            &budget,
+            &TrainingStats::default(),
+            &scratch,
+            &[],
+            &mut mask,
+        )
+        .unwrap();
+        assert_eq!(mask, [0, 0, 1, 0, 1, 0]);
+        assert_reduced_cache(cache.as_ref().unwrap(), &samples, &indices, &mask);
+    }
+}
+
 #[test]
 fn initial_cache_errors_discard_partial_work_and_allow_retry() {
     let (mut samples, mut options) = histogram_fixture(8192, 3);
@@ -4073,6 +4249,22 @@ fn serial_and_parallel_sweeps_have_identical_stable_ties() {
     let serial = train(&samples, &options).unwrap();
     assert_eq!(signature(&parallel), signature(&serial));
     assert!(parallel.leaves() > 1 && parallel.leaves() <= 8);
+    options.property_dedup = true;
+    for workers in [1, 4] {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(workers)
+            .build()
+            .unwrap();
+        for parallel in [false, true] {
+            options.parallel = parallel;
+            let actual = pool.install(|| train(&samples, &options)).unwrap();
+            assert_eq!(signature(&actual), signature(&serial));
+            let null_pool = pool
+                .install(|| execution::serial(|| train(&samples, &options)))
+                .unwrap();
+            assert_eq!(signature(&null_pool), signature(&serial));
+        }
+    }
 }
 
 // Independent full rescans: no histogram transfers or incremental entropy.

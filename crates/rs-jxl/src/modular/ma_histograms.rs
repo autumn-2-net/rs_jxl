@@ -146,6 +146,55 @@ pub(super) fn collect_mapped<T: PropertyValue, const PACKED: bool, const COMPACT
     }
 }
 
+/// Collect an unremapped pair into fresh buffers. When both complete extra-bit
+/// totals fit u32, two counters share one u64 without carries between halves.
+/// The packed storage is unpacked before scoring or caching the histograms.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn collect_fresh_pair<T: PropertyValue>(
+    samples: &Samples<impl SampleStorage>,
+    indices: &[usize],
+    values: &[T],
+    tokens: [&[ResidualToken]; 2],
+    strides: [usize; 2],
+    extra_bounds: [u64; 2],
+    counts: [&mut [u32]; 2],
+    extra: [&mut [u64]; 2],
+) {
+    let [counts_a, counts_b] = counts;
+    let [extra_a, extra_b] = extra;
+    let [tokens_a, tokens_b] = tokens;
+    let [stride_a, stride_b] = strides;
+    debug_assert!(extra_a.iter().chain(extra_b.iter()).all(|&v| v == 0));
+    if indices.len() >= 512 && extra_bounds.iter().all(|&n| n <= u64::from(u32::MAX)) {
+        for &i in indices {
+            let bin = values[i].index();
+            let weight = u64::from(samples.counts[i]);
+            let (a, b) = (tokens_a[i], tokens_b[i]);
+            counts_a[bin * stride_a + usize::from(a.token)] += weight as u32;
+            counts_b[bin * stride_b + usize::from(b.token)] += weight as u32;
+            extra_a[bin] += weight * ((u64::from(b.nbits) << 32) | u64::from(a.nbits));
+        }
+        for (a, b) in extra_a.iter_mut().zip(extra_b) {
+            *b = *a >> 32;
+            *a = u64::from(*a as u32);
+        }
+    } else {
+        for &i in indices {
+            let bin = values[i].index();
+            let weight = u32::from(samples.counts[i]);
+            let (a, b) = (tokens_a[i], tokens_b[i]);
+            counts_a[bin * stride_a + usize::from(a.token)] += weight;
+            counts_b[bin * stride_b + usize::from(b.token)] += weight;
+            extra_a[bin] += u64::from(weight) * u64::from(a.nbits);
+            extra_b[bin] += u64::from(weight) * u64::from(b.nbits);
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "ma_histogram_pair_tests.rs"]
+mod pair_tests;
+
 /// Two compacted predictors share the property/weight scan, retaining their
 /// independent trimmed strides and exact extra-bit accumulators.
 #[allow(clippy::too_many_arguments)]

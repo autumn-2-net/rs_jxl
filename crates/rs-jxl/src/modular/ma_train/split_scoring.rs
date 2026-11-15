@@ -11,8 +11,8 @@ use super::{
     BinHistogram, DefaultScorer, DescriptionCost, HistogramSplit, OnceLock, ParentHistogram,
     Predictor, PropertyHistogram, PropertyScratch, PropertyValue, SampleStorage, Samples,
     ScoringOptions, SearchOptions, SparseHistogramPlan, TrainOptions, WP_PROPERTY,
-    collect_compact_pair, collect_mapped, collect_property_marginals, histogram_stride, ma_binning,
-    ma_dominance, ma_events, ma_search, prepare_property_bins,
+    collect_compact_pair, collect_fresh_pair, collect_mapped, collect_property_marginals,
+    histogram_stride, ma_binning, ma_dominance, ma_events, ma_search, prepare_property_bins,
 };
 use crate::{Error, Result};
 
@@ -486,18 +486,16 @@ pub(super) fn evaluate_property_values<T: PropertyValue>(
                                 [&mut scratch.extra, &mut scratch.paired_extra],
                             );
                         } else {
-                            for &i in indices {
-                                let bin = values[i].index();
-                                let weight = u32::from(samples.counts[i]);
-                                let a = tokens[i];
-                                let b = other_tokens[i];
-                                scratch.increase[bin * storage_stride + usize::from(a.token)] +=
-                                    weight;
-                                scratch.paired_increase
-                                    [bin * other_symbols + usize::from(b.token)] += weight;
-                                scratch.extra[bin] += u64::from(weight) * u64::from(a.nbits);
-                                scratch.paired_extra[bin] += u64::from(weight) * u64::from(b.nbits);
-                            }
+                            collect_fresh_pair(
+                                samples,
+                                indices,
+                                values,
+                                [tokens, other_tokens],
+                                [storage_stride, other_symbols],
+                                [parent.extra_bits, parents[predictor + 1].extra_bits],
+                                [&mut scratch.increase, &mut scratch.paired_increase],
+                                [&mut scratch.extra, &mut scratch.paired_extra],
+                            );
                         }
                         drop(_pair_fill_scope);
                     } else if options.histogram_shards

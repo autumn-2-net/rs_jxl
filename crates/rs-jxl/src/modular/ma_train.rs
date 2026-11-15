@@ -105,8 +105,8 @@ use super::tree::{Node, Tree, pack_signed};
 mod ma_histograms;
 pub use ma_histograms::{DenseHistogram, PropertyBins};
 use ma_histograms::{
-    HistogramShards, SparseHistogramPlan, collect_compact_pair, collect_mapped, histogram_stride,
-    prepare_property_bins,
+    HistogramShards, SparseHistogramPlan, collect_compact_pair, collect_fresh_pair, collect_mapped,
+    histogram_stride, prepare_property_bins,
 };
 
 #[path = "ma_events.rs"]
@@ -462,6 +462,7 @@ fn constraint_thresholds(options: &TrainOptions, property: usize) -> Option<Vec<
 
 #[derive(Default)]
 struct TrainingStats {
+    profile_properties: bool,
     detached_subtrees: AtomicUsize,
     dynamic_forks: AtomicUsize,
     histogram_handoffs: AtomicUsize,

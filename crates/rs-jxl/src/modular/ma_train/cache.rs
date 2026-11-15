@@ -7,13 +7,16 @@
 
 #[cfg(test)]
 use super::Mutex;
+use super::split_scoring::histogram_detail_scope;
 use super::{
     Arc, AtomicUsize, HistogramShards, OnceLock, Ordering, ParentHistogram, PredictorPlan,
     PropertyColumn, PropertyValue, ResidualToken, SampleStorage, Samples, TrainOptions,
     collect_mapped, execution,
 };
-use super::split_scoring::histogram_detail_scope;
 use crate::{Error, Result};
+
+#[path = "cache_packed.rs"]
+mod packed;
 
 fn cache_pair14_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
@@ -215,10 +218,8 @@ impl PropertyHistogram {
         histogram.allocate_predictors_unconditional(parents, stride);
         let active = plan.active();
         let columns = histogram.predictors.len();
-        let two_preds = active.len() == 2
-            && active[0] < active[1]
-            && active[1] < columns
-            && columns == 2;
+        let two_preds =
+            active.len() == 2 && active[0] < active[1] && active[1] < columns && columns == 2;
         {
             let _fill_scope = histogram_detail_scope("ma.cache_fused_fill");
             let used = &mut histogram.used;
@@ -230,17 +231,21 @@ impl PropertyHistogram {
                     &samples.residuals[active[0]][..],
                     &samples.residuals[active[1]][..],
                 );
-                for &i in indices {
-                    let bin = values[i].index();
-                    let weight = u32::from(samples.counts[i]);
-                    used[bin] += 1;
-                    weights[bin] += weight;
-                    let residual = a[i];
-                    first.counts[bin * first.symbols + usize::from(residual.token)] += weight;
-                    first.extra[bin] += u64::from(weight) * u64::from(residual.nbits);
-                    let residual = b[i];
-                    second.counts[bin * second.symbols + usize::from(residual.token)] += weight;
-                    second.extra[bin] += u64::from(weight) * u64::from(residual.nbits);
+                if !packed::collect_pair(
+                    samples, indices, values, parents, used, weights, first, second,
+                ) {
+                    for &i in indices {
+                        let bin = values[i].index();
+                        let weight = u32::from(samples.counts[i]);
+                        used[bin] += 1;
+                        weights[bin] += weight;
+                        let residual = a[i];
+                        first.counts[bin * first.symbols + usize::from(residual.token)] += weight;
+                        first.extra[bin] += u64::from(weight) * u64::from(residual.nbits);
+                        let residual = b[i];
+                        second.counts[bin * second.symbols + usize::from(residual.token)] += weight;
+                        second.extra[bin] += u64::from(weight) * u64::from(residual.nbits);
+                    }
                 }
             } else {
                 for &i in indices {
@@ -251,8 +256,7 @@ impl PropertyHistogram {
                     for &predictor in active {
                         let column = &mut histogram.predictors[predictor];
                         let residual = samples.residuals[predictor][i];
-                        column.counts[bin * column.symbols + usize::from(residual.token)] +=
-                            weight;
+                        column.counts[bin * column.symbols + usize::from(residual.token)] += weight;
                         column.extra[bin] += u64::from(weight) * u64::from(residual.nbits);
                     }
                 }
@@ -603,15 +607,9 @@ impl PropertyHistogram {
             let (low_tokens, high_tokens) =
                 (&samples.residuals[low][..], &samples.residuals[high][..]);
             let mut columns: [(&mut BinHistogram, &[ResidualToken]); 2] = if first < second {
-                [
-                    (low_histogram, low_tokens),
-                    (high_histogram, high_tokens),
-                ]
+                [(low_histogram, low_tokens), (high_histogram, high_tokens)]
             } else {
-                [
-                    (high_histogram, high_tokens),
-                    (low_histogram, low_tokens),
-                ]
+                [(high_histogram, high_tokens), (low_histogram, low_tokens)]
             };
             for &i in removed {
                 let bin = values[i].index();

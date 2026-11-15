@@ -379,6 +379,8 @@ impl TreeSamples {
         let _scope = crate::profile::scope("ma.prepare_samples");
         let samples = samples.into_iter();
         validate_samples(samples.clone(), options)?;
+        let thresholds_scope =
+            super::split_scoring::histogram_detail_scope("ma.prepare_thresholds");
         let thresholds: Vec<_> = options
             .properties
             .iter()
@@ -396,6 +398,7 @@ impl TreeSamples {
                     })
             })
             .collect();
+        drop(thresholds_scope);
         let mut result = Self {
             properties: options
                 .properties
@@ -409,6 +412,8 @@ impl TreeSamples {
             global_max_symbols: 0,
         };
         let config = HybridUintConfig::new(4, 1, 2).map_err(|e| Error::Encoding(e.to_string()))?;
+        let columns_scope =
+            super::split_scoring::histogram_detail_scope("ma.prepare_columns_dedup");
         let capacity = sample_storage::split_record_capacity(samples.clone())?;
         let mut dedup = sample_storage::DedupTable::new(&options.properties);
         dedup.prepare(&mut result, capacity)?;
@@ -432,6 +437,7 @@ impl TreeSamples {
             );
             dedup.insert(&mut result, &key, sample.weight)?;
         }
+        drop(columns_scope);
         if options.tree_learning.enabled() {
             result.global_max_symbols = result
                 .residuals

@@ -5,6 +5,7 @@
 //! Required multiplier skeletons, column partitioning and depth-first tree training.
 //! This layer owns node/leaf budgets, child commit order and histogram handoff scheduling.
 
+use super::split_scoring::histogram_detail_scope;
 use super::{
     Arc, HistogramBudget, HistogramCache, Intersection, Node, OnceLock, Ordering, ParentHistogram,
     Predictor, PropertyColumn, PropertyValue, SampleStorage, Samples, ScratchPool, Split,
@@ -49,6 +50,7 @@ pub(super) fn partition_node<const REORDER: bool>(
     bin: usize,
     below_count: usize,
 ) {
+    let _scope = histogram_detail_scope("ma.partition_columns");
     // Borrow the split column separately so its type dispatch stays outside
     // both scanning and swapping, without widening or moving its allocation.
     let (before, tail) = samples.properties.split_at_mut(property);
@@ -320,7 +322,11 @@ pub(super) fn train_nodes(
     samples: &mut Samples<impl SampleStorage>,
     options: &TrainOptions,
 ) -> Result<Vec<Node>> {
-    train_nodes_with_stats(samples, options, &TrainingStats::default())
+    let stats = TrainingStats {
+        profile_properties: crate::profile::enabled(),
+        ..Default::default()
+    };
+    train_nodes_with_stats(samples, options, &stats)
 }
 
 pub(super) fn train_nodes_with_stats(
@@ -545,6 +551,7 @@ pub(super) fn train_pending_in_frontier<const REORDER: bool>(
             continue;
         }
         if split.symmetric.is_some() {
+            let _scope = histogram_detail_scope("ma.commit_symmetric");
             let children = super::symmetric::commit::<REORDER>(
                 samples, options, stats, indices, &mut nodes, state, split,
             )?;
@@ -570,6 +577,7 @@ pub(super) fn train_pending_in_frontier<const REORDER: bool>(
             split.bin,
             split.below_count,
         );
+        let child_scope = histogram_detail_scope("ma.prepare_children");
         let greater = nodes.len();
         let less_equal = greater + 1;
         nodes.push(scaled_leaf(
@@ -626,6 +634,7 @@ pub(super) fn train_pending_in_frontier<const REORDER: bool>(
             && low.max(high) >= 512
             && (!detach_children || inherit)
         {
+            let _scope = histogram_detail_scope("ma.child_parent_histograms");
             let smaller_parents = parent_histograms(samples, removed);
             larger.parents = Some(subtract_parent_histograms(
                 state.parents.take().expect("split has parent histograms"),
@@ -645,6 +654,7 @@ pub(super) fn train_pending_in_frontier<const REORDER: bool>(
         }
         // Release a non-inherited cache before reserving any ready-child work.
         drop(state);
+        drop(child_scope);
         if let Some(frontier) = frontier
             && let Some(permit) = frontier.acquire(low, high)
         {
@@ -676,6 +686,7 @@ pub(super) fn train_pending_in_frontier<const REORDER: bool>(
             && work >= 65_536
         {
             // Both read-only child searches finish before the next column move.
+            let _scope = histogram_detail_scope("ma.ready_children_join");
             let shared_samples = &*samples;
             let (high_result, low_result) = execution::join(
                 || {
@@ -755,35 +766,34 @@ pub(super) fn train_pending_in_frontier<const REORDER: bool>(
             stats.dominated_predictors.load(Ordering::Relaxed),
         ),
     );
-    let property_evals: Vec<usize> = (0..24)
-        .map(|id| stats.property_evals[id].load(Ordering::Relaxed))
-        .collect();
-    let property_wins: Vec<usize> = (0..24)
-        .map(|id| stats.property_wins[id].load(Ordering::Relaxed))
-        .collect();
-    let wins_pred: Vec<Vec<usize>> = (0..2)
-        .map(|p| {
-            (0..20)
-                .map(|id| stats.property_wins_pred[p][id].load(Ordering::Relaxed))
-                .collect()
-        })
-        .collect();
-    crate::profile::note(
-        "ma.property_wins_pred",
-        format_args!("{wins_pred:?}"),
-    );
-    let gap = &stats.property_gap;
-    crate::profile::note(
-        "ma.property_gap",
-        format_args!(
-            "evals={property_evals:?} wins={property_wins:?} \
+    if stats.profile_properties {
+        let property_evals: Vec<usize> = (0..24)
+            .map(|id| stats.property_evals[id].load(Ordering::Relaxed))
+            .collect();
+        let property_wins: Vec<usize> = (0..24)
+            .map(|id| stats.property_wins[id].load(Ordering::Relaxed))
+            .collect();
+        let wins_pred: Vec<Vec<usize>> = (0..2)
+            .map(|p| {
+                (0..20)
+                    .map(|id| stats.property_wins_pred[p][id].load(Ordering::Relaxed))
+                    .collect()
+            })
+            .collect();
+        crate::profile::note("ma.property_wins_pred", format_args!("{wins_pred:?}"));
+        let gap = &stats.property_gap;
+        crate::profile::note(
+            "ma.property_gap",
+            format_args!(
+                "evals={property_evals:?} wins={property_wins:?} \
              gap[le101,le105,le120,gt120]={}/{}/{}/{}",
-            gap[0].load(Ordering::Relaxed),
-            gap[1].load(Ordering::Relaxed),
-            gap[2].load(Ordering::Relaxed),
-            gap[3].load(Ordering::Relaxed),
-        ),
-    );
+                gap[0].load(Ordering::Relaxed),
+                gap[1].load(Ordering::Relaxed),
+                gap[2].load(Ordering::Relaxed),
+                gap[3].load(Ordering::Relaxed),
+            ),
+        );
+    }
     Ok(nodes)
 }
 

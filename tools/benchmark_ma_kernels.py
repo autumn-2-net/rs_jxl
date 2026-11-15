@@ -77,8 +77,12 @@ def main():
     parser.add_argument("--effort", type=int, choices=range(1, 12), default=9)
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--profile", choices=("off", "stages", "detail"), default="off")
+    parser.add_argument("--profile-ma-nodes", action="store_true",
+                        help="Include MA node-size timing buckets (requires profiling)")
     parser.add_argument("--timeout", type=float, default=600)
     args = parser.parse_args()
+    if args.profile_ma_nodes and args.profile == "off":
+        parser.error("--profile-ma-nodes requires --profile stages or detail")
     if (args.repeats < 1 or not math.isfinite(args.timeout) or args.timeout <= 0
             or not all(1 <= t <= 256 for t in args.threads)
             or len(args.threads) != len(set(args.threads))):
@@ -103,7 +107,8 @@ def main():
         shutil.copy2(path, target)
         frozen[name] = target
     manifest = dict(cases=cases, threads=args.threads, repeats=args.repeats,
-                    profile=args.profile, avx512=args.avx512, effort=args.effort,
+                    profile=args.profile, profile_ma_nodes=args.profile_ma_nodes,
+                    avx512=args.avx512, effort=args.effort,
                     binaries={name: dict(source=str(variants[name]), sha256=file_sha256(path))
                               for name, path in frozen.items()},
                     decoder=dict(path=str(args.decoder), sha256=file_sha256(args.decoder)),
@@ -133,6 +138,8 @@ def main():
                             if args.profile != "off":
                                 active_env["RS_JXL_PROFILE"] = "1"
                                 active_env["RS_JXL_PROFILE_DETAIL"] = "1" if args.profile == "detail" else "0"
+                                if args.profile_ma_nodes:
+                                    active_env["RS_JXL_PROFILE_MA_NODES"] = "1"
                             process = run_process([str(frozen[name]), str(snapshot), "--output", str(output),
                                                    "--effort", str(args.effort), "--threads", str(threads),
                                                    "--direct-candidate", "baseline"], active_env, args.timeout)

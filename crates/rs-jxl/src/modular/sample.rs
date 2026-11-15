@@ -743,6 +743,7 @@ impl PropertySamples {
         properties: &[usize],
         max_values: usize,
     ) -> Result<PropertyQuantization> {
+        let _scope = crate::profile::scope("ma.quantization");
         validate_properties(properties, max_values)?;
         if self
             .channel_pixel_count

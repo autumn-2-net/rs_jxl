@@ -860,6 +860,7 @@ pub(super) fn collect_samples(
     wp: &weighted::Header,
     stream_id: usize,
 ) -> Result<Vec<ma_train::Sample>> {
+    let _scope = crate::profile::scope("ma.collect_samples");
     let target = legacy_sample_count(planes, options)?;
     if options.sample_limit.is_some_and(|limit| target > limit) {
         return Err(Error::Limit("legacy MA selected-sample budget exceeded"));

@@ -34,6 +34,7 @@ impl From<PreparedSamples> for PreparedInput {
 
 impl PreparedInput {
     fn into_tree_samples(self, options: &TrainOptions) -> Result<TreeSamples> {
+        let _scope = super::split_scoring::histogram_detail_scope("ma.prepared_convert");
         options.validate()?;
         if !options.multiplier_info.is_empty() {
             return Err(Error::InvalidInput(
