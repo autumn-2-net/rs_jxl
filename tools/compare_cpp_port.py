@@ -242,8 +242,12 @@ def decoder_command(binary, jxl, png, depth):
 def run_process(command, environment, timeout):
     start = perf_counter()
     try:
+        # A detached benchmark has no console to inherit. Suppress new console
+        # allocation for every codec child, not just the Python launcher.
+        flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
         result = subprocess.run(command, env=environment, stdin=subprocess.DEVNULL,
-                                capture_output=True, timeout=timeout, check=False)
+                                capture_output=True, timeout=timeout, check=False,
+                                creationflags=flags)
         record = dict(returncode=result.returncode, stdout=result.stdout.decode(errors="replace"),
                       stderr=result.stderr.decode(errors="replace"))
     except subprocess.TimeoutExpired as error:

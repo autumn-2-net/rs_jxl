@@ -155,6 +155,19 @@ class PngTests(unittest.TestCase):
 
 
 class ProtocolTests(unittest.TestCase):
+    def test_background_codec_children_do_not_create_windows(self):
+        for platform in ("nt", "posix"):
+            result = subprocess.CompletedProcess(["codec"], 0, b"receipt", b"diagnostic")
+            with patch.object(port.os, "name", platform), \
+                 patch.object(port.subprocess, "CREATE_NO_WINDOW", 0x08000000, create=True), \
+                 patch.object(port.subprocess, "run", return_value=result) as run:
+                record = port.run_process(["codec"], {}, 3)
+            self.assertEqual(run.call_args.kwargs["creationflags"],
+                             0x08000000 if platform == "nt" else 0)
+            self.assertTrue(run.call_args.kwargs["capture_output"])
+            self.assertEqual(record["stdout"], "receipt")
+            self.assertEqual(record["stderr"], "diagnostic")
+
     def test_sample_cap_is_omitted_unless_explicit_and_valid(self):
         for mode in port.MODES:
             command = port.encoder_command("rust", "rust", "in.png", "out.jxl", 1, 9, mode)

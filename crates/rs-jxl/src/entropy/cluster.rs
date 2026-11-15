@@ -10,10 +10,10 @@
 //! versioned cost-reducing ANS merges, and first-occurrence canonical indexing.
 //! The merge cost is the source ANSPopulationCost (Fast normalization), including
 //! serialized histogram bits, not just Shannon entropy.
-//! Best refinement uses enc_cluster_bound.h's 16-bin entropy lower bound and
-//! rounding margin to skip non-beneficial pairs. This source optimization is
-//! active without its experimental environment gate; surviving pairs retain
-//! the exact population cost, heap ordering, and version checks.
+//! Best refinement strengthens enc_cluster_bound.h's 16-bin entropy bound with
+//! the within-bin conditional entropy of both inputs. Concavity preserves a
+//! lower bound while retaining information lost by coarsening. The source
+//! rounding margin remains; surviving pairs use the exact population cost.
 //!
 //! Preexisting coding centers use the source KL divergence, remain immutable,
 //! and retain their indices during incremental clustering/refit. Seed distances
@@ -440,7 +440,50 @@ fn entropy_sketch(counts: &[u64]) -> EntropySketch {
     sketch
 }
 
+#[derive(Clone, Copy)]
+struct RefinementSketch {
+    buckets: EntropySketch,
+    conditional_entropy: f64,
+}
+
+impl RefinementSketch {
+    fn new(counts: &[u64]) -> Self {
+        let buckets = entropy_sketch(counts);
+        let mut conditional_entropy = 0.0;
+        for (symbol, &count) in counts.iter().enumerate() {
+            if count == 0 {
+                continue;
+            }
+            let bucket = if symbol < 8 {
+                symbol
+            } else {
+                (symbol.ilog2() as usize + 5).min(15)
+            };
+            let count = count as f64;
+            conditional_entropy += count * (buckets[bucket] / count).log2();
+        }
+        Self {
+            buckets,
+            conditional_entropy,
+        }
+    }
+
+    fn lower_bound(&self, other: &Self) -> f64 {
+        // Weighted conditional entropy is concave: mixing two histograms
+        // cannot reduce the sum of their within-bucket entropy contributions.
+        conditional_merge_lower_bound(
+            &self.buckets,
+            &other.buckets,
+            self.conditional_entropy + other.conditional_entropy,
+        )
+    }
+}
+
 fn merge_lower_bound(a: &EntropySketch, b: &EntropySketch) -> f64 {
+    conditional_merge_lower_bound(a, b, 0.0)
+}
+
+fn conditional_merge_lower_bound(a: &EntropySketch, b: &EntropySketch, within: f64) -> f64 {
     let total: f64 = a.iter().zip(b).map(|(a, b)| a + b).sum();
     if total == 0.0 {
         return 0.0;
@@ -453,7 +496,7 @@ fn merge_lower_bound(a: &EntropySketch, b: &EntropySketch) -> f64 {
         }
     }
     // Source margin covers float/fixed-point population-cost rounding.
-    (entropy - 1.0 - total * 0.0001).max(0.0)
+    (entropy + within - 1.0 - total * 0.0001).max(0.0)
 }
 
 fn refine(histograms: &mut [Histogram], symbols: &mut [usize]) -> Result<()> {
@@ -496,7 +539,7 @@ fn refine_with_workers(
     let mut sketches: Option<Vec<_>> = use_bound.then(|| {
         histograms
             .iter()
-            .map(|h| entropy_sketch(&h.counts))
+            .map(|h| RefinementSketch::new(&h.counts))
             .collect()
     });
     let mut bounded_pairs = 0usize;
@@ -513,7 +556,7 @@ fn refine_with_workers(
         let mut bounded = 0;
         for second in first + 1..histograms.len() {
             if sketches.as_ref().is_some_and(|s| {
-                merge_lower_bound(&s[first], &s[second])
+                s[first].lower_bound(&s[second])
                     >= f64::from(histograms[first].entropy) + f64::from(histograms[second].entropy)
             }) {
                 bounded += 1;
@@ -561,10 +604,9 @@ fn refine_with_workers(
         let other = histograms[second].clone();
         histograms[first].add(&other)?;
         if let Some(sketches) = &mut sketches {
-            let other = sketches[second];
-            for (destination, source) in sketches[first].iter_mut().zip(other) {
-                *destination += source;
-            }
+            // The merged conditional entropy is stronger than simply retaining
+            // the sum of its children, and is rebuilt only for accepted merges.
+            sketches[first] = RefinementSketch::new(&histograms[first].counts);
         }
         histograms[first].entropy = histograms[first].population_cost()?;
         for target in &mut renumbering {
@@ -580,7 +622,7 @@ fn refine_with_workers(
             .collect();
         let update = |j: usize| -> Result<(Option<Pair>, usize)> {
             if sketches.as_ref().is_some_and(|s| {
-                merge_lower_bound(&s[first], &s[j])
+                s[first].lower_bound(&s[j])
                     >= f64::from(histograms[first].entropy) + f64::from(histograms[j].entropy)
             }) {
                 return Ok((None, 1));
@@ -1631,6 +1673,163 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn conditional_bound_recovers_entropy_hidden_inside_sketch_buckets() {
+        let mut counts = vec![0; 256];
+        counts[128..].fill(4096);
+        let sketch = RefinementSketch::new(&counts);
+        assert_eq!(merge_lower_bound(&sketch.buckets, &sketch.buckets), 0.0);
+        let bound = sketch.lower_bound(&sketch);
+        assert!(bound > 7_000_000.0);
+        let combined: Vec<_> = counts.iter().map(|&n| n * 2).collect();
+        assert!(bound <= f64::from(fast_population_cost(&combined).unwrap()));
+    }
+
+    #[test]
+    fn conditional_bound_is_below_entropy_and_population_cost() {
+        let mut state = 0x8712_93ab_52d4_a791u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for length in [1, 2, 8, 16, 31, 64, 128, 256] {
+            for shape in 0..6 {
+                for scale in [1, 100, 100_000] {
+                    let mut counts = || -> Vec<u64> {
+                        (0..length)
+                            .map(|i| {
+                                let n = next();
+                                let value = match shape {
+                                    0 => 0,
+                                    1 => u64::from(i == length - 1),
+                                    2 => u64::from(n % 7 == 0),
+                                    3 => n % 33,
+                                    4 => u64::from(i >= length / 2) * (1 + n % 8),
+                                    _ => {
+                                        if n % 31 == 0 {
+                                            100
+                                        } else {
+                                            1
+                                        }
+                                    }
+                                };
+                                value * scale
+                            })
+                            .collect()
+                    };
+                    let a = counts();
+                    let b = counts();
+                    let sa = RefinementSketch::new(&a);
+                    let sb = RefinementSketch::new(&b);
+                    let sum: Vec<_> = a.iter().zip(&b).map(|(a, b)| a + b).collect();
+                    let total = sum.iter().sum::<u64>() as f64;
+                    let entropy: f64 = sum
+                        .iter()
+                        .filter(|&&n| n != 0)
+                        .map(|&n| n as f64 * (total / n as f64).log2())
+                        .sum();
+                    let bound = sa.lower_bound(&sb);
+                    assert!(bound >= merge_lower_bound(&sa.buckets, &sb.buckets));
+                    assert!(
+                        bound <= entropy + 1e-6,
+                        "len={length} shape={shape} scale={scale}"
+                    );
+                    assert!(
+                        bound <= f64::from(fast_population_cost(&sum).unwrap()),
+                        "len={length} shape={shape} scale={scale}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn conditional_bound_handles_bucket_edges_and_near_limit_weights() {
+        for symbol in [
+            0, 7, 8, 15, 16, 31, 32, 127, 128, 255, 256, 1023, 1024, 32767,
+        ] {
+            let mut counts = vec![0; symbol + 1];
+            counts[symbol] = 100;
+            let sketch = RefinementSketch::new(&counts);
+            assert_eq!(sketch.conditional_entropy, 0.0);
+            if symbol != 0 {
+                counts[symbol - 1] = 50;
+                let sketch = RefinementSketch::new(&counts);
+                assert!(sketch.conditional_entropy.is_finite());
+                let total = 150.0;
+                let entropy = 100.0 * (total / 100.0f64).log2() + 50.0 * (total / 50.0f64).log2();
+                assert!(sketch.lower_bound(&RefinementSketch::new(&[])) <= entropy);
+            }
+        }
+        for length in [2, 16, 64, 256] {
+            for mode in 0..4 {
+                let mut a = vec![1; length];
+                let mut b = vec![1; length];
+                let rest = i32::MAX as u64 - (length * 2) as u64;
+                if mode == 0 {
+                    for n in &mut a {
+                        *n += rest / (length * 2) as u64;
+                    }
+                    for n in &mut b {
+                        *n += rest / (length * 2) as u64;
+                    }
+                } else {
+                    a[length - 1] += rest / 2;
+                    b[if mode == 1 { length - 1 } else { length / 2 }] += rest - rest / 2;
+                }
+                if mode == 3 {
+                    b.fill(0);
+                }
+                let sa = RefinementSketch::new(&a);
+                let sb = RefinementSketch::new(&b);
+                let sum: Vec<_> = a.iter().zip(&b).map(|(a, b)| a + b).collect();
+                let bound = sa.lower_bound(&sb);
+                let combined_cost = fast_population_cost(&sum).unwrap();
+                assert!(
+                    bound <= f64::from(combined_cost),
+                    "len={length} mode={mode}"
+                );
+                let a_cost = fast_population_cost(&a).unwrap();
+                let b_cost = fast_population_cost(&b).unwrap();
+                if bound >= f64::from(a_cost) + f64::from(b_cost) {
+                    assert!(combined_cost - (a_cost + b_cost) >= 0.0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn conditional_refinement_matches_unpruned_dense_and_sparse_subbuckets() {
+        for shape in 0..4 {
+            let input: Vec<_> = (0..48)
+                .map(|i| {
+                    let mut counts = vec![0; 256];
+                    for (symbol, count) in counts.iter_mut().enumerate().skip(8) {
+                        *count = match shape {
+                            0 => 1 + ((symbol * 13 + (i / 4) * 71) % 29) as u64,
+                            1 => u64::from(symbol % 16 == (i / 4) % 16) * (1 + i as u64) * 1000,
+                            2 => {
+                                u64::from(symbol >= 128) * (symbol % 13 + 1) as u64 * (1 + i as u64)
+                            }
+                            _ => u64::from(symbol % 8 == (i / 4) % 8) * 10 + 1,
+                        };
+                    }
+                    Histogram::new(&counts).unwrap()
+                })
+                .collect();
+            let mut bounded = input.clone();
+            let mut unbounded = input;
+            let mut actual: Vec<_> = (0..48).collect();
+            let mut expected = actual.clone();
+            refine_with_workers(&mut bounded, &mut actual, true, 1).unwrap();
+            refine_with_workers(&mut unbounded, &mut expected, false, 1).unwrap();
+            assert_eq!(actual, expected, "shape={shape}");
+            assert_same_histograms(&bounded, &unbounded);
         }
     }
 

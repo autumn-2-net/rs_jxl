@@ -529,3 +529,256 @@ Local evidence under `out/low-effort-hotspots-20261114/`:
 `shared6/summary.json`, `shared-stages2/summary.json`, and
 `shared-controls/summary.json`. The frozen new benchmark executable is
 `bin/shared-e5.exe`; the CLI and FFI Release targets use the same source revision.
+
+## Completed 200-Image Follow-up (2026-11-15)
+
+The full effort refresh completed: 1,800 JXL encodes passed independent djxl
+pixel comparisons and all 200 recompressed PNGs passed sample comparisons.
+The cohort contains 619,577,505 pixels. JXL uses eight threads, one timed trial
+per image/effort. Native timing excludes I/O, process startup and verification,
+but includes encoder pool setup. Official 0.12 and previous Rust timings are
+cached, non-simultaneous measurements, not controlled paired repetitions.
+
+| Effort | Native seconds | MPix/s | Mean image bpp | Total bytes | Cached official seconds |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 1 | 2.547 | 243.249 | 8.680542 | 647,286,556 | 2.364 |
+| 2 | 11.281 | 54.921 | 7.886610 | 577,376,725 | 15.458 |
+| 3 | 15.300 | 40.496 | 7.583748 | 580,127,256 | 22.034 |
+| 4 | 24.370 | 25.424 | 7.318401 | 547,802,335 | 41.813 |
+| 5 | 47.460 | 13.055 | 6.900750 | 473,845,779 | 50.357 |
+| 6 | 59.570 | 10.401 | 6.810007 | 466,296,945 | 64.026 |
+| 7 | 89.425 | 6.928 | 6.701164 | 454,940,039 | 98.096 |
+| 8 | 171.237 | 3.618 | 6.654696 | 451,718,709 | 267.529 |
+| 9 | 305.103 | 2.031 | 6.439719 | 424,240,942 | 470.475 |
+
+Mean image bpp gives each image equal weight; total-byte changes need not follow
+it. e2-e9 retain the previous full-run sizes. e1 now uses real FastLossless,
+whereas the historical Rust e1 followed the e2-like route; its much faster time
+must not be presented as an equal-compression speedup. Against cached official
+0.12, e9 takes 35.15% less time and 5.42% fewer bytes on this cohort. e1 remains
+7.76% slower. These aggregates do not imply every image improves.
+
+PNG level 9 totals 718,252,404 bytes, mean image bpp 9.858680, and 433.437 seconds
+with one thread. It uses Pillow optimized PNG for 182 images and OpenCV/libpng
+for 18 16-bit images. This is not an optimal-PNG search or a same-thread speed
+comparison. Original PNGs total 708,591,234 bytes. e9 exceeds recompressed PNG
+on three images by only 1,135 bytes combined; nevertheless paper9bde remains
+354,791 bytes versus its original PNG's 323,776 bytes (+9.58%). Recompressed PNG
+alone would hide that remaining target.
+
+### Targeted Profiles and Scaling
+
+Six additional e8/e9, eight-thread profiles on original 1515.hdr, 1244.hdr and
+phoboslab.org passed official pixel comparison. Stage times below are inclusive
+scope sums across tasks: they overlap, can exceed wall time, and must not be
+added together or treated as exclusive CPU percentages.
+
+| Image / effort | Native wall seconds | Cluster refine scope sum | MA train scope sum | LZ parse scope sum |
+| --- | ---: | ---: | ---: | ---: |
+| 1515.hdr e8 | 12.245 | 38.984 | 38.234 | 2.846 |
+| 1515.hdr e9 | 22.249 | 88.273 | 57.575 | 1.371 |
+| 1244.hdr e8 | 9.505 | 21.548 | 34.280 | 2.677 |
+| 1244.hdr e9 | 20.243 | 72.090 | 61.745 | secondary |
+| phoboslab.org e8 | 4.732 | 3.410 | 5.580 | 2.777 |
+| phoboslab.org e9 | 18.050 | 4.385 | 29.608 | 62.631 |
+
+The HDR cases are not primarily LZ bottlenecks. 1515 e8 evaluates 2,290,296
+initial histogram pairs; its lower-bound counters skip only 7,051 pairs across
+initial and update phases combined. e9 evaluates 4,639,365 initial pairs.
+Do not divide the combined skip count by initial pairs to report a prune rate.
+`entropy/cluster.rs::refine_with_workers` evaluates full population costs;
+`ans_histogram.rs::fast_population_cost` tries a flat table and three rebalancing
+shifts. This is a concrete target for cheaper candidate bounds/ranking before
+normalization, not another generic LZ or wider-SIMD change.
+
+A separate uninstrumented 1515 e8 check, two repetitions at each thread count,
+passed four more pixel comparisons:
+
+| Threads | Runs (seconds) | Mean seconds | MPix/s from mean |
+| --- | --- | ---: | ---: |
+| 4 | 22.40819, 21.03890 | 21.72355 | 0.561 |
+| 8 | 12.46471, 11.38805 | 11.92638 | 1.022 |
+
+Eight threads reduce time by 45.10% (1.82x speedup). This disproves a wholly
+serial route for this case, not all possible task-granularity problems. No
+one-thread or 16/32-thread sweep was run here.
+
+### Next Experiments, Not Proven Improvements
+
+1. **HDR clustering work.** Measure normalization and merge-update work
+   separately; try stronger cheap bounds or a shortlist followed by exact
+   population costs. Check allocation/dispatch costs per merge. The current
+   code already has sketch bounds, versioned heap entries and parallel work;
+   do not describe these as missing. Approximate candidate selection may alter
+   compression and needs final bytes/time plus pixel validation, not an old
+   codestream hash requirement.
+2. **MA small/middle nodes.** 1515 e8 makes 577,520 node searches across 192
+   learners. In `ma_train/split_search.rs`, the allocation-free serial reduction
+   excludes `property_dedup`, which ordinary projection enables. Preserve dedup
+   while reducing candidates directly. Separately test histogram-cache admission
+   for the two-predictor middle-sized subtrees: existing earlier admission only
+   covers the 14-predictor case. Do not blindly increase memory budgets.
+3. **e3 HDR model selection.** Six HDR images account for 26,300,567 extra bytes
+   at e3 versus e2. e2 uses fixed Gradient prediction/property 9; e3 replaces it
+   with fixed Weighted prediction/property 15 and WP preset 0, without retaining
+   the former model. RCT, LZ and entropy policy do not explain this transition.
+   Separate prediction from context routing in ablations, then evaluate a cheap
+   representative-tile selector. Threshold saturation and WP quality remain
+   hypotheses, not established causes. Similar official sizes point to an
+   inherited policy weakness, not a newly invalid bitstream.
+4. **e8 marginal work.** e7 to e8 adds 91.48% time for 0.708% fewer total bytes.
+   1515 adds 9.38 seconds for 0.048% fewer bytes, and 1546 adds 6.36 seconds for
+   0.022%. e8 adds properties, finer bins, sampling and lower split admission,
+   plus Best/Precise entropy policy. Newly added MA properties do win many splits;
+   removing them is a compression-policy experiment, not proven waste removal.
+5. **Long-page LZ.** phobos e9 has a different bottleneck: optimal parsing and
+   chain batch filling. Its corpus result takes 15.99 seconds versus official
+   13.90, but saves 15.76% bytes, so it is not simply a bad route. Investigate
+   useful-match density and DP work separately from HDR clustering.
+
+Evidence: `out/effort-png200-20261114/{points.csv,summary.json,bpp-time.png,`
+`size-time.png}`, `out/post200-profile-20261115/heavy/summary.json`, and
+`out/post200-profile-20261115/hdr-threads/summary.json`. This follow-up changes
+no encoder policy or implementation; the above is a prioritized investigation
+plan based on measured stages and source inspection.
+
+## Conditional-Entropy Pruning Experiment
+
+The follow-up changes only Best histogram refinement in `entropy/cluster.rs`.
+It does not replace clustering with K-means, add encoder trials, reduce MA
+sampling, or change the decoder. The existing logarithmic 16-bin sketch loses
+all information about symbol distribution within a bin. Retaining a per-center
+conditional entropy makes its merge lower bound considerably tighter.
+
+For histogram `h`, total `N`, sketch `S(h)`, and bucket total `B[b]`, define:
+
+```text
+E(h) = sum_s h[s] * log2(N / h[s])
+C(h) = sum_b sum_{s in b} h[s] * log2(B[b] / h[s])
+E(a+b) >= E(S(a)+S(b)) + C(a) + C(b)
+bound = max(0, E(S(a)+S(b)) + C(a) + C(b) - 1 - 0.0001*(Na+Nb))
+```
+
+Zero terms are omitted. Homogeneity and concavity of conditional entropy give
+the inequality. The last two terms retain the existing source's margin for
+fixed-point/f32 ANS population-cost rounding. Shannon statistics are computed
+independently in f64, not from the `Histogram.entropy` field, which refinement
+overwrites with population cost. Rebuild only the surviving center's statistic
+after an accepted merge; other centers retain their values. Surviving candidate
+pairs still use the existing exact Fast population-cost calculation and heap.
+The separate neighborhood experiment retains its original coarse-bound API.
+
+No new unsafe code, model tables, syntax, public options or global caches are
+introduced. The added statistic occupies one f64 per center. This is a
+calculation-pruning change, not an approximate nearest-neighbor shortlist.
+
+### Paired Original-Image Results
+
+Evidence root: `out/cluster-bound-20261115/`. The baseline is the frozen
+`out/effort-png200-20261114/bin/portfolio_lab.exe`; the candidate is frozen as
+`bin/conditional.exe` under the evidence root. The paired report records both
+executable hashes and original input hashes. Builds/tests did not overlap timed
+encodes. No official encoding baseline was rerun.
+
+Fourteen originals cover two large 16-bit HDR images, a long webpage, manga,
+alpha icons, photographs, textures, editor/document screenshots and palette
+artwork. At e8/e9 and eight threads, two interleaved repetitions per image and
+binary produce 112 independent official djxl pixel checks, all passing. Timings
+are sums of per-image medians, excluding I/O and verification. Each image has
+equal weight in mean bpp. None of these encodes changed output size.
+
+| Effort / build | Native seconds | MPix/s | Mean image bpp | Total bytes |
+| --- | ---: | ---: | ---: | ---: |
+| e8 baseline | 31.97589 | 2.19067 | 7.109451 | 85,194,173 |
+| e8 conditional bound | 27.33085 | 2.56299 | 7.109451 | 85,194,173 |
+| e9 baseline | 69.35344 | 1.01002 | 6.585603 | 76,378,401 |
+| e9 conditional bound | 59.35988 | 1.18007 | 6.585603 | 76,378,401 |
+
+Aggregate time falls 14.53% at e8 and 14.41% at e9. The cohort deliberately
+contains hotspot images; these percentages are not predictions for the full
+200-image corpus. In particular, gains are not universal:
+
+| Original / effort | Baseline seconds | New seconds | Time change |
+| --- | ---: | ---: | ---: |
+| 1515.hdr e8 | 12.68961 | 10.44196 | -17.71% |
+| 1515.hdr e9 | 22.56118 | 17.32019 | -23.23% |
+| 1244.hdr e8 | 9.55704 | 7.52971 | -21.21% |
+| 1244.hdr e9 | 20.39727 | 15.63578 | -23.34% |
+| phoboslab.org e8 | 4.47048 | 4.06911 | -8.98% |
+| phoboslab.org e9 | 18.15129 | 18.38911 | +1.31% |
+| 0446 e9 | 1.26590 | 1.21294 | -4.18% |
+| wallhaven-mlzoy1 e8 | 2.22523 | 2.34647 | +5.45% |
+| wallhaven-mlzoy1 e9 | 3.30811 | 3.21032 | -2.96% |
+
+The e9 aggregate excluding both HDR originals is essentially unchanged. The
+phobos e9 run ranges overlap and its main bottleneck remains LZ, not clustering.
+Do not suppress the small slower-image results or infer universal acceleration
+from the total.
+
+### Why the HDR Improvement Is Credible
+
+Six additional profiled encodes pass official pixel validation. These scope
+times are inclusive sums across parallel work, not exclusive CPU time or wall
+time. The baseline profile is cached from the preceding investigation.
+
+| Original / effort | Old refine scope seconds | New refine scope seconds | Old skipped pairs | New skipped pairs |
+| --- | ---: | ---: | ---: | ---: |
+| 1515.hdr e8 | 38.984 | 23.596 | 7,051 | 1,662,959 |
+| 1515.hdr e9 | 88.273 | 54.473 | 292,229 | 3,902,984 |
+| 1244.hdr e8 | 21.548 | 8.676 | 33,102 | 1,227,910 |
+| 1244.hdr e9 | 72.090 | 42.423 | 246,353 | 3,499,865 |
+| phoboslab.org e8 | 3.410 | 1.787 | 89,917 | 226,695 |
+| phoboslab.org e9 | 4.385 | 2.163 | 126,721 | 280,230 |
+
+Skip counts include initial and post-merge candidate evaluations. They are not
+percentages of initial pairs. Both the algorithm counters and paired whole-image
+time support a real improvement on the HDR cases.
+
+Four wallpaper diagnostics at one/eight threads also pass pixel validation.
+Single-thread refine time falls from 0.1894 to 0.0888 seconds, while whole-image
+instrumented time is almost unchanged (14.768 to 14.733 seconds). Its MA training
+takes about 7.6 seconds. The corresponding eight-thread diagnostic reverses the
+first paired timing result, so the initial +5.45% is not by itself evidence of
+a repeatable clustering regression. These diagnostics are not headline timings.
+
+Validation: 180 affected entropy tests pass, including empty/singleton and wide
+prefix cases, serial/parallel refinement, dense/sparse distributions inside the
+same sketch bucket, bucket boundaries, and weights near i32::MAX. Numerical tests
+compare the adjusted bound against Shannon entropy and the actual population
+cost; primitive refinement tests compare with unpruned merge decisions. Pixel
+acceptance remains comparison with the original samples, not old JXL bytes.
+
+The conservative-bound change is retained. Lazy exact-cost evaluation remains a
+separate possible follow-up; it was not implemented or credited with these gains.
+No full-corpus rerun or commit/push was performed for this experiment.
+
+### Thread Controls and Wallpaper Retest
+
+A separate three-original cohort (16-bit RGB rough-linen texture, DIV2K 0446,
+and paper9bde) uses one/eight threads and two interleaved repetitions. All 48
+official pixel comparisons pass, with unchanged sizes. These are controls, not
+a substitute for single-thread measurements on the large HDR originals.
+
+| Effort / threads | Baseline seconds | New seconds | Time change | Baseline / new MPix/s |
+| --- | ---: | ---: | ---: | ---: |
+| e8 / 1 | 11.51270 | 11.05686 | -3.96% | 0.45802 / 0.47690 |
+| e8 / 8 | 2.02852 | 1.93831 | -4.45% | 2.59943 / 2.72040 |
+| e9 / 1 | 19.26271 | 18.53676 | -3.77% | 0.27374 / 0.28446 |
+| e9 / 8 | 3.27017 | 3.26210 | -0.25% | 1.61245 / 1.61644 |
+
+For both binaries and thread counts, this cohort totals 9,155,124 bytes at e8
+and 8,866,664 bytes at e9; mean image bpp is 16.742353 and 16.164490 respectively.
+High bpp here reflects the small cohort including a 16-bit RGB texture. The
+eight-thread e9 difference is too small to claim a meaningful speedup.
+
+Five more uninstrumented interleaved wallpaper e8 repetitions give medians of
+2.413074 seconds baseline and 2.392030 seconds new (-0.87%). Ranges are
+2.28282-2.44521 and 2.30270-2.50071 respectively. The initially observed +5.45%
+does not reproduce consistently. Treat this case as effectively unchanged, not
+as a demonstrated improvement or proof that no future image can regress.
+
+Across `profile3/`, `paired14/`, `wallpaper-profile/`, `threads3/`, and
+`wallpaper-repeat5/`, all 180 original-pixel checks pass on 15 distinct originals.
+Every matched baseline/candidate image-effort-thread key has the same output
+size. Reports contain raw trial times, commands, receipts and hashes; no encoded
+byte identity is required by the experiment.

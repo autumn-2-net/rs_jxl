@@ -194,6 +194,8 @@ def main(argv=None):
     for name in ("previous", "comparison", "encoder", "decoder", "outdir"):
         parser.add_argument("--" + name, type=Path, required=True)
     parser.add_argument("--label", default="rs_jxl current")
+    parser.add_argument("--resume-harness-update", action="store_true",
+                        help="Allow source-only harness repair; keep saved trials and codec identity")
     args = parser.parse_args(argv)
     args.outdir.mkdir(parents=True, exist_ok=True)
     progress = refresh.ProgressWriter(args.outdir / "progress.json")
@@ -206,6 +208,8 @@ def main(argv=None):
                          "--label", args.label]
             if (args.outdir / "jxl/identity.json").exists():
                 arguments.append("--resume")
+                if args.resume_harness_update:
+                    arguments.append("--resume-harness-update")
             current = refresh.benchmark(refresh.arguments(arguments))
             corpus.require(current["status"] == "complete", "JXL matrix incomplete; see jxl/summary.json")
             previous = corpus.loads(args.comparison.read_bytes())
