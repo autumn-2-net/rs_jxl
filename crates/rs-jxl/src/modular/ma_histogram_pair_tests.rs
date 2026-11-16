@@ -39,6 +39,7 @@ fn fresh_pair_matches_scalar_with_full_width_extra_counts() {
                 bounds,
                 [&mut a[1..bins * sa + 1], &mut b[1..bins * sb + 1]],
                 [&mut ea[1..bins + 1], &mut eb[1..bins + 1]],
+                contiguous_range(indices),
             );
             for (token, stride, counts, extra) in [
                 (tokens[0], sa, &mut expected_a, &mut expected_ea),
@@ -105,13 +106,34 @@ fn fresh_pair_matches_scalar_with_full_width_extra_counts() {
                 let indices: Vec<_> = (0..records).rev().collect();
                 let values: Vec<_> = (0..records).map(|i| (i * 37 % bins) as u32).collect();
                 check(&samples, &indices, &values, bins);
+                let forward: Vec<_> = (0..records).collect();
+                check(&samples, &forward, &values, bins);
+                check(&samples, &forward[records.min(7)..], &values, bins);
                 if bins < 256 {
                     let bytes: Vec<_> = values.iter().map(|&n| n as u8).collect();
                     check(&samples, &indices, &bytes, bins);
+                    check(&samples, &forward, &bytes, bins);
                 }
                 let filtered: Vec<_> = indices.into_iter().filter(|i| i % 7 != 0).collect();
                 check(&samples, &filtered, &values, bins);
             }
         }
     }
+}
+
+#[test]
+fn contiguous_sample_proof_checks_every_index_and_overflow() {
+    assert_eq!(contiguous_range(&[]), None);
+    assert_eq!(contiguous_range(&(0..511).collect::<Vec<_>>()), None);
+    assert_eq!(
+        contiguous_range(&(7..519).collect::<Vec<_>>()),
+        Some(7..519)
+    );
+    let mut indices: Vec<_> = (7..519).collect();
+    indices.swap(13, 14);
+    assert_eq!(contiguous_range(&indices), None);
+    indices.swap(13, 14);
+    indices[13] = indices[12];
+    assert_eq!(contiguous_range(&indices), None);
+    assert_eq!(contiguous_range(&vec![usize::MAX; 512]), None);
 }

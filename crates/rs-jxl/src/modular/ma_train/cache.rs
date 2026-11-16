@@ -232,7 +232,15 @@ impl PropertyHistogram {
                     &samples.residuals[active[1]][..],
                 );
                 if !packed::collect_pair(
-                    samples, indices, values, parents, used, weights, first, second,
+                    samples,
+                    indices,
+                    values,
+                    parents,
+                    used,
+                    weights,
+                    first,
+                    second,
+                    plan.contiguous.clone(),
                 ) {
                     for &i in indices {
                         let bin = values[i].index();

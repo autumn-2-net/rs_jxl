@@ -8,6 +8,17 @@ use super::TreeSamples;
 use super::{ParentHistogram, PropertyValue, ResidualToken, SampleStorage, Samples};
 use crate::{Error, Result};
 
+/// Node-local proof for the physically partitioned learner. Validate all indices,
+/// not just endpoints; arbitrary subsets keep the indexed collectors.
+pub(super) fn contiguous_range(indices: &[usize]) -> Option<std::ops::Range<usize>> {
+    if indices.len() < 512 {
+        return None;
+    }
+    let start = indices[0];
+    let range = start..start.checked_add(indices.len())?;
+    indices.iter().copied().eq(range.clone()).then_some(range)
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum DenseHistogram {
     #[default]
@@ -159,6 +170,7 @@ pub(super) fn collect_fresh_pair<T: PropertyValue>(
     extra_bounds: [u64; 2],
     counts: [&mut [u32]; 2],
     extra: [&mut [u64]; 2],
+    contiguous: Option<std::ops::Range<usize>>,
 ) {
     let [counts_a, counts_b] = counts;
     let [extra_a, extra_b] = extra;
@@ -166,13 +178,29 @@ pub(super) fn collect_fresh_pair<T: PropertyValue>(
     let [stride_a, stride_b] = strides;
     debug_assert!(extra_a.iter().chain(extra_b.iter()).all(|&v| v == 0));
     if indices.len() >= 512 && extra_bounds.iter().all(|&n| n <= u64::from(u32::MAX)) {
-        for &i in indices {
-            let bin = values[i].index();
-            let weight = u64::from(samples.counts[i]);
-            let (a, b) = (tokens_a[i], tokens_b[i]);
-            counts_a[bin * stride_a + usize::from(a.token)] += weight as u32;
-            counts_b[bin * stride_b + usize::from(b.token)] += weight as u32;
-            extra_a[bin] += weight * ((u64::from(b.nbits) << 32) | u64::from(a.nbits));
+        if let Some(range) = contiguous {
+            debug_assert!(indices.iter().copied().eq(range.clone()));
+            let rows = values[range.clone()]
+                .iter()
+                .zip(&samples.counts[range.clone()])
+                .zip(&tokens_a[range.clone()])
+                .zip(&tokens_b[range]);
+            for (((&value, &weight), &a), &b) in rows {
+                let bin = value.index();
+                let weight = u64::from(weight);
+                counts_a[bin * stride_a + usize::from(a.token)] += weight as u32;
+                counts_b[bin * stride_b + usize::from(b.token)] += weight as u32;
+                extra_a[bin] += weight * ((u64::from(b.nbits) << 32) | u64::from(a.nbits));
+            }
+        } else {
+            for &i in indices {
+                let bin = values[i].index();
+                let weight = u64::from(samples.counts[i]);
+                let (a, b) = (tokens_a[i], tokens_b[i]);
+                counts_a[bin * stride_a + usize::from(a.token)] += weight as u32;
+                counts_b[bin * stride_b + usize::from(b.token)] += weight as u32;
+                extra_a[bin] += weight * ((u64::from(b.nbits) << 32) | u64::from(a.nbits));
+            }
         }
         for (a, b) in extra_a.iter_mut().zip(extra_b) {
             *b = *a >> 32;

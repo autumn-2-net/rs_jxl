@@ -42,7 +42,12 @@ fn empty(bins: usize, stride: usize) -> BinHistogram {
     }
 }
 
-fn check<T: PropertyValue>(samples: &TreeSamples, values: &[T], indices: &[usize], bins: usize) {
+fn check<T: PropertyValue>(
+    samples: &Samples<impl SampleStorage>,
+    values: &[T],
+    indices: &[usize],
+    bins: usize,
+) {
     let parents = parent_histograms(samples, indices);
     let mut used = vec![0; bins];
     let mut weights = vec![0; bins];
@@ -56,6 +61,7 @@ fn check<T: PropertyValue>(samples: &TreeSamples, values: &[T], indices: &[usize
         &mut weights,
         &mut a,
         &mut b,
+        super::super::super::ma_histograms::contiguous_range(indices),
     );
     assert_eq!(accepted, usize::BITS >= 64 && indices.len() >= 512);
     if !accepted {
@@ -91,9 +97,13 @@ fn fused_packed_pairs_match_wide_independent_counters() {
                 let (samples, values) = samples(records, bins, pattern);
                 let indices: Vec<_> = (0..records).rev().collect();
                 check(&samples, &values, &indices, bins);
+                let forward: Vec<_> = (0..records).collect();
+                check(&samples, &values, &forward, bins);
+                check(&samples, &values, &forward[records.min(7)..], bins);
                 if bins <= 256 {
                     let packed: Vec<_> = values.iter().map(|&v| v as u8).collect();
                     check(&samples, &packed, &indices, bins);
+                    check(&samples, &packed, &forward, bins);
                 }
                 let removed: Vec<_> = indices.iter().copied().filter(|i| i % 7 != 0).collect();
                 check(&samples, &values, &removed, bins);
@@ -137,7 +147,8 @@ fn fused_packed_pairs_accept_full_halves_and_reject_overflow_before_writes() {
             &mut used,
             &mut weights,
             &mut a,
-            &mut b
+            &mut b,
+            None,
         ));
         assert_eq!(used, [0]);
         assert_eq!(weights, [0]);
@@ -145,5 +156,26 @@ fn fused_packed_pairs_accept_full_halves_and_reject_overflow_before_writes() {
         assert_eq!(a.extra, [0]);
         assert_eq!(b.extra, [0]);
         parents = original;
+    }
+}
+
+#[test]
+fn contiguous_packed_pairs_use_local_indices_in_nested_subtree_loans() {
+    let (mut samples, _) = samples(2301, 17, 0);
+    let mut views = samples.ranges_mut(&[7..1107, 1113..2300]).unwrap();
+    for view in &mut views {
+        assert_ne!(view.base(), 0);
+        let PropertyColumn::Wide(values) = &view.properties[0] else {
+            panic!("wide fixture");
+        };
+        let indices: Vec<_> = (5..view.counts.len()).collect();
+        check(view, values, &indices, 17);
+        let mut nested = view.ranges_mut(&[11..1031]).unwrap();
+        let nested = &mut nested[0];
+        let PropertyColumn::Wide(values) = &nested.properties[0] else {
+            panic!("wide fixture");
+        };
+        let indices: Vec<_> = (0..nested.counts.len()).collect();
+        check(nested, values, &indices, 17);
     }
 }

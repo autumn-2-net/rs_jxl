@@ -64,6 +64,8 @@ pub(super) fn predictor_penalty(predictor: Predictor, parent: Predictor, thresho
 /// enc_ma.cc::FindBestSplitImpl representative/penalty construction. This proof
 /// belongs to one node, not to retained worker scratch or an inherited cache.
 pub(super) struct PredictorPlan {
+    // Indices are local to the current Samples view, including subtree loans.
+    pub(super) contiguous: Option<std::ops::Range<usize>>,
     pub(super) parent_predictor: usize,
     pub(super) representative: [usize; 14],
     pub(super) penalty: [f32; 14],
@@ -75,6 +77,7 @@ impl PredictorPlan {
     pub(super) fn identity(predictors: usize) -> Self {
         debug_assert!(predictors <= 14);
         Self {
+            contiguous: None,
             parent_predictor: 0,
             representative: std::array::from_fn(|i| i),
             penalty: [0.0; 14],
@@ -92,6 +95,9 @@ impl PredictorPlan {
     ) -> Self {
         let predictors = parents.len();
         let mut plan = Self::identity(predictors);
+        if predictors == 2 {
+            plan.contiguous = super::ma_histograms::contiguous_range(indices);
+        }
         plan.parent_predictor = parent_predictor;
         plan.active_count = 0;
         for predictor in 0..predictors {
@@ -495,6 +501,7 @@ pub(super) fn evaluate_property_values<T: PropertyValue>(
                                 [parent.extra_bits, parents[predictor + 1].extra_bits],
                                 [&mut scratch.increase, &mut scratch.paired_increase],
                                 [&mut scratch.extra, &mut scratch.paired_extra],
+                                plan.contiguous.clone(),
                             );
                         }
                         drop(_pair_fill_scope);

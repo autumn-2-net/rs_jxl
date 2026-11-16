@@ -16,6 +16,7 @@ pub(super) fn collect_pair<T: PropertyValue>(
     weights: &mut [u32],
     first: &mut BinHistogram,
     second: &mut BinHistogram,
+    contiguous: Option<std::ops::Range<usize>>,
 ) -> bool {
     if usize::BITS < 64
         || indices.len() < 512
@@ -34,14 +35,31 @@ pub(super) fn collect_pair<T: PropertyValue>(
     debug_assert!(weights.iter().all(|&v| v == 0));
     debug_assert!(first.extra.iter().chain(&second.extra).all(|&v| v == 0));
     let (a, b) = (&samples.residuals[0][..], &samples.residuals[1][..]);
-    for &i in indices {
-        let bin = values[i].index();
-        let weight = u64::from(samples.counts[i]);
-        used[bin] += ((weight << 32) | 1) as usize;
-        let (a, b) = (a[i], b[i]);
-        first.counts[bin * first.symbols + usize::from(a.token)] += weight as u32;
-        second.counts[bin * second.symbols + usize::from(b.token)] += weight as u32;
-        first.extra[bin] += weight * ((u64::from(b.nbits) << 32) | u64::from(a.nbits));
+    if let Some(range) = contiguous {
+        debug_assert!(indices.iter().copied().eq(range.clone()));
+        let rows = values[range.clone()]
+            .iter()
+            .zip(&samples.counts[range.clone()])
+            .zip(&a[range.clone()])
+            .zip(&b[range]);
+        for (((&value, &weight), &a), &b) in rows {
+            let bin = value.index();
+            let weight = u64::from(weight);
+            used[bin] += ((weight << 32) | 1) as usize;
+            first.counts[bin * first.symbols + usize::from(a.token)] += weight as u32;
+            second.counts[bin * second.symbols + usize::from(b.token)] += weight as u32;
+            first.extra[bin] += weight * ((u64::from(b.nbits) << 32) | u64::from(a.nbits));
+        }
+    } else {
+        for &i in indices {
+            let bin = values[i].index();
+            let weight = u64::from(samples.counts[i]);
+            used[bin] += ((weight << 32) | 1) as usize;
+            let (a, b) = (a[i], b[i]);
+            first.counts[bin * first.symbols + usize::from(a.token)] += weight as u32;
+            second.counts[bin * second.symbols + usize::from(b.token)] += weight as u32;
+            first.extra[bin] += weight * ((u64::from(b.nbits) << 32) | u64::from(a.nbits));
+        }
     }
     for (records, weight) in used.iter_mut().zip(weights) {
         *weight = ((*records as u64) >> 32) as u32;
