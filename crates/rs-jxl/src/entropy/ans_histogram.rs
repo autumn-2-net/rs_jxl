@@ -478,28 +478,15 @@ impl<Counts: AsRef<[u16]> + AsMut<[u16]>> NormalizedHistogram<Counts> {
                     }
                 };
                 // Keep the first equal candidate, as std::max/min_element do.
-                let mut best_inc = 0;
-                for i in 1..bins.len() {
-                    if inc(&bins[i]) >> ac[bins[i].count_index].step_log
-                        > inc(&bins[best_inc]) >> ac[bins[best_inc].count_index].step_log
-                    {
-                        best_inc = i;
-                    }
-                }
-                if inc(&bins[best_inc]) > 0 {
+                let (best_inc, inc_score) =
+                    best_adjustment(bins, true, |bin| (inc(bin), ac[bin.count_index].step_log));
+                if inc_score > 0 {
                     let bin = &mut bins[best_inc];
                     rest -= 1 << ac[bin.count_index].step_log;
                     bin.count_index -= 1;
                 } else {
-                    let mut best_dec = 0;
-                    for i in 1..bins.len() {
-                        let candidate = dec(&bins[i]);
-                        let best = dec(&bins[best_dec]);
-                        if candidate.0 >> candidate.1 < best.0 >> best.1 {
-                            best_dec = i;
-                        }
-                    }
-                    if dec(&bins[best_dec]).0 >= 0 {
+                    let (best_dec, dec_score) = best_adjustment(bins, false, dec);
+                    if dec_score >= 0 {
                         break;
                     }
                     let bin = &mut bins[best_dec];
@@ -535,6 +522,29 @@ impl<Counts: AsRef<[u16]> + AsMut<[u16]>> NormalizedHistogram<Counts> {
         }
         Ok(())
     }
+}
+
+// The winning bin stays unchanged during a scan. Keep its unshifted score as
+// well: arithmetic right shifts can collapse distinct scores into equal keys.
+#[inline]
+fn best_adjustment<T>(bins: &[T], maximize: bool, score: impl Fn(&T) -> (i64, u8)) -> (usize, i64) {
+    let (mut best_raw, shift) = score(&bins[0]);
+    let mut best_key = best_raw >> shift;
+    let mut best = 0;
+    for (i, bin) in bins.iter().enumerate().skip(1) {
+        let (raw, shift) = score(bin);
+        let key = raw >> shift;
+        if if maximize {
+            key > best_key
+        } else {
+            key < best_key
+        } {
+            best = i;
+            best_key = key;
+            best_raw = raw;
+        }
+    }
+    (best, best_raw)
 }
 
 #[cfg(test)]
@@ -674,6 +684,51 @@ pub(super) mod test_decode {
 mod tests {
     use super::*;
     use test_decode::Reader;
+
+    #[test]
+    fn adjustment_reduction_preserves_raw_scores_first_ties_and_signed_keys() {
+        use std::cell::Cell;
+        let check = |values: &[(i64, u8)]| {
+            for maximize in [false, true] {
+                // Independent form of the previous best-bin comparison loop.
+                let mut expected = 0;
+                for i in 1..values.len() {
+                    let a = values[i].0 >> values[i].1;
+                    let b = values[expected].0 >> values[expected].1;
+                    if (maximize && a > b) || (!maximize && a < b) {
+                        expected = i;
+                    }
+                }
+                let calls = Cell::new(0);
+                let actual = best_adjustment(values, maximize, |&entry| {
+                    calls.set(calls.get() + 1);
+                    entry
+                });
+                assert_eq!(actual, (expected, values[expected].0));
+                assert_eq!(calls.get(), values.len());
+            }
+        };
+        for values in [
+            vec![(0, 0)],
+            vec![(0, 10), (1, 10), (1023, 10)],
+            vec![(-1, 10), (-1024, 10), (-2, 10)],
+            vec![(i64::MAX, 0), (i64::MIN, 0), (0, 0)],
+            vec![(i64::MAX, 10), (i64::MAX, 0), (-1, 0)],
+            vec![(8, 3), (1, 0), (3, 1), (-2, 1)],
+        ] {
+            check(&values);
+        }
+        let mut state = 0x6b8c_d432_521a_77f1u64;
+        for length in 1..=MAX_ALPHABET_SIZE {
+            let values: Vec<_> = (0..length)
+                .map(|i| {
+                    state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    (state as i64, (i % 11) as u8)
+                })
+                .collect();
+            check(&values);
+        }
+    }
 
     const STRATEGIES: [AnsHistogramStrategy; 5] = [
         AnsHistogramStrategy::Fast,
