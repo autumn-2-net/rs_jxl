@@ -410,12 +410,20 @@ impl Model {
     ) -> Result<Self> {
         let _profile = crate::profile::scope("entropy.model_candidate");
         crate::profile::note("entropy.model_candidate", format_args!("prefix={prefix}"));
+        // The cluster API's prefix flag is only a singleton guard. Gate the
+        // experiment here, where the actual coding mode is known.
+        let clustering = if prefix && matches!(options.clustering, ClusterStrategy::Emeans(_)) {
+            super::cluster::emeans::fallback();
+            ClusterStrategy::Best
+        } else {
+            options.clustering
+        };
         let (clustered, map) = if options.add_fixed_histograms {
             super::cluster::cluster_with_preexisting(
                 counts,
                 &[vec![if prefix { 128 } else { 16 }; 256]],
                 options.max_histograms,
-                options.clustering,
+                clustering,
                 prefix && options.prefix_singleton_guard,
             )?
         } else if counts.len() == 1 && counts[0].len() <= super::prefix_code::MAX_ALPHABET_SIZE {
@@ -432,7 +440,7 @@ impl Model {
             let (clustered, map) = super::cluster::cluster_with_options(
                 counts,
                 options.max_histograms,
-                options.clustering,
+                clustering,
                 prefix && options.prefix_singleton_guard,
             )?;
             (clustered, map)
@@ -1098,6 +1106,55 @@ mod fixed_tests;
 mod tests {
     use super::super::options::{AnsHistogramStrategy, ClusterStrategy};
     use super::*;
+
+    #[test]
+    fn ema_prefix_and_incremental_models_keep_original_path() {
+        let streams = vec![
+            (0..4096)
+                .map(|i| Token::literal(i % 64, ((i / 64 + i % 7) % 31) as u32))
+                .collect::<Vec<_>>(),
+        ];
+        let ema = ClusterStrategy::Emeans(super::super::cluster::emeans::Options::default());
+        for guard in [false, true] {
+            let base = EntropyOptions {
+                prefix_singleton_guard: guard,
+                ..Default::default()
+            };
+            let options = EntropyOptions {
+                clustering: ema,
+                ..base
+            };
+            let a = Model::build_with_options(&streams, 64, false, Coding::Prefix, &base).unwrap();
+            let b =
+                Model::build_with_options(&streams, 64, false, Coding::Prefix, &options).unwrap();
+            assert_eq!(encoded(&a, &streams), encoded(&b, &streams));
+        }
+        for coding in [Coding::Prefix, Coding::Ans] {
+            let base = EntropyOptions {
+                streaming_mode: true,
+                ..Default::default()
+            };
+            // Start from identical already-stored tables. Only the append
+            // requests EMA, which must leave those tables frozen.
+            let mut a = Model::build_with_options(&streams, 64, false, coding, &base).unwrap();
+            let mut b = Model::build_with_options(&streams, 64, false, coding, &base).unwrap();
+            assert_eq!(
+                a.append_with_options(&streams, 64, false, &base).unwrap(),
+                b.append_with_options(
+                    &streams,
+                    64,
+                    false,
+                    &EntropyOptions {
+                        clustering: ema,
+                        ..base
+                    }
+                )
+                .unwrap()
+            );
+            assert_eq!(encoded(&a, &streams), encoded(&b, &streams));
+            assert_eq!(a.map, b.map);
+        }
+    }
 
     #[test]
     fn source_singleton_entropy_and_empty_winner_fallback() {

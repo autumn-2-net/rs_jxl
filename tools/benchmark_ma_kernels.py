@@ -15,11 +15,83 @@ import shutil
 from statistics import median
 import tempfile
 
-from compare_cpp_port import (
-    check_process, clean_environment, compare_pixels, decoder_command,
-    file_sha256, png_samples, run_process,
-)
-from corpus_inputs import prepare
+
+def parse_ema(values, variants, distances=(), polish=(), final_assignment=()):
+    ema = {}
+    for value in values:
+        match = re.fullmatch(r"([a-zA-Z0-9_-]+)=([0-9]+):(random|farthest)", value)
+        if match is None:
+            raise ValueError("Require --ema NAME=PASSES:random|farthest")
+        name, passes, initialization = match.groups()
+        passes = int(passes)
+        if name not in variants or name in ema or not 1 <= passes <= 255:
+            raise ValueError("EMA requires a known, unique variant and passes in 1..255")
+        ema[name] = dict(passes=passes, initialization=initialization)
+    for flag, settings, field, pattern in (
+            ("--ema-distance", distances, "distance", r"cross-entropy|hellinger|merge-entropy"),
+            ("--ema-polish", polish, "polish", r"[0-9]+")):
+        seen = set()
+        for value in settings:
+            match = re.fullmatch(r"([a-zA-Z0-9_-]+)=(" + pattern + r")", value)
+            if match is None:
+                raise ValueError(f"Require {flag} NAME=" + (
+                    "cross-entropy|hellinger|merge-entropy" if field == "distance" else "PASSES (0..255)"))
+            name, setting = match.groups()
+            if name not in ema or name in seen:
+                raise ValueError(f"{flag} requires a known, unique --ema variant")
+            if field == "polish":
+                setting = int(setting)
+                if not 0 <= setting <= 255:
+                    raise ValueError("EMA polish passes must be in 0..255")
+            ema[name][field] = setting
+            seen.add(name)
+    seen = set()
+    for name in final_assignment:
+        if not re.fullmatch(r"[a-zA-Z0-9_-]+", name) or name not in ema or name in seen:
+            raise ValueError("--ema-final-assignment requires a safe, unique --ema variant name")
+        ema[name]["final_assignment"] = True
+        seen.add(name)
+    return ema
+
+
+def ema_arguments(options):
+    if options is None:
+        return []
+    result = ["--ema-passes", str(options["passes"])]
+    if options["initialization"] == "farthest":
+        result.append("--ema-farthest")
+    if "distance" in options:
+        result.extend(["--ema-distance", options["distance"]])
+    if "polish" in options:
+        result.extend(["--ema-polish", str(options["polish"])])
+    if options.get("final_assignment", False):
+        result.append("--ema-final-assignment")
+    return result
+
+
+def validate_ema_receipt(row, options):
+    # Older baseline binaries predate all EMA receipt fields.
+    if options is None and not any(field in row for field in (
+            "ema_passes", "ema_farthest", "ema_distance", "ema_polish", "ema_final_assignment")):
+        return
+    passes = options["passes"] if options is not None else None
+    farthest = options is not None and options["initialization"] == "farthest"
+    if ("ema_passes" not in row or "ema_farthest" not in row
+            or type(row["ema_passes"]) is not type(passes)
+            or row["ema_passes"] != passes or row["ema_farthest"] is not farthest):
+        raise ValueError("EMA receipt does not match requested passes/initialization")
+    distance = options.get("distance", "cross-entropy") if options is not None else None
+    polish = options.get("polish", 0) if options is not None else 0
+    # Legacy EMA binaries only implement cross-entropy without polishing.
+    actual_distance = row.get("ema_distance", "cross-entropy" if options is not None else None)
+    actual_polish = row.get("ema_polish", 0)
+    if (type(actual_distance) is not type(distance) or actual_distance != distance
+            or type(actual_polish) is not int or actual_polish != polish):
+        raise ValueError("EMA receipt does not match requested distance/polish")
+    final_assignment = options.get("final_assignment", False) if options is not None else False
+    actual_final_assignment = row.get("ema_final_assignment", False)
+    if type(actual_final_assignment) is not bool or actual_final_assignment is not final_assignment:
+        raise ValueError("EMA receipt does not match requested final assignment")
 
 
 def summarize(rows):
@@ -71,6 +143,14 @@ def main():
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--variant", action="append", required=True, metavar="NAME=EXECUTABLE")
     parser.add_argument("--avx512", nargs="*", default=[], help="Variant names opting into existing AVX512 scoring")
+    parser.add_argument("--ema", action="append", default=[], metavar="NAME=PASSES:random|farthest",
+                        help="Opt a variant into EMA clustering with 1..255 passes; repeat per variant")
+    parser.add_argument("--ema-distance", action="append", default=[], metavar="NAME=MODE",
+                        help="Set cross-entropy, hellinger or merge-entropy for a --ema variant")
+    parser.add_argument("--ema-polish", action="append", default=[], metavar="NAME=PASSES",
+                        help="Set 0..255 polishing passes for a --ema variant")
+    parser.add_argument("--ema-final-assignment", action="append", default=[], metavar="NAME",
+                        help="Assign against frozen final centers for a --ema variant")
     parser.add_argument("--decoder", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--threads", type=int, nargs="+", default=[1, 4, 16])
@@ -95,6 +175,18 @@ def main():
         variants[name] = Path(path).resolve(strict=True)
     if not set(args.avx512) <= variants.keys():
         parser.error("Unknown AVX512 variant")
+    try:
+        ema = parse_ema(args.ema, variants, args.ema_distance, args.ema_polish,
+                        args.ema_final_assignment)
+    except ValueError as error:
+        parser.error(str(error))
+
+    from compare_cpp_port import (
+        check_process, clean_environment, compare_pixels, decoder_command,
+        file_sha256, png_samples, run_process,
+    )
+    from corpus_inputs import prepare
+
     cases = json.loads(args.manifest.read_text(encoding="utf-8"))["cases"]
     if not cases or len({str(Path(c["source"]).resolve()) for c in cases}) != len(cases):
         parser.error("Require a nonempty manifest of distinct sources")
@@ -108,7 +200,7 @@ def main():
         frozen[name] = target
     manifest = dict(cases=cases, threads=args.threads, repeats=args.repeats,
                     profile=args.profile, profile_ma_nodes=args.profile_ma_nodes,
-                    avx512=args.avx512, effort=args.effort,
+                    avx512=args.avx512, ema=ema, effort=args.effort,
                     binaries={name: dict(source=str(variants[name]), sha256=file_sha256(path))
                               for name, path in frozen.items()},
                     decoder=dict(path=str(args.decoder), sha256=file_sha256(args.decoder)),
@@ -142,7 +234,8 @@ def main():
                                     active_env["RS_JXL_PROFILE_MA_NODES"] = "1"
                             process = run_process([str(frozen[name]), str(snapshot), "--output", str(output),
                                                    "--effort", str(args.effort), "--threads", str(threads),
-                                                   "--direct-candidate", "baseline"], active_env, args.timeout)
+                                                   "--direct-candidate", "baseline"] + ema_arguments(ema.get(name)),
+                                                  active_env, args.timeout)
                             check_process(process)
                             row = json.loads(process["stdout"])
                             if (not row["direct"] or row["encode_calls"] != 1
@@ -151,6 +244,7 @@ def main():
                                     or not math.isfinite(row["seconds"]) or row["seconds"] <= 0
                                     or (row["width"], row["height"]) != (expected.width, expected.height)):
                                 raise ValueError("Invalid native encoder receipt")
+                            validate_ema_receipt(row, ema.get(name))
                             dec = run_process(decoder_command(args.decoder, output, decoded, expected.depth), env, args.timeout)
                             check_process(dec)
                             compare_pixels(expected, png_samples(decoded.read_bytes()))

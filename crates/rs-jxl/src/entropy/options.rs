@@ -251,6 +251,9 @@ impl EntropyOptions {
     }
 
     pub fn validate(&self) -> Result<()> {
+        if let ClusterStrategy::Emeans(options) = self.clustering {
+            options.validate()?;
+        }
         if self.max_histograms > MAX_HISTOGRAMS
             || (self.max_histograms == 0 && !self.streaming_mode)
         {

@@ -37,6 +37,9 @@ use crate::{Error, Result};
 #[path = "cluster_neighborhood.rs"]
 pub(crate) mod neighborhood;
 
+#[path = "cluster_emeans.rs"]
+pub mod emeans;
+
 const MAX_ALPHABET: usize = super::prefix_code::MAX_ALPHABET_SIZE;
 const MAX_CLUSTERS: usize = 256;
 const MIN_DISTINCT_DISTANCE: f32 = 48.0;
@@ -47,6 +50,9 @@ pub enum ClusterStrategy {
     Fast,
     #[default]
     Best,
+    /// Experimental token-weighted EMA assignment followed by ANS merges.
+    /// Not a preset; prefix and incremental models retain Best clustering.
+    Emeans(emeans::Options),
 }
 
 #[derive(Clone, Debug)]
@@ -211,6 +217,28 @@ fn update_distances(
 
 fn fast_cluster(
     input: &[Histogram],
+    output: Vec<Histogram>,
+    limit: usize,
+    prefix_codes: bool,
+    workers: usize,
+) -> Result<(Vec<Histogram>, Vec<usize>)> {
+    let previous = output.len();
+    let (mut output, mut symbols) = seed_histograms(input, output, limit, prefix_codes, workers)?;
+    let _assign_profile = crate::profile::scope("entropy.cluster.assign");
+    assign_histograms(
+        input,
+        &mut output,
+        &mut symbols,
+        previous,
+        limit,
+        prefix_codes,
+        workers,
+    )?;
+    Ok((output, symbols))
+}
+
+fn seed_histograms(
+    input: &[Histogram],
     mut output: Vec<Histogram>,
     limit: usize,
     prefix_codes: bool,
@@ -270,16 +298,6 @@ fn fast_cluster(
         ),
     );
     drop(seed_profile);
-    let _assign_profile = crate::profile::scope("entropy.cluster.assign");
-    assign_histograms(
-        input,
-        &mut output,
-        &mut symbols,
-        previous,
-        limit,
-        prefix_codes,
-        workers,
-    )?;
     Ok((output, symbols))
 }
 
@@ -724,6 +742,9 @@ pub fn cluster_with_preexisting(
     prefix_codes: bool,
 ) -> Result<(Vec<Vec<u64>>, Vec<u8>)> {
     let _profile = crate::profile::scope("entropy.cluster");
+    if let ClusterStrategy::Emeans(options) = strategy {
+        options.validate()?;
+    }
     if crate::profile::enabled() {
         crate::profile::note(
             "entropy.cluster",
@@ -771,14 +792,28 @@ pub fn cluster_with_preexisting(
     if strategy == ClusterStrategy::Fastest {
         additional = additional.min(4);
     }
-    let (mut histograms, mut symbols) = fast_cluster(
-        &input,
-        centers,
-        previous.len() + additional,
-        prefix_codes,
-        pool_workers(),
-    )?;
-    if previous.is_empty() && strategy == ClusterStrategy::Best {
+    let proposal = match strategy {
+        ClusterStrategy::Emeans(options) if previous.is_empty() && !prefix_codes => {
+            emeans::propose(&input, additional, options, pool_workers())?
+        }
+        ClusterStrategy::Emeans(_) => {
+            emeans::fallback();
+            None
+        }
+        _ => None,
+    };
+    let (mut histograms, mut symbols) = match proposal {
+        Some(proposal) => proposal,
+        None => fast_cluster(
+            &input,
+            centers,
+            previous.len() + additional,
+            prefix_codes,
+            pool_workers(),
+        )?,
+    };
+    if previous.is_empty() && matches!(strategy, ClusterStrategy::Best | ClusterStrategy::Emeans(_))
+    {
         refine(&mut histograms, &mut symbols)?;
     }
     let mut canonical = vec![usize::MAX; histograms.len()];

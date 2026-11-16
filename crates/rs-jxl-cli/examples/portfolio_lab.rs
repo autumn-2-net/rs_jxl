@@ -12,6 +12,34 @@ use std::{fs, io::Write, path::PathBuf, sync::Arc, time::Instant};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+enum DirectEmaDistance {
+    #[default]
+    CrossEntropy,
+    Hellinger,
+    MergeEntropy,
+}
+
+impl DirectEmaDistance {
+    fn name(self) -> &'static str {
+        match self {
+            Self::CrossEntropy => "cross-entropy",
+            Self::Hellinger => "hellinger",
+            Self::MergeEntropy => "merge-entropy",
+        }
+    }
+}
+
+impl From<DirectEmaDistance> for rs_jxl::entropy::cluster::emeans::Distance {
+    fn from(value: DirectEmaDistance) -> Self {
+        match value {
+            DirectEmaDistance::CrossEntropy => Self::CrossEntropy,
+            DirectEmaDistance::Hellinger => Self::Hellinger,
+            DirectEmaDistance::MergeEntropy => Self::MergeEntropy,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum DirectSourceTools {
     Baseline,
@@ -126,6 +154,21 @@ impl DirectMaProfile {
     after_help = "Candidate probe_seconds sum elapsed probe work and can exceed scout_seconds when roots run concurrently; scout_seconds is wall time."
 )]
 struct Args {
+    /// Opt-in EMA histogram clustering; ordinary defaults are unchanged.
+    #[arg(long, requires = "direct_candidate", value_parser = clap::value_parser!(u8).range(1..))]
+    ema_passes: Option<u8>,
+    /// Keep ordinary farthest-point initialization instead of random seeds.
+    #[arg(long, requires = "ema_passes")]
+    ema_farthest: bool,
+    /// Override the EMA assignment distance for this experiment only.
+    #[arg(long, value_enum, requires = "ema_passes")]
+    ema_distance: Option<DirectEmaDistance>,
+    /// Optional native Fast ANS population-cost relocation passes.
+    #[arg(long, requires = "ema_passes")]
+    ema_polish: Option<u8>,
+    /// Assign against frozen final EMA centers before rebuilding histograms.
+    #[arg(long, requires = "ema_passes")]
+    ema_final_assignment: bool,
     input: Option<PathBuf>,
     #[arg(long, required_unless_present_any = ["plan_only", "list_candidates"])]
     output: Option<PathBuf>,
@@ -198,6 +241,7 @@ fn encode_direct(args: &Args, image: &rs_jxl::Image, recipe: Candidate) -> Resul
         && args.direct_source_tools.is_none()
         && args.direct_ma_profile.is_none()
         && args.direct_tree_learning.is_none()
+        && args.ema_passes.is_none()
     {
         Some(rs_jxl::scheduler::native::encode_native_candidate(
             &rs_jxl::scheduler::CandidateParams::default().backend(1)?,
@@ -236,6 +280,24 @@ fn encode_direct(args: &Args, image: &rs_jxl::Image, recipe: Candidate) -> Resul
         }
     }
     let receipt = Arc::new(refinement::Receipt::default());
+    if let Some(passes) = args.ema_passes {
+        use rs_jxl::entropy::cluster::{ClusterStrategy, emeans};
+        let strategy = ClusterStrategy::Emeans(emeans::Options {
+            passes,
+            distance: args.ema_distance.unwrap_or_default().into(),
+            polish_passes: args.ema_polish.unwrap_or(0),
+            final_assignment: args.ema_final_assignment,
+            initialization: if args.ema_farthest {
+                emeans::Initialization::Farthest
+            } else {
+                emeans::Initialization::Random
+            },
+        });
+        configured.modular.entropy_options.clustering = strategy;
+        if let Some(reference) = &mut configured.source_patch_reference {
+            reference.modular.entropy_options.clustering = strategy;
+        }
+    }
     let learning_receipt = Arc::new(TreeLearningReceipt::default());
     configured.modular.refinement.receipt = Some(Arc::clone(&receipt));
     configured.modular.tree_learning_receipt = Some(Arc::clone(&learning_receipt));
@@ -304,6 +366,7 @@ fn encode_direct(args: &Args, image: &rs_jxl::Image, recipe: Candidate) -> Resul
         "offset_seconds": work.offset_seconds, "refit_seconds": work.refit_seconds,
         "model_seconds": work.model_seconds, "write_seconds": work.write_seconds,
     });
+    let ema_work = rs_jxl::entropy::cluster::emeans::work();
     println!(
         "{}",
         serde_json::json!({
@@ -315,6 +378,17 @@ fn encode_direct(args: &Args, image: &rs_jxl::Image, recipe: Candidate) -> Resul
             "seconds": seconds, "mpix_per_second": pixels / 1e6 / seconds,
             "encode_calls": 1, "preparation_cache_bytes": 0,
             "direct_ma_profile": actual_profile,
+            "ema_passes": args.ema_passes,
+            "ema_farthest": args.ema_farthest,
+            "ema_distance": args.ema_passes.map(|_| args.ema_distance.unwrap_or_default().name()),
+            "ema_polish": if args.ema_passes.is_some() { args.ema_polish.unwrap_or(0) } else { 0 },
+            "ema_final_assignment": args.ema_passes.is_some() && args.ema_final_assignment,
+            "ema_work": {
+                "calls": ema_work.calls, "fallbacks": ema_work.fallbacks,
+                "contexts": ema_work.contexts, "initial_centers": ema_work.initial_centers,
+                "occupied_centers": ema_work.occupied_centers,
+                "parallel_batches": ema_work.parallel_batches,
+            },
             "direct_tree_learning": learning_mode,
             "tree_learning": {
                 "learners": learning.learners, "records": learning.records,
@@ -471,6 +545,122 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn ema_experiments_require_passes_and_preserve_defaults() {
+        let base = [
+            "lab",
+            "input.png",
+            "--direct-candidate",
+            "baseline",
+            "--output",
+            "out.jxl",
+        ];
+        let args = Args::try_parse_from(base).unwrap();
+        assert_eq!(args.ema_passes, None);
+        assert_eq!(args.ema_distance, None);
+        assert_eq!(args.ema_polish, None);
+        assert!(!args.ema_final_assignment);
+        let args = Args::try_parse_from(base.into_iter().chain(["--ema-passes", "3"])).unwrap();
+        assert_eq!(
+            args.ema_distance.unwrap_or_default(),
+            DirectEmaDistance::CrossEntropy
+        );
+        assert_eq!(args.ema_polish.unwrap_or(0), 0);
+        assert!(!args.ema_final_assignment);
+        assert!(Args::try_parse_from(base.into_iter().chain(["--ema-final-assignment"])).is_err());
+        let args = Args::try_parse_from(base.into_iter().chain([
+            "--ema-passes",
+            "3",
+            "--ema-final-assignment",
+        ]))
+        .unwrap();
+        assert!(args.ema_final_assignment);
+        let args = Args::try_parse_from(base.into_iter().chain([
+            "--ema-passes",
+            "3",
+            "--ema-distance",
+            "merge-entropy",
+            "--ema-polish",
+            "1",
+            "--ema-final-assignment",
+        ]))
+        .unwrap();
+        assert!(args.ema_final_assignment);
+        for (name, expected) in [
+            (
+                "cross-entropy",
+                rs_jxl::entropy::cluster::emeans::Distance::CrossEntropy,
+            ),
+            (
+                "hellinger",
+                rs_jxl::entropy::cluster::emeans::Distance::Hellinger,
+            ),
+            (
+                "merge-entropy",
+                rs_jxl::entropy::cluster::emeans::Distance::MergeEntropy,
+            ),
+        ] {
+            assert!(
+                Args::try_parse_from(base.into_iter().chain(["--ema-distance", name])).is_err()
+            );
+            let args = Args::try_parse_from(base.into_iter().chain([
+                "--ema-passes",
+                "3",
+                "--ema-distance",
+                name,
+            ]))
+            .unwrap();
+            let distance = args.ema_distance.unwrap();
+            assert_eq!(distance.name(), name);
+            assert_eq!(
+                rs_jxl::entropy::cluster::emeans::Distance::from(distance),
+                expected
+            );
+        }
+        for passes in ["0", "255"] {
+            assert!(
+                Args::try_parse_from(base.into_iter().chain(["--ema-polish", passes])).is_err()
+            );
+            let args = Args::try_parse_from(base.into_iter().chain([
+                "--ema-passes",
+                "3",
+                "--ema-distance",
+                "hellinger",
+                "--ema-polish",
+                passes,
+            ]))
+            .unwrap();
+            assert_eq!(args.ema_polish, Some(passes.parse().unwrap()));
+        }
+        for (flag, value) in [
+            ("--ema-distance", "unknown"),
+            ("--ema-distance", "CrossEntropy"),
+            ("--ema-polish", "256"),
+            ("--ema-polish", "-1"),
+            ("--ema-polish", "1.5"),
+        ] {
+            assert!(
+                Args::try_parse_from(base.into_iter().chain(["--ema-passes", "3", flag, value,]))
+                    .is_err()
+            );
+        }
+        assert!(
+            Args::try_parse_from([
+                "lab",
+                "input.png",
+                "--output",
+                "out.jxl",
+                "--ema-passes",
+                "3",
+                "--ema-distance",
+                "hellinger",
+                "--ema-polish",
+                "1",
+            ])
+            .is_err()
+        );
+    }
+
     #[test]
     fn direct_baseline_accepts_all_source_efforts_without_relaxing_search() {
         let image = rs_jxl::Image::new(
