@@ -594,6 +594,37 @@ impl DcContexts {
         }
     }
 
+    /// Encoder-only size experiment: pair DCT8 luma buckets without changing
+    /// thresholds or qdc values. Build the tokenization/header model afterwards.
+    /// Chroma keeps its existing distinctions; only referenced IDs are retained.
+    #[must_use]
+    pub(crate) fn with_paired_luma(mut self) -> Self {
+        let buckets = self.num_dc_contexts();
+        // Map order is Y, X, B. Source chroma IDs start at `buckets`, so these
+        // luma aliases cannot merge a chroma context with a luma context.
+        for (i, context) in self.context_map[..buckets].iter_mut().enumerate() {
+            *context = (i / 2) as u8;
+        }
+        let mut remap = [u8::MAX; 256];
+        let mut num_contexts = 0;
+        for plane in self
+            .context_map
+            .chunks_exact_mut(NUM_COEFFICIENT_ORDERS * buckets)
+        {
+            for context in &mut plane[..buckets] {
+                let id = &mut remap[usize::from(*context)];
+                if *id == u8::MAX {
+                    *id = num_contexts;
+                    num_contexts += 1;
+                }
+                *context = *id;
+            }
+            plane[buckets..].fill(0);
+        }
+        self.num_contexts = num_contexts;
+        self
+    }
+
     /// Only JXL channel 1 has thresholds; channels 0/2 have empty vectors.
     pub fn luma_thresholds(&self) -> &[i32] {
         &self.thresholds
@@ -1030,6 +1061,98 @@ mod tests {
         let contexts = DcContexts::from_counts(&concentrated, total, 5, false);
         assert_eq!(contexts.requested_thresholds(), 7);
         assert_eq!(contexts.luma_thresholds(), [1022]);
+    }
+
+    fn assert_paired_luma(source: DcContexts, grayscale: bool) {
+        use super::super::ac_tokens::BlockContextModel;
+
+        let thresholds = source.luma_thresholds().to_vec();
+        let requested = source.requested_thresholds();
+        let original_map = source.context_map().to_vec();
+        let original_model = BlockContextModel::new(
+            [&[], &thresholds, &[]],
+            &[],
+            &original_map,
+            usize::from(source.num_contexts()),
+        )
+        .unwrap();
+        let paired = source.with_paired_luma();
+        assert_eq!(paired.luma_thresholds(), thresholds);
+        assert_eq!(paired.requested_thresholds(), requested);
+        let buckets = thresholds.len() + 1;
+        let pairs = buckets.div_ceil(2);
+        assert_eq!(paired.num_dc_contexts(), buckets);
+        assert_eq!(paired.context_map().len(), original_map.len());
+        assert_eq!(
+            usize::from(paired.num_contexts()),
+            if grayscale { pairs + 1 } else { 3 * pairs }
+        );
+        for (channel, plane) in paired
+            .context_map()
+            .chunks_exact(NUM_COEFFICIENT_ORDERS * buckets)
+            .enumerate()
+        {
+            for (i, &id) in plane[..buckets].iter().enumerate() {
+                let expected = if channel == 0 {
+                    i / 2
+                } else if grayscale {
+                    pairs
+                } else {
+                    channel * pairs + i / 2
+                };
+                assert_eq!(usize::from(id), expected);
+            }
+            assert!(plane[buckets..].iter().all(|&id| id == 0));
+        }
+        assert!(
+            paired
+                .context_map()
+                .iter()
+                .all(|&id| id < paired.num_contexts())
+        );
+        // The model validates dense IDs and verifies that qdc nomination is
+        // unchanged even though the AC block-context IDs are now merged.
+        let model = BlockContextModel::new(
+            [&[], paired.luma_thresholds(), &[]],
+            &[],
+            paired.context_map(),
+            usize::from(paired.num_contexts()),
+        )
+        .unwrap();
+        for dc in [i32::MIN, i32::MAX].into_iter().chain(-1025..=1024) {
+            assert_eq!(
+                model.dc_context([0, dc, 0]),
+                original_model.dc_context([0, dc, 0])
+            );
+        }
+    }
+
+    #[test]
+    fn paired_luma_maps_all_bucket_counts_without_changing_thresholds_or_qdc() {
+        let counts = [1024; 2048];
+        let total = 2048 * 1024;
+        for grayscale in [false, true] {
+            for requested in 1..=7 {
+                let contexts =
+                    DcContexts::from_counts(&counts, total, 1 << (14 - requested), grayscale);
+                assert_eq!(contexts.requested_thresholds(), requested);
+                assert_eq!(contexts.luma_thresholds().len(), usize::from(requested));
+                assert_paired_luma(contexts, grayscale);
+            }
+        }
+    }
+
+    #[test]
+    fn paired_luma_preserves_requested_thresholds_when_fewer_cuts_exist() {
+        let total = 2048 * 1024;
+        let mut counts = [0; 2048];
+        counts[2047] = total;
+        for grayscale in [false, true] {
+            let contexts = DcContexts::from_counts(&counts, total, 5, grayscale);
+            assert_eq!(contexts.requested_thresholds(), 7);
+            assert_eq!(contexts.luma_thresholds(), [1022]);
+            assert_paired_luma(contexts, grayscale);
+        }
     }
 
     #[test]

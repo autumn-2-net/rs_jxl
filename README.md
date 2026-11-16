@@ -394,6 +394,7 @@ must repeat the relevant checks; historical binding validation remains separate.
 - [Fast lossless source port](docs/FJXL_PORT_STATUS.md)
 - [Byte-reversible JPEG API](docs/JPEG_API.md)
 - [Experimental JPEG AC HybridUint head/tail search](docs/JPEG_HEAD_TAIL_20261110.md)
+- [JPEG coefficient compression experiments](docs/JPEG_COMPRESSION_TUNING_20261116.md)
 - [Maintained Rust decoder and API](docs/DECODER_STATUS.md)
 - [Lossless codec performance baseline](docs/PERFORMANCE_BASELINE_20261024.md)
 - [JPEG reconstruction optimization](docs/DECODER_PERFORMANCE_20261024.md)

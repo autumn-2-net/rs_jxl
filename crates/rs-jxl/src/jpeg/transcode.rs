@@ -2,10 +2,13 @@
 // BSD-3-Clause; see docs/PORTING_KERNELS.md for the retained notice.
 //! Coefficient-only JPEG frame assembly from enc_frame.cc::EncodeGroups at
 //! b866b3d. Public byte input and resource contracts live in archival.rs.
+//!
+//! `jpeg.stage.*` scopes are disjoint outer stages. Other JPEG scopes are
+//! inclusive diagnostics nested within those stages, not additional wall time.
 
 use super::{
     ac_tokens::{self, AcTokenError, BlockContextModel, Dct8Input, Dct8Plane, TokenizeLimits},
-    cfl::{CflMode, JpegCfl},
+    cfl::{CflFitPolicy, CflMode, JpegCfl},
     coefficient_order::{Dct8Group, Dct8Image, Dct8Orders, OrderPolicy},
     data::{JpegData, JpegError},
     dc_streams::{self, CflMaps, DcGroup, DcStreamError, PrepareLimits},
@@ -43,6 +46,9 @@ pub struct Options {
     pub sample_limit: usize,
     pub reconstruction_quality: u8,
     pub cfl: CflMode,
+    pub cfl_fit: CflFitPolicy,
+    pub symmetric_ma: bool,
+    pub paired_luma: bool,
     pub order: OrderPolicy,
     pub max_output_bytes: usize,
     pub max_coefficients: usize,
@@ -60,6 +66,9 @@ impl Default for Options {
             sample_limit: usize::MAX,
             reconstruction_quality: 4,
             cfl: CflMode::Enabled,
+            cfl_fit: CflFitPolicy::Source,
+            symmetric_ma: false,
+            paired_luma: false,
             order: OrderPolicy::Source,
             max_output_bytes: usize::MAX,
             max_coefficients: usize::MAX,
@@ -119,6 +128,7 @@ fn coefficient_groups(
     cfl: &JpegCfl<'_, '_>,
     maximum: usize,
 ) -> Result<Vec<[Vec<i32>; 3]>> {
+    let _scope = crate::profile::scope("jpeg.ac.coefficients");
     let (width, height) = geometry.dimensions_in_blocks();
     let count = width
         .checked_mul(height)
@@ -172,6 +182,7 @@ fn tokenize_groups(
     model: BlockContextModel<'_>,
     options: &Options,
 ) -> Result<CoefficientEntropy> {
+    let tokenize_scope = crate::profile::scope("jpeg.ac.tokenize");
     let hs = layout.subsampling().horizontal_shifts();
     let vs = layout.subsampling().vertical_shifts();
     let dc_columns = geometry.dimensions_in_blocks().0.div_ceil(256);
@@ -228,6 +239,7 @@ fn tokenize_groups(
         )
         .map_err(ac_token_error)
     })?;
+    drop(tokenize_scope);
     let mut entropy = CoefficientEntropy::source(
         streams,
         model.num_ac_contexts(),
@@ -266,6 +278,7 @@ fn prepare_ac(
     options: &Options,
 ) -> Result<(Dct8Orders, CoefficientEntropy)> {
     let groups = coefficient_groups(layout, geometry, cfl, options.max_coefficients)?;
+    let order_scope = crate::profile::scope("jpeg.ac.order");
     let views: Vec<_> = groups
         .iter()
         .map(|p| Dct8Group::I32(p.each_ref().map(Vec::as_slice)))
@@ -273,6 +286,7 @@ fn prepare_ac(
     let (width, height) = geometry.dimensions_in_blocks();
     let image = Dct8Image::new(width, height, &views).map_err(invalid)?;
     let orders = Dct8Orders::compute(&image, options.tier, options.order);
+    drop(order_scope);
     let entropy = tokenize_groups(layout, geometry, &groups, dc, &orders, model, options)?;
     Ok((orders, entropy))
 }
@@ -296,6 +310,7 @@ impl AcData<'_> {
             Self::Direct(orders, entropy, trial) => {
                 entropy::write_single_histogram_group(writer, groups)?;
                 entropy::write_orders(orders, writer)?;
+                let _scope = crate::profile::scope("jpeg.assembly.ac_model");
                 if *trial {
                     entropy.write_trial_model(writer)
                 } else {
@@ -375,6 +390,7 @@ pub(crate) struct Prepared {
 
 impl Prepared {
     pub(crate) fn new(jpeg: &JpegData, options: &Options) -> Result<Self> {
+        let metadata_scope = crate::profile::scope("jpeg.stage.metadata_prepare");
         let layout = TranscodeLayout::new(jpeg).map_err(invalid)?;
         let geometry = FrameGeometry::new(jpeg.width, jpeg.height, layout.subsampling())?;
         let display = super::color_metadata::prepare_metadata(
@@ -400,8 +416,10 @@ impl Prepared {
         {
             return Err(Error::Limit("JPEG AC coefficient storage"));
         }
+        drop(metadata_scope);
         // Validate reconstruction eligibility before the costly coefficient stage.
-        let reconstruction =
+        let reconstruction = {
+            let _stage = crate::profile::scope("jpeg.stage.reconstruction_serialize_validate");
             super::reconstruction_metadata::serialize_reconstruction_metadata_with_sources(
                 jpeg,
                 options.max_output_bytes,
@@ -411,13 +429,18 @@ impl Prepared {
                     xmp_box_payload: xmp.as_deref(),
                 },
             )
-            .map_err(metadata_error)?;
-        let jbrd = super::reconstruction_brotli::compress_parts(
-            &reconstruction.header,
-            &reconstruction.payload,
-            u32::from(options.reconstruction_quality),
-            options.max_output_bytes,
-        )?;
+            .map_err(metadata_error)?
+        };
+        let jbrd = {
+            let _stage = crate::profile::scope("jpeg.stage.reconstruction_brotli");
+            super::reconstruction_brotli::compress_parts(
+                &reconstruction.header,
+                &reconstruction.payload,
+                u32::from(options.reconstruction_quality),
+                options.max_output_bytes,
+            )?
+        };
+        let _stage = crate::profile::scope("jpeg.stage.image_header");
         let image_header = crate::codestream::image_header_fields(
             jpeg.width,
             jpeg.height,
@@ -474,13 +497,26 @@ impl Prepared {
                 "head/tail experiment cannot use source-search AC cache".into(),
             ));
         }
+        if cache.is_some() && (options.cfl_fit != CflFitPolicy::Source || options.paired_luma) {
+            return Err(Error::InvalidInput(
+                "experimental AC policy cannot use source-search AC cache".into(),
+            ));
+        }
         let layout = TranscodeLayout::new(jpeg).map_err(invalid)?;
         let geometry = FrameGeometry::new(jpeg.width, jpeg.height, layout.subsampling())?;
-        let cfl = JpegCfl::compute(&layout, options.cfl);
+        let cfl = {
+            let _stage = crate::profile::scope("jpeg.stage.cfl");
+            JpegCfl::compute_with_policy(&layout, options.cfl, options.cfl_fit)
+        };
+        let dc_scope = crate::profile::scope("jpeg.stage.dc_prepare");
         let quants = layout.planes().each_ref().map(|p| p.quantization());
         let dc_quant = DcQuantization::from_layout(quants)?;
         let ac_quant = RawDct8Quantization::from_layout(quants)?;
-        let contexts = layout.dc_contexts();
+        let contexts = if options.paired_luma {
+            layout.dc_contexts().with_paired_luma()
+        } else {
+            layout.dc_contexts()
+        };
         let model = BlockContextModel::new(
             [&[], contexts.luma_thresholds(), &[]],
             &[],
@@ -500,6 +536,8 @@ impl Prepared {
             )
             .map_err(dc_stream_error)
         })?;
+        drop(dc_scope);
+        let ac_scope = crate::profile::scope("jpeg.stage.ac_prepare");
         let build_ac = || prepare_ac(&layout, geometry, &cfl, &dc, model, options);
         let direct;
         let ac = if let Some(cache) = cache {
@@ -508,6 +546,8 @@ impl Prepared {
             direct = build_ac()?;
             AcData::Direct(&direct.0, &direct.1, false)
         };
+        drop(ac_scope);
+        let auxiliary_scope = crate::profile::scope("jpeg.stage.auxiliary_prepare");
         let maps = cfl.dimensions_in_tiles();
         let maps = CflMaps {
             width: maps.0 as usize,
@@ -535,6 +575,15 @@ impl Prepared {
             options.tier as i8,
             options.decoding_speed,
         )?;
+        if options.symmetric_ma {
+            for policy in [&mut dc_options, &mut metadata_options, &mut quant_options] {
+                if policy.custom_tree.is_none() && policy.fixed_tree.is_none() {
+                    policy.tree_learning = crate::modular::ma_train::TreeLearning::Symmetric;
+                    policy.source_ma_scoring.description =
+                        crate::modular::ma_train::DescriptionCost::Half;
+                }
+            }
+        }
         for policy in [
             &mut dc_options,
             &mut metadata_options,
@@ -582,6 +631,7 @@ impl Prepared {
         }];
         // No Global/ModularDC/ModularAC pixels exist, but their ID gaps must
         // remain in the learned tree's property-1 routing.
+        let ma_scope = crate::profile::scope("jpeg.auxiliary.ma");
         let auxiliary = Shared::build_with_execution(
             &[
                 Domain {
@@ -609,9 +659,12 @@ impl Prepared {
                 cooperative: options.cooperative_ma,
             },
         )?;
+        drop(ma_scope);
+        drop(auxiliary_scope);
         // Reuse the prepared auxiliaries/coefficients; arbitrate the complete
         // container so alignment, TOC widths and box headers are included.
         let emit = |ac: &AcData<'_>| -> Result<Vec<u8>> {
+            let _stage = crate::profile::scope("jpeg.stage.assembly");
             let mut sections: Vec<_> = (0..geometry.section_count())
                 .map(|_| BitWriter::new(options.max_output_bytes))
                 .collect();
@@ -640,12 +693,18 @@ impl Prepared {
             }
             let global_ac = &mut sections[section(1 + geometry.dc_group_count())];
             ac_quant.write_header(global_ac, |w, _| auxiliary.write_stream(quant_id, w))?;
-            ac.write_global(global_ac, geometry.group_count())?;
-            for index in 0..geometry.group_count() {
-                ac.write_group(
-                    index,
-                    &mut sections[section(2 + geometry.dc_group_count() + index)],
-                )?;
+            {
+                let _scope = crate::profile::scope("jpeg.assembly.ac_global");
+                ac.write_global(global_ac, geometry.group_count())?;
+            }
+            {
+                let _scope = crate::profile::scope("jpeg.assembly.ac_groups");
+                for index in 0..geometry.group_count() {
+                    ac.write_group(
+                        index,
+                        &mut sections[section(2 + geometry.dc_group_count() + index)],
+                    )?;
+                }
             }
             let sections = sections
                 .into_iter()

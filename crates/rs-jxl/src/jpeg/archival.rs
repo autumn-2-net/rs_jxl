@@ -108,6 +108,9 @@ impl TranscodeOptions {
                 .reconstruction_quality
                 .unwrap_or((self.effort + 1).min(11)),
             cfl: self.cfl,
+            cfl_fit: super::cfl::CflFitPolicy::Source,
+            symmetric_ma: false,
+            paired_luma: false,
             order: self.order,
             max_output_bytes: self.limits.max_output_bytes,
             max_coefficients: self.limits.max_coefficients,
@@ -138,6 +141,7 @@ pub(crate) fn transcode_in_pool(
 }
 
 pub(crate) fn read_input(input: &[u8], limits: &CoefficientReadLimits) -> Result<JpegData> {
+    let _stage = crate::profile::scope("jpeg.stage.read_coefficients");
     let mut jpeg = read_coefficients_with_limits(input, limits).map_err(|e| match e {
         CoefficientReadError::Jpeg(JpegError::LimitExceeded { resource, .. }) => {
             Error::Limit(resource)

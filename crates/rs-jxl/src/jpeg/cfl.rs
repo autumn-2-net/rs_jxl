@@ -28,6 +28,17 @@ pub enum CflMode {
     Enabled,
 }
 
+/// Encoder-only factor selection; neither policy changes the inverse arithmetic.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CflFitPolicy {
+    #[default]
+    Source,
+    /// Select a scored maximum in bins 0..=254, nearest zero correlation.
+    /// Equidistant ties choose the lower bin (the negative factor).
+    /// This opt-in heuristic does not guarantee a smaller encoded file.
+    ActualMaximum,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CflError {
     InvalidChannel(usize),
@@ -151,6 +162,17 @@ impl<'layout, 'jpeg> JpegCfl<'layout, 'jpeg> {
     /// execution policy. A serial scope stays caller-local; no pool is created.
     /// This does not validate that every later forward block fits i32 arithmetic.
     pub fn compute(layout: &'layout TranscodeLayout<'jpeg>, mode: CflMode) -> Self {
+        Self::compute_with_policy(layout, mode, CflFitPolicy::Source)
+    }
+
+    /// Fit once with an explicit encoder policy, retaining the existing sampling
+    /// guards, float votes and checked integer forward/inverse arithmetic.
+    /// No alternate encode or size-based fallback is performed.
+    pub fn compute_with_policy(
+        layout: &'layout TranscodeLayout<'jpeg>,
+        mode: CflMode,
+        policy: CflFitPolicy,
+    ) -> Self {
         let (width, height) = layout.dimensions_in_blocks();
         let dimensions = (
             width.div_ceil(COLOR_TILE_DIM_IN_BLOCKS),
@@ -166,7 +188,7 @@ impl<'layout, 'jpeg> JpegCfl<'layout, 'jpeg> {
                 || [0; 257],
                 |differences, ty| {
                     (0..dimensions.0)
-                        .map(|tx| fit_tile(layout, channel, tx, ty as u32, differences))
+                        .map(|tx| fit_tile(layout, channel, tx, ty as u32, differences, policy))
                         .collect::<Vec<_>>()
                 },
             )
@@ -317,12 +339,33 @@ fn choose_factor(differences: &[i32; 257]) -> i8 {
     }
 }
 
+fn choose_actual_maximum_factor(differences: &[i32; 257]) -> i8 {
+    let (mut best, mut maximum, mut sum, mut offset_sum) = (OFFSET, 0, 0, 0);
+    // Bin 255 scores +128, which cannot be emitted as an i8 without wrapping.
+    for (index, &difference) in differences[..255].iter().enumerate() {
+        sum += difference;
+        if index == OFFSET {
+            offset_sum = sum;
+        }
+        if sum > maximum || (sum == maximum && index.abs_diff(OFFSET) < best.abs_diff(OFFSET)) {
+            best = index;
+            maximum = sum;
+        }
+    }
+    if maximum > offset_sum + 1 {
+        i8::try_from(best as i32 - OFFSET as i32).expect("bins 0..=254 fit i8")
+    } else {
+        0
+    }
+}
+
 fn fit_tile(
     layout: &TranscodeLayout<'_>,
     channel: usize,
     tx: u32,
     ty: u32,
     differences: &mut [i32; 257],
+    policy: CflFitPolicy,
 ) -> i8 {
     differences.fill(0);
     let (width, height) = layout.dimensions_in_blocks();
@@ -373,8 +416,15 @@ fn fit_tile(
             }
         }
     }
-    choose_factor(differences)
+    match policy {
+        CflFitPolicy::Source => choose_factor(differences),
+        CflFitPolicy::ActualMaximum => choose_actual_maximum_factor(differences),
+    }
 }
+
+#[cfg(test)]
+#[path = "cfl_peak_tests.rs"]
+mod peak_tests;
 
 #[cfg(test)]
 mod tests {

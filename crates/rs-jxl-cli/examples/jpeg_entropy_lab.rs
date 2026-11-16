@@ -1,4 +1,4 @@
-//! Isolated JPEG AC head/tail experiment; original JPEG bytes are the oracle.
+//! Isolated JPEG compression experiments; original JPEG bytes are the oracle.
 use std::{fs, io::Write, path::PathBuf, sync::Arc, time::Instant};
 
 use clap::Parser;
@@ -16,6 +16,17 @@ struct Args {
     /// Expanded standard AC HybridUint configurations, exact container fallback.
     #[arg(long)]
     head_tail: bool,
+    /// Choose a representable actual CfL maximum; one-pass, no size fallback.
+    #[arg(long, conflicts_with = "head_tail")]
+    cfl_peak: bool,
+    /// Lend the existing pool to auxiliary MA split search.
+    #[arg(long)]
+    cooperative: bool,
+    /// Native symmetric MA with half description cost, without a second encode.
+    #[arg(long, conflicts_with = "head_tail")]
+    symmetric_ma: bool,
+    #[arg(long, conflicts_with = "head_tail")]
+    paired_luma: bool,
 }
 
 fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
@@ -27,16 +38,34 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let options = TranscodeOptions {
         effort: args.effort,
         threads: usize::from(args.threads),
+        cooperative_ma: args.cooperative.then(Default::default),
         ..Default::default()
     };
     let receipt = Arc::new(jpeg::head_tail::Receipt::default());
     let start = Instant::now();
-    let output = if args.head_tail {
+    let output = if args.cfl_peak || args.symmetric_ma || args.paired_luma {
+        jpeg::tuning::transcode(
+            &input,
+            &options,
+            jpeg::tuning::Options {
+                cfl_fit: if args.cfl_peak {
+                    jpeg::cfl::CflFitPolicy::ActualMaximum
+                } else {
+                    Default::default()
+                },
+                symmetric_ma: args.symmetric_ma,
+                paired_luma: args.paired_luma,
+            },
+        )?
+    } else if args.head_tail {
         jpeg::head_tail::transcode(&input, &options, &receipt)?
     } else {
         jpeg::transcode(&input, &options)?
     };
     let seconds = start.elapsed().as_secs_f64();
+    if let Some(report) = rs_jxl::profile::report() {
+        eprint!("{report}");
+    }
     let reconstructed = rs_jxl::decode::reconstruct_jpeg(&output, &Default::default())?;
     if reconstructed != input {
         return Err("native JPEG reconstruction differs from original bytes".into());
@@ -60,7 +89,9 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         "{}",
         serde_json::json!({"bytes":output.len(),"seconds":seconds,"width":width,"height":height,
         "bpp":output.len() as f64*8.0/pixels,"mpix_per_second":pixels/1e6/seconds,
-        "jpeg_bytes":input.len(),"native_verified":true,"head_tail":head_tail,
+        "jpeg_bytes":input.len(),"native_verified":true,"head_tail":head_tail,"cfl_peak":args.cfl_peak,
+        "cooperative":args.cooperative,"symmetric_ma":args.symmetric_ma,
+        "paired_luma":args.paired_luma,
         "timing":"native JPEG parse and encode; excludes disk I/O, dimension inspection and reconstruction"})
     );
     Ok(())
@@ -78,7 +109,17 @@ fn main() -> std::process::ExitCode {
 
 #[test]
 fn experiment_is_explicit_and_validates_effort_and_threads() {
-    assert!(!Args::try_parse_from(["lab", "in.jpg"]).unwrap().head_tail);
+    let defaults = Args::try_parse_from(["lab", "in.jpg"]).unwrap();
+    assert!(
+        !defaults.head_tail
+            && !defaults.cfl_peak
+            && !defaults.symmetric_ma
+            && !defaults.cooperative
+            && !defaults.paired_luma
+    );
+    for flag in ["--cfl-peak", "--symmetric-ma", "--paired-luma"] {
+        assert!(Args::try_parse_from(["lab", "in.jpg", "--head-tail", flag]).is_err());
+    }
     assert!(
         Args::try_parse_from(["lab", "in.jpg", "--head-tail"])
             .unwrap()

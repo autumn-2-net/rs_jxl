@@ -80,6 +80,7 @@ impl CoefficientEntropy {
         }
         let mut lz_enabled = false;
         if !matches!(lz, LzPolicy::Disabled) {
+            let _scope = crate::profile::scope("jpeg.ac.rle");
             let config = match lz {
                 LzPolicy::Explicit(config) => config.clone(),
                 _ => SourceConfig {
@@ -124,6 +125,7 @@ impl CoefficientEntropy {
                 })
                 .collect::<Result<_>>()?;
         }
+        let _scope = crate::profile::scope("jpeg.ac.entropy_model");
         let model = Model::build_with_options(
             &streams,
             contexts + usize::from(lz_enabled),
