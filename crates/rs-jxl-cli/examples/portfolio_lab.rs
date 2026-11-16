@@ -154,6 +154,9 @@ impl DirectMaProfile {
     after_help = "Candidate probe_seconds sum elapsed probe work and can exceed scout_seconds when roots run concurrently; scout_seconds is wall time."
 )]
 struct Args {
+    /// Experimental native Palette cost vote, reusing rejected-state pilots.
+    #[arg(long, requires = "direct_candidate", value_parser = ["shadow", "veto", "route"])]
+    palette_pilot: Option<String>,
     /// Opt-in EMA histogram clustering; ordinary defaults are unchanged.
     #[arg(long, requires = "direct_candidate", value_parser = clap::value_parser!(u8).range(1..))]
     ema_passes: Option<u8>,
@@ -242,6 +245,7 @@ fn encode_direct(args: &Args, image: &rs_jxl::Image, recipe: Candidate) -> Resul
         && args.direct_ma_profile.is_none()
         && args.direct_tree_learning.is_none()
         && args.ema_passes.is_none()
+        && args.palette_pilot.is_none()
     {
         Some(rs_jxl::scheduler::native::encode_native_candidate(
             &rs_jxl::scheduler::CandidateParams::default().backend(1)?,
@@ -278,6 +282,26 @@ fn encode_direct(args: &Args, image: &rs_jxl::Image, recipe: Candidate) -> Resul
         if let Some(reference) = &mut configured.source_patch_reference {
             reference.modular.tree_learning = mode.into();
         }
+    }
+    let palette_pilot = args.palette_pilot.as_ref().map(|mode| {
+        use rs_jxl::modular::palette::admission::{Experiment, Mode};
+        Arc::new(Experiment::new(
+            match mode.as_str() {
+                "shadow" => Mode::Shadow,
+                "veto" => Mode::Veto,
+                "route" => Mode::Route,
+                _ => unreachable!("validated palette pilot"),
+            },
+            None,
+        ))
+    });
+    if let Some(pilot) = &palette_pilot {
+        configured
+            .modular
+            .palette_policy
+            .as_mut()
+            .ok_or("palette pilot requires a native palette policy")?
+            .admission = Some(pilot.clone());
     }
     let receipt = Arc::new(refinement::Receipt::default());
     if let Some(passes) = args.ema_passes {
@@ -367,6 +391,17 @@ fn encode_direct(args: &Args, image: &rs_jxl::Image, recipe: Candidate) -> Resul
         "model_seconds": work.model_seconds, "write_seconds": work.write_seconds,
     });
     let ema_work = rs_jxl::entropy::cluster::emeans::work();
+    let palette_work = palette_pilot.as_ref().map(|pilot| {
+        let events = pilot.events();
+        serde_json::json!({
+            "attempts": events.len(),
+            "vetoed": events.iter().filter(|e| e.vetoed).count(),
+            "promoted": events.iter().filter(|e| e.promoted).count(),
+            "unavailable": events.iter().filter(|e| e.unavailable.is_some()).count(),
+            "reused_planes": events.iter().map(|e| e.reused_planes).sum::<usize>(),
+            "scoring_work_seconds": pilot.scoring_seconds(),
+        })
+    });
     println!(
         "{}",
         serde_json::json!({
@@ -396,6 +431,8 @@ fn encode_direct(args: &Args, image: &rs_jxl::Image, recipe: Candidate) -> Resul
                 "symmetric_splits": learning.symmetric_splits,
             },
             "source_ma_defaults": configured.modular.source_ma_defaults,
+            "palette_pilot": args.palette_pilot,
+            "palette_work": palette_work,
             "source_tools": {
                 "profile": args.direct_source_tools.map(DirectSourceTools::name),
                 "patch_parallel_gather": configured.source_patch_parallel_gather,

@@ -153,7 +153,10 @@ fn veto_is_reject_only_shadow_and_forced_choices_win() {
                 old,
                 forced,
             );
-            assert_eq!(vetoed, mode == Mode::Veto && allow_veto && !forced && old);
+            assert_eq!(
+                vetoed,
+                (mode == Mode::Veto && allow_veto && !forced && old).then_some(false)
+            );
             let record = experiment.events().remove(0);
             assert_eq!(record.old_would_accept, Some(old));
             assert_eq!(record.proxy_would_accept, Some(false));
@@ -225,15 +228,18 @@ fn table_budget_is_unavailable_not_a_veto_or_kernel_budget_change() {
     .unwrap();
     let experiment = Experiment::new(Mode::Veto, Some(target()));
     let mut cursor = Cursor::new(Some(&experiment), &[], target().stage, 23, true);
-    assert!(!cursor.next().unwrap().compare(
-        &original,
-        &candidate,
-        &[],
-        &transform,
-        PaletteMode::Absolute,
-        true,
-        false
-    ));
+    assert_eq!(
+        cursor.next().unwrap().compare(
+            &original,
+            &candidate,
+            &[],
+            &transform,
+            PaletteMode::Absolute,
+            true,
+            false
+        ),
+        None
+    );
     let record = experiment.events().remove(0);
     assert!(record.unavailable.unwrap().contains("budget"));
     assert!(record.proxy_would_accept.is_none());
@@ -259,4 +265,109 @@ fn admission_target_identity_is_stream_local_and_counts_unselected_attempts() {
     let visit = selected.next().unwrap();
     assert_eq!(visit.target.ordinal, 1);
     assert!(selected.next().is_none());
+}
+
+#[test]
+fn route_can_rescue_an_old_rejection_and_cache_is_state_local() {
+    let original: Vec<_> = [37, 73, 109]
+        .into_iter()
+        .map(|factor| {
+            channel(
+                (0..4096)
+                    .map(|i| {
+                        let h = (i as u32).wrapping_mul(0x9e37_79b9);
+                        let k = ((h ^ (h >> 16)).wrapping_mul(0x85eb_ca6b) >> 28) as i32;
+                        ((k * factor + 17) % 251) * 200
+                    })
+                    .collect(),
+                64,
+            )
+        })
+        .collect();
+    let (mapped, transform) = candidate(&original);
+    let (skip, after) = compare(&original, &mapped, &[], &[], &transform).unwrap();
+    assert!(after.total_bits < skip.total_bits);
+    let experiment = Experiment::new(Mode::Route, None);
+    let mut cursor = Cursor::new(Some(&experiment), &[], PaletteStage::PostRct, 1, true);
+    for expected_reuse in [0, 3] {
+        assert_eq!(
+            cursor.next().unwrap().compare(
+                &original,
+                &mapped,
+                &[],
+                &transform,
+                PaletteMode::Absolute,
+                false,
+                false
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            experiment.events().last().unwrap().reused_planes,
+            expected_reuse
+        );
+    }
+    cursor.next().unwrap().accepted();
+    assert_eq!(
+        cursor.next().unwrap().compare(
+            &original,
+            &mapped,
+            &[],
+            &transform,
+            PaletteMode::Absolute,
+            false,
+            true
+        ),
+        None
+    );
+    assert_eq!(experiment.events().last().unwrap().reused_planes, 0);
+    let mut channels = original.clone();
+    let mut state = PaletteState::new(16).unwrap();
+    let mut transforms = Vec::new();
+    assert!(
+        attempt_with_admission(
+            &mut channels,
+            &mut state,
+            &mut transforms,
+            16,
+            0,
+            3,
+            1024,
+            true,
+            PaletteMode::Absolute,
+            PaletteTools::default(),
+            -1.0,
+            false,
+            None,
+            None,
+            cursor.next()
+        )
+        .unwrap()
+    );
+    assert_eq!(channels, mapped);
+    assert_eq!(transforms, vec![transform]);
+    assert!(cursor.cache.borrow().is_empty());
+    assert!(experiment.events().last().unwrap().promoted);
+}
+
+#[test]
+fn route_keeps_forced_and_disabled_decisions() {
+    let original = vec![channel(vec![0; 256], 32)];
+    let (mapped, transform) = candidate(&original);
+    for (allow, forced) in [(true, false), (false, false), (true, true)] {
+        let experiment = Experiment::new(Mode::Route, None);
+        let mut cursor = Cursor::new(Some(&experiment), &[], PaletteStage::PreRct, 0, allow);
+        assert_eq!(
+            cursor.next().unwrap().compare(
+                &original,
+                &mapped,
+                &[],
+                &transform,
+                PaletteMode::Absolute,
+                true,
+                forced
+            ),
+            (allow && !forced).then_some(false)
+        );
+    }
 }

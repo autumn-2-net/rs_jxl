@@ -16,6 +16,17 @@ from statistics import median
 import tempfile
 
 
+def parse_experiments(values, variants):
+    result = {}
+    for value in values:
+        name, separator, experiment = value.partition("=")
+        if (not separator or name not in variants or name in result
+                or experiment not in ("coarse", "narrow", "palette", "veto", "combined")):
+            raise ValueError("Require unique --experiment NAME=coarse|narrow|palette|veto|combined")
+        result[name] = experiment
+    return result
+
+
 def parse_ema(values, variants, distances=(), polish=(), final_assignment=()):
     ema = {}
     for value in values:
@@ -142,6 +153,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--variant", action="append", required=True, metavar="NAME=EXECUTABLE")
+    parser.add_argument("--experiment", action="append", default=[], metavar="NAME=MODE")
     parser.add_argument("--avx512", nargs="*", default=[], help="Variant names opting into existing AVX512 scoring")
     parser.add_argument("--ema", action="append", default=[], metavar="NAME=PASSES:random|farthest",
                         help="Opt a variant into EMA clustering with 1..255 passes; repeat per variant")
@@ -176,6 +188,7 @@ def main():
     if not set(args.avx512) <= variants.keys():
         parser.error("Unknown AVX512 variant")
     try:
+        experiments = parse_experiments(args.experiment, variants)
         ema = parse_ema(args.ema, variants, args.ema_distance, args.ema_polish,
                         args.ema_final_assignment)
     except ValueError as error:
@@ -200,7 +213,7 @@ def main():
         frozen[name] = target
     manifest = dict(cases=cases, threads=args.threads, repeats=args.repeats,
                     profile=args.profile, profile_ma_nodes=args.profile_ma_nodes,
-                    avx512=args.avx512, ema=ema, effort=args.effort,
+                    avx512=args.avx512, ema=ema, experiments=experiments, effort=args.effort,
                     binaries={name: dict(source=str(variants[name]), sha256=file_sha256(path))
                               for name, path in frozen.items()},
                     decoder=dict(path=str(args.decoder), sha256=file_sha256(args.decoder)),
@@ -227,6 +240,14 @@ def main():
                             stem = f"{index:03}-t{threads}-r{repeat}-{name}"
                             output, decoded = directory/(stem+".jxl"), directory/(stem+".png")
                             active_env = dict(env, RS_JXL_MA_AVX512="1" if name in args.avx512 else "0")
+                            experiment = experiments.get(name)
+                            active_env["RS_JXL_MA_COARSE_CONTINUE"] = "1" if experiment in ("coarse", "combined") else "0"
+                            active_env["RS_JXL_PREDICT_NARROW"] = "1" if experiment in ("narrow", "combined") else "0"
+                            extra = []
+                            pilot = None
+                            if experiment in ("palette", "veto", "combined"):
+                                pilot = "veto" if experiment == "veto" else "route"
+                                extra = ["--palette-pilot", pilot]
                             if args.profile != "off":
                                 active_env["RS_JXL_PROFILE"] = "1"
                                 active_env["RS_JXL_PROFILE_DETAIL"] = "1" if args.profile == "detail" else "0"
@@ -234,7 +255,7 @@ def main():
                                     active_env["RS_JXL_PROFILE_MA_NODES"] = "1"
                             process = run_process([str(frozen[name]), str(snapshot), "--output", str(output),
                                                    "--effort", str(args.effort), "--threads", str(threads),
-                                                   "--direct-candidate", "baseline"] + ema_arguments(ema.get(name)),
+                                                   "--direct-candidate", "baseline"] + extra + ema_arguments(ema.get(name)),
                                                   active_env, args.timeout)
                             check_process(process)
                             row = json.loads(process["stdout"])
@@ -245,6 +266,8 @@ def main():
                                     or (row["width"], row["height"]) != (expected.width, expected.height)):
                                 raise ValueError("Invalid native encoder receipt")
                             validate_ema_receipt(row, ema.get(name))
+                            if row.get("palette_pilot") != pilot:
+                                raise ValueError("Palette pilot receipt does not match requested mode")
                             dec = run_process(decoder_command(args.decoder, output, decoded, expected.depth), env, args.timeout)
                             check_process(dec)
                             compare_pixels(expected, png_samples(decoded.read_bytes()))

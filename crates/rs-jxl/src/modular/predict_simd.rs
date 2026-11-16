@@ -6,16 +6,16 @@
 //! `lib/jxl/modular/encoding/context_predict.h`, `ClampedGradient`, `Select`,
 //! `detail::PredictOne`, and the edge-aware loads in `detail::Predict`.
 //!
-//! Parent integration: register this module, then call `residual_row` once per
-//! channel row and stateless predictor. In `encode::tokenize`, a fixed leaf can
+//! `residual_row` is the full-domain wide API. Tokenization uses `ChannelResiduals`
+//! to prove actual transformed samples once per channel when explicitly enabled
+//! by RS_JXL_PREDICT_NARROW=1. In `encode::tokenize`, a fixed leaf can
 //! consume this row directly; a dynamic tree can select from cached predictor
 //! rows after lookup. Subtract the leaf offset from the returned i64 residual,
 //! check divisibility, divide by the multiplier, THEN check conversion to i32.
 //! `encode::learn` can sample these same rows in candidate-predictor order.
 //! Weighted state/properties must still advance in raster order when needed.
-//! No parent module or encode call site is changed by this file.
 //!
-//! SIMD uses signed i64 lanes, including subtraction, across the ENTIRE i32
+//! The wide API uses signed i64 lanes, including subtraction, across the ENTIRE i32
 //! sample domain. No range hint or pre-scan is required for transformed 8/16-bit
 //! data. Average divisions truncate toward zero, not toward negative infinity.
 //! The wide mathematical gradient clamp equals the source's wrapping-i32
@@ -25,9 +25,10 @@
 //! Runtime AVX2/SSE2 dispatch is x86_64-only; other targets and short rows use
 //! the existing safe scalar equations. Borders/tails need no readable padding.
 //! Omitted: Weighted, predictor search, tree/property evaluation, reconstruction,
-//! fused multi-predictor traversal, narrow-lane specialization, and non-x86 SIMD.
+//! fused multi-predictor traversal, and non-x86 SIMD.
 
 use super::predictor::{Neighbors, Predictor, PredictorError, predict_one};
+use std::cell::Cell;
 use std::fmt;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -50,6 +51,270 @@ impl fmt::Display for RowError {
 }
 
 impl std::error::Error for RowError {}
+
+/// Read at channel scope, never in a row or pixel loop. No default policy change.
+pub(super) fn narrow_enabled() -> bool {
+    std::env::var_os("RS_JXL_PREDICT_NARROW").is_some_and(|v| v == "1")
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Bounds {
+    lo: i64,
+    hi: i64,
+}
+
+impl Bounds {
+    fn fits(self) -> bool {
+        self.lo >= i64::from(i32::MIN) && self.hi <= i64::from(i32::MAX)
+    }
+
+    fn add(self, rhs: Self) -> Self {
+        Self {
+            lo: self.lo + rhs.lo,
+            hi: self.hi + rhs.hi,
+        }
+    }
+
+    fn sub(self, rhs: Self) -> Self {
+        Self {
+            lo: self.lo - rhs.hi,
+            hi: self.hi - rhs.lo,
+        }
+    }
+
+    fn scale(self, n: i64) -> Self {
+        debug_assert!(n > 0);
+        Self {
+            lo: self.lo * n,
+            hi: self.hi * n,
+        }
+    }
+
+    fn divide(self, n: i64) -> Self {
+        Self {
+            lo: self.lo / n,
+            hi: self.hi / n,
+        }
+    }
+
+    /// Follows the kernel's exact evaluation order, not just its final formula.
+    /// All proof arithmetic is i64 (at most 20 times an i32 endpoint).
+    fn permits(self, p: Predictor) -> bool {
+        let prediction = match p {
+            Predictor::Zero => Self { lo: 0, hi: 0 },
+            Predictor::Left
+            | Predictor::Top
+            | Predictor::TopRight
+            | Predictor::TopLeft
+            | Predictor::LeftLeft => self,
+            Predictor::Average0
+            | Predictor::Average1
+            | Predictor::Average2
+            | Predictor::Average3 => {
+                let sum = self.scale(2);
+                if !sum.fits() {
+                    return false;
+                }
+                sum.divide(2)
+            }
+            Predictor::Select => {
+                // This also excludes abs(i32::MIN), including its positive result.
+                if self.hi - self.lo > i64::from(i32::MAX) {
+                    return false;
+                }
+                self
+            }
+            Predictor::Gradient => {
+                if !self.scale(2).fits() || !self.scale(2).sub(self).fits() {
+                    return false;
+                }
+                self // The mathematical gradient is clamped to [min(l,t),max(l,t)].
+            }
+            Predictor::Average4 => {
+                // 6*t - 2*tt + 7*l + ll + trr + 3*tr + 8, then /16.
+                // 7*l is implemented as (l<<3)-l, so 8*l must fit too.
+                if ![2, 3, 4, 6, 7, 8].into_iter().all(|n| self.scale(n).fits()) {
+                    return false;
+                }
+                let mut sum = self.scale(6).sub(self.scale(2));
+                if !sum.fits() {
+                    return false;
+                }
+                for term in [
+                    self.scale(7),
+                    self,
+                    self,
+                    self.scale(3),
+                    Self { lo: 8, hi: 8 },
+                ] {
+                    sum = sum.add(term);
+                    if !sum.fits() {
+                        return false;
+                    }
+                }
+                sum.divide(16)
+            }
+            _ => return false,
+        };
+        prediction.fits() && self.sub(prediction).fits()
+    }
+}
+
+/// A range proof tied to an immutable transformed plane, not a bit-depth hint.
+/// Private fields prevent applying a proof to unrelated or subsequently mutated
+/// samples. Only SIMD interiors use the proof: borders may introduce zero and
+/// remain scalar. Unrequested/unproven predictors always use the wide API.
+pub(super) struct ChannelResiduals<'a> {
+    pixels: &'a [i32],
+    width: usize,
+    stride: usize,
+    height: usize,
+    narrow_mask: u16,
+    usage: Option<Cell<ChannelUsage>>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct ChannelUsage {
+    optin: bool,
+    narrow_rows: u128,
+    narrow_row_samples: u128,
+    narrow_simd_samples: u128,
+    fallback_rows: u128,
+    fallback_samples: u128,
+}
+
+impl Drop for ChannelResiduals<'_> {
+    fn drop(&mut self) {
+        if let Some(usage) = &self.usage {
+            let u = usage.get();
+            crate::profile::note(
+                "modular.predict_narrow.usage",
+                format_args!(
+                    "optin={} active=0x{:04x} narrow_rows={} narrow_row_samples={} narrow_simd_samples={} narrow_scalar_edge_tail_samples={} fallback_rows={} fallback_samples={}",
+                    u.optin,
+                    self.narrow_mask,
+                    u.narrow_rows,
+                    u.narrow_row_samples,
+                    u.narrow_simd_samples,
+                    u.narrow_row_samples - u.narrow_simd_samples,
+                    u.fallback_rows,
+                    u.fallback_samples
+                ),
+            );
+        }
+    }
+}
+
+impl<'a> ChannelResiduals<'a> {
+    pub(super) fn new(
+        pixels: &'a [i32],
+        width: usize,
+        stride: usize,
+        height: usize,
+        predictors: &[Predictor],
+        narrow: bool,
+    ) -> Result<Self, RowError> {
+        let last = height
+            .checked_sub(1)
+            .ok_or(RowError::Plane(PredictorError::InvalidDimensions))?;
+        Neighbors::from_plane(pixels, width, stride, 0, last).map_err(RowError::Plane)?;
+        #[allow(unused_mut)]
+        let mut result = Self {
+            pixels,
+            width,
+            stride,
+            height,
+            narrow_mask: 0,
+            usage: crate::profile::enabled().then(|| {
+                Cell::new(ChannelUsage {
+                    optin: narrow,
+                    ..Default::default()
+                })
+            }),
+        };
+        #[cfg(target_arch = "x86_64")]
+        if narrow
+            && width >= 12
+            && predictors.iter().any(|p| !p.has_weighted())
+            && std::is_x86_feature_detected!("avx2")
+        {
+            let _scope = crate::profile::scope("modular.predict_narrow.proof");
+            // SAFETY: AVX2 detected; the final visible row was validated above.
+            let (lo, hi) = unsafe { x86::avx2_range(pixels, width, stride, height) };
+            let range = Bounds {
+                lo: i64::from(lo),
+                hi: i64::from(hi),
+            };
+            let mut requested = 0u16;
+            for &p in predictors {
+                if !p.has_weighted() {
+                    requested |= 1 << p as u32;
+                    if range.permits(p) {
+                        result.narrow_mask |= 1 << p as u32;
+                    }
+                }
+            }
+            if crate::profile::enabled() {
+                crate::profile::note(
+                    "modular.predict_narrow.channel",
+                    format_args!(
+                        "range=[{lo},{hi}] requested=0x{requested:04x} active=0x{:04x} wide=0x{:04x} planned_vector_residuals={}",
+                        result.narrow_mask,
+                        requested & !result.narrow_mask,
+                        ((width - 4) / 8 * 8) as u128
+                            * height as u128
+                            * u128::from(result.narrow_mask.count_ones())
+                    ),
+                );
+            }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = (predictors, narrow);
+        Ok(result)
+    }
+
+    fn record_row(&self, narrow: bool) {
+        // Diagnostic-only channel-local counters: no atomics, clock reads or
+        // formatting in row loops, and no increments when profiling is off.
+        if let Some(usage) = &self.usage {
+            let mut u = usage.get();
+            if narrow {
+                u.narrow_rows += 1;
+                u.narrow_row_samples += self.width as u128;
+                u.narrow_simd_samples += ((self.width - 4) / 8 * 8) as u128;
+            } else {
+                u.fallback_rows += 1;
+                u.fallback_samples += self.width as u128;
+            }
+            usage.set(u);
+        }
+    }
+
+    pub(super) fn residual_row(
+        &self,
+        y: usize,
+        p: Predictor,
+        out: &mut [i64],
+    ) -> Result<(), RowError> {
+        if y >= self.height {
+            return Err(RowError::Plane(PredictorError::PositionOutOfBounds));
+        }
+        #[cfg(target_arch = "x86_64")]
+        if (p as u32) < 14 && self.narrow_mask & (1 << p as u32) != 0 {
+            let row = Row::new(self.pixels, self.width, self.stride, y, p, out.len())?;
+            row.scalar_range(p, out, 0, 2);
+            // SAFETY: the private channel proof establishes CPU support, every
+            // i32 intermediate/residual, and the immutable source's range.
+            let next = unsafe { x86::avx2_narrow_row(&row, p, out) };
+            row.scalar_range(p, out, next, self.width);
+            self.record_row(true);
+            return Ok(());
+        }
+        residual_row(self.pixels, self.width, self.stride, y, p, out)?;
+        self.record_row(false);
+        Ok(())
+    }
+}
 
 struct Row<'a> {
     pixels: &'a [i32],
@@ -353,6 +618,91 @@ mod x86 {
         kernel!("avx2", 4, __m256i);
     }
 
+    mod avx2_narrow {
+        use super::Row;
+        use std::arch::x86_64::*;
+        use std::arch::x86_64::{
+            _mm256_add_epi32 as add, _mm256_and_si256 as and, _mm256_andnot_si256 as andnot,
+            _mm256_cmpgt_epi32 as gt, _mm256_or_si256 as or, _mm256_set1_epi32 as splat,
+            _mm256_slli_epi32 as shl, _mm256_srli_epi32 as shr, _mm256_sub_epi32 as sub,
+            _mm256_xor_si256 as xor,
+        };
+
+        #[inline]
+        #[target_feature(enable = "avx2")]
+        unsafe fn load(ptr: *const i32) -> __m256i {
+            // SAFETY: the kernel supplies exactly eight readable i32 samples.
+            unsafe { _mm256_loadu_si256(ptr.cast()) }
+        }
+
+        #[inline]
+        #[target_feature(enable = "avx2")]
+        unsafe fn store(ptr: *mut i64, value: __m256i) {
+            // SAFETY: eight writable i64 elements; sign-extend, never saturate.
+            unsafe {
+                _mm256_storeu_si256(
+                    ptr.cast(),
+                    _mm256_cvtepi32_epi64(_mm256_castsi256_si128(value)),
+                );
+                _mm256_storeu_si256(
+                    ptr.add(4).cast(),
+                    _mm256_cvtepi32_epi64(_mm256_extracti128_si256::<1>(value)),
+                );
+            }
+        }
+
+        #[inline]
+        #[target_feature(enable = "avx2")]
+        unsafe fn sign(value: __m256i) -> __m256i {
+            _mm256_srai_epi32::<31>(value)
+        }
+
+        // Exact same equations and toward-zero division as the wide backends.
+        kernel!("avx2", 8, __m256i);
+    }
+
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn avx2_range(
+        pixels: &[i32],
+        width: usize,
+        stride: usize,
+        height: usize,
+    ) -> (i32, i32) {
+        use std::arch::x86_64::*;
+        let mut low = _mm256_set1_epi32(i32::MAX);
+        let mut high = _mm256_set1_epi32(i32::MIN);
+        let (mut lo, mut hi) = (i32::MAX, i32::MIN);
+        for y in 0..height {
+            let row = &pixels[y * stride..y * stride + width];
+            let mut x = 0;
+            while width - x >= 8 {
+                // SAFETY: a full visible block, no row padding is examined.
+                let v = unsafe { _mm256_loadu_si256(row.as_ptr().add(x).cast()) };
+                low = _mm256_min_epi32(low, v);
+                high = _mm256_max_epi32(high, v);
+                x += 8;
+            }
+            for &v in &row[x..] {
+                lo = lo.min(v);
+                hi = hi.max(v);
+            }
+        }
+        let mut lows = [0; 8];
+        let mut highs = [0; 8];
+        // SAFETY: each array has exactly eight i32 lanes.
+        unsafe {
+            _mm256_storeu_si256(lows.as_mut_ptr().cast(), low);
+            _mm256_storeu_si256(highs.as_mut_ptr().cast(), high);
+        }
+        for v in lows {
+            lo = lo.min(v);
+        }
+        for v in highs {
+            hi = hi.max(v);
+        }
+        (lo, hi)
+    }
+
     macro_rules! dispatch {
         ($name:ident, $backend:ident, $feature:literal) => {
             #[target_feature(enable = $feature)]
@@ -383,7 +733,12 @@ mod x86 {
 
     dispatch!(sse2_row, sse2, "sse2");
     dispatch!(avx2_row, avx2, "avx2");
+    dispatch!(avx2_narrow_row, avx2_narrow, "avx2");
 }
+
+#[cfg(test)]
+#[path = "predict_simd_narrow_tests.rs"]
+mod narrow_tests;
 
 #[cfg(test)]
 mod tests {

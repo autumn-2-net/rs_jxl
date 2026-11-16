@@ -124,7 +124,7 @@ pub struct PaletteOptions {
     /// Opt-in single-decision laboratory replay. Never enabled by effort presets.
     pub counterfactual: Option<Arc<counterfactual::Experiment>>,
     /// Disabled-by-default native downstream pilot; fresh receipt per invocation.
-    /// Shadow leaves all choices unchanged; Veto can only reject old acceptances.
+    /// Shadow observes, Veto only rejects, Route replaces both cost decisions.
     pub admission: Option<Arc<admission::Experiment>>,
 }
 
@@ -646,7 +646,7 @@ fn attempt_with_admission(
     };
     let old_would_accept =
         accept_without_cost || !cost_after.is_some_and(|after| after > cost_before);
-    let vetoed = admission.as_ref().is_some_and(|admission| {
+    let decision = admission.as_ref().and_then(|admission| {
         admission.compare(
             channels,
             &candidate,
@@ -657,7 +657,7 @@ fn attempt_with_admission(
             forced,
         )
     });
-    let rejected = !forced && (!old_would_accept || vetoed);
+    let rejected = !forced && !decision.unwrap_or(old_would_accept);
     if let Some(event) = &mut event {
         if let Transform::Palette {
             colors,
@@ -699,6 +699,9 @@ fn attempt_with_admission(
         return Err(Error::Limit("palette transform count"));
     }
     transforms.push(transform);
+    if let Some(admission) = &admission {
+        admission.accepted();
+    }
     *channels = candidate;
     state.meta_channels = meta;
     if let (Some((receipt, _)), Some(event)) = (observation, event) {

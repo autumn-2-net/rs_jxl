@@ -121,6 +121,7 @@ fn cached_pair_matches_generic_wide_predictions_and_wire_contexts() {
                     &header,
                     0,
                     19,
+                    false,
                     &mut super::super::Scratch::default(),
                     Some(&history),
                     |t| integrated.push(t),

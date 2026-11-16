@@ -17,6 +17,21 @@ use super::{
 use crate::{Error, Result};
 
 mod activity;
+mod coarse;
+
+pub(super) fn coarse_continue_enabled(options: &TrainOptions, records: usize) -> bool {
+    coarse::eligible(options, records)
+        && std::env::var("RS_JXL_MA_COARSE_CONTINUE").as_deref() == Ok("1")
+}
+
+pub(super) fn train_coarse_continue(
+    samples: &mut Samples<impl SampleStorage>,
+    options: &TrainOptions,
+    stats: &TrainingStats,
+    scratch: &ScratchPool,
+) -> Result<Vec<Node>> {
+    coarse::train(samples, options, stats, scratch)
+}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum SeedTopology {

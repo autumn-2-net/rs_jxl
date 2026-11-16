@@ -373,6 +373,9 @@ pub(super) fn train_nodes_with_scratch(
     if options.seed.is_some() {
         return super::seed::train(samples, options, stats, scratch_pool);
     }
+    if super::seed::coarse_continue_enabled(options, samples.counts.len()) {
+        return super::seed::train_coarse_continue(samples, options, stats, scratch_pool);
+    }
     if let Some(nodes) = ma_channel::train(samples, options, stats, scratch_pool)? {
         return Ok(nodes);
     }
@@ -511,7 +514,11 @@ pub(super) fn train_pending_in_frontier<const REORDER: bool>(
             continue;
         }
         let slots = scratch_pool.dispatch_slots.load(Ordering::Relaxed);
-        if detach && slots > 1 && end - begin <= options.parallel_tools.grain(records, slots) {
+        if detach
+            && state.decision.is_none()
+            && slots > 1
+            && end - begin <= options.parallel_tools.grain(records, slots)
+        {
             let history = options
                 .parallel_tools
                 .inherit_histograms

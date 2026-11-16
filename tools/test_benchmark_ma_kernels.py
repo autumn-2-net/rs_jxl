@@ -1,9 +1,18 @@
 import unittest
 
-from benchmark_ma_kernels import parse_stages, summarize
+from benchmark_ma_kernels import parse_experiments, parse_stages, summarize
 
 
 class KernelBenchmarkTests(unittest.TestCase):
+    def test_experiments_are_explicit_and_variant_scoped(self):
+        self.assertEqual(parse_experiments([], {"base": None}), {})
+        self.assertEqual(parse_experiments(["new=palette"], {"base": None, "new": None}),
+                         {"new": "palette"})
+        for values in [["missing=narrow"], ["new=unknown"],
+                       ["new=coarse", "new=narrow"], ["new"]]:
+            with self.assertRaises(ValueError):
+                parse_experiments(values, {"new": None})
+
     def test_stage_table_does_not_parse_parent_edges_as_timing(self):
         report = ("stage | calls | total seconds | longest seconds\n"
                   "ma.learn | 3 | 1.2 | 0.7\n"

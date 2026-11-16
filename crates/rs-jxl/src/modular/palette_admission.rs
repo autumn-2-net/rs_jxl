@@ -30,6 +30,7 @@ use crate::modular::{
 };
 use crate::tools::lz77::{self, Command, FilterPolicy, Literal, Lz77Mode, Lz77Options};
 use crate::{Error, Result};
+use std::cell::RefCell;
 use std::ops::Range;
 use std::sync::{
     Mutex, MutexGuard,
@@ -56,6 +57,8 @@ pub enum Mode {
     Shadow,
     /// Only veto old acceptances. Explicit force/zero/direct and replay win.
     Veto,
+    /// Replace the old cost vote in either direction. Explicit requests win.
+    Route,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -93,6 +96,8 @@ pub struct Record {
     pub old_would_accept: Option<bool>,
     pub proxy_would_accept: Option<bool>,
     pub vetoed: bool,
+    pub promoted: bool,
+    pub reused_planes: usize,
     pub forced: bool,
     /// Kernel decline, explicit Skip, budget limit, or pilot error; not a vote.
     pub unavailable: Option<String>,
@@ -147,6 +152,7 @@ pub(crate) struct Cursor<'a> {
     stream_id: usize,
     ordinal: usize,
     allow_veto: bool,
+    cache: RefCell<Vec<Option<PlaneScore>>>,
 }
 
 pub(crate) struct Visit<'a> {
@@ -154,6 +160,7 @@ pub(crate) struct Visit<'a> {
     prefix: &'a [Transform],
     target: Target,
     allow_veto: bool,
+    cache: &'a RefCell<Vec<Option<PlaneScore>>>,
 }
 
 impl<'a> Cursor<'a> {
@@ -171,10 +178,11 @@ impl<'a> Cursor<'a> {
             stream_id,
             ordinal: 0,
             allow_veto,
+            cache: RefCell::new(Vec::new()),
         }
     }
 
-    pub(crate) fn next(&mut self) -> Option<Visit<'a>> {
+    pub(crate) fn next(&mut self) -> Option<Visit<'_>> {
         let target = Target {
             stage: self.stage,
             stream_id: self.stream_id,
@@ -188,11 +196,17 @@ impl<'a> Cursor<'a> {
                 prefix: self.prefix,
                 target,
                 allow_veto: self.allow_veto,
+                cache: &self.cache,
             })
     }
 }
 
 impl Visit<'_> {
+    pub(crate) fn accepted(&self) {
+        // Channel indices and contents may both change after a transform.
+        self.cache.borrow_mut().clear();
+    }
+
     pub(crate) fn unavailable(&self, mode: PaletteMode, forced: bool, reason: &str) {
         self.experiment.lock().push(Record {
             target: self.target,
@@ -202,6 +216,8 @@ impl Visit<'_> {
             old_would_accept: None,
             proxy_would_accept: None,
             vetoed: false,
+            promoted: false,
+            reused_planes: 0,
             forced,
             unavailable: Some(reason.into()),
         });
@@ -217,9 +233,18 @@ impl Visit<'_> {
         mode: PaletteMode,
         old_would_accept: bool,
         forced: bool,
-    ) -> bool {
+    ) -> Option<bool> {
         let start = Instant::now();
-        let result = compare(channels, candidate, self.prefix, transforms, transform);
+        let mut reused = 0;
+        let result = compare_cached(
+            channels,
+            candidate,
+            self.prefix,
+            transforms,
+            transform,
+            &mut self.cache.borrow_mut(),
+            &mut reused,
+        );
         let nanos = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
         let _ = self.experiment.scoring_nanos.fetch_update(
             Ordering::Relaxed,
@@ -234,6 +259,8 @@ impl Visit<'_> {
             old_would_accept: Some(old_would_accept),
             proxy_would_accept: None,
             vetoed: false,
+            promoted: false,
+            reused_planes: reused,
             forced,
             unavailable: None,
         };
@@ -241,19 +268,30 @@ impl Visit<'_> {
             Ok((skip, candidate)) => {
                 let accept = candidate.total_bits <= skip.total_bits;
                 record.proxy_would_accept = Some(accept);
-                record.vetoed = self.experiment.mode == Mode::Veto
+                record.vetoed = matches!(self.experiment.mode, Mode::Veto | Mode::Route)
                     && self.allow_veto
                     && !forced
                     && old_would_accept
                     && !accept;
+                record.promoted = self.experiment.mode == Mode::Route
+                    && self.allow_veto
+                    && !forced
+                    && !old_would_accept
+                    && accept;
                 record.skip = Some(skip);
                 record.candidate = Some(candidate);
             }
             Err(error) => record.unavailable = Some(error.to_string()),
         }
-        let vetoed = record.vetoed;
+        let decision = if record.vetoed {
+            Some(false)
+        } else if record.promoted {
+            Some(true)
+        } else {
+            None
+        };
         self.experiment.lock().push(record);
-        vetoed
+        decision
     }
 }
 
@@ -272,12 +310,33 @@ fn header_bits(transforms: &[Transform]) -> Result<usize> {
     Ok(writer.bits_written())
 }
 
+#[cfg(test)]
 fn compare(
     original: &[Channel],
     candidate: &[Channel],
     prefix: &[Transform],
     transforms: &[Transform],
     transform: &Transform,
+) -> Result<(Score, Score)> {
+    compare_cached(
+        original,
+        candidate,
+        prefix,
+        transforms,
+        transform,
+        &mut Vec::new(),
+        &mut 0,
+    )
+}
+
+fn compare_cached(
+    original: &[Channel],
+    candidate: &[Channel],
+    prefix: &[Transform],
+    transforms: &[Transform],
+    transform: &Transform,
+    cache: &mut Vec<Option<PlaneScore>>,
+    reused: &mut usize,
 ) -> Result<(Score, Score)> {
     let Transform::Palette {
         begin, channels, ..
@@ -294,9 +353,17 @@ fn compare(
     let after_header = header_bits(&script)?;
     // Unchanged planes, including unselected alpha/extra channels and old meta,
     // cancel. No masking: selected RGBA and hidden RGB are scored verbatim.
-    let before = original[begin..begin + channels]
-        .iter()
-        .map(|c| plane_score(c, false))
+    cache.resize_with(original.len(), || None);
+    let before = (begin..begin + channels)
+        .map(|i| {
+            if let Some(score) = &cache[i] {
+                *reused += 1;
+                return Ok(score.clone());
+            }
+            let score = plane_score(&original[i], false)?;
+            cache[i] = Some(score.clone());
+            Ok(score)
+        })
         .collect::<Result<Vec<_>>>()?;
     let after = vec![
         plane_score(&candidate[0], true)?,

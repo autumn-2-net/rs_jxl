@@ -6,6 +6,7 @@
 use super::{
     encode,
     group::Channel,
+    predict_simd::{ChannelResiduals, narrow_enabled},
     predictor::Predictor,
     tree::{ChannelTree, Tree, pack_signed},
     weighted,
@@ -61,6 +62,7 @@ fn channel(
     wp: &weighted::Header,
     previous_channels: usize,
     stream_id: usize,
+    narrow: bool,
     scratch: &mut Scratch,
     history: Option<&[[i32; 2]]>,
     mut emit: impl FnMut(Literal),
@@ -75,18 +77,21 @@ fn channel(
     if let Some(leaf) = plan.leaf()
         && !leaf.predictor.has_weighted()
     {
+        let residuals = ChannelResiduals::new(
+            &channel.samples,
+            channel.width,
+            channel.width,
+            channel.height,
+            &[leaf.predictor],
+            narrow,
+        )
+        .map_err(|e| Error::Encoding(e.to_string()))?;
         let row = &mut scratch.rows[leaf.predictor as usize];
         row.resize(channel.width, 0);
         for y in 0..channel.height {
-            super::predict_simd::residual_row(
-                &channel.samples,
-                channel.width,
-                channel.width,
-                y,
-                leaf.predictor,
-                row,
-            )
-            .map_err(|e| Error::Encoding(e.to_string()))?;
+            residuals
+                .residual_row(y, leaf.predictor, row)
+                .map_err(|e| Error::Encoding(e.to_string()))?;
             for &value in row.iter() {
                 let residual = value - i64::from(leaf.offset);
                 let residual = if leaf.multiplier == 1 {
@@ -113,6 +118,17 @@ fn channel(
     if pair::emit(channel, &plan, history, &mut emit)? {
         return Ok(());
     }
+    // Do not scan planes consumed by the fused fixed/pair paths above. The
+    // immutable proof and predictor mask are shared by every cached row below.
+    let residuals = ChannelResiduals::new(
+        &channel.samples,
+        channel.width,
+        channel.width,
+        channel.height,
+        &plan.predictors,
+        narrow,
+    )
+    .map_err(|e| Error::Encoding(e.to_string()))?;
     let mut column = 0;
     encode::visit_channel_with_history(
         planes,
@@ -132,15 +148,9 @@ fn channel(
                 for &predictor in &plan.predictors {
                     let row = &mut scratch.rows[predictor as usize];
                     row.resize(channel.width, 0);
-                    super::predict_simd::residual_row(
-                        &channel.samples,
-                        channel.width,
-                        channel.width,
-                        pos / channel.width,
-                        predictor,
-                        row,
-                    )
-                    .map_err(|e| Error::Encoding(e.to_string()))?;
+                    residuals
+                        .residual_row(pos / channel.width, predictor, row)
+                        .map_err(|e| Error::Encoding(e.to_string()))?;
                 }
             }
             let leaf = plan.lookup_pixel(props, neighbors)?;
@@ -291,6 +301,7 @@ fn tokenize_as<T: Copy + Send>(
                 wp,
                 previous_channels,
                 stream_id,
+                narrow_enabled(),
                 &mut scratch,
                 history.and_then(|cache| cache.channel(c)),
                 |t| tokens.push(convert(t)),
@@ -326,6 +337,7 @@ fn tokenize_as<T: Copy + Send>(
                 wp,
                 previous_channels,
                 stream_id,
+                narrow_enabled(),
                 &mut Scratch::default(),
                 history.and_then(|cache| cache.channel(*c)),
                 |t| {
@@ -396,6 +408,108 @@ mod tests {
         )
         .unwrap();
         result
+    }
+
+    #[test]
+    fn experiment5_narrow_static_and_dynamic_tokens_match_wide_and_scalar() {
+        let wp = weighted::Header::default();
+        for width in [1, 11, 12, 17, 65] {
+            for wide in [false, true] {
+                let planes = [Channel {
+                    width,
+                    height: 4,
+                    hshift: 0,
+                    vshift: 0,
+                    samples: (0..width * 4)
+                        .map(|i| {
+                            if wide {
+                                [i32::MIN, i32::MAX, -1, 0][i % 4]
+                            } else {
+                                [-65535, 65535, -2, -1, 0, 1, 2][i % 7]
+                            }
+                        })
+                        .collect(),
+                }];
+                for id in 0..14 {
+                    let predictor = Predictor::try_from(id).unwrap();
+                    for dynamic in [false, true] {
+                        let leaf = Node::Leaf {
+                            predictor,
+                            offset: -17,
+                            multiplier: 1,
+                        };
+                        let nodes = if dynamic {
+                            // Property 2 survives channel filtering and defeats
+                            // the fixed/pair paths, exercising the row cache.
+                            vec![
+                                Node::Split {
+                                    property: 2,
+                                    threshold: 1,
+                                    greater: 1,
+                                    less_equal: 2,
+                                },
+                                leaf,
+                                Node::Leaf {
+                                    predictor: Predictor::Left,
+                                    offset: 3,
+                                    multiplier: 1,
+                                },
+                            ]
+                        } else {
+                            vec![leaf]
+                        };
+                        let tree = Tree::new(nodes).unwrap();
+                        let expected = scalar(&planes, &tree, &wp);
+                        for enabled in [false, true] {
+                            let mut actual = Vec::new();
+                            channel(
+                                &planes,
+                                0,
+                                &tree,
+                                &wp,
+                                3,
+                                19,
+                                enabled,
+                                &mut Scratch::default(),
+                                None,
+                                |t| actual.push(t),
+                            )
+                            .unwrap();
+                            assert_eq!(
+                                actual, expected,
+                                "p={predictor:?} dynamic={dynamic} wide={wide} narrow={enabled} width={width}"
+                            );
+                        }
+                    }
+                }
+                let mut divisible = planes.clone();
+                for (i, value) in divisible[0].samples.iter_mut().enumerate() {
+                    *value = (i as i32 - 30) * 6 + 5;
+                }
+                let tree = Tree::new(vec![Node::Leaf {
+                    predictor: Predictor::Zero,
+                    offset: 5,
+                    multiplier: 6,
+                }])
+                .unwrap();
+                let expected = scalar(&divisible, &tree, &wp);
+                let mut actual = Vec::new();
+                channel(
+                    &divisible,
+                    0,
+                    &tree,
+                    &wp,
+                    3,
+                    19,
+                    true,
+                    &mut Scratch::default(),
+                    None,
+                    |t| actual.push(t),
+                )
+                .unwrap();
+                assert_eq!(actual, expected);
+            }
+        }
     }
 
     #[test]
