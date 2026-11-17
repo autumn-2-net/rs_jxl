@@ -115,6 +115,51 @@ fn wide_extra_plane_with_narrow_main_preserves_its_native_type() {
 }
 
 #[test]
+fn wide_gray_move_preserves_mixed_extra_order_and_optional_output() {
+    let source = image(31, PixelLayout::Gray, 7, 5);
+    let mut metadata = source.metadata().clone();
+    metadata
+        .extra_channels
+        .push(ExtraChannelInfo::new(ExtraChannelType::Depth, 31).unwrap());
+    metadata
+        .extra_channels
+        .push(ExtraChannelInfo::new(ExtraChannelType::SelectionMask, 8).unwrap());
+    let depth = PixelData::U32((0..35).map(|i| 2_147_483_647 - i * 16_777_217).collect());
+    let mask = PixelData::U8((0..35).map(|i| (i * 7) as u8).collect());
+    let source = source
+        .with_metadata(metadata, vec![depth.clone(), mask.clone()])
+        .unwrap();
+    let bytes = encode(&source, &options()).unwrap();
+    for include_extra_channels in [false, true] {
+        let decoded = decode(
+            &bytes,
+            &DecodeOptions {
+                include_extra_channels,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let frame = &decoded.frames[0];
+        assert_eq!(frame.layout, PixelLayout::Gray);
+        assert_eq!(frame.pixels, *source.pixels());
+        if include_extra_channels {
+            assert_eq!(frame.extra_planes, [depth.clone(), mask.clone()]);
+        } else {
+            assert!(frame.extra_planes.is_empty());
+        }
+        assert_eq!(decoded.info.extra_channels.len(), 2);
+        assert_eq!(
+            decoded.info.extra_channels[0].ec_type,
+            rs_jxl::decode::ExtraChannel::Depth
+        );
+        assert_eq!(
+            decoded.info.extra_channels[1].ec_type,
+            rs_jxl::decode::ExtraChannel::SelectionMask
+        );
+    }
+}
+
+#[test]
 fn unequal_alpha_depth_keeps_authoritative_original_plane() {
     let source = Image::new(4, 1, PixelLayout::Gray, PixelData::U8(vec![3, 7, 19, 251])).unwrap();
     let mut metadata = source.metadata().clone();

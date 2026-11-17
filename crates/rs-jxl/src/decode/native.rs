@@ -99,7 +99,7 @@ fn plane(plane: JxlNativeIntegerPlane) -> Result<PixelData> {
 }
 
 pub(super) fn frame(
-    captured: JxlNativeIntegerFrame,
+    mut captured: JxlNativeIntegerFrame,
     info: &JxlBasicInfo,
     header: &JxlFrameHeader,
     index: usize,
@@ -141,17 +141,26 @@ pub(super) fn frame(
     let samples = count
         .checked_mul(channels)
         .ok_or(Error::Limit("native interleaved samples"))?;
-    let pixels = pack(samples, depth, |i| {
-        let channel = i % channels;
-        let pixel = i / channels;
-        if channel < color {
-            return captured.planes[channel].samples[pixel];
-        }
-        let alpha = &captured.planes[color + alpha.unwrap()];
-        let alpha_max = (1u64 << alpha.bits_per_sample) - 1;
-        // Interleaved alpha shares the color range; its separate plane remains exact.
-        ((u64::from(alpha.samples[pixel]) * max + alpha_max / 2) / alpha_max) as u32
-    })?;
+    let pixels = if color == 1 && alpha.is_none() && depth > 16 {
+        // Native capture already owns the final full-width gray words. Keep
+        // narrow main planes on pack: a wide extra alone can select this path.
+        PixelData::U32(std::mem::take(&mut captured.planes[0].samples))
+    } else {
+        pack(samples, depth, |i| {
+            let channel = i % channels;
+            let pixel = i / channels;
+            if channel < color {
+                return captured.planes[channel].samples[pixel];
+            }
+            let alpha = &captured.planes[color + alpha.unwrap()];
+            if alpha.bits_per_sample == depth {
+                return alpha.samples[pixel];
+            }
+            let alpha_max = (1u64 << alpha.bits_per_sample) - 1;
+            // Interleaved alpha shares the color range; its separate plane remains exact.
+            ((u64::from(alpha.samples[pixel]) * max + alpha_max / 2) / alpha_max) as u32
+        })?
+    };
     let extra_planes = if options.include_extra_channels {
         captured
             .planes

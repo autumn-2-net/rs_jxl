@@ -56,28 +56,28 @@ transparent icon, gray photo, 64x64 RGB16 photo and PDF/text screenshot.
 
 Times are medians in milliseconds. Throughput counts spatial pixels, not channels.
 
-| Sample | Before ms | After ms | Speedup | After MPix/s |
-| --- | ---: | ---: | ---: | ---: |
-| WP8 ANS singleton | 2.061 | 1.140 | 1.808x | 229.97 |
-| WP8 non-unit leaf control | 1.914 | 1.911 | 1.001x | 137.18 |
-| Gradient8 non-unit leaf control | 1.259 | 1.312 | 0.960x | 199.77 |
-| Gradient8 varying, config 420 | 1.877 | 1.479 | 1.269x | 177.24 |
-| Gradient8 varying, alternate config | 1.837 | 1.848 | 0.994x | 141.83 |
-| WP16 prefix singleton | 1.721 | 1.090 | 1.580x | 240.57 |
-| Gradient31 ANS singleton | 4.624 | 3.392 | 1.363x | 77.29 |
-| WP8 alternate-config singleton | 2.149 | 1.054 | 2.039x | 248.69 |
-| WP16 LZ input | 5.177 | 4.989 | 1.038x | 52.54 |
-| Gradient8 prefix singleton | 1.040 | 0.579 | 1.798x | 452.95 |
-| Ordinary RGBA8 with hidden RGB | 2.731 | 2.912 | 0.938x | 22.51 |
-| Ordinary RGBA16 with hidden RGB | 9.090 | 9.036 | 1.006x | 7.25 |
-| Ordinary RGBA31 with hidden RGB | 7.254 | 7.497 | 0.968x | 8.74 |
-| Ordinary Gray16 | 1.216 | 1.227 | 0.991x | 53.41 |
-| Kodak | 61.437 | 61.899 | 0.993x | 6.35 |
-| Webpage | 56.292 | 56.816 | 0.991x | 33.82 |
-| Transparent icon | 32.266 | 32.651 | 0.988x | 8.03 |
-| Gray photo | 10.828 | 10.607 | 1.021x | 23.57 |
-| Small RGB16 photo | 0.722 | 0.705 | 1.024x | 5.81 |
-| PDF/text | 176.848 | 175.762 | 1.006x | 8.28 |
+| Sample | Before ms | After ms | Before MPix/s | After MPix/s | Speedup |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| WP8 ANS singleton | 2.061 | 1.140 | 127.22 | 229.97 | 1.808x |
+| WP8 non-unit leaf control | 1.914 | 1.911 | 136.98 | 137.18 | 1.001x |
+| Gradient8 non-unit leaf control | 1.259 | 1.312 | 208.15 | 199.77 | 0.960x |
+| Gradient8 varying, config 420 | 1.877 | 1.479 | 139.62 | 177.24 | 1.269x |
+| Gradient8 varying, alternate config | 1.837 | 1.848 | 142.72 | 141.83 | 0.994x |
+| WP16 prefix singleton | 1.721 | 1.090 | 152.30 | 240.57 | 1.580x |
+| Gradient31 ANS singleton | 4.624 | 3.392 | 56.70 | 77.29 | 1.363x |
+| WP8 alternate-config singleton | 2.149 | 1.054 | 121.97 | 248.69 | 2.039x |
+| WP16 LZ input | 5.177 | 4.989 | 50.63 | 52.54 | 1.038x |
+| Gradient8 prefix singleton | 1.040 | 0.579 | 251.98 | 452.95 | 1.798x |
+| Ordinary RGBA8 with hidden RGB | 2.731 | 2.912 | 23.99 | 22.51 | 0.938x |
+| Ordinary RGBA16 with hidden RGB | 9.090 | 9.036 | 7.21 | 7.25 | 1.006x |
+| Ordinary RGBA31 with hidden RGB | 7.254 | 7.497 | 9.03 | 8.74 | 0.968x |
+| Ordinary Gray16 | 1.216 | 1.227 | 53.89 | 53.41 | 0.991x |
+| Kodak | 61.437 | 61.899 | 6.40 | 6.35 | 0.993x |
+| Webpage | 56.292 | 56.816 | 34.13 | 33.82 | 0.991x |
+| Transparent icon | 32.266 | 32.651 | 8.12 | 8.03 | 0.988x |
+| Gray photo | 10.828 | 10.607 | 23.09 | 23.57 | 1.021x |
+| Small RGB16 photo | 0.722 | 0.705 | 5.67 | 5.81 | 1.024x |
+| PDF/text | 176.848 | 175.762 | 8.23 | 8.28 | 1.006x |
 
 The six real-image medians sum to **338.392 -> 338.440 ms** for 4,286,834
 pixels, or **12.67 MPix/s** after the change. This is effectively unchanged.

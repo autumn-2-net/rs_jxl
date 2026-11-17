@@ -2,7 +2,9 @@
 //! Fixed-tool fixtures, with tiny typed-storage and retained-frame regressions;
 //! no MA training, tool search, LZ77 search or external decoder processes.
 
-use rs_jxl::decode::{DecodeOptions, DecodedFrame, DecodedImage, StreamDecoder, decode};
+use rs_jxl::decode::{
+    DecodeOptions, DecodedFrame, DecodedImage, SampleFormat, StreamDecoder, decode,
+};
 use rs_jxl::entropy::stream::Coding;
 use rs_jxl::metadata::{Animation, BitDepth, ExtraChannelInfo, ExtraChannelType};
 use rs_jxl::modular::encode::FixedTree;
@@ -250,6 +252,70 @@ fn full_decode_large_rgba8_typed_destination_is_exact() {
         assert!(decoded.complete, "{context}");
         assert_eq!(decoded.frames.len(), 1, "{context}");
         assert_original(&decoded.frames[0], &source, &expected_alpha, &context);
+    }
+}
+
+#[test]
+fn rgb_rgba16_output_tails_preserve_original_words_and_hidden_rgb() {
+    for width in [1, 3, 7, 9, 17] {
+        let rgba = source(16, width, 3);
+        for has_alpha in [false, true] {
+            let image = if has_alpha {
+                rgba.clone()
+            } else {
+                let PixelData::U16(values) = rgba.pixels() else {
+                    unreachable!()
+                };
+                let pixels = PixelData::U16(
+                    values
+                        .chunks_exact(4)
+                        .flat_map(|pixel| pixel[..3].iter().copied())
+                        .collect(),
+                );
+                let image = Image::new(width, 3, PixelLayout::Rgb, pixels).unwrap();
+                let mut metadata = image.metadata().clone();
+                metadata.modular_16_bit_buffer_sufficient = false;
+                image.with_metadata(metadata, vec![]).unwrap()
+            };
+            let bytes = encode(&image, &encoding(Route::Plain)).unwrap();
+            let expected_extras = if has_alpha {
+                vec![alpha(&image)]
+            } else {
+                Vec::new()
+            };
+            let check = |frame: &DecodedFrame| {
+                assert!(frame.complete);
+                assert_eq!((frame.width, frame.height), (width as usize, 3));
+                assert_eq!(frame.layout, image.layout());
+                assert_eq!(
+                    &frame.pixels,
+                    image.pixels(),
+                    "width={width}, alpha={has_alpha}"
+                );
+                assert_eq!(frame.extra_planes, expected_extras);
+            };
+            for threads in [1, 2] {
+                for format in [SampleFormat::Native, SampleFormat::U16] {
+                    let options = DecodeOptions {
+                        threads,
+                        format,
+                        ..Default::default()
+                    };
+                    let batch = decode(&bytes, &options).unwrap();
+                    assert!(batch.complete);
+                    assert_eq!(batch.frames.len(), 1);
+                    check(&batch.frames[0]);
+                    let mut stream = StreamDecoder::new(&options).unwrap();
+                    for chunk in bytes.chunks(7) {
+                        stream.push(chunk).unwrap();
+                    }
+                    assert!(stream.finish().unwrap().complete);
+                    let frames = stream.take_frames();
+                    assert_eq!(frames.len(), 1);
+                    check(&frames[0]);
+                }
+            }
+        }
     }
 }
 

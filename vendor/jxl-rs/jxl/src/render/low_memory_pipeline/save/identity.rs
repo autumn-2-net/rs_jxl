@@ -281,6 +281,15 @@ fn load_f32_as_f16<D: SimdDescriptor>(d: D, src: &[f32]) -> D::U16Vec {
 }
 
 #[inline(always)]
+fn load_f32_as_u16<D: SimdDescriptor>(d: D, src: &[f32], max: f32) -> D::U16Vec {
+    let len = D::U16Vec::LEN;
+    let mut buf = [0u16; 32];
+    // Reuse the planar quantizer verbatim, including its clamp/round behavior.
+    f32_to_u16_simd(d, src, &mut buf[..len], max, len);
+    D::U16Vec::load(d, &buf[..len])
+}
+
+#[inline(always)]
 fn load_i16_as_f16<D: SimdDescriptor>(d: D, src: &[i16], scale: f32) -> D::U16Vec {
     let len = D::U16Vec::LEN;
     let mut buf = [0u16; 32];
@@ -380,6 +389,13 @@ enum AlphaF16<'a> {
     I16(&'a [i16], f32),
 }
 
+#[derive(Clone, Copy)]
+enum AlphaU16<'a> {
+    None,
+    Opaque,
+    F32(&'a [f32]),
+}
+
 simd_function!(
     store_f32_to_u8_interleaved,
     d: D,
@@ -464,6 +480,45 @@ simd_function!(
                     U16SimdVec::store_interleaved_4(vr, vg, vb, va, out_chunk);
                 });
             }
+        }
+    }
+);
+
+simd_function!(
+    store_f32_to_u16_interleaved,
+    d: D,
+    fn store_f32_to_u16_interleaved_impl(
+        r: &[f32],
+        g: &[f32],
+        b: &[f32],
+        max: u16,
+        alpha: AlphaU16<'_>,
+        out: &mut [u16],
+    ) {
+        let max_f32 = max as f32;
+        match alpha {
+            AlphaU16::None => run_simd_chunks!(out, u16, U16Vec, 3, |n, out_chunk| {
+                let vr = load_f32_as_u16(d, &r[n..], max_f32);
+                let vg = load_f32_as_u16(d, &g[n..], max_f32);
+                let vb = load_f32_as_u16(d, &b[n..], max_f32);
+                U16SimdVec::store_interleaved_3(vr, vg, vb, out_chunk);
+            }),
+            AlphaU16::Opaque => {
+                let va = D::U16Vec::splat(d, max);
+                run_simd_chunks!(out, u16, U16Vec, 4, |n, out_chunk| {
+                    let vr = load_f32_as_u16(d, &r[n..], max_f32);
+                    let vg = load_f32_as_u16(d, &g[n..], max_f32);
+                    let vb = load_f32_as_u16(d, &b[n..], max_f32);
+                    U16SimdVec::store_interleaved_4(vr, vg, vb, va, out_chunk);
+                });
+            }
+            AlphaU16::F32(a) => run_simd_chunks!(out, u16, U16Vec, 4, |n, out_chunk| {
+                let vr = load_f32_as_u16(d, &r[n..], max_f32);
+                let vg = load_f32_as_u16(d, &g[n..], max_f32);
+                let vb = load_f32_as_u16(d, &b[n..], max_f32);
+                let va = load_f32_as_u16(d, &a[n..], max_f32);
+                U16SimdVec::store_interleaved_4(vr, vg, vb, va, out_chunk);
+            }),
         }
     }
 );
@@ -589,6 +644,44 @@ pub(super) fn store_fused(
                 }
                 _ => false,
             }
+        }
+        JxlDataFormat::U16 {
+            bit_depth,
+            endianness,
+        } if endianness == Endianness::native() => {
+            let [
+                SaveChannelType::F32,
+                SaveChannelType::F32,
+                SaveChannelType::F32,
+                rest @ ..,
+            ] = stage.channel_types.as_slice()
+            else {
+                return false;
+            };
+            let alpha = match (rest, stage.fill_opaque_alpha) {
+                ([], false) => AlphaU16::None,
+                ([], true) => AlphaU16::Opaque,
+                ([SaveChannelType::F32], false) => AlphaU16::F32(f32_row(3)),
+                _ => return false,
+            };
+            let output_slice = &mut output_buf.row_mut(output_y)[0..len * out_channels * 2];
+            if output_slice
+                .as_mut_ptr()
+                .align_offset(std::mem::align_of::<u16>())
+                != 0
+            {
+                return false;
+            }
+            let max = ((1u32 << bit_depth) - 1) as u16;
+            store_f32_to_u16_interleaved(
+                f32_row(0),
+                f32_row(1),
+                f32_row(2),
+                max,
+                alpha,
+                u16::cast_slice_mut(output_slice),
+            );
+            true
         }
         JxlDataFormat::F16 { endianness } if endianness == Endianness::native() => {
             let output_slice = &mut output_buf.row_mut(output_y)[0..len * out_channels * 2];

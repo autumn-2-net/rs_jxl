@@ -319,3 +319,29 @@ inputs. `decoder_hybrid_uint` exercises singleton symbols requiring extra bits,
 low initial ANS states, normalization boundaries and truncated reads using the
 actual maintained ANS implementation. Measurements and central test
 results are in `docs/DECODER_READER_DISPATCH_20261117.md` in the parent repository.
+
+## Fused Native-Endian U16 Output (2026-11-17)
+
+`render/low_memory_pipeline/save/identity.rs` adds an RGB/RGBA U16 store that
+reuses the existing `f32_to_u16_simd` quantizer and `U16SimdVec` interleavers.
+It avoids converting full planar rows to scratch and reading those rows back
+for interleaving. Native-endian, aligned F32 RGB rows qualify, with absent,
+opaque or F32 alpha; other channel types, grayscale, unaligned destinations
+and non-native endianness retain the existing fallback. The clamp, scaling,
+rounding and alpha-channel order are unchanged. Existing SIMD chunk/tail
+handling is reused, with no new intrinsics, unsafe blocks or ARM-specific work.
+
+Parent `decoder_parallel_pixels` adds native/explicit U16 RGB/RGBA tail cases,
+hidden RGB, authoritative alpha, multiple thread counts and incremental input.
+The development example `check_u16_output` compiles the actual maintained
+quantizer/store source and explicitly exercises Scalar, SSE4.2 and AVX.
+It compares each implementation against its previous planar quantizer and
+checks original normalized integer words across implementations. Existing
+scalar ties-away versus x86 ties-even behavior for floating-point half-way
+values is recorded, not changed by this optimization. Unused buffer glue in
+that example is unreachable; end-to-end tests exercise real buffers.
+
+The parent adapter separately moves wide grayscale capture output and skips
+equal-depth alpha scaling. A parent JPEG scan-buffer experiment was dropped
+after timing regressions. See
+`docs/DECODER_OUTPUT_SPEED_20261117.md` for measured scope and limitations.
