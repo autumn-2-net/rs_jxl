@@ -549,6 +549,33 @@ pub struct DcContexts {
 }
 
 impl DcContexts {
+    /// Explicit experiment model; unlike the source factory, the requested
+    /// threshold count is the supplied count. Only luma has DC thresholds.
+    /// Accepts the BlockCtxMap wire bounds (15 thresholds, 16 contexts), not
+    /// the source factory's narrower policy. DC preparation may be narrower.
+    pub(crate) fn from_parts(thresholds: Vec<i32>, context_map: Vec<u8>) -> crate::Result<Self> {
+        use super::ac_tokens::BlockContextModel;
+
+        if thresholds.len() > 15 || thresholds.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(crate::Error::InvalidInput(
+                "explicit luma DC thresholds must be sorted, unique and at most fifteen".into(),
+            ));
+        }
+        let num_contexts = context_map
+            .iter()
+            .copied()
+            .max()
+            .map_or(0, |id| usize::from(id) + 1);
+        BlockContextModel::new([&[], &thresholds, &[]], &[], &context_map, num_contexts)
+            .map_err(|error| crate::Error::InvalidInput(error.to_string()))?;
+        Ok(Self {
+            requested_thresholds: thresholds.len() as u8,
+            thresholds,
+            context_map,
+            num_contexts: num_contexts as u8,
+        })
+    }
+
     fn from_counts(counts: &[u64; 2048], total: u64, quality_sum: u64, grayscale: bool) -> Self {
         let ceil_log2 = |n: u64| (u64::BITS - (n - 1).leading_zeros()) as i32;
         let requested_thresholds =
@@ -1152,6 +1179,39 @@ mod tests {
             assert_eq!(contexts.requested_thresholds(), 7);
             assert_eq!(contexts.luma_thresholds(), [1022]);
             assert_paired_luma(contexts, grayscale);
+        }
+    }
+
+    #[test]
+    fn explicit_context_parts_accept_wire_maxima_and_record_supplied_thresholds() {
+        let thresholds: Vec<i32> = (-7..=7).collect();
+        let mut map = vec![0; 3 * NUM_COEFFICIENT_ORDERS * 16];
+        for (i, id) in map[..16].iter_mut().enumerate() {
+            *id = i as u8;
+        }
+        let contexts = DcContexts::from_parts(thresholds.clone(), map.clone()).unwrap();
+        assert_eq!(contexts.luma_thresholds(), thresholds);
+        assert_eq!(contexts.requested_thresholds(), 15);
+        assert_eq!(contexts.num_dc_contexts(), 16);
+        assert_eq!(contexts.num_contexts(), 16);
+        assert_eq!(contexts.context_map(), map);
+        let contexts = DcContexts::from_parts(Vec::new(), vec![0; 3 * 13]).unwrap();
+        assert_eq!(contexts.requested_thresholds(), 0);
+        assert_eq!(contexts.num_contexts(), 1);
+    }
+
+    #[test]
+    fn explicit_context_parts_reject_bad_thresholds_map_shape_and_sparse_ids() {
+        for thresholds in [vec![0, 0], vec![1, 0], (0..16).collect()] {
+            let map = vec![0; 3 * NUM_COEFFICIENT_ORDERS * (thresholds.len() + 1)];
+            assert!(DcContexts::from_parts(thresholds, map).is_err());
+        }
+        assert!(DcContexts::from_parts(Vec::new(), Vec::new()).is_err());
+        assert!(DcContexts::from_parts(Vec::new(), vec![0; 38]).is_err());
+        for bad in [2, 16, u8::MAX] {
+            let mut map = vec![0; 39];
+            map[0] = bad;
+            assert!(DcContexts::from_parts(Vec::new(), map).is_err());
         }
     }
 

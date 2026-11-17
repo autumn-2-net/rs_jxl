@@ -3,9 +3,12 @@
 //! No JPEG-to-RGB decoder is used here. `transcode` and `transcode_to` produce
 //! byte-reversible JPEG containers. Full optimized source-tool parity remains
 //! tracked separately from this independently verified coefficient path.
+pub mod ac_audit;
+mod ac_histogram_groups;
 pub mod ac_tokens;
 mod archival;
 pub mod bitstream;
+mod block_context_tuning;
 pub mod cfl;
 pub mod coefficient_order;
 pub mod coefficient_reader;
@@ -24,6 +27,7 @@ pub mod frame_header;
 pub mod head_tail;
 pub mod huffman;
 pub mod modular_policy;
+mod order_tuning;
 pub mod quantization;
 pub mod reader;
 pub mod reconstruction_brotli;
@@ -35,6 +39,7 @@ pub mod scan_progression;
 pub mod scan_writer;
 pub mod search;
 mod sequential;
+pub mod size_breakdown;
 pub mod sof;
 mod transcode;
 pub mod transcode_layout;

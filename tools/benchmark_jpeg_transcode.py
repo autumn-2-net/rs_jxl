@@ -19,6 +19,11 @@ import compare_cpp_port as port
 from benchmark_fast_context import load_cases
 from benchmark_jpeg_head_tail import validate_measurement
 from benchmark_ma_models import trial_order
+from jpeg_lab_receipts import (
+    EXPERIMENT_FLAGS, AC_LZ_FLAGS, AC_HISTOGRAM_FLAGS, BLOCK_CONTEXT_FLAGS, AC_ORDER_FLAGS,
+    SIZE_BREAKDOWN_FIELDS, ac_lz_mode, ac_histograms, representation_modes,
+    validate_experiments, validate_size_breakdown, validate_audit,
+)
 
 
 def summary(cases, name):
@@ -31,10 +36,10 @@ def summary(cases, name):
                 mpix_per_second=pixels / 1e6 / seconds, jpeg_ratio=size / original)
 
 
-def arguments():
+def arguments(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--encoder", required=True, type=Path)
-    p.add_argument("--baseline", type=Path, help="Optional paired old jpeg_entropy_lab")
+    p.add_argument("--baseline", type=Path, help="Optional paired jpeg_entropy_lab; may match --encoder")
     p.add_argument("--decoder", required=True, type=Path)
     p.add_argument("--manifest", required=True, type=Path)
     p.add_argument("--out", required=True, type=Path)
@@ -42,11 +47,22 @@ def arguments():
     p.add_argument("--threads", type=int, default=8)
     p.add_argument("--repeats", type=int, default=3)
     p.add_argument("--timeout", type=float, default=300)
-    p.add_argument("--candidate-arg", action="append", default=[],
-                   choices=["--cooperative", "--symmetric-ma", "--cfl-peak", "--paired-luma"])
+    for name in ("baseline", "candidate"):
+        p.add_argument(f"--{name}-arg", action="append", default=[],
+                       choices=EXPERIMENT_FLAGS + AC_LZ_FLAGS + AC_HISTOGRAM_FLAGS + BLOCK_CONTEXT_FLAGS + AC_ORDER_FLAGS,
+                       help=f"Repeat as --{name}-arg=--flag for each experiment")
     p.add_argument("--profile", action="store_true")
     p.set_defaults(case=[])
-    a = p.parse_args()
+    a = p.parse_args(argv)
+    for name in ("baseline", "candidate"):
+        # Clap arguments are single-valued; keep harmless identical repeats once.
+        setattr(a, f"{name}_arg", list(dict.fromkeys(getattr(a, f"{name}_arg"))))
+        try:
+            ac_lz_mode(getattr(a, f"{name}_arg"))
+            ac_histograms(getattr(a, f"{name}_arg"))
+            representation_modes(getattr(a, f"{name}_arg"))
+        except ValueError as error:
+            p.error(f"{name}: {error}")
     if not 1 <= a.threads <= 256 or a.repeats < 1 or not 0 < a.timeout < float("inf"):
         p.error("Invalid execution limits")
     if a.out.exists():
@@ -69,6 +85,8 @@ def benchmark(args):
                   timing="Native parse and encode only; median per image then sum",
                   correctness="Native and official djxl complete original JPEG byte equality",
                   cases=[])
+    if any("--audit-ac" in getattr(args, f"{name}_arg") for name in variants):
+        report["timing"] = "Diagnostic run: audited variants include AC audit work; not a speed benchmark"
     sources = load_cases(args)
     if not sources:
         raise ValueError("Empty case manifest")
@@ -98,17 +116,17 @@ def benchmark(args):
                             restored = encoded.with_suffix(".jpg")
                             cmd = [str(variants[name]), str(snapshot), "--output", str(encoded),
                                    "--effort", str(args.effort), "--threads", str(args.threads)]
-                            if name == "candidate":
-                                cmd += args.candidate_arg
+                            flags = getattr(args, f"{name}_arg")
+                            cmd += flags
                             sample = dict(repeat=repeat, encoder=port.run_process(cmd, env, args.timeout))
                             case["variants"][name].append(sample)
                             port.check_process(sample["encoder"])
                             m = json.loads(sample["encoder"]["stdout"])
                             validate_measurement(m, "baseline", encoded.stat().st_size, width, height)
-                            for flag in ["cooperative", "symmetric_ma", "cfl_peak", "paired_luma"]:
-                                expected = name == "candidate" and '--' + flag.replace('_', '-') in args.candidate_arg
-                                if m.get(flag, False) is not expected:
-                                    raise ValueError(f"Experiment receipt mismatch: {flag}")
+                            validate_experiments(m, flags, channels=len(sampling))
+                            validate_size_breakdown(m, encoded.stat().st_size)
+                            if "--audit-ac" in flags:
+                                validate_audit(m)
                             if m["jpeg_bytes"] != len(original):
                                 raise ValueError("Input byte count mismatch")
                             sample["measurement"] = m

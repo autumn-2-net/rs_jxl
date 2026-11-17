@@ -49,6 +49,12 @@ pub struct Options {
     pub cfl_fit: CflFitPolicy,
     pub symmetric_ma: bool,
     pub paired_luma: bool,
+    pub ac_lz: super::entropy::AcLzSearch,
+    pub ac_histograms: usize,
+    pub block_context: super::block_context_tuning::Policy,
+    pub ac_order: super::order_tuning::Policy,
+    pub size_receipt: Option<std::sync::Arc<super::size_breakdown::Receipt>>,
+    pub ac_audit: Option<std::sync::Arc<super::ac_audit::Receipt>>,
     pub order: OrderPolicy,
     pub max_output_bytes: usize,
     pub max_coefficients: usize,
@@ -69,6 +75,12 @@ impl Default for Options {
             cfl_fit: CflFitPolicy::Source,
             symmetric_ma: false,
             paired_luma: false,
+            ac_lz: Default::default(),
+            ac_histograms: 1,
+            block_context: Default::default(),
+            ac_order: Default::default(),
+            size_receipt: None,
+            ac_audit: None,
             order: OrderPolicy::Source,
             max_output_bytes: usize::MAX,
             max_coefficients: usize::MAX,
@@ -240,12 +252,14 @@ fn tokenize_groups(
         .map_err(ac_token_error)
     })?;
     drop(tokenize_scope);
-    let mut entropy = CoefficientEntropy::source(
+    let mut entropy = CoefficientEntropy::grouped(
         streams,
-        model.num_ac_contexts(),
+        model.num_contexts(),
         options.tier,
         options.decoding_speed,
         options.max_tokens,
+        options.ac_lz,
+        options.ac_histograms,
     )?;
     if let Some(receipt) = &options.ac_head_tail {
         entropy.propose_head_tail(options.tier, options.decoding_speed, receipt)?;
@@ -286,6 +300,7 @@ fn prepare_ac(
     let (width, height) = geometry.dimensions_in_blocks();
     let image = Dct8Image::new(width, height, &views).map_err(invalid)?;
     let orders = Dct8Orders::compute(&image, options.tier, options.order);
+    let orders = super::order_tuning::apply(&orders, options.ac_order).map_err(invalid)?;
     drop(order_scope);
     let entropy = tokenize_groups(layout, geometry, &groups, dc, &orders, model, options)?;
     Ok((orders, entropy))
@@ -308,7 +323,7 @@ impl AcData<'_> {
     fn write_global(&self, writer: &mut BitWriter, groups: usize) -> Result<()> {
         match self {
             Self::Direct(orders, entropy, trial) => {
-                entropy::write_single_histogram_group(writer, groups)?;
+                entropy.write_histogram_groups(writer, groups)?;
                 entropy::write_orders(orders, writer)?;
                 let _scope = crate::profile::scope("jpeg.assembly.ac_model");
                 if *trial {
@@ -359,6 +374,16 @@ pub(crate) fn with_pool<T: Send>(
 }
 
 fn validate_execution(options: &Options) -> Result<()> {
+    if options.paired_luma && options.block_context != super::block_context_tuning::Policy::Source {
+        return Err(Error::InvalidInput(
+            "paired_luma cannot be combined with a block-context override".into(),
+        ));
+    }
+    if !(1..=4).contains(&options.ac_histograms) {
+        return Err(Error::InvalidInput(
+            "JPEG experimental AC histogram count must be 1..=4".into(),
+        ));
+    }
     if let Some(limits) = options.cooperative_ma {
         limits.validate()?;
     }
@@ -492,12 +517,24 @@ impl Prepared {
         pool: Option<&rayon::ThreadPool>,
         cache: Option<&mut SearchCache<'_>>,
     ) -> Result<Vec<u8>> {
+        if options.ac_audit.is_some() && (cache.is_some() || options.ac_head_tail.is_some()) {
+            return Err(Error::InvalidInput(
+                "AC audit requires a direct, single-model transcode".into(),
+            ));
+        }
         if cache.is_some() && options.ac_head_tail.is_some() {
             return Err(Error::InvalidInput(
                 "head/tail experiment cannot use source-search AC cache".into(),
             ));
         }
-        if cache.is_some() && (options.cfl_fit != CflFitPolicy::Source || options.paired_luma) {
+        if cache.is_some()
+            && (options.cfl_fit != CflFitPolicy::Source
+                || options.paired_luma
+                || options.ac_lz != super::entropy::AcLzSearch::Source
+                || options.block_context != super::block_context_tuning::Policy::Source
+                || options.ac_order != super::order_tuning::Policy::Source
+                || options.ac_histograms != 1)
+        {
             return Err(Error::InvalidInput(
                 "experimental AC policy cannot use source-search AC cache".into(),
             ));
@@ -512,11 +549,14 @@ impl Prepared {
         let quants = layout.planes().each_ref().map(|p| p.quantization());
         let dc_quant = DcQuantization::from_layout(quants)?;
         let ac_quant = RawDct8Quantization::from_layout(quants)?;
-        let contexts = if options.paired_luma {
-            layout.dc_contexts().with_paired_luma()
-        } else {
-            layout.dc_contexts()
-        };
+        let contexts = super::block_context_tuning::prepare(
+            &layout,
+            if options.paired_luma {
+                super::block_context_tuning::Policy::PairedLuma
+            } else {
+                options.block_context
+            },
+        )?;
         let model = BlockContextModel::new(
             [&[], contexts.luma_thresholds(), &[]],
             &[],
@@ -547,6 +587,9 @@ impl Prepared {
             AcData::Direct(&direct.0, &direct.1, false)
         };
         drop(ac_scope);
+        if let (Some(receipt), AcData::Direct(_, entropy, false)) = (&options.ac_audit, &ac) {
+            receipt.record(entropy.audit()?);
+        }
         let auxiliary_scope = crate::profile::scope("jpeg.stage.auxiliary_prepare");
         let maps = cfl.dimensions_in_tiles();
         let maps = CflMaps {
@@ -665,6 +708,17 @@ impl Prepared {
         // container so alignment, TOC widths and box headers are included.
         let emit = |ac: &AcData<'_>| -> Result<Vec<u8>> {
             let _stage = crate::profile::scope("jpeg.stage.assembly");
+            let mut costs = super::size_breakdown::SizeBreakdown::default();
+            costs.ac_block_contexts = Some(model.num_contexts());
+            costs.dc_thresholds = Some(contexts.luma_thresholds().len());
+            costs.ac_lz_enabled = match ac {
+                AcData::Direct(_, entropy, _) => Some(entropy.lz_enabled()),
+                AcData::Cached(_) => None,
+            };
+            costs.ac_histogram_groups = match ac {
+                AcData::Direct(_, entropy, _) => Some(entropy.histogram_groups()),
+                AcData::Cached(_) => None,
+            };
             let mut sections: Vec<_> = (0..geometry.section_count())
                 .map(|_| BitWriter::new(options.max_output_bytes))
                 .collect();
@@ -680,36 +734,48 @@ impl Prepared {
             QuantizerParams::jpeg().write(global)?;
             ac_tokens::write_block_context_map(model, global)?;
             entropy::write_jpeg_color_correlation(global)?;
+            costs.global_bits = global.bits_written();
             auxiliary.write_global_info(global)?;
+            costs.aux_model_bits = global.bits_written() - costs.global_bits;
             for (index, dc_group) in dc.iter().enumerate() {
                 let writer = &mut sections[section(index + 1)];
+                let before = writer.bits_written();
                 writer.write(2, u64::from(dc_group.extra_dc_precision))?;
                 auxiliary.write_stream(index + 1, writer)?;
+                costs.dc_bits += writer.bits_written() - before;
+                let before = writer.bits_written();
                 let metadata = &ac_metadata[index];
                 let area = metadata.rect.width * metadata.rect.height;
                 let bits = (usize::BITS - (area - 1).leading_zeros()) as u8;
                 writer.write(bits, (area - 1) as u64)?;
                 auxiliary.write_stream(1 + 2 * geometry.dc_group_count() + index, writer)?;
+                costs.ac_metadata_bits += writer.bits_written() - before;
             }
             let global_ac = &mut sections[section(1 + geometry.dc_group_count())];
+            let before = global_ac.bits_written();
             ac_quant.write_header(global_ac, |w, _| auxiliary.write_stream(quant_id, w))?;
+            costs.quant_bits = global_ac.bits_written() - before;
             {
                 let _scope = crate::profile::scope("jpeg.assembly.ac_global");
+                let before = global_ac.bits_written();
                 ac.write_global(global_ac, geometry.group_count())?;
+                costs.ac_model_bits = global_ac.bits_written() - before;
             }
             {
                 let _scope = crate::profile::scope("jpeg.assembly.ac_groups");
                 for index in 0..geometry.group_count() {
-                    ac.write_group(
-                        index,
-                        &mut sections[section(2 + geometry.dc_group_count() + index)],
-                    )?;
+                    let writer = &mut sections[section(2 + geometry.dc_group_count() + index)];
+                    let before = writer.bits_written();
+                    ac.write_group(index, writer)?;
+                    costs.ac_data_bits += writer.bits_written() - before;
                 }
             }
             let sections = sections
                 .into_iter()
                 .map(|mut w| {
+                    let before = w.bits_written();
                     w.zero_pad_to_byte()?;
+                    costs.padding_bits += w.bits_written() - before;
                     w.into_bytes().map_err(Error::from)
                 })
                 .collect::<Result<Vec<_>>>()?;
@@ -727,6 +793,8 @@ impl Prepared {
                 output.append_byte_aligned(&bytes)?;
             }
             let codestream = output.into_bytes()?;
+            costs.header_bits = (self.image_header.len() + frame_header.len()) * 8;
+            costs.reconstruction_bits = self.reconstruction.len() * 8;
             let mut boxes: Vec<(&[u8; 4], &[u8])> = self
                 .exif
                 .as_deref()
@@ -736,13 +804,24 @@ impl Prepared {
             if let Some(payload) = self.xmp.as_deref() {
                 boxes.push((b"xml ", payload));
             }
-            super::container::wrap_with_metadata(
+            costs.metadata_bits = boxes.iter().map(|(_, payload)| payload.len() * 8).sum();
+            let output = super::container::wrap_with_metadata(
                 &codestream,
                 &self.reconstruction,
                 self.level,
                 &boxes,
                 options.max_output_bytes,
-            )
+            )?;
+            costs.container_bits = (output.len() - codestream.len() - self.reconstruction.len())
+                * 8
+                - costs.metadata_bits;
+            if costs.total_bits() != output.len() * 8 {
+                return Err(Error::Encoding("JPEG wire-cost accounting mismatch".into()));
+            }
+            if let Some(receipt) = &options.size_receipt {
+                receipt.record(costs);
+            }
+            Ok(output)
         };
         let baseline = emit(&ac)?;
         if let Some(receipt) = &options.ac_head_tail {

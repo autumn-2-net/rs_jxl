@@ -13,6 +13,9 @@ use super::options::{ClusterStrategy, EntropyOptions, PREFIX_LOG_ALPHA_SIZE, Uin
 use super::{hybrid_uint::HybridUintConfig, prefix_code::PrefixCode};
 use crate::{Error, Result, bit_writer::BitWriter};
 
+#[path = "stream_audit.rs"]
+pub mod audit;
+
 /// The global MA tree's maximum leaf count plus an optional LZ77 distance
 /// context. Raw contexts are not the at-most-256 clustered histogram IDs.
 pub const MAX_RAW_CONTEXTS: usize = (1 << 21) + 1;
