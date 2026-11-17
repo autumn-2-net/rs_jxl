@@ -475,6 +475,7 @@ pub(super) fn run_on_specialized_tree<F: FnOnce(&mut dyn ModularChannelDecoder) 
     lut_scratch: &mut [u8; LUT_TABLE_SIZE],
     tree_scratch: &mut TreeScratch,
     wide_gradient: bool,
+    can_skip_single_symbol: bool,
     run: F,
 ) -> Result<()> {
     // TODO(veluca): consider skipping the pruning if header.uses_global_tree is true.
@@ -594,6 +595,8 @@ pub(super) fn run_on_specialized_tree<F: FnOnce(&mut dyn ModularChannelDecoder) 
         });
     }
 
+    let uses_non420 = !tree.histograms.can_use_config_420_fast_path();
+
     if let [
         TreeNode::Leaf {
             predictor: Predictor::Gradient,
@@ -603,15 +606,41 @@ pub(super) fn run_on_specialized_tree<F: FnOnce(&mut dyn ModularChannelDecoder) 
         },
     ] = pruned_tree.as_slice()
     {
+        if can_skip_single_symbol && let Some(symbol) = single_symbol {
+            return run(&mut SingleGradientOnly {
+                clustered_ctx: *id as usize,
+                reader: unpack_signed(symbol),
+            });
+        }
+        if !uses_non420 {
+            return run(&mut SingleGradientOnly {
+                clustered_ctx: *id as usize,
+                reader: Reader420NoLz,
+            });
+        }
         return run(&mut SingleGradientOnly {
             clustered_ctx: *id as usize,
             reader: ReaderGeneric,
         });
     }
 
-    let uses_non420 = !tree.histograms.can_use_config_420_fast_path();
-
     if !uses_non_wp {
+        // Match the existing singleton proof, preserving entropy reads when a
+        // low ANS state still needs renormalization at channel entry.
+        if can_skip_single_symbol
+            && let Some(symbol) = single_symbol
+            && let Some(mut wp) = WpOnly::new(
+                pruned_tree,
+                header,
+                xsize,
+                unpack_signed(symbol),
+                lut_scratch,
+                lut_stack,
+                wp_scratch,
+            )
+        {
+            return run(&mut wp);
+        }
         if !uses_non420 {
             if let Some(mut wp) = WpOnly::new(
                 pruned_tree,

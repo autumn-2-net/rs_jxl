@@ -36,6 +36,56 @@ use error::Error;
 use hybrid_uint::HybridUint;
 use util::CeilLog2;
 
+#[test]
+fn singleton_ans_low_initial_state_requires_renormalization() {
+    // Actual upstream ANS fixture: one symbol, 20, with frequency 4096.
+    // A constant-symbol shortcut must not skip the first normalization read.
+    let mut histogram = BitReader::new(&[0b00100101, 0b01]);
+    let codes = ans::AnsCodes::decode(1, 5, &mut histogram).unwrap();
+    assert_eq!(codes.single_symbol(0), Some(20));
+
+    let mut br = BitReader::new(&[0x13, 0, 0, 0, 0, 0]);
+    let mut reader = ans::AnsReader::init(&mut br).unwrap();
+    assert_eq!(br.total_bits_read(), 32);
+    assert!(!reader.is_normalized());
+    assert_eq!(reader.read(&codes, &mut br, 0), 20);
+    assert_eq!(br.total_bits_read(), 48);
+    assert!(reader.is_normalized());
+    br.check_for_error().unwrap();
+    reader.check_final_state().unwrap();
+}
+
+#[test]
+fn singleton_ans_normalization_guard_boundary() {
+    for (state, normalized) in [(0xffffu32, false), (0x10000u32, true)] {
+        let bytes = state.to_le_bytes();
+        let mut br = BitReader::new(&bytes);
+        let reader = ans::AnsReader::init(&mut br).unwrap();
+        assert_eq!(reader.is_normalized(), normalized, "state={state:#x}");
+        assert_eq!(br.total_bits_read(), 32);
+        br.check_for_error().unwrap();
+    }
+}
+
+#[test]
+fn singleton_ans_truncated_normalization_preserves_reader_error() {
+    let mut histogram = BitReader::new(&[0b00100101, 0b01]);
+    let codes = ans::AnsCodes::decode(1, 5, &mut histogram).unwrap();
+    let bytes = [0x13, 0, 0, 0, 0];
+    for length in [4, 5] {
+        let mut br = BitReader::new(&bytes[..length]);
+        let mut reader = ans::AnsReader::init(&mut br).unwrap();
+        assert!(!reader.is_normalized());
+        assert_eq!(reader.read(&codes, &mut br, 0), 20);
+        assert_eq!(br.total_bits_read(), 48);
+        assert_eq!(overread(&br), Some(48 - length * 8));
+        // Optimistic zero lookahead can reach the expected ANS endpoint even
+        // when its bytes are absent. Finalization must also inspect BitReader.
+        assert!(reader.is_normalized());
+        reader.check_final_state().unwrap();
+    }
+}
+
 // Reference formulas retain the pre-optimization JPEG XL Project code.
 // Copyright (c) the JPEG XL Project Authors. All rights reserved.
 // Governed by the BSD-style license in vendor/jxl-rs.
@@ -311,5 +361,76 @@ fn serialized_configs_and_errors_match_before_optimization() {
                 }
             }
         }
+    }
+}
+#[test]
+fn singleton_gradient_symbol_retains_extra_bits_ans_and_prefix() {
+    use rs_jxl::decode::{self, DecodeOptions};
+    use rs_jxl::entropy::{
+        HybridUintConfig,
+        options::{EntropyOptions, UintConfigStrategy},
+        stream::Coding,
+    };
+    use rs_jxl::modular::{
+        predictor::Predictor,
+        tree::{Node, Tree},
+    };
+    use rs_jxl::{EncodeOptions, Image, ModularOptions, PixelData, PixelLayout, encode};
+    let (width, height) = (17u32, 19u32);
+    // Clamped Gradient predicts the preceding row/column ramp maximum, so
+    // every residual is 3. Packed 6 has token 3 AND two extra bits under
+    // HybridUint(0,0,0); a singleton histogram does not eliminate those bits.
+    let image = Image::new(
+        width,
+        height,
+        PixelLayout::Gray,
+        PixelData::U16(
+            (0..height)
+                .flat_map(|y| (0..width).map(move |x| (3 * (x + y + 1)) as u16))
+                .collect(),
+        ),
+    )
+    .unwrap();
+    let config = HybridUintConfig::new(0, 0, 0).unwrap();
+    let encoded_value = config.encode(6);
+    assert_eq!((encoded_value.token, encoded_value.nbits), (3, 2));
+    for coding in [Coding::Ans, Coding::Prefix] {
+        let options = EncodeOptions {
+            threads: 1,
+            modular: ModularOptions {
+                rct: None,
+                lz77: false,
+                entropy: coding,
+                source_ma_defaults: false,
+                source_tool_defaults: false,
+                custom_tree: Some(
+                    Tree::new(vec![Node::Leaf {
+                        predictor: Predictor::Gradient,
+                        offset: 0,
+                        multiplier: 1,
+                    }])
+                    .unwrap(),
+                ),
+                entropy_options: EntropyOptions {
+                    uint_config: UintConfigStrategy::Fixed(config),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let bytes = encode(&image, &options).unwrap();
+        let decoded = decode::decode(&bytes, &DecodeOptions::default()).unwrap();
+        assert!(decoded.complete);
+        assert_eq!(decoded.frames.len(), 1);
+        let frame = &decoded.frames[0];
+        assert!(frame.complete);
+        assert_eq!(
+            (frame.width, frame.height, frame.layout),
+            (width as usize, height as usize, PixelLayout::Gray)
+        );
+        assert_eq!(decoded.info.bit_depth.bits_per_sample(), 16);
+        assert!(frame.extra_planes.is_empty());
+        assert_eq!(frame.pixels, *image.pixels());
     }
 }

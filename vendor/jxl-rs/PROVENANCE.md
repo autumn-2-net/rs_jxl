@@ -295,3 +295,27 @@ and ANS/prefix streams. `decode_wide_integer`, `decode_lossless_edges` and
 `decoder_parallel_pixels` cover the surrounding integer, frame and group paths.
 Measured performance and independent official-stream checks are recorded in
 the parent's `docs/PIXEL_CODEC_SPEED_20261109.md`, not inferred from the shortcut.
+
+## Modular Reader Dispatch (2026-11-17)
+
+`frame/modular/decode/specialized_trees.rs` reuses the existing constant reader
+for single-leaf Gradient and weighted-only trees when every reachable leaf has
+the same singleton symbol and no HybridUint extra bits. LZ77 remains excluded.
+Single-leaf Gradient also uses the existing `(4,2,0)` reader when all entropy
+configs qualify. Predictor arithmetic, weighted error updates and final stream
+validation are unchanged; this adds no unsafe code or CPU requirements.
+
+`entropy_coding/ans.rs` exposes an internal normalized-state check, forwarded by
+`entropy_coding/decode.rs` and evaluated once per channel in
+`frame/modular/decode/channel.rs`. The new constant routes require prefix coding
+or a current ANS state of at least 65536. Lower states retain entropy reads:
+even a singleton may need a 16-bit renormalization before reaching the expected
+final state. Initialization does not impose that lower bound. Existing Zero
+and FlatTree shortcuts are outside this change.
+
+Parent `decoder_reader_dispatch` verifies original 8/16/31-bit samples,
+invisible RGB, both entropy coders, alternate configs, non-unit leaves and LZ77
+inputs. `decoder_hybrid_uint` exercises singleton symbols requiring extra bits,
+low initial ANS states, normalization boundaries and truncated reads using the
+actual maintained ANS implementation. Measurements and central test
+results are in `docs/DECODER_READER_DISPATCH_20261117.md` in the parent repository.

@@ -371,6 +371,7 @@ pub(super) fn decode_modular_channel(
         return Ok(());
     }
 
+    let can_skip_single_symbol = reader.can_skip_single_symbol(&tree.histograms);
     run_on_specialized_tree(
         tree,
         chan,
@@ -381,6 +382,7 @@ pub(super) fn decode_modular_channel(
         tree_lut_scratch,
         tree_scratch,
         wide_gradient,
+        can_skip_single_symbol,
         |t| {
             decode_modular_channel_impl(
                 t,

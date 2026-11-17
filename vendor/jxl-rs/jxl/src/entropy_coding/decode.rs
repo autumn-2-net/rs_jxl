@@ -291,6 +291,16 @@ impl SymbolReader {
         matches!(self.state, SymbolReaderState::Lz77(_))
     }
 
+    /// Whether a proven no-extra-bit singleton can bypass entropy reads.
+    /// Check once at channel entry: singleton reads preserve a normalized ANS
+    /// state, while a low initial state must first consume renormalization bits.
+    /// Prefix singleton entries consume no bits. LZ77 always needs its history.
+    #[inline]
+    pub fn can_skip_single_symbol(&self, histograms: &Histograms) -> bool {
+        !self.has_lz77()
+            && (matches!(histograms.codes, Codes::Huffman(_)) || self.ans_reader.is_normalized())
+    }
+
     #[inline(always)]
     pub fn read_token_ans_no_lz77(
         &mut self,

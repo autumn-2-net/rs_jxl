@@ -456,6 +456,14 @@ impl AnsReader {
         Ok(Self(initial_state))
     }
 
+    /// A singleton ANS read leaves a normalized state unchanged. A low initial
+    /// state still needs the ordinary reader's 16-bit renormalization, even
+    /// though decoding the singleton itself carries no entropy.
+    #[inline]
+    pub fn is_normalized(&self) -> bool {
+        self.0 >= 1 << 16
+    }
+
     #[inline(always)]
     pub fn read(&mut self, codes: &AnsCodes, br: &mut BitReader, ctx: usize) -> u32 {
         codes.read(br, &mut self.0, ctx)
