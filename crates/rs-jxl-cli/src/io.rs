@@ -77,11 +77,15 @@ fn read_limited(mut reader: impl Read, limit: usize) -> Result<Vec<u8>> {
 }
 
 pub(crate) fn read_input(path: &Path) -> Result<Vec<u8>> {
+    read_input_with_limit(path, usize::MAX)
+}
+
+pub(crate) fn read_input_with_limit(path: &Path, limit: usize) -> Result<Vec<u8>> {
     if stdio(path) {
-        return read_limited(io::stdin().lock(), usize::MAX);
+        return read_limited(io::stdin().lock(), limit);
     }
     let file = File::open(path)?;
-    read_limited(file, usize::MAX)
+    read_limited(file, limit)
 }
 
 struct TemporaryOutput {

@@ -295,3 +295,21 @@ and ANS/prefix streams. `decode_wide_integer`, `decode_lossless_edges` and
 `decoder_parallel_pixels` cover the surrounding integer, frame and group paths.
 Measured performance and independent official-stream checks are recorded in
 the parent's `docs/PIXEL_CODEC_SPEED_20261109.md`, not inferred from the shortcut.
+
+## Experimental entropy bridge (2026-11-17)
+
+`jxl/src/api/experimental_entropy.rs` exposes bounded native parsing of
+independently serialized JXL histogram headers, no-LZ77 symbol streams and
+standalone MA trees for the Plus pixel research path. It reuses upstream
+`entropy_coding/decode.rs` and follows `frame/modular/tree.rs` for standalone
+tree parsing. Context/symbol/node/byte budgets, declared bit consumption,
+zero byte padding, ANS terminal state, predictor/multiplier bounds and nonempty
+MA split ranges are checked. This helper does not change normal image decoding
+or its defaults. The parent adapter is `rs-jxl/src/entropy/experimental_decode.rs`.
+
+The subsequent bounded LZ77 constructor accepts a declared distance multiplier
+and expanded symbol budget. Separate strict `SymbolReader` methods in
+`entropy_coding/decode.rs` reject output overrun, unavailable history/window
+distances, unfinished copies and prior decode failures. Standard narrow-row
+distance aliases are preserved. Header/data bit checks and ANS termination
+remain exact; normal image-decoder read/finalization methods are unchanged.

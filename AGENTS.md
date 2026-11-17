@@ -1,5 +1,54 @@
 # Direct Rust Port Rules
 
+- The user additionally authorized an independent experimental `jxl_plus` format
+  (extension `.jxl_plus`) in `crates/rs-jxl-plus`, depending one-way on `rs-jxl`.
+  First port the PJA JPEG DCT v7 model at
+  `1058f63fbfb9c60cc6640b7bb130d6f7c7ea7dbd` to native Rust, then improve it.
+  Standard-JXL conformance rules below continue to apply to the standard backend;
+  the new backend has its own syntax and decoder. Preserve PJA MIT attribution.
+  The user now requests the complete PJA functionality port before pruning:
+  include arithmetic-coded and lossless JPEG, JPEG-LS, JPEG 2000 and all original
+  algorithm/model paths. Do not preemptively
+  replace these by a reduced subset. Track their actual support explicitly;
+  the initial Huffman DCT path is not a complete PJA port. Original opaque-byte
+  modes must be identified as such, never counted as coefficient recompression.
+  Latest user steering: original PJA bitstream/archive compatibility is not a
+  deliverable or a constraint on the final format. Stop public .pja APIs and
+  CLI compatibility expansion. Retain existing original-code comparisons only
+  as development checks of translated algorithms. First finish the port; the
+  eventual jxl_plus format will use the original JXL codestream plus additional
+  extensions. The existing experimental v0 is not that final format design.
+  The user now authorizes removing format integrity hashes and testing static
+  instead of adaptive probabilities. Keep structural/resource checks and exact
+  original-byte tests. Static-model comparisons must include transmitted table
+  costs and actual decoding; do not treat a frozen uniform prior as a fitted
+  static model. Latest cleanup instruction removes old PJA archive/hash/plugin
+  helpers and their protocol-only tests, implicit GivenTables, recursive archive
+  repair/patch syntax, whole-file raw fallback and original-size admission gates.
+  Preserve all coding tools (Full/Fast/V7, MED/Blend/symbol, dynamic/static and
+  JPEG/JLS/J2K/HT paths) for selection/composition with JXL tools; a weak result
+  in one experiment does not authorize deleting a coding tool. Keep original-
+  source algorithm oracles, valid-input reconstruction and boundary tests.
+  The user further clarifies that the final JXL-derived extension format must
+  support adaptive probabilities and pixel-lossless images as well as
+  byte-reversible JPEG. Treat `comr9` as an incomplete pixel-model research
+  prototype, not a finished format to copy. Preserve both static/JXL entropy
+  and adaptive-model options; signal deterministic model profiles, parameters
+  and reset/dependency rules in the stream rather than decoder environment
+  variables. JPEG-only experiment results do not establish pixel-model results.
+  No large corpus run unless explicitly requested; focused local tests and
+  development-only original-source oracles are allowed.
+  The user now explicitly requests larger-dataset validation of compression
+  gains alongside speed optimization. Fixed, documented local corpus runs are
+  authorized; report development and previously unused samples separately.
+  Judge compression by aggregate complete bytes on the fixed dataset; the user
+  accepts individual files growing. Distinguish fixed-profile results from
+  trying every tool and selecting the smallest result per file.
+  Keep default JPEG encoding on V7 with its original band rule; do not enable
+  probability refinement or extra parallel bands by default. Continue speed
+  optimization of that default. The user next wants the pixel-lossless Plus
+  route to reuse JXL tools with optional adaptive probability coding.
+
 - Port the existing optimized libjxl C++ source, starting at commit
   `b866b3defec13494bfbaf705db93581cda118e37`. Record source files for each module.
 - Do not substitute an existing Rust encoder. Do not introduce zune-jpegxl,

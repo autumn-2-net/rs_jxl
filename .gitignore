@@ -6,6 +6,7 @@
 /dist/
 /python/*.egg-info/
 *.jxl
+*.jxl_plus
 *.profraw
 __pycache__/
 *.py[cod]

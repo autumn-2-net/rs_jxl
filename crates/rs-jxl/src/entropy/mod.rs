@@ -7,6 +7,9 @@ mod ans_histogram;
 pub mod cluster;
 pub mod config_search;
 pub mod context_map;
+/// Bounded native entropy/tree reader for internal tool experiments.
+#[doc(hidden)]
+pub mod experimental_decode;
 pub mod hybrid_uint;
 mod jobs;
 pub mod options;

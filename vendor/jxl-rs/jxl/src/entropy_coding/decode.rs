@@ -334,6 +334,94 @@ impl SymbolReader {
         self.read_unsigned_inline(histograms, br, context)
     }
 
+    /// Strict opt-in stream reader for the bounded experimental entropy API.
+    /// Unlike the standard decoder's permissive distance clamping, rejects
+    /// copies outside available history/window and beyond the output budget.
+    /// `remaining` counts expanded output values, including this call.
+    pub fn read_unsigned_bounded(
+        &mut self,
+        histograms: &Histograms,
+        br: &mut BitReader,
+        context: usize,
+        remaining: usize,
+    ) -> std::result::Result<u32, &'static str> {
+        if remaining == 0 {
+            return Err("experimental entropy output budget exhausted");
+        }
+        let SymbolReaderState::Lz77(state) = &mut self.state else {
+            return Ok(self.read_unsigned_inline(histograms, br, context));
+        };
+        if state.num_to_copy as usize > remaining {
+            return Err("experimental LZ77 copy exceeds output budget");
+        }
+        if let Some(symbol) = state.pull_symbol() {
+            state.push_decoded_symbol(symbol);
+            return Ok(symbol);
+        }
+        let cluster = histograms.map_context_to_cluster(context);
+        let token = match &histograms.codes {
+            Codes::Huffman(hc) => hc.read(br, cluster),
+            Codes::Ans(ans) => self.ans_reader.read(ans, br, cluster),
+        };
+        let Some(length_token) = token.checked_sub(state.min_symbol) else {
+            let symbol = histograms.uint_configs[cluster].read(token, br);
+            state.push_decoded_symbol(symbol);
+            return Ok(symbol);
+        };
+        let length = histograms
+            .lz77_length_uint
+            .as_ref()
+            .unwrap()
+            .read(length_token, br);
+        let length = length
+            .checked_add(state.min_length)
+            .ok_or("experimental LZ77 length overflow")?;
+        if length == 0 || length as usize > remaining {
+            return Err("experimental LZ77 copy exceeds output budget");
+        }
+        let distance_cluster = histograms.lz_dist_cluster as usize;
+        let distance_token = match &histograms.codes {
+            Codes::Huffman(hc) => hc.read(br, distance_cluster),
+            Codes::Ans(ans) => self.ans_reader.read(ans, br, distance_cluster),
+        };
+        let distance_symbol = histograms.uint_configs[distance_cluster].read(distance_token, br);
+        let distance_sub_1 = if state.dist_multiplier == 0 {
+            distance_symbol
+        } else if let Some(distance) = distance_symbol.checked_sub(120) {
+            distance
+        } else {
+            let (offset, rows) = Lz77State::SPECIAL_DISTANCES[distance_symbol as usize];
+            // Nonpositive narrow-row aliases normatively mean distance one;
+            // preserve that mapping, while rejecting positive overflow.
+            let distance =
+                (i64::from(state.dist_multiplier) * i64::from(rows) + i64::from(offset)).max(1);
+            u32::try_from(distance - 1)
+                .map_err(|_| "experimental LZ77 special distance overflow")?
+        };
+        let distance = distance_sub_1
+            .checked_add(1)
+            .ok_or("experimental LZ77 distance overflow")?;
+        if distance > 1 << Lz77State::LOG_WINDOW_SIZE || distance > state.num_decoded {
+            return Err("experimental LZ77 distance exceeds available history");
+        }
+        // Validation above proves apply_copy's standard clamping is inactive.
+        state.apply_copy(distance_symbol, length);
+        let symbol = state.pull_symbol().unwrap();
+        state.push_decoded_symbol(symbol);
+        Ok(symbol)
+    }
+
+    /// Experimental terminal check; normal image-decoder finalization is
+    /// deliberately unchanged. The caller also checks entropy final state.
+    pub fn check_bounded_lz77_complete(&self) -> std::result::Result<(), &'static str> {
+        if let SymbolReaderState::Lz77(state) = &self.state
+            && state.num_to_copy != 0
+        {
+            return Err("experimental LZ77 stream ends inside a copy");
+        }
+        Ok(())
+    }
+
     #[inline(always)]
     pub fn read_signed_inline(
         &mut self,

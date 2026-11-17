@@ -1,0 +1,18 @@
+[package]
+name = "rs-jxl-plus"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Experimental native Rust JPEG recompression using the PJA v7 model"
+
+[dependencies]
+rs-jxl = { path = "../rs-jxl" }
+rayon.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+rs-jxl-image = { path = "../rs-jxl-image" }
+
+[lints]
+workspace = true

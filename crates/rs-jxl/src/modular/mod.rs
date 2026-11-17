@@ -24,6 +24,9 @@ pub mod ma_train;
 pub(crate) mod orchestration;
 pub mod palette;
 pub mod palette_groups;
+/// Bounded preparation/reconstruction primitives for internal Plus experiments.
+#[doc(hidden)]
+pub mod plus_bridge;
 pub mod predict_simd;
 pub mod predictor;
 pub mod rct_simd;

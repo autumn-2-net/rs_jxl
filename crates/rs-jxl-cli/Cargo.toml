@@ -1,5 +1,6 @@
 [package]
 name = "rs-jxl-cli"
+default-run = "rs-jxl"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -15,6 +16,7 @@ path = "src/main.rs"
 
 [dependencies]
 rs-jxl = { path = "../rs-jxl", features = ["experimental-lz77-hotspots"] }
+rs-jxl-plus = { path = "../rs-jxl-plus" }
 rs-jxl-image = { path = "../rs-jxl-image" }
 clap = { workspace = true, features = ["derive"] }
 png.workspace = true

@@ -585,6 +585,7 @@ dependencies = [
  "png",
  "rs-jxl",
  "rs-jxl-image",
+ "rs-jxl-plus",
  "serde_json",
 ]
 
@@ -607,6 +608,16 @@ dependencies = [
  "png",
  "rs-jxl",
  "zune-jpeg",
+]
+
+[[package]]
+name = "rs-jxl-plus"
+version = "0.1.0"
+dependencies = [
+ "rayon",
+ "rs-jxl",
+ "rs-jxl-image",
+ "serde_json",
 ]
 
 [[package]]

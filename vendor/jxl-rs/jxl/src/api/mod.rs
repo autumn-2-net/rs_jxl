@@ -10,6 +10,7 @@ mod codestream_parser;
 mod color;
 mod data_types;
 mod decoder;
+pub mod experimental_entropy;
 mod input;
 mod jpeg;
 mod native_integer;

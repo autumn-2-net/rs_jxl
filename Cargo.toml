@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/rs-jxl",
+    "crates/rs-jxl-plus",
     "crates/rs-jxl-cli",
     "crates/rs-jxl-image",
     "crates/rs-jxl-ffi",

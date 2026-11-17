@@ -972,7 +972,7 @@ pub(super) fn predefined<'a>(
     super::fixed::build(bits, mode).map(Some)
 }
 
-fn learn(
+pub(super) fn learn(
     planes: &[Channel],
     options: &ModularOptions,
     wp: &weighted::Header,
