@@ -39,10 +39,24 @@ default, or the currently retained states when the new option is enabled:
   logical frame's duration.
 - Adaptive merged rectangles (`MergedPrevious`/`MergedFirst`): an additional
   cost-guided proposal when `allow_multi_rect` and `adaptive_rectangles` are
-  enabled. The estimate is anchored by the initial full frame's measured encoded
-  bytes per pixel. It proposes a partition only; its estimated cost is never
+  enabled. The initial full frame's measured bytes per pixel remains the anchor.
+  When the most recent winning Full frame differs from that rate by at least
+  2x, one additional base-grid proposal per reference uses that measured rate.
+  Existing and extra-grid plans remain eligible; identical ordered rectangles
+  for the same source are tried only once. A losing Full trial can be pruned,
+  so only a winning complete Full updates the estimate for the next input.
+  The rates propose partitions only; their estimated costs are never
   reported as encoded size or used to select the winner. All legacy candidates
   remain eligible, with new proposals appended after them for stable ties.
+
+This feedback addresses a simple opening frame followed by more complex images:
+the opening frame alone can substantially underestimate the cost of transmitting
+unchanged pixels between distant edits. It adds at most one actual encode trial
+per eligible reference, reusing difference maps, finalized-byte pruning, payload
+caching and caller budgets. It adds no new API field, frame tool or bitstream
+syntax. Static `analyze` uses the caller's geometry rate and cannot include this
+encode-time measurement; its candidate counts are not the feedback-expanded
+search history. See [measurements](MULTIFRAME_RATE_FEEDBACK_20261117.md).
 
 Rust builds a shared exact difference map per analyzed input/reference pair.
 Bounds, changed-pixel counts, mask construction and rectangle proposals reuse

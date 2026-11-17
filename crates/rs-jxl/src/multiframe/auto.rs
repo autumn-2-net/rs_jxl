@@ -2,8 +2,8 @@
 mod trial;
 
 use super::{
-    AutoEncodeResult, AutoFrameReport, AutoOptions, Reference, candidates::candidates, compatible,
-    lookahead::Lookahead, payload::Payloads, references::ReferenceSlots,
+    AutoEncodeResult, AutoFrameReport, AutoOptions, Reference, Strategy, candidates::candidates,
+    compatible, lookahead::Lookahead, payload::Payloads, references::ReferenceSlots,
 };
 use crate::{EncodeOptions, Error, Image, Result};
 use std::time::Instant;
@@ -129,6 +129,7 @@ fn encode_inner(
     let mut trials = 0usize;
     let mut pixels = 0u64;
     let mut anchor_bytes_per_pixel = 1.0;
+    let mut recent_full_bytes_per_pixel = None;
     for (index, image) in images.iter().enumerate() {
         let analysis_started = Instant::now();
         let mut differences = Vec::new();
@@ -137,6 +138,7 @@ fn encode_inner(
             index,
             auto,
             anchor_bytes_per_pixel,
+            recent_full_bytes_per_pixel,
             &mut differences,
             &slots,
             &lookahead,
@@ -233,6 +235,15 @@ fn encode_inner(
             .iter()
             .position(|(rank, _)| *rank == winner_rank)
             .expect("winner has a complete report");
+        // Learn only from the winning complete Full frame. A losing Full trial
+        // may be pruned, so observing its completion would make future proposal
+        // sets depend on the pruning switch. This rate affects the next input.
+        if completed[winner_index].1.strategy == Strategy::Full {
+            recent_full_bytes_per_pixel = Some(
+                winner_bytes.len() as f64
+                    / (u64::from(canvas.width()) * u64::from(canvas.height())) as f64,
+            );
+        }
         append(&mut stream, winner_bytes, options.max_output_bytes)?;
         available = winner_references;
         reports.push(AutoFrameReport {
