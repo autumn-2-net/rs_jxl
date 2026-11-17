@@ -479,6 +479,9 @@ fn zero_duration_merged_layers_preserve_samples_and_reference_slots() {
                     reference,
                     prune,
                     tile_size: 4,
+                    // Exercise the original merged-layer reference contract.
+                    adaptive_splits: false,
+                    allow_multiply_mask: false,
                     ..Default::default()
                 },
             )

@@ -24,8 +24,8 @@ def _auto_options(value, strategy):
         raise ValueError("auto_options require strategy='auto'")
     if not isinstance(value, Mapping):
         raise TypeError("auto_options must be a mapping of Rust option names")
-    booleans = {"allow_mask", "allow_multi_rect", "prune", "adaptive_rectangles",
-                "retained_reference", "reference_lookahead", "adaptive_rate_feedback"}
+    booleans = {"allow_mask", "allow_multiply_mask", "allow_multi_rect", "prune", "adaptive_rectangles",
+                "retained_reference", "reference_lookahead", "adaptive_rate_feedback", "adaptive_splits"}
     integers = {"tile_size": (1, 0xffffffff),
                 "max_rectangles": (1, sys.maxsize * 2 + 1),
                 "max_frames": (0, sys.maxsize * 2 + 1),
@@ -133,6 +133,11 @@ def encode_multiframe(frames, output=None, *, layout="auto", durations=1,
     by the recent winning complete Full frame's measured rate. Set it to False
     inside auto_options to retain the first-frame-rate policy. It is inactive
     when allow_multi_rect or adaptive_rectangles is disabled.
+    adaptive_splits defaults to True and adds measured-rate geometric splits;
+    it is inactive under the same multi-rectangle/adaptive controls.
+    allow_multiply_mask defaults to True and permits two-layer multiply/add
+    masks. allow_mask=False disables both ordinary and multiply masks; the new
+    mask does not depend on the multi-rectangle or adaptive controls.
     extra_tile_sizes=[16, 64] adds partition grids without replacing tile_size.
     Duplicate partitions are skipped; extra trials may take longer. For a fixed
     reference state selection uses bytes, not minimum rectangle area.

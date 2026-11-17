@@ -306,7 +306,8 @@ search defaults or perform difference analysis, planning or selection.
 
 | Auto Option | Accepted Value | Native Default |
 | --- | --- | --- |
-| `allow_mask` | bool | true |
+| `allow_mask` | bool; master gate for ordinary alpha and multiply masks | true |
+| `allow_multiply_mask` | bool; two-layer Multiply/Add mask when eligible | true |
 | `allow_multi_rect` | bool | true |
 | `tile_size` | positive u32 integer | 32 |
 | `extra_tile_sizes` | list/tuple of positive u32 integers | [] |
@@ -314,6 +315,7 @@ search defaults or perform difference analysis, planning or selection.
 | `prune` | bool | true |
 | `adaptive_rectangles` | bool | true |
 | `adaptive_rate_feedback` | bool; additional partitions using recent winning Full-frame costs | true |
+| `adaptive_splits` | bool; additional bounded two-axis geometric partition | true |
 | `retained_reference` | bool; true requires `reference="auto"` | false |
 | `reference_lookahead` | bool; true requires `retained_reference=True` | false |
 | `max_frames` | nonnegative native usize integer | usize::MAX |
@@ -331,11 +333,33 @@ not new Python limits. Direct ABI requests also enforce these types with serde
 and reject duplicate members.
 
 `adaptive_rate_feedback=False` restores the original first-frame cost estimate
-for rectangle proposals. The default true adds recent-rate proposals while
+for rate-guided geometry; it does not remove other tools. The default true adds recent-rate proposals while
 retaining all original choices; actual encoded bytes still select the winner.
 It has no effect if `allow_multi_rect` or `adaptive_rectangles` is false.
 `strategy="crop"` remains the Python default and does not use automatic-search
-options. Automatic reports include the configured `adaptive_rate_feedback` bool.
+options. `adaptive_splits=True` also requires `allow_multi_rect` and
+`adaptive_rectangles`; it uses measured rates to propose a bounded two-axis
+partition while retaining older candidates. Disable it with
+`auto_options={"adaptive_splits": False}` or CLI `--no-adaptive-splits`.
+
+`allow_multiply_mask=True` permits a fixed pair of ordinary Multiply then Add
+layers, rather than a rectangle partition. It requires `allow_mask=True` but
+does not depend on multi-rectangle/adaptive controls or `max_rectangles`.
+CLI `--no-multiply-mask` disables this tool; `--no-mask` disables both mask tools.
+It currently accepts integer 1..16-bit Gray/GA/RGB/RGBA in U8/U16 storage, with no extras other
+than an optional full-resolution integer 1..16-bit alpha. Color and alpha depths
+may differ. It retains alpha metadata and all hidden RGB samples, including
+partial or associated alpha; it does not add alpha to RGB. Floating/wide samples,
+other extra planes and configured patch tools are ineligible. Other eligible
+full/crop/mask/rectangle candidates remain available.
+
+To select the `f4e240c` candidate policy preceding splits and multiply masks, set both
+`adaptive_splits=False` and `allow_multiply_mask=False` with other settings
+unchanged. Merely disabling `adaptive_rectangles` or rate feedback does not
+recover that whole candidate set. These are independent booleans, not a new
+strategy/mode parameter; `strategy="crop"` remains the Python default.
+Automatic reports include all three configured booleans
+`adaptive_rate_feedback`, `adaptive_splits` and `allow_multiply_mask`.
 
 Automatic frame reports distinguish completed work from pruning:
 
@@ -376,15 +400,23 @@ are areas submitted to the encoder, including interrupted layers, not analysis
 scans. Regular-layer counts exclude private reference-only patch frames; in a
 pruned record they also exclude a partially encoded layer. Candidate bytes include
 layer headers/private patch frames but exclude shared image/container overhead.
+A completed multiply-mask trial has two layers and charges two bbox areas to
+`trial_pixels`; pruning charges only layers actually submitted, including an
+interrupted layer. `planned_frames` remains two. Strategy labels are
+`MultiplyMaskPrevious`/`MultiplyMaskFirst`/`MultiplyMaskRetained`; split proposals
+use `SplitPrevious`/`SplitFirst`/`SplitRetained`. Configured tool flags do not
+mean that the tool was eligible or selected.
 
 Pruning can reorder execution, but only proven byte bounds can stop losing trials;
 it preserves selection and stable ties for the same eligible set with sufficient
 budgets. `prune=False` completes all eligible candidates or fails. Adaptive
 `MergedPrevious`/`MergedFirst` proposals follow all legacy candidates and are
 selected only by actual encoded bytes. Their cost estimate uses the initial full
-frame's measured bytes per pixel only to propose geometry. Disable them with
-`adaptive_rectangles=False`; `allow_multi_rect=False` disables both tile and merged
-proposals. No performance or compression improvement is claimed yet.
+frame's measured bytes per pixel, with eligible recent-rate feedback, only to
+propose geometry. `adaptive_rectangles=False` disables merged, feedback and
+two-axis split proposals; `allow_multi_rect=False` also disables tile proposals.
+Neither switch disables multiply masks. Actual complete bytes select winners;
+the API does not promise a speed or compression improvement for every sequence.
 
 ### Retained Reference Mode
 
@@ -572,6 +604,10 @@ depth. Zero is accepted. Analysis does not obtain this value by encoding; actual
 among real candidate encodes by bytes. Minimum geometric area does not imply
 minimum compressed bytes. Do not treat `best_geometric_reference` or a suitability
 label as an encoder winner or speed prediction.
+Static analysis does not generate encode-time recent-rate, two-axis split or
+multiply-mask proposals. It has neither actual Full-rate history nor encoder
+patch configuration, and these new encoding booleans are not `analysis_options`.
+Its candidate list therefore does not enumerate the entire automatic search.
 
 The report contains `width`, `height`, `channels` (including extra channels),
 `frame_count`, native `reference`, `crop_supported`, `rectangle_bytes_per_pixel`,

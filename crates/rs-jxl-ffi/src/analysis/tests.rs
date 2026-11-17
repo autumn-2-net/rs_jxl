@@ -249,6 +249,12 @@ fn analysis_enums_have_explicit_snake_case_wire_names() {
         (Strategy::MergedPrevious, "merged_previous"),
         (Strategy::MergedFirst, "merged_first"),
         (Strategy::MergedRetained, "merged_retained"),
+        (Strategy::SplitPrevious, "split_previous"),
+        (Strategy::SplitFirst, "split_first"),
+        (Strategy::SplitRetained, "split_retained"),
+        (Strategy::MultiplyMaskPrevious, "multiply_mask_previous"),
+        (Strategy::MultiplyMaskFirst, "multiply_mask_first"),
+        (Strategy::MultiplyMaskRetained, "multiply_mask_retained"),
     ] {
         assert_eq!(strategy(value), expected);
     }

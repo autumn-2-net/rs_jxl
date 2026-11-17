@@ -48,10 +48,15 @@ older geometric bounding-box heuristic used by `multiframe::plan`.
 full frames only. Mask and multi-rectangle strategies are enabled by default
 where the core can preserve samples and metadata exactly:
 
-- `--no-mask` disables mask candidates. The current mask route requires an
+- `--no-mask` disables both mask tools. The ordinary alpha-mask route requires an
   existing opaque integer gray-alpha/RGBA image with exactly one alpha channel;
   it does not insert alpha, reinterpret partial transparency or discard hidden
   color samples. Eligibility remains the core encoder's decision.
+- `--no-multiply-mask` disables only the new fixed two-layer Multiply/Add mask.
+  It supports integer 1..16-bit Gray/GA/RGB/RGBA, including partial alpha and
+  hidden RGB, with at most one full-resolution alpha and no configured patch
+  tools. It does not add alpha to RGB. Both bbox layers are charged to trial work;
+  their fixed count of two is independent of `--max-rectangles`.
 - `--no-multi-rect` disables both tile and adaptive multi-rectangle candidates.
   Intermediate rectangles have zero duration; the final rectangle carries the
   input duration.
@@ -59,13 +64,20 @@ where the core can preserve samples and metadata exactly:
   or the command fails explicitly on an error. By default, inexpensive candidates
   may execute first; a candidate stops only when a provable byte lower bound
   cannot win under the canonical tie rule. Estimates cannot remove old candidates.
-- `--no-adaptive-rectangles` disables the additional `MergedPrevious`/`MergedFirst`
-  proposals (and `MergedRetained` when enabled), retaining tile candidates. The estimate uses the initial full
-  frame's measured bytes per pixel only to propose rectangles; actual encoded
-  bytes select the winner. This control is independent of pruning.
+- `--no-adaptive-rectangles` disables merged, recent-rate and two-axis split
+  proposals, retaining tile candidates. Measured bytes per pixel only propose
+  geometry; actual encoded bytes select the winner. Pruning remains independent.
+- `--no-adaptive-rate-feedback` disables additional geometry based on the recent
+  winning Full-frame rate, retaining the initial Full-frame rate policy.
+- `--no-adaptive-splits` disables the additional two-axis split proposal. It
+  otherwise requires multi-rectangle and adaptive-rectangle tools to be enabled.
 - `--tile-size PIXELS` defaults to 32 and must be positive.
 - `--max-rectangles N` defaults to 32 and accepts positive native `usize` values,
   with no extra 4096 cap. Geometry is validated even if candidates are disabled.
+
+The three new-tool booleans default to enabled. To recover the `f4e240c` candidate
+policy, disable splits and multiply masks together, leaving other settings
+unchanged. See [compression and speed measurements](MULTIFRAME_COMPRESSION_20261118.md).
 
 ### Retained References (Opt-In)
 
@@ -129,6 +141,10 @@ of fewer bytes for either the next frame or the whole sequence.
 
 Candidate reports identify each logical input frame (one-based), the winner
 index, completed candidate count, pruned count and native `analysis_elapsed`.
+They also include configured `adaptive_rate_feedback`, `adaptive_splits` and
+`allow_multiply_mask` booleans; eligibility can still prevent a requested tool
+from producing a candidate. New strategies use `SplitPrevious/First/Retained`
+and `MultiplyMaskPrevious/First/Retained` labels.
 The zero-based winner index addresses completed candidates in canonical order,
 not execution order. New Merged candidates follow all legacy candidates to keep
 existing equal-byte preferences. `candidate=N` lines report strategy via Rust

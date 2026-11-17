@@ -7,6 +7,8 @@ pub struct AutoOptions {
     /// SmallestCrop tests both first/previous references using actual bytes.
     pub reference: Reference,
     pub allow_mask: bool,
+    /// Add two-layer multiply/add masks (default on); inactive when allow_mask is false.
+    pub allow_multiply_mask: bool,
     pub allow_multi_rect: bool,
     pub tile_size: u32,
     /// Additional rectangle grids, tried after the original candidates. Empty
@@ -20,6 +22,9 @@ pub struct AutoOptions {
     /// Add partitions guided by the most recent winning complete Full frame
     /// rate (default on). Inactive when multi-rectangle/adaptive proposals are disabled.
     pub adaptive_rate_feedback: bool,
+    /// Add measured-rate geometric split proposals (default on); inactive
+    /// when multi-rectangle or adaptive proposals are disabled.
+    pub adaptive_splits: bool,
     /// Retain a winning delta's background and rotate the other saved canvas.
     /// Opt-in, requires SmallestCrop. May evict frame zero; not a global optimum.
     pub retained_reference: bool,
@@ -37,6 +42,7 @@ impl Default for AutoOptions {
         Self {
             reference: Reference::SmallestCrop,
             allow_mask: true,
+            allow_multiply_mask: true,
             allow_multi_rect: true,
             tile_size: 32,
             extra_tile_sizes: Vec::new(),
@@ -44,6 +50,7 @@ impl Default for AutoOptions {
             prune: true,
             adaptive_rectangles: true,
             adaptive_rate_feedback: true,
+            adaptive_splits: true,
             retained_reference: false,
             reference_lookahead: false,
             max_frames: usize::MAX,
@@ -68,6 +75,12 @@ pub enum Strategy {
     MaskRetained,
     TilesRetained,
     MergedRetained,
+    SplitPrevious,
+    SplitFirst,
+    SplitRetained,
+    MultiplyMaskPrevious,
+    MultiplyMaskFirst,
+    MultiplyMaskRetained,
 }
 
 #[derive(Debug)]
@@ -111,6 +124,8 @@ pub struct AutoDiffReport {
 }
 #[derive(Debug)]
 pub struct AutoFrameReport {
+    pub allow_multiply_mask: bool,
+    pub adaptive_splits: bool,
     /// Requested configuration; disabled multi-rectangle/adaptive controls can
     /// make feedback inactive without changing this reported value.
     pub adaptive_rate_feedback: bool,

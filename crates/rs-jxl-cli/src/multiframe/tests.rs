@@ -40,12 +40,14 @@ fn defaults_preserve_order_and_enable_safe_strategies() {
     assert!(!auto.retained_reference && !args.report_json);
     assert!(!auto.reference_lookahead);
     assert!(auto.adaptive_rate_feedback);
+    assert!(auto.adaptive_splits);
     assert_eq!(
         auto.reference_lookahead,
         AutoOptions::default().reference_lookahead
     );
     args.validate_options().unwrap();
     assert!(auto.allow_mask && auto.allow_multi_rect);
+    assert!(auto.allow_multiply_mask);
     assert_eq!(auto.prune, AutoOptions::default().prune);
     assert_eq!(
         auto.adaptive_rectangles,
@@ -60,6 +62,40 @@ fn defaults_preserve_order_and_enable_safe_strategies() {
     assert_eq!(auto.max_frames, usize::MAX);
     assert_eq!(auto.max_total_trials, usize::MAX);
     assert_eq!(auto.max_trial_pixels, u64::MAX);
+}
+
+#[test]
+fn multiply_masks_default_on_and_have_an_independent_disable_flag() {
+    for flags in [
+        vec!["--no-multiply-mask"],
+        vec!["--no-multiply-mask", "--no-multi-rect"],
+        vec!["--no-multiply-mask", "--no-adaptive-rectangles"],
+    ] {
+        let args = parse(&flags);
+        args.validate_options().unwrap();
+        assert!(!args.auto_options().allow_multiply_mask);
+    }
+    let auto = parse(&["--no-mask"]).auto_options();
+    assert!(!auto.allow_mask);
+    assert!(
+        auto.allow_multiply_mask,
+        "master mask gate is independent of the tool preference"
+    );
+}
+
+#[test]
+fn geometric_splits_default_on_and_can_be_disabled_independently() {
+    assert!(parse(&[]).auto_options().adaptive_splits);
+    for flags in [
+        vec!["--no-adaptive-splits"],
+        vec!["--no-adaptive-splits", "--no-multi-rect"],
+        vec!["--no-adaptive-splits", "--no-adaptive-rectangles"],
+        vec!["--no-adaptive-splits", "--no-adaptive-rate-feedback"],
+    ] {
+        let args = parse(&flags);
+        args.validate_options().unwrap();
+        assert!(!args.auto_options().adaptive_splits);
+    }
 }
 
 #[test]
@@ -431,6 +467,8 @@ fn report_uses_actual_candidate_statistics_and_core_winner() {
     let result = AutoEncodeResult {
         bytes: vec![0; 123],
         frames: vec![AutoFrameReport {
+            allow_multiply_mask: false,
+            adaptive_splits: false,
             adaptive_rate_feedback: true,
             winner_index: 1,
             retained_reference: true,
@@ -504,7 +542,7 @@ fn report_uses_actual_candidate_statistics_and_core_winner() {
     assert_eq!(
         report,
         concat!(
-            "frame 1: winner=1 candidates=2 pruned=1 analysis_elapsed=250ms retained_reference=true reference_lookahead=true adaptive_rate_feedback=true lookahead_comparisons=3 reused_payloads=2 reused_payload_pixels=25 references_before=[None, Some(0), Some(1), None] references_after=[None, Some(0), Some(1), None]\n",
+            "frame 1: winner=1 candidates=2 pruned=1 analysis_elapsed=250ms retained_reference=true reference_lookahead=true adaptive_rate_feedback=true adaptive_splits=false allow_multiply_mask=false lookahead_comparisons=3 reused_payloads=2 reused_payload_pixels=25 references_before=[None, Some(0), Some(1), None] references_after=[None, Some(0), Some(1), None]\n",
             "  difference reference=1 source=2 changed_pixels=0 bounds=None\n",
             "  difference reference=0 source=1 changed_pixels=6 bounds=Some(Rect { x: 1, y: 2, width: 3, height: 4 })\n",
             "  candidate=0 strategy=Full reference_index=None source=0 save_as_reference=0 encoded_bytes=100 encoded_frames=1 trial_pixels=100 elapsed=1s\n",
@@ -530,6 +568,8 @@ fn report_uses_actual_candidate_statistics_and_core_winner() {
                 "retained_reference": true,
                 "reference_lookahead": true,
                 "adaptive_rate_feedback": true,
+                "adaptive_splits": false,
+                "allow_multiply_mask": false,
                 "lookahead_comparisons": 3,
                 "reused_payloads": 2,
                 "reused_payload_pixels": 25,

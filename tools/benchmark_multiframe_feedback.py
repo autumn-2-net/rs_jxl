@@ -46,6 +46,8 @@ def main():
     parser.add_argument("--effort", type=int, help="override manifest effort (otherwise 9)")
     parser.add_argument("--after-rate-feedback", choices=("on", "off"),
                         help="override the after build's adaptive_rate_feedback only")
+    parser.add_argument("--after-adaptive-splits", choices=("on", "off"))
+    parser.add_argument("--after-multiply-mask", choices=("on", "off"))
     parser.add_argument("--streams-dir", type=Path, help="NEW directory for first encoded streams")
     args = parser.parse_args()
     if (args.out.exists() or args.repeats < 1 or args.warmups < 0
@@ -125,11 +127,15 @@ def main():
                        pixels=pixels, durations=durations, builds={})
             report["cases"].append(row)
             build_options = {name: dict(options) for name in libraries}
-            if args.after_rate_feedback is not None:
-                build_options["after"]["auto_options"] = {
-                    **options.get("auto_options", {}),
-                    "adaptive_rate_feedback": args.after_rate_feedback == "on"}
+            for field, value in (("adaptive_rate_feedback", args.after_rate_feedback),
+                                 ("adaptive_splits", args.after_adaptive_splits),
+                                 ("allow_multiply_mask", args.after_multiply_mask)):
+                if value is not None:
+                    build_options["after"]["auto_options"] = {
+                        **build_options["after"].get("auto_options", {}), field: value == "on"}
             row["after_rate_feedback"] = args.after_rate_feedback
+            row["after_adaptive_splits"] = args.after_adaptive_splits
+            row["after_multiply_mask"] = args.after_multiply_mask
             with ExitStack() as stack:
                 encoders, decoders = {}, {}
                 for name, lib in libraries.items():

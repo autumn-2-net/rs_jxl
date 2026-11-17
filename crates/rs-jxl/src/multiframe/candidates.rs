@@ -17,11 +17,25 @@ pub(super) struct Candidate {
 }
 
 impl Candidate {
+    pub(super) fn multiply_mask(&self) -> bool {
+        matches!(
+            self.strategy,
+            Strategy::MultiplyMaskPrevious
+                | Strategy::MultiplyMaskFirst
+                | Strategy::MultiplyMaskRetained
+        )
+    }
+    pub(super) fn replace(&self) -> bool {
+        !self.mask && !self.multiply_mask()
+    }
     // Ranking only. No candidate is discarded using this estimate.
     pub(super) fn estimated_work(&self) -> u64 {
         let area = self.rects.iter().fold(0u64, |sum, rect| {
             sum.saturating_add(u64::from(rect.width) * u64::from(rect.height))
         });
+        if self.multiply_mask() {
+            return area.saturating_mul(2).saturating_add(128);
+        }
         // Sparse mask contents are cheaper, but materialization/transforms still
         // visit the entire bbox. Keep a scan-cost floor instead of treating that
         // work as almost free. This weight ranks trials, never bounds their bytes.
@@ -42,6 +56,7 @@ pub(super) fn candidates(
     differences: &mut Vec<AutoDiffReport>,
     slots: &ReferenceSlots,
     lookahead: &Lookahead,
+    has_patches: bool,
 ) -> Result<Vec<Candidate>> {
     let mut maps = Vec::new();
     if index != 0
@@ -84,7 +99,102 @@ pub(super) fn candidates(
         &maps,
         &mut result,
     )?;
+    extend_adaptive_splits(
+        index,
+        auto,
+        bytes_per_pixel,
+        recent_full_bytes_per_pixel,
+        &maps,
+        &mut result,
+    )?;
+    // Preserve every preceding canonical candidate, including axis splits.
+    // This two-layer operation is independent of the multi-rectangle budget.
+    if auto.allow_mask && auto.allow_multiply_mask && !has_patches {
+        for &(reference, source, ref diff) in &maps {
+            let Some(rect) = diff.bounds() else {
+                continue;
+            };
+            if !super::multiply_mask::eligible(&images[reference], &images[index]) {
+                continue;
+            }
+            let first = reference == 0 && (index != 1 || auto.reference == Reference::First);
+            let previous = reference + 1 == index;
+            result
+                .try_reserve(1)
+                .map_err(|_| Error::Limit("multiply mask candidate allocation"))?;
+            result.push(Candidate {
+                strategy: if first {
+                    Strategy::MultiplyMaskFirst
+                } else if previous {
+                    Strategy::MultiplyMaskPrevious
+                } else {
+                    Strategy::MultiplyMaskRetained
+                },
+                tile_size: None,
+                reference_index: Some(reference),
+                diff: Some(Arc::clone(diff)),
+                source,
+                rects: vec![rect],
+                mask: false,
+            });
+        }
+    }
     Ok(result)
+}
+
+// One two-axis proposal per live reference, after every older candidate. The
+// measured rate guides geometry only; final byte comparison and limits remain
+// in the ordinary trial executor. Static analysis has no measured rate history.
+fn extend_adaptive_splits(
+    index: usize,
+    auto: &AutoOptions,
+    anchor: f64,
+    recent: Option<f64>,
+    maps: &[(usize, u8, Arc<DiffMap>)],
+    result: &mut Vec<Candidate>,
+) -> Result<()> {
+    if !auto.adaptive_splits || !auto.allow_multi_rect || !auto.adaptive_rectangles {
+        return Ok(());
+    }
+    let rate = if auto.adaptive_rate_feedback {
+        alternate_rate(anchor, recent).unwrap_or(anchor)
+    } else {
+        anchor
+    };
+    for &(reference, source, ref diff) in maps {
+        let Some(rects) = super::splits::propose(diff, auto.tile_size, auto.max_rectangles, rate)?
+        else {
+            continue;
+        };
+        if rects.len() <= 1
+            || result.iter().any(|candidate| {
+                candidate.replace() && candidate.source == source && candidate.rects == rects
+            })
+        {
+            continue;
+        }
+        let first = reference == 0 && (index != 1 || auto.reference == Reference::First);
+        let previous = reference + 1 == index;
+        result
+            .try_reserve(1)
+            .map_err(|_| Error::Limit("adaptive split candidate allocation"))?;
+        result.push(Candidate {
+            strategy: if first {
+                Strategy::SplitFirst
+            } else if previous {
+                Strategy::SplitPrevious
+            } else {
+                Strategy::SplitRetained
+            },
+            tile_size: Some(auto.tile_size),
+            reference_index: Some(reference),
+            diff: None,
+            source,
+            rects,
+            mask: false,
+        });
+    }
+    Ok(())
 }
 
 // A winning complete Full frame supplies a second proposal cost, never a byte
@@ -121,7 +231,7 @@ fn extend_recent_rate(
         };
         if rects.len() <= 1
             || result.iter().any(|candidate| {
-                !candidate.mask && candidate.source == source && candidate.rects == rects
+                candidate.replace() && candidate.source == source && candidate.rects == rects
             })
         {
             continue;
@@ -285,7 +395,7 @@ fn candidates_from_references(
                 partition::propose(diff, auto.tile_size, auto.max_rectangles, bytes_per_pixel)?
             && rects.len() > 1
             && !result.iter().any(|candidate| {
-                !candidate.mask && candidate.source == source && candidate.rects == rects
+                candidate.replace() && candidate.source == source && candidate.rects == rects
             })
         {
             merged.push(Candidate {
@@ -464,6 +574,67 @@ mod tests {
             result.len(),
             count,
             "nearby rates preserve the candidate set"
+        );
+    }
+    #[test]
+    fn multiply_mask_appends_after_old_candidates_and_skips_patch_routes() {
+        let first = Image::new(16, 16, PixelLayout::Gray, PixelData::U8(vec![0; 256])).unwrap();
+        let mut values = vec![0; 256];
+        values[17] = 71;
+        let second = Image::new(16, 16, PixelLayout::Gray, PixelData::U8(values)).unwrap();
+        let images = [first, second];
+        let disabled = AutoOptions {
+            reference: Reference::Previous,
+            allow_multiply_mask: false,
+            ..Default::default()
+        };
+        let enabled = AutoOptions {
+            allow_multiply_mask: true,
+            ..disabled.clone()
+        };
+        let plans = |auto: &AutoOptions, patches| {
+            candidates(
+                &images,
+                1,
+                auto,
+                1.0,
+                None,
+                &mut Vec::new(),
+                &ReferenceSlots::default(),
+                &Lookahead::default(),
+                patches,
+            )
+            .unwrap()
+        };
+        let old = plans(&disabled, false);
+        let new = plans(&enabled, false);
+        assert_eq!(new.len(), old.len() + 1);
+        for (a, b) in old.iter().zip(&new) {
+            assert_eq!(
+                (a.strategy, a.rects.as_slice(), a.source, a.mask),
+                (b.strategy, b.rects.as_slice(), b.source, b.mask)
+            );
+        }
+        let added = new.last().unwrap();
+        assert!(added.multiply_mask() && !added.replace() && !added.mask);
+        assert_eq!(added.strategy, Strategy::MultiplyMaskPrevious);
+        assert_eq!((added.source, added.reference_index), (1, Some(0)));
+        assert_eq!(
+            added.estimated_work(),
+            130,
+            "one-pixel bbox means two pixels and two layer overheads"
+        );
+        assert_eq!(plans(&enabled, true).len(), old.len());
+        assert_eq!(
+            plans(
+                &AutoOptions {
+                    allow_mask: false,
+                    ..enabled
+                },
+                false
+            )
+            .len(),
+            old.len()
         );
     }
 }

@@ -285,12 +285,15 @@ Python 转码的 `limits` 支持 `max_input_bytes`、`max_output_bytes`、
 
 | `auto_options` 成员 | 默认值 / 范围 | 作用 |
 | --- | --- | --- |
-| `allow_mask` | **True**，bool | 允许安全条件下的二值 alpha mask + BLEND 候选 |
-| `allow_multi_rect` | **True**，bool | 允许多个 REPLACE 矩形层；关闭也关闭 merged 候选 |
+| `allow_mask` | **True**，bool | mask 总开关；允许安全条件下的二值 alpha mask + BLEND，也门控 Multiply/Add mask |
+| `allow_multiply_mask` | **True**，bool | 增加固定两层的 Multiply/Add mask；须同时 allow_mask=True，不依赖多矩形或 adaptive 开关 |
+| `allow_multi_rect` | **True**，bool | 允许多个 REPLACE 矩形层；关闭也关闭 merged、码率反馈及 split 候选，不关闭 mask |
 | `tile_size` | **32**，正 u32 | 初始网格边长；不是每个最终 crop 都必须这么大 |
 | `extra_tile_sizes` | **[]**，正 u32 的 list/tuple | 添加其他网格尺度，例如 `[8, 16, 64]`；相同拆分去重，保留原候选，可能增加耗时 |
 | `max_rectangles` | **32**，正 usize | 单个多矩形候选的矩形数上限，不是序列总帧数 |
 | `adaptive_rectangles` | **True**，bool | 在传统 tiled 候选之外加入成本估计驱动的合并矩形候选 |
+| `adaptive_rate_feedback` | **True**，bool | 保留首帧码率候选，并在最近获胜的完整 Full 码率相差至少两倍时增加对应候选；须开启多矩形和 adaptive_rectangles |
+| `adaptive_splits` | **True**，bool | 增加有界双轴几何切分候选，按实测码率估计分区；须开启多矩形和 adaptive_rectangles |
 | `prune` | **True**，bool | 只用已完成输出给出的字节下界终止必败候选；不是凭估计删候选 |
 | `retained_reference` | **False**，bool | 轮换两个完整参考画布，保留获胜差分的背景；要求 `reference="auto"` |
 | `reference_lookahead` | **False**，bool | 看下一输入的精确几何差异，辅助决定旧参考的保留；要求 retained_reference=True |
@@ -329,12 +332,31 @@ for frame in report["frames"]:
 
 - 精确差异比较所有通道，包括 invisible RGB 和 extra planes；主方案是 REPLACE + crop。
 - mask 当前要求双方都是不超过 16 位、完全不透明、非预乘的整数 GA/RGBA，且没有额外平面。
-  不会自动给 RGB 加 alpha，也不对半透明图套用透明黑技巧。
+  这是旧二值 alpha/BLEND mask 的条件，不是所有 mask 工具的限制。
+- 新 Multiply/Add mask 接受 U8/U16 存储的整数 1..16 位 Gray/GA/RGB/RGBA；可有且仅有一个全分辨率、
+  整数 1..16 位 alpha，颜色和 alpha 位深可不同。它将 alpha 作为独立样本处理，保留半透明、
+  预乘标记和 invisible RGB，不给 RGB 添加 alpha。不支持其他 extra planes、浮点、宽整数或
+  subsampled alpha；配置任一种 component/source/tile patches 时不生成此候选。
+  两层使用相同 bbox，先 Multiply 保留/清零，再 Add 写入变更样本；仅最后一层携带逻辑时长。
+  它不受 `max_rectangles` 限制；完整候选的 `trial_pixels` 按每层计费，共两倍 bbox 面积。
+  若被剪枝，仅计实际提交的层（含未编码完的一层），pruned 报告的 `planned_frames=2`。
 - subsampled extra channels 的插值与合成顺序限制当前 crop 复用，相关输入保留 full-frame。
 - 多矩形通常增加零时长中间层，可能增加头开销和解码成本。网格越细、矩形越多不一定越小。
 - 自动选择是当前帧候选内的局部字节最优，不承诺低于所有独立 JXL 之和。
 - 预算是硬错误边界，不是超时后静默返回低 effort 结果；默认不额外限额。
 - 相同 crop payload 的合法复用由内部处理，无需参数；并非所有 mask/patch 候选都能共享。
+
+以上新工具均保留 full/crop 和其他符合条件的旧候选，按实际完整编码字节选择，不保证每个输入
+都更小或更快。报告中 `adaptive_rate_feedback`、`adaptive_splits`、`allow_multiply_mask`
+是配置值，不表示一定符合条件或获胜；新策略名为 `SplitPrevious/First/Retained` 和
+`MultiplyMaskPrevious/First/Retained`（各自展开为三个完整枚举名）。Python 默认
+`strategy="crop"` 不变，只有显式 `strategy="auto"` 使用这些开关。
+
+CLI 对应 `--no-adaptive-rate-feedback`、`--no-adaptive-splits`、`--no-multiply-mask`；
+`--no-mask` 是所有 mask 的总关闭开关。关闭 `adaptive_rectangles` 只禁用自适应矩形类，
+不会禁用 Multiply/Add mask，不能据此声称恢复全部旧候选。若要恢复新增这两个工具之前的
+`f4e240c` 候选策略，应同时设 `adaptive_splits=False`、`allow_multiply_mask=False`，其他参数保持
+不变；`adaptive_rate_feedback` 仍是独立开关，False 只恢复首帧码率估计。
 
 ### 异尺寸与显式 layers
 
@@ -364,6 +386,9 @@ analysis = rs_jxl.analyze_multiframe(
 `history_window` 是非负 usize，默认 0；正值检查往前该距离内、除第一/上一帧之外的历史
 输入，返回 `history`，不会假装这些帧已经保存在解码器参考槽中。扫描增加的时间包含在
 `analysis_seconds`。`improves_static_bbox` 是几何潜力，不是保证压缩更小。
+静态分析没有实际 Full 码率历史或编码器 patch 配置，因此不增加 encode-time 的近期码率、
+双轴 split 或 Multiply/Add mask 候选。这些新布尔字段不是 `analysis_options`，分析报告
+并不枚举实际 auto 编码的全部候选。
 新增 `geometry` 汇总多矩形最小面积、层数和潜在试编码工作量；重复矩形计数可用于判断
 payload 复用机会。原 `reference_modes` 仍然只统计单 bbox，避免悄悄改变旧字段含义。
 它不运行编码，不接受 effort、prune 或编码预算；不能据此声称已经选出压缩体积最优方案。

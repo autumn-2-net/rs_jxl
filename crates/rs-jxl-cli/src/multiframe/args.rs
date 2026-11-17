@@ -130,9 +130,12 @@ pub(crate) struct EncodeFramesArgs {
     /// Choose retained states using the next input (opt-in; no future encoding)
     #[arg(long, requires = "retained_reference")]
     pub(super) reference_lookahead: bool,
-    /// Disable the safe mask candidate
+    /// Disable all mask candidates, including multiply/add masks
     #[arg(long)]
     no_mask: bool,
+    /// Disable two-layer multiply/add masks (also disabled by --no-mask)
+    #[arg(long)]
+    no_multiply_mask: bool,
     /// Disable the safe multi-rectangle candidate
     #[arg(long)]
     no_multi_rect: bool,
@@ -145,6 +148,9 @@ pub(crate) struct EncodeFramesArgs {
     /// Disable recent complete-Full rate feedback; retain first-frame-rate proposals
     #[arg(long)]
     no_adaptive_rate_feedback: bool,
+    /// Disable measured-rate geometric split proposals
+    #[arg(long)]
+    no_adaptive_splits: bool,
     /// Tile side length for multi-rectangle planning
     #[arg(long, default_value_t = AutoOptions::default().tile_size, value_parser = clap::value_parser!(u32).range(1..), value_name = "PIXELS")]
     tile_size: u32,
@@ -184,10 +190,12 @@ impl EncodeFramesArgs {
             retained_reference: self.retained_reference,
             reference_lookahead: self.reference_lookahead,
             allow_mask: !self.no_mask,
+            allow_multiply_mask: !self.no_multiply_mask,
             allow_multi_rect: !self.no_multi_rect,
             prune: !self.no_prune,
             adaptive_rectangles: !self.no_adaptive_rectangles,
             adaptive_rate_feedback: !self.no_adaptive_rate_feedback,
+            adaptive_splits: !self.no_adaptive_splits,
             tile_size: self.tile_size,
             extra_tile_sizes: self.extra_tile_sizes.clone(),
             max_rectangles: self.max_rectangles,

@@ -55,7 +55,7 @@ impl Trial<'_> {
         let initial_pixels = *pixels;
         let workers = crate::execution::worker_count().min(4);
         if cutoff.is_none()
-            && !candidate.mask
+            && candidate.replace()
             && candidate.rects.len() > 1
             && workers > 1
             && !crate::execution::is_serial()
@@ -68,7 +68,14 @@ impl Trial<'_> {
         let mut encoded_frames = 0;
         let mut submitted_parts = 0;
         let mut lower_bound = None;
-        for (part, &rect) in candidate.rects.iter().enumerate() {
+        let planned_frames = if candidate.multiply_mask() {
+            2
+        } else {
+            candidate.rects.len()
+        };
+        let mut multiply_images: Option<std::array::IntoIter<Image, 2>> = None;
+        for part in 0..planned_frames {
+            let rect = candidate.rects[if candidate.multiply_mask() { 0 } else { part }];
             if cutoff.is_some_and(|maximum| bytes.len() >= maximum) {
                 lower_bound = Some(bytes.len());
                 break;
@@ -78,9 +85,28 @@ impl Trial<'_> {
                 .filter(|&n| n <= self.max_trial_pixels)
                 .ok_or(Error::Limit("automatic trial pixel work"))?;
             submitted_parts += 1;
-            let final_part = part + 1 == candidate.rects.len();
+            let final_part = part + 1 == planned_frames;
             let last = self.last_input && final_part;
-            let frame_image = if candidate.mask {
+            let frame_image = if candidate.multiply_mask() {
+                if multiply_images.is_none() {
+                    let (keep, update) = crate::multiframe::multiply_mask::images(
+                        image,
+                        rect,
+                        candidate
+                            .diff
+                            .as_ref()
+                            .expect("multiply mask difference map"),
+                    )?;
+                    multiply_images = Some([keep, update].into_iter());
+                }
+                Cow::Owned(
+                    multiply_images
+                        .as_mut()
+                        .expect("multiply mask images")
+                        .next()
+                        .expect("two multiply mask layers"),
+                )
+            } else if candidate.mask {
                 Cow::Owned(regions::mask_from_map(
                     image,
                     rect,
@@ -107,7 +133,13 @@ impl Trial<'_> {
                         } else {
                             destination
                         },
-                        mode: if candidate.mask {
+                        mode: if candidate.multiply_mask() {
+                            if part == 0 {
+                                BlendMode::Multiply
+                            } else {
+                                BlendMode::Add
+                            }
+                        } else if candidate.mask {
                             BlendMode::Blend
                         } else {
                             BlendMode::Replace
@@ -129,7 +161,7 @@ impl Trial<'_> {
                 cutoff.map(|maximum| maximum - bytes.len()),
                 options.max_output_bytes,
             );
-            let encoded = if candidate.mask {
+            let encoded = if !candidate.replace() {
                 crate::encode::encode_logical_frame_trial(
                     canvas,
                     &frame,
@@ -165,7 +197,7 @@ impl Trial<'_> {
         }
 
         if let Some(lower_bound) = lower_bound {
-            if !candidate.mask {
+            if candidate.replace() {
                 payloads.skip(&candidate.rects[submitted_parts..]);
             }
             return Ok(Outcome::Pruned(AutoPrunedReport {
@@ -176,7 +208,7 @@ impl Trial<'_> {
                 save_as_reference: final_save,
                 lower_bound,
                 encoded_frames,
-                planned_frames: candidate.rects.len(),
+                planned_frames,
                 trial_pixels: *pixels - initial_pixels,
                 elapsed: started.elapsed(),
             }));

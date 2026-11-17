@@ -27,7 +27,7 @@ impl Payloads {
     }
     pub(super) fn new<'a>(candidates: impl Iterator<Item = &'a Candidate>) -> Self {
         let mut result = Self::default();
-        for candidate in candidates.filter(|c| !c.mask) {
+        for candidate in candidates.filter(|c| c.replace()) {
             for &rect in &candidate.rects {
                 result.entries.entry(key(rect)).or_default().0 += 1;
             }

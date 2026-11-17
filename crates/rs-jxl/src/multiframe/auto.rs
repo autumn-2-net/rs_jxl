@@ -142,6 +142,7 @@ fn encode_inner(
             &mut differences,
             &slots,
             &lookahead,
+            options.has_patches(),
         )?
         .into_iter()
         .enumerate()
@@ -247,6 +248,8 @@ fn encode_inner(
         append(&mut stream, winner_bytes, options.max_output_bytes)?;
         available = winner_references;
         reports.push(AutoFrameReport {
+            allow_multiply_mask: auto.allow_multiply_mask,
+            adaptive_splits: auto.adaptive_splits,
             adaptive_rate_feedback: auto.adaptive_rate_feedback,
             retained_reference: auto.retained_reference,
             reference_lookahead: auto.reference_lookahead,

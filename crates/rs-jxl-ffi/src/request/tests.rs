@@ -344,11 +344,15 @@ fn auto_options_default_to_native_and_keep_outer_reference() {
     assert_eq!(actual.reference_lookahead, default.reference_lookahead);
     assert!(!actual.reference_lookahead);
     assert!(actual.adaptive_rate_feedback);
+    assert!(actual.adaptive_splits);
+    assert_eq!(actual.adaptive_splits, default.adaptive_splits);
     assert_eq!(
         actual.adaptive_rate_feedback,
         default.adaptive_rate_feedback
     );
     assert_eq!(actual.allow_mask, default.allow_mask);
+    assert!(actual.allow_multiply_mask);
+    assert_eq!(actual.allow_multiply_mask, default.allow_multiply_mask);
     assert_eq!(actual.allow_multi_rect, default.allow_multi_rect);
     assert_eq!(actual.tile_size, default.tile_size);
     assert_eq!(actual.extra_tile_sizes, default.extra_tile_sizes);
@@ -368,16 +372,21 @@ fn auto_options_default_to_native_and_keep_outer_reference() {
 }
 
 #[test]
-fn mode_does_not_require_other_search_controls() {
+fn adaptive_tools_do_not_require_other_search_controls() {
     for (multi, adaptive) in [(true, true), (false, true), (true, false), (false, false)] {
         let request = automatic(json!({
+            "allow_mask": false,
+            "allow_multiply_mask": true,
             "adaptive_rate_feedback": false,
+            "adaptive_splits": true,
             "allow_multi_rect": multi,
             "adaptive_rectangles": adaptive,
         }));
         request.validate().unwrap();
         let native = request.auto_options.unwrap().native(Reference::First);
         assert!(!native.adaptive_rate_feedback);
+        assert!(native.allow_multiply_mask && !native.allow_mask);
+        assert!(native.adaptive_splits);
         assert_eq!(native.allow_multi_rect, multi);
         assert_eq!(native.adaptive_rectangles, adaptive);
     }
@@ -387,6 +396,7 @@ fn mode_does_not_require_other_search_controls() {
 fn auto_options_forward_all_overrides_and_zero_budgets() {
     let request = automatic(json!({
         "allow_mask": false,
+        "allow_multiply_mask": false,
         "allow_multi_rect": false,
         "tile_size": 8,
         "extra_tile_sizes": [16, 64],
@@ -394,6 +404,7 @@ fn auto_options_forward_all_overrides_and_zero_budgets() {
         "prune": false,
         "adaptive_rectangles": false,
         "adaptive_rate_feedback": false,
+        "adaptive_splits": false,
         "max_frames": 0,
         "max_total_trials": 0,
         "max_trial_pixels": 0,
@@ -404,8 +415,10 @@ fn auto_options_forward_all_overrides_and_zero_budgets() {
     assert!(!auto.retained_reference);
     assert!(!auto.reference_lookahead);
     assert!(!auto.allow_mask && !auto.allow_multi_rect);
+    assert!(!auto.allow_multiply_mask);
     assert!(!auto.prune && !auto.adaptive_rectangles);
     assert!(!auto.adaptive_rate_feedback);
+    assert!(!auto.adaptive_splits);
     assert_eq!((auto.tile_size, auto.max_rectangles), (8, 4097));
     assert_eq!(auto.extra_tile_sizes, [16, 64]);
     assert_eq!(
@@ -557,6 +570,8 @@ fn auto_options_serde_rejects_unknown_duplicate_and_wrong_types() {
         r#"{"retained_reference":true,"retained_reference":false}"#,
         r#"{"reference_lookahead":true,"reference_lookahead":false}"#,
         r#"{"adaptive_rate_feedback":true,"adaptive_rate_feedback":false}"#,
+        r#"{"adaptive_splits":true,"adaptive_splits":false}"#,
+        r#"{"allow_multiply_mask":true,"allow_multiply_mask":false}"#,
         r#"{"max_frames":1,"max_frames":2}"#,
         r#"[]"#,
         r#"true"#,
@@ -573,7 +588,9 @@ fn auto_options_serde_rejects_unknown_duplicate_and_wrong_types() {
         "retained_reference",
         "reference_lookahead",
         "adaptive_rate_feedback",
+        "adaptive_splits",
         "allow_mask",
+        "allow_multiply_mask",
         "allow_multi_rect",
         "prune",
         "adaptive_rectangles",

@@ -393,6 +393,9 @@ fn merged_rectangles_match_official_decoders() {
                         reference,
                         tile_size: 4,
                         max_rectangles: 2,
+                        // This oracle specifically requires the original merged proposal.
+                        adaptive_splits: false,
+                        allow_multiply_mask: false,
                         ..Default::default()
                     },
                 )

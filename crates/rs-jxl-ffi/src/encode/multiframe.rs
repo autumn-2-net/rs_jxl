@@ -68,6 +68,8 @@ pub(super) fn auto_frame_report(index: usize, frame: &multiframe::AutoFrameRepor
         "retained_reference": frame.retained_reference,
         "reference_lookahead": frame.reference_lookahead,
         "adaptive_rate_feedback": frame.adaptive_rate_feedback,
+        "adaptive_splits": frame.adaptive_splits,
+        "allow_multiply_mask": frame.allow_multiply_mask,
         "lookahead_comparisons": frame.lookahead_comparisons,
         "reused_payloads": frame.reused_payloads,
         "reused_payload_pixels": frame.reused_payload_pixels,

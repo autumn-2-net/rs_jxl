@@ -33,6 +33,11 @@ default, or the currently retained states when the new option is enabled:
 - Crop REPLACE: the exact bounding rectangle of all changed samples.
 - Binary alpha mask: changed pixels retain their current values; unchanged
   pixels become zero with alpha zero. BLEND references the chosen full image.
+- Multiply/add mask (`MultiplyMaskPrevious`/`MultiplyMaskFirst`/
+  `MultiplyMaskRetained`): two ordinary layers use the same difference bbox.
+  The zero-duration Multiply layer keeps unchanged samples with one and clears
+  changed samples with zero; Add supplies the changed target samples and carries
+  the logical duration. No alpha channel or sample metadata is added or changed.
 - Multiple REPLACE rectangles: occupied tiles are tightened to changed samples
   and adjacent equal spans are merged. Each rectangle is an ordinary JXL layer;
   intermediate layers have duration zero, and only the final layer carries the
@@ -49,6 +54,14 @@ default, or the currently retained states when the new option is enabled:
   The rates propose partitions only; their estimated costs are never
   reported as encoded size or used to select the winner. All legacy candidates
   remain eligible, with new proposals appended after them for stable ties.
+- Two-axis splits (`SplitPrevious`/`SplitFirst`/`SplitRetained`): with
+  `adaptive_splits=true` (default), an additional bounded guillotine partition
+  can split occupied tiles along either axis and tighten each output rectangle.
+  It uses the initial measured Full rate, or the eligible recent Full rate when
+  rate feedback is enabled. It requires both `allow_multi_rect` and
+  `adaptive_rectangles`, respects `max_rectangles`, and retains all older plans.
+  It adds at most one unique proposal per reference at the base `tile_size`;
+  actual complete encoded bytes, not estimated area, decide whether it wins.
 
 This feedback addresses a simple opening frame followed by more complex images:
 the opening frame alone can substantially underestimate the cost of transmitting
@@ -56,12 +69,15 @@ unchanged pixels between distant edits. It adds at most one actual encode trial
 per eligible reference, reusing difference maps, finalized-byte pruning, payload
 caching and caller budgets. It adds no frame tool or bitstream syntax.
 Static `analyze` uses the caller's geometry rate and cannot include this
-encode-time measurement; its candidate counts are not the feedback-expanded
-search history. See [measurements](MULTIFRAME_RATE_FEEDBACK_20261117.md).
+encode-time measurement. It also does not add two-axis split or multiply-mask
+proposals: it has neither measured-rate history nor encoder patch options.
+Its candidate counts are not the full automatic encode search history. See
+[feedback measurements](MULTIFRAME_RATE_FEEDBACK_20261117.md).
 
 `AutoOptions.adaptive_rate_feedback` is a separate boolean alongside
 `allow_mask`, `allow_multi_rect` and `adaptive_rectangles`. It defaults to true;
-false restores the original first-frame rate policy. CLI callers can disable it
+false restores the original first-frame rate policy for rate-guided geometry;
+it does not disable the other tools. CLI callers can disable it
 with `--no-adaptive-rate-feedback`. Python callers use the existing options map:
 
 ```python
@@ -78,6 +94,31 @@ proposals also disables feedback proposals. Search reports include
 was needed or won. Both settings emit ordinary JXL and use the same decoder and
 `.jxl` extension. Feedback can select more rectangles, but full/crop/mask and
 original rectangle plans remain eligible and compete by actual encoded bytes.
+
+`adaptive_splits` and `allow_multiply_mask` are also independent booleans,
+defaulting to true. CLI disables them with `--no-adaptive-splits` and
+`--no-multiply-mask`; Python uses the same names in `auto_options`. `--no-mask`
+or `allow_mask=false` disables **both** ordinary alpha masks and multiply masks.
+Multiply masks do not depend on `allow_multi_rect`, `adaptive_rectangles` or
+`max_rectangles`: they are a fixed two-layer operation, not a partition search.
+There are no new required option dependencies; an inactive tool preference is
+still reported as configured.
+
+Multiply masks currently accept integer depths 1..16 with U8/U16 Gray, GA, RGB
+or RGBA storage. An optional alpha must be the sole extra channel, full resolution and
+integer 1..16 bits; its depth may differ from color. Alpha is an independent
+sample under Multiply/Add, so partial or associated alpha and invisible RGB do
+not use the opacity assumptions of the older BLEND mask. Other extra planes,
+floating/wide samples and subsampled alpha are ineligible. Configured component,
+source or tile patches disable this tool, even when detection might find no
+atlas. Full/crop and every other eligible fallback remain in the search.
+
+To recover the candidate policy preceding these two tools (`f4e240c`),
+set `adaptive_splits=false` and `allow_multiply_mask=false`, keeping the remaining
+controls unchanged. `adaptive_rate_feedback` remains a separate control; turning
+it off selects the first-frame rate, not the whole older candidate set.
+See [the split/mask comparison](MULTIFRAME_COMPRESSION_20261118.md) for complete
+sizes, separate development/real-input results and encode/decode MPix/s.
 
 Rust builds a shared exact difference map per analyzed input/reference pair.
 Bounds, changed-pixel counts, mask construction and rectangle proposals reuse
@@ -113,7 +154,7 @@ coarser grids can avoid excessive independent coding overhead. Neither is
 universally better. All proposals compete using actual encoded bytes, with
 the existing finalized-byte pruning and repeated-rectangle payload cache.
 Reports identify the proposing `tile_size` (null for full/crop/mask).
-`max_rectangles` applies to each candidate; explicit trial/pixel budgets still
+`max_rectangles` applies to each rectangle-partition candidate; explicit trial/pixel budgets still
 apply to all submitted work. Extra grids have no effect when multi-rectangle
 planning is disabled. Positive integer values are required even in that case.
 
@@ -194,7 +235,7 @@ smaller stream. It remains opt-in and does not change default reference policy.
 
 ### Repeated Candidate Payloads
 
-Within one logical input, non-mask candidates can crop exactly the same rectangle
+Within one logical input, unmasked REPLACE candidates can crop exactly the same rectangle
 against different references. Their encoded Modular sections are reusable even
 though their source/save slots and timing headers differ. Native Rust now
 encodes those sections once when a complete reusable result is available and
@@ -245,6 +286,8 @@ always considered. Each `AutoFrameReport` contains:
   is never a completed size. `encoded_frames` counts fully finished regular
   layers only, excluding an interrupted layer and private reference-only frames.
 - `analysis_elapsed`: native elapsed difference/planning time.
+- `adaptive_rate_feedback`, `adaptive_splits` and `allow_multiply_mask`: configured
+  booleans, not evidence that a corresponding proposal was eligible or selected.
 - `differences`: `AutoDiffReport` entries containing zero-based input `reference`,
   exact `changed_pixels`, and `bounds: Option<Rect>`. No change has zero pixels
   and `None` bounds; no analyzed references gives an empty list. A reference
@@ -267,6 +310,11 @@ always considered. Each `AutoFrameReport` contains:
 interrupted layer, not analysis scans. Time fields are native `Duration`s; the
 FFI exposes seconds as `elapsed_seconds` and `analysis_seconds` without Python
 timing or recomputation.
+A complete multiply-mask candidate charges the bbox twice, once per layer,
+and reports `encoded_frames=2`. A pruned candidate reports `planned_frames=2`
+and charges only submitted layers, including an interrupted layer. It does not
+share ordinary REPLACE payload-cache entries. Logical `max_frames` still counts
+inputs, while candidate/pixel/output budgets apply to its actual work and bytes.
 
 `prune=true` (the default) ranks inexpensive work first, then stops a losing
 trial only when finalized output gives a provable byte lower bound that cannot
@@ -276,12 +324,13 @@ with `prune=false` completes all eligible trials or fails explicitly on an error
 For the same candidate set and sufficient budgets, pruning preserves selection;
 it does not change eligibility or the preference among equal-byte candidates.
 
-Execution ordering estimates submitted area and per-layer work. Masks retain a
+Execution ordering estimates submitted area and per-layer work. Binary alpha masks retain a
 sparse-content discount, but also pay a bbox scan term: changed pixels plus
 one eighth of submitted area (rounded up), then the same layer term as other
 candidates. This is a heuristic work weight, not a measured speed ratio or a
 compressed-byte bound. It neither removes masks nor expands the candidate set;
 canonical equal-byte tie-breaking remains independent of execution order.
+Multiply-mask ranking instead accounts for both bbox submissions and both layers.
 See the [ordering experiment](MULTIFRAME_ORDER_BENCHMARK.md), including the
 rejected full-area ordering and timing controls, for the measured scope.
 
@@ -301,16 +350,19 @@ pixel plus 64 heuristic bytes per layer; 64 is not a normative header size.
 The planner is not an exhaustive partition search. Allocation is checked, and
 there is no quadratic all-pairs rectangle search.
 Both geometry controls must be positive; `max_rectangles` has no additional
-4096 cap. `allow_mask`, `allow_multi_rect`, `prune` and `adaptive_rectangles`
-default to true. Set `adaptive_rectangles=false` to retain legacy rectangle
-proposals without the new merged proposal; this is independent of pruning.
-`allow_multi_rect=false` disables both tile and adaptive multi-rectangle proposals.
+4096 cap. `allow_mask`, `allow_multiply_mask`, `allow_multi_rect`, `prune`,
+`adaptive_rectangles`, `adaptive_rate_feedback` and `adaptive_splits` default to
+true. `adaptive_rectangles=false` removes merged, recent-rate and two-axis split
+proposals while retaining tile plans; it does not disable multiply masks.
+`allow_multi_rect=false` disables tile and all adaptive multi-rectangle proposals,
+but neither mask tool. Pruning is independent of these eligibility controls.
 
 Smaller output can cost more encoding and decoding time: each selected rectangle
 is a real layer, and coalescing many layers can require repeated full-canvas work.
-Selection does not optimize decoder latency. Keep pruning but set
-`adaptive_rectangles=false` for the old candidate set with less repeated work;
-use an explicit smaller `max_rectangles` to explore a different size/layer tradeoff.
+Selection does not optimize decoder latency. Disable individual tools explicitly
+to compare search costs; `adaptive_rectangles=false` alone does not recover the
+whole older candidate set. Use an explicit smaller `max_rectangles` to explore a
+different rectangle size/layer tradeoff; multiply masks remain fixed at two layers.
 Neither setting is a hidden codec limit or an effort change.
 
 Input frame (`max_frames`), candidate-count (`max_total_trials`) and cumulative

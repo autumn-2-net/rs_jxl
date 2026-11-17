@@ -11,11 +11,13 @@ mod auto;
 mod candidates;
 mod diff;
 mod lookahead;
+mod multiply_mask;
 mod partition;
 mod payload;
 mod references;
 mod regions;
 mod scales;
+mod splits;
 mod types;
 pub(crate) use analysis::analyze_in_pool;
 pub use analysis::{
