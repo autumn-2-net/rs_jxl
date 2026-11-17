@@ -53,6 +53,17 @@ impl Trial<'_> {
         let final_save = if self.last_input { 0 } else { destination };
         let started = Instant::now();
         let initial_pixels = *pixels;
+        let workers = crate::execution::worker_count().min(4);
+        if cutoff.is_none()
+            && !candidate.mask
+            && candidate.rects.len() > 1
+            && workers > 1
+            && !crate::execution::is_serial()
+            && rayon::current_thread_index().is_some()
+            && candidate.rects.iter().all(|&r| !payloads.has_entry(r))
+        {
+            return self.run_parallel(candidate, trial_refs, trial_slots, pixels, workers, started);
+        }
         let mut bytes = Vec::new();
         let mut encoded_frames = 0;
         let mut submitted_parts = 0;
@@ -186,6 +197,102 @@ impl Trial<'_> {
             report,
             references: trial_refs,
             slots: trial_slots,
+        })
+    }
+
+    /// Only unbounded, unshared Replace payloads enter this path. Images and
+    /// encoded payloads live for at most one worker-sized batch, never the
+    /// entire candidate. Reference validation/publication stays canonical.
+    fn run_parallel(
+        &self,
+        candidate: &Candidate,
+        mut references: [Option<bool>; 4],
+        mut slots: ReferenceSlots,
+        pixels: &mut u64,
+        workers: usize,
+        started: Instant,
+    ) -> Result<Outcome> {
+        let initial_pixels = *pixels;
+        let mut bytes = Vec::new();
+        for (batch_index, rects) in candidate.rects.chunks(workers).enumerate() {
+            let first = batch_index * workers;
+            let mut jobs = Vec::with_capacity(rects.len());
+            // Charge all speculative pixels before dispatch, so workers can
+            // never collectively exceed the existing cumulative work cap.
+            for (i, &rect) in rects.iter().enumerate() {
+                *pixels = pixels
+                    .checked_add(u64::from(rect.width) * u64::from(rect.height))
+                    .filter(|&n| n <= self.max_trial_pixels)
+                    .ok_or(Error::Limit("automatic trial pixel work"))?;
+                let part = first + i;
+                let final_part = part + 1 == candidate.rects.len();
+                let last = self.last_input && final_part;
+                let image = crop(self.image, rect)?;
+                let options = FrameOptions {
+                    origin: (rect.x as i32, rect.y as i32),
+                    duration: if final_part { self.duration } else { 0 },
+                    save_as_reference: if last { 0 } else { self.destination },
+                    blend: BlendInfo {
+                        source: if part == 0 {
+                            candidate.source
+                        } else {
+                            self.destination
+                        },
+                        mode: BlendMode::Replace,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                };
+                references = crate::encode::validate_frame_references(
+                    self.canvas.into(),
+                    (&image).into(),
+                    &options,
+                    self.options,
+                    last,
+                    references,
+                )?;
+                jobs.push((image, options, last, final_part));
+            }
+            let encoded = crate::execution::map_mut(&mut jobs, |_, (image, options, last, _)| {
+                crate::encode::encode_logical_frame_trial(
+                    self.canvas,
+                    &Frame {
+                        image,
+                        options: options.clone(),
+                    },
+                    self.options,
+                    *last,
+                    None,
+                )
+            });
+            for (result, (_, settings, last, final_part)) in encoded.into_iter().zip(jobs) {
+                let output = result?.into_complete()?;
+                append(&mut bytes, output, self.options.max_output_bytes)?;
+                slots.saved_layer(
+                    self.index,
+                    settings.save_as_reference,
+                    settings.duration,
+                    final_part,
+                    last,
+                );
+            }
+        }
+        let report = AutoCandidateReport {
+            strategy: candidate.strategy,
+            tile_size: candidate.tile_size,
+            reference_index: candidate.reference_index,
+            source: candidate.source,
+            save_as_reference: if self.last_input { 0 } else { self.destination },
+            encoded_bytes: bytes.len(),
+            encoded_frames: candidate.rects.len(),
+            trial_pixels: *pixels - initial_pixels,
+            elapsed: started.elapsed(),
+        };
+        Ok(Outcome::Complete {
+            bytes,
+            report,
+            references,
+            slots,
         })
     }
 }

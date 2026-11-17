@@ -345,3 +345,48 @@ The parent adapter separately moves wide grayscale capture output and skips
 equal-depth alpha scaling. A parent JPEG scan-buffer experiment was dropped
 after timing regressions. See
 `docs/DECODER_OUTPUT_SPEED_20261117.md` for measured scope and limitations.
+
+## Direct Reference Background Copies (2026-11-17)
+
+`render/low_memory_pipeline/mod.rs` recognizes an Extend suffix consisting only
+of single-channel, identity-orientation, native-endian F32 saves, with unchanged
+channel types, zero downsampling and unique compatible output mappings. It
+copies outside-crop background rows directly from each channel's selected
+reference into the existing BufferSplitter views. Missing references supply
+positive zero. Other suffixes keep the original render stages.
+
+The direct path uses whole-width strips instead of scratch-width strips; the
+changed-region coverage is identical, though its subdivision may be coarser.
+It avoids the intermediate scratch copy and per-row stage dispatch. Full
+reference allocation, frame ordering, reference ownership and flush behavior
+are unchanged. No new unsafe code, intrinsics or platform requirements are added.
+
+Parent `decoder_reference_copy` checks an independent original-sample composite
+for RGB/RGBA8/16, separate color/alpha sources, absent references, same-slot
+overwrites, cross-slot saves and clipped crops; it also covers incremental
+input, finite F32 words, rotated output and raw layers. Measurements and
+central verification are in `docs/MULTIFRAME_SPEED_20261117.md` in the parent.
+
+## Reuse Hidden Replace Reference Canvases (2026-11-17)
+
+`frame/decode.rs`, `frame/mod.rs`, `frame/render.rs` and
+`api/codestream_parser/frame_info.rs` additionally allow a hidden coalesced
+Regular Modular frame to take ownership of its same-slot post-transform
+reference canvas. Every channel must use Replace from that same slot; the
+reference must have the exact canvas dimensions/channel count and unique Arc
+ownership. The initial gate permits only RGB integer samples up to 16 bits,
+optionally one full-resolution integer alpha, and excludes patches, LF
+dependencies, noise, splines, upsampling, XYB/YCbCr and capture paths.
+
+The moved canvas supplies the unchanged outside pixels. Extend still controls
+crop coordinates and clipping, but its outside render is skipped. The normal
+frame finalizer publishes the updated reference; no layer is reordered. Pre-CT
+and incompatible references are checked before taking the slot and use the
+existing validation/allocation path. Coalescing is immutable for the decoder;
+hidden coalesced frames have no API Save stage, including during explicit flush.
+An early hidden flush may no longer mark pixels dirty solely because of an
+internal background copy. Visible output and reference data remain the contract.
+
+The parent `decoder_reference_copy` includes a same-slot RGB/RGBA8/16 chain,
+incremental input and F32/raw-layer fallbacks, using an independent original-word
+compositor. The parent speed report records final validation and measurements.

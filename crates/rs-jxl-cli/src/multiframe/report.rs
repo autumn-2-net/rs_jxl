@@ -14,7 +14,7 @@ pub(super) fn write_report(
     for (frame_index, frame) in result.frames.iter().enumerate() {
         writeln!(
             output,
-            "frame {}: winner={} candidates={} pruned={} analysis_elapsed={:?} retained_reference={} reference_lookahead={} lookahead_comparisons={} reused_payloads={} reused_payload_pixels={} references_before={:?} references_after={:?}",
+            "frame {}: winner={} candidates={} pruned={} analysis_elapsed={:?} retained_reference={} reference_lookahead={} adaptive_rate_feedback={} lookahead_comparisons={} reused_payloads={} reused_payload_pixels={} references_before={:?} references_after={:?}",
             frame_index + 1,
             frame.winner_index,
             frame.candidates.len(),
@@ -22,6 +22,7 @@ pub(super) fn write_report(
             frame.analysis_elapsed,
             frame.retained_reference,
             frame.reference_lookahead,
+            frame.adaptive_rate_feedback,
             frame.lookahead_comparisons,
             frame.reused_payloads,
             frame.reused_payload_pixels,
@@ -127,6 +128,7 @@ fn frame_report(index: usize, frame: &rs_jxl::multiframe::AutoFrameReport) -> Va
         "winner_index": frame.winner_index,
         "retained_reference": frame.retained_reference,
         "reference_lookahead": frame.reference_lookahead,
+        "adaptive_rate_feedback": frame.adaptive_rate_feedback,
         "lookahead_comparisons": frame.lookahead_comparisons,
         "reused_payloads": frame.reused_payloads,
         "reused_payload_pixels": frame.reused_payload_pixels,

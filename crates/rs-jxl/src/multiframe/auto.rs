@@ -238,7 +238,7 @@ fn encode_inner(
         // Learn only from the winning complete Full frame. A losing Full trial
         // may be pruned, so observing its completion would make future proposal
         // sets depend on the pruning switch. This rate affects the next input.
-        if completed[winner_index].1.strategy == Strategy::Full {
+        if auto.adaptive_rate_feedback && completed[winner_index].1.strategy == Strategy::Full {
             recent_full_bytes_per_pixel = Some(
                 winner_bytes.len() as f64
                     / (u64::from(canvas.width()) * u64::from(canvas.height())) as f64,
@@ -247,6 +247,7 @@ fn encode_inner(
         append(&mut stream, winner_bytes, options.max_output_bytes)?;
         available = winner_references;
         reports.push(AutoFrameReport {
+            adaptive_rate_feedback: auto.adaptive_rate_feedback,
             retained_reference: auto.retained_reference,
             reference_lookahead: auto.reference_lookahead,
             lookahead_comparisons: lookahead.comparisons,

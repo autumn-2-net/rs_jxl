@@ -20,6 +20,11 @@ pub(super) struct Payloads {
 }
 
 impl Payloads {
+    /// Even an unpopulated entry has a future reuse obligation. Parallel trial
+    /// batches must leave every such entry on the original serial path.
+    pub(super) fn has_entry(&self, rect: Rect) -> bool {
+        self.entries.contains_key(&key(rect))
+    }
     pub(super) fn new<'a>(candidates: impl Iterator<Item = &'a Candidate>) -> Self {
         let mut result = Self::default();
         for candidate in candidates.filter(|c| !c.mask) {

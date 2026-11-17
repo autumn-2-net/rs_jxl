@@ -44,6 +44,8 @@ def main():
     parser.add_argument("--warmups", type=int, default=1)
     parser.add_argument("--threads", type=int, help="override manifest threads (otherwise 4)")
     parser.add_argument("--effort", type=int, help="override manifest effort (otherwise 9)")
+    parser.add_argument("--after-rate-feedback", choices=("on", "off"),
+                        help="override the after build's adaptive_rate_feedback only")
     parser.add_argument("--streams-dir", type=Path, help="NEW directory for first encoded streams")
     args = parser.parse_args()
     if (args.out.exists() or args.repeats < 1 or args.warmups < 0
@@ -122,6 +124,12 @@ def main():
             row = dict(label=label, family=family, options=recorded_options, frames=source_records,
                        pixels=pixels, durations=durations, builds={})
             report["cases"].append(row)
+            build_options = {name: dict(options) for name in libraries}
+            if args.after_rate_feedback is not None:
+                build_options["after"]["auto_options"] = {
+                    **options.get("auto_options", {}),
+                    "adaptive_rate_feedback": args.after_rate_feedback == "on"}
+            row["after_rate_feedback"] = args.after_rate_feedback
             with ExitStack() as stack:
                 encoders, decoders = {}, {}
                 for name, lib in libraries.items():
@@ -136,7 +144,7 @@ def main():
                     for name in names:
                         build = row["builds"][name]
                         start = time.perf_counter()
-                        encoded, info = encoders[name].encode_multiframe(frames, return_info=True, **options)
+                        encoded, info = encoders[name].encode_multiframe(frames, return_info=True, **build_options[name])
                         encode_seconds = time.perf_counter() - start
                         start = time.perf_counter()
                         actual, metadata = decoders[name].decode(encoded, frame=None, return_info=True)
@@ -147,6 +155,8 @@ def main():
                         size, sha = len(encoded), hashlib.sha256(encoded).hexdigest()
                         if "complete_bytes" in build and build["complete_bytes"] != size:
                             raise AssertionError(f"nondeterministic encoded size: {label}/{name}")
+                        if "first_sha256" in build and build["first_sha256"] != sha:
+                            raise AssertionError(f"nondeterministic encoded bytes: {label}/{name}")
                         if "complete_bytes" not in build:
                             build.update(complete_bytes=size, first_sha256=sha, search_reports=info.get("search_reports", info.get("frames")), first_encode_info=info)
                             if args.streams_dir:

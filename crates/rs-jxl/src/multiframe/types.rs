@@ -17,6 +17,9 @@ pub struct AutoOptions {
     pub prune: bool,
     /// Add a cost-estimated rectangle proposal; retain all legacy candidates.
     pub adaptive_rectangles: bool,
+    /// Add partitions guided by the most recent winning complete Full frame
+    /// rate (default on). Inactive when multi-rectangle/adaptive proposals are disabled.
+    pub adaptive_rate_feedback: bool,
     /// Retain a winning delta's background and rotate the other saved canvas.
     /// Opt-in, requires SmallestCrop. May evict frame zero; not a global optimum.
     pub retained_reference: bool,
@@ -40,6 +43,7 @@ impl Default for AutoOptions {
             max_rectangles: 32,
             prune: true,
             adaptive_rectangles: true,
+            adaptive_rate_feedback: true,
             retained_reference: false,
             reference_lookahead: false,
             max_frames: usize::MAX,
@@ -107,6 +111,9 @@ pub struct AutoDiffReport {
 }
 #[derive(Debug)]
 pub struct AutoFrameReport {
+    /// Requested configuration; disabled multi-rectangle/adaptive controls can
+    /// make feedback inactive without changing this reported value.
+    pub adaptive_rate_feedback: bool,
     pub retained_reference: bool,
     pub reference_lookahead: bool,
     pub lookahead_comparisons: usize,

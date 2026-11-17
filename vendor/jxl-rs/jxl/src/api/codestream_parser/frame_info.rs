@@ -315,12 +315,13 @@ impl FrameInfo {
             decoder_state.level5_limits = level5_limits;
             decoder_state.native_integer_capture = self.native_integer_capture.clone();
             decoder_state.keep_slots(std::mem::replace(&mut self.keep_slots, [true; 8]));
-            let frame = Frame::from_header_and_toc(
+            let frame = Frame::from_header_and_toc_with_coalescing(
                 self.frame_header.take().unwrap(),
                 toc,
                 decoder_state,
                 self.frame_counters,
                 self.buffer_recycler.clone(),
+                decode_options.coalescing,
             )?;
 
             let num_groups = frame.header().num_groups();

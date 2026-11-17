@@ -6,6 +6,12 @@ performance results are preserved in that commit. This round changes only
 automatic multiframe encoding decisions; it introduces no JXL syntax or decoder
 change.
 
+Follow-up API change: `adaptive_rate_feedback=true` enables this search and remains
+the automatic encoder's default. Setting it to false restores the original
+first-frame rate policy; see [automatic frames](MULTIFRAME_AUTO.md). The
+measurements below describe the original candidate at `0ce4cd7`, before the
+explicit policy selector and subsequent speed work.
+
 ## Change
 
 The adaptive rectangle partitioner previously used the first full frame's

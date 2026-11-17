@@ -25,7 +25,7 @@ def _auto_options(value, strategy):
     if not isinstance(value, Mapping):
         raise TypeError("auto_options must be a mapping of Rust option names")
     booleans = {"allow_mask", "allow_multi_rect", "prune", "adaptive_rectangles",
-                "retained_reference", "reference_lookahead"}
+                "retained_reference", "reference_lookahead", "adaptive_rate_feedback"}
     integers = {"tile_size": (1, 0xffffffff),
                 "max_rectangles": (1, sys.maxsize * 2 + 1),
                 "max_frames": (0, sys.maxsize * 2 + 1),
@@ -129,6 +129,10 @@ def encode_multiframe(frames, output=None, *, layout="auto", durations=1,
     it uses exact differences against only the next input to choose which old
     state to retain, without encoding future inputs or guaranteeing fewer bytes.
     Both flags default to False in Rust.
+    adaptive_rate_feedback defaults to True in Rust and adds partitions guided
+    by the recent winning complete Full frame's measured rate. Set it to False
+    inside auto_options to retain the first-frame-rate policy. It is inactive
+    when allow_multi_rect or adaptive_rectangles is disabled.
     extra_tile_sizes=[16, 64] adds partition grids without replacing tile_size.
     Duplicate partitions are skipped; extra trials may take longer. For a fixed
     reference state selection uses bytes, not minimum rectangle area.

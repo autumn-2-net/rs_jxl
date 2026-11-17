@@ -313,6 +313,7 @@ search defaults or perform difference analysis, planning or selection.
 | `max_rectangles` | positive native usize integer | 32 |
 | `prune` | bool | true |
 | `adaptive_rectangles` | bool | true |
+| `adaptive_rate_feedback` | bool; additional partitions using recent winning Full-frame costs | true |
 | `retained_reference` | bool; true requires `reference="auto"` | false |
 | `reference_lookahead` | bool; true requires `retained_reference=True` | false |
 | `max_frames` | nonnegative native usize integer | usize::MAX |
@@ -328,6 +329,13 @@ disabled. Zero budgets are forwarded unchanged and cause explicit native resourc
 failures when work exceeds them. Omitting budgets uses native unlimited defaults,
 not new Python limits. Direct ABI requests also enforce these types with serde
 and reject duplicate members.
+
+`adaptive_rate_feedback=False` restores the original first-frame cost estimate
+for rectangle proposals. The default true adds recent-rate proposals while
+retaining all original choices; actual encoded bytes still select the winner.
+It has no effect if `allow_multi_rect` or `adaptive_rectangles` is false.
+`strategy="crop"` remains the Python default and does not use automatic-search
+options. Automatic reports include the configured `adaptive_rate_feedback` bool.
 
 Automatic frame reports distinguish completed work from pruning:
 

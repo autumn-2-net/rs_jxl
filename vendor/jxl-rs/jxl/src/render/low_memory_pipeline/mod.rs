@@ -11,12 +11,14 @@ use row_buffers::RowBuffer;
 
 use super::RenderPipeline;
 use super::internal::{RenderPipelineShared, RunInOutStage, RunInPlaceStage};
-use crate::api::JxlOutputBuffer;
+use crate::api::{JxlDataFormat, JxlOutputBuffer};
 use crate::error::Result;
+use crate::headers::Orientation;
 use crate::image::{DataTypeTag, Image, ImageDataType, Rect};
-use crate::render::buffer_splitter::{BufferSplitter, SaveStageBufferInfo};
+use crate::render::buffer_splitter::{BufferSplitter, OutputChannelRef, SaveStageBufferInfo};
 use crate::render::internal::Stage;
 use crate::render::low_memory_pipeline::input_buffers::InputBuffers;
+use crate::render::save::SaveChannelType;
 use crate::render::{ErasedLocalState, MAX_BORDER};
 use crate::util::sync::atomic::Ordering;
 use crate::util::tracing_wrappers::*;
@@ -123,6 +125,98 @@ pub struct LowMemoryRenderPipeline {
     downsampling_for_stage: Vec<(usize, usize)>,
     // Sorted indices to call get_distinct_indices.
     sorted_buffer_indices: Vec<Vec<(usize, usize, usize)>>,
+}
+
+struct OutsideFrameSave {
+    channel: usize,
+    source: usize,
+    output_buffer_index: usize,
+}
+
+impl LowMemoryRenderPipeline {
+    // Outside the crop, Extend supplies the background unchanged. When its entire suffix is
+    // planar native-F32 saves, copying those same bytes directly avoids the intermediate row
+    // buffers and per-row stage dispatch. Any conversion or other stage needs the usual path.
+    fn direct_outside_frame_saves(&self, extend: usize) -> Option<Vec<OutsideFrameSave>> {
+        let Stage::Extend(e) = &self.shared.stages[extend] else {
+            return None;
+        };
+        let mut saves: Vec<OutsideFrameSave> = vec![];
+        for (i, stage) in self.shared.stages.iter().enumerate().skip(extend + 1) {
+            let Stage::Save(s) = stage else {
+                return None;
+            };
+            if s.orientation != Orientation::Identity
+                || s.data_format != JxlDataFormat::f32()
+                || s.channels.len() != 1
+                || s.channel_types.as_slice() != [SaveChannelType::F32]
+                || s.output_channels() != 1
+                || s.fill_opaque_alpha
+                || self.downsampling_for_stage[i] != (0, 0)
+                || saves
+                    .iter()
+                    .any(|old| old.output_buffer_index == s.output_buffer_index)
+            {
+                return None;
+            }
+            let info = self.save_buffer_info.get(s.output_buffer_index)?.as_ref()?;
+            if info.downsample != (0, 0)
+                || info.orientation != Orientation::Identity
+                || info.byte_size != std::mem::size_of::<f32>()
+                || !info.after_extend
+            {
+                return None;
+            }
+            let channel = s.channels[0];
+            let source = if channel < 3 {
+                e.blending_info.source as usize
+            } else {
+                // Synthetic channels are deliberately left untouched by Extend and cannot
+                // be copied from a reference frame.
+                e.ec_blending_info.get(channel - 3)?.source as usize
+            };
+            if let Some(bg) = e.reference_frames.get(source)?.as_ref()
+                && bg.frame.get(channel)?.size() != e.image_size
+            {
+                return None;
+            }
+            saves.push(OutsideFrameSave {
+                channel,
+                source,
+                output_buffer_index: s.output_buffer_index,
+            });
+        }
+        (!saves.is_empty()).then_some(saves)
+    }
+
+    fn copy_outside_frame_directly(
+        &self,
+        saves: &[OutsideFrameSave],
+        rect: Rect,
+        buffers: &mut [Option<OutputChannelRef>],
+    ) {
+        let Stage::Extend(e) = &self.shared.stages[self.shared.extend_stage_index.unwrap()] else {
+            unreachable!("extend stage is not an extend stage");
+        };
+        for save in saves {
+            let Some(buf) = buffers[save.output_buffer_index].as_mut() else {
+                continue;
+            };
+            if let Some(bg) = &e.reference_frames[save.source] {
+                // Use the existing raw-image view rather than casting the destination. This
+                // also supports unaligned API buffers and preserves every F32 bit unchanged.
+                let background = bg.frame[save.channel].get_rect(rect).into_raw();
+                for y in 0..rect.size.1 {
+                    buf.row_mut(y).copy_from_slice(background.row(y));
+                }
+            } else {
+                // The absent-reference background is positive zero in every channel.
+                for y in 0..rect.size.1 {
+                    buf.row_mut(y).fill(0);
+                }
+            }
+        }
+    }
 }
 
 impl RenderPipeline for LowMemoryRenderPipeline {
@@ -434,15 +528,22 @@ impl RenderPipeline for LowMemoryRenderPipeline {
             e.frame_origin.0 + self.shared.input_size.0 as isize,
             e.frame_origin.1 + self.shared.input_size.1 as isize,
         );
+        let direct_saves = self.direct_outside_frame_saves(self.shared.extend_stage_index.unwrap());
+        // Direct copies need no scratch rows, so each strip can span a whole canvas row.
+        // The fallback still splits at the render pipeline's scratch-buffer width.
+        let strip_width = if direct_saves.is_some() {
+            e.image_size.0.max(1)
+        } else {
+            self.shared.chunk_size
+        };
         // Split the full image area in 4 strips: left and right of the frame, and above and below.
-        // We divide each part further in strips of width self.shared.chunk_size.
         let mut strips = vec![];
         // Above (including left and right)
         if e.frame_origin.1 > 0 {
             let xend = e.image_size.0;
             let yend = (e.frame_origin.1 as usize).min(e.image_size.1);
-            for x in (0..xend).step_by(self.shared.chunk_size) {
-                let xe = (x + self.shared.chunk_size).min(xend);
+            for x in (0..xend).step_by(strip_width) {
+                let xe = (x + strip_width).min(xend);
                 strips.push((x..xe, 0..yend));
             }
         }
@@ -451,8 +552,8 @@ impl RenderPipeline for LowMemoryRenderPipeline {
             let ystart = frame_end.1.max(0) as usize;
             let yend = e.image_size.1;
             let xend = e.image_size.0;
-            for x in (0..xend).step_by(self.shared.chunk_size) {
-                let xe = (x + self.shared.chunk_size).min(xend);
+            for x in (0..xend).step_by(strip_width) {
+                let xe = (x + strip_width).min(xend);
                 strips.push((x..xe, ystart..yend));
             }
         }
@@ -461,8 +562,8 @@ impl RenderPipeline for LowMemoryRenderPipeline {
             let ystart = e.frame_origin.1.max(0) as usize;
             let yend = (frame_end.1 as usize).min(e.image_size.1);
             let xend = (e.frame_origin.0 as usize).min(e.image_size.0);
-            for x in (0..xend).step_by(self.shared.chunk_size) {
-                let xe = (x + self.shared.chunk_size).min(xend);
+            for x in (0..xend).step_by(strip_width) {
+                let xe = (x + strip_width).min(xend);
                 strips.push((x..xe, ystart..yend));
             }
         }
@@ -472,8 +573,8 @@ impl RenderPipeline for LowMemoryRenderPipeline {
             let xend = e.image_size.0;
             let ystart = e.frame_origin.1.max(0) as usize;
             let yend = (frame_end.1 as usize).min(e.image_size.1);
-            for x in (xstart..xend).step_by(self.shared.chunk_size) {
-                let xe = (x + self.shared.chunk_size).min(xend);
+            for x in (xstart..xend).step_by(strip_width) {
+                let xe = (x + strip_width).min(xend);
                 strips.push((x..xe, ystart..yend));
             }
         }
@@ -481,7 +582,9 @@ impl RenderPipeline for LowMemoryRenderPipeline {
 
         // TODO(veluca): parallelize here.
         let mut data = self.per_thread_data.get();
-        data.ensure_populated(self)?;
+        if direct_saves.is_none() {
+            data.ensure_populated(self)?;
+        }
 
         for (xrange, yrange) in strips {
             let rect_to_render = Rect {
@@ -499,7 +602,11 @@ impl RenderPipeline for LowMemoryRenderPipeline {
                 full_image_size,
                 (0, 0),
             );
-            self.render_outside_frame_internal(&mut data, xrange, yrange, &mut local_buffers)?;
+            if let Some(saves) = &direct_saves {
+                self.copy_outside_frame_directly(saves, rect_to_render, &mut local_buffers);
+            } else {
+                self.render_outside_frame_internal(&mut data, xrange, yrange, &mut local_buffers)?;
+            }
         }
         Ok(())
     }

@@ -164,6 +164,7 @@ where
 #[derive(Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AutoOptions {
+    pub adaptive_rate_feedback: bool,
     pub retained_reference: bool,
     pub reference_lookahead: bool,
     pub allow_mask: bool,
@@ -182,6 +183,7 @@ impl Default for AutoOptions {
     fn default() -> Self {
         let native = rs_jxl::multiframe::AutoOptions::default();
         Self {
+            adaptive_rate_feedback: native.adaptive_rate_feedback,
             retained_reference: native.retained_reference,
             reference_lookahead: native.reference_lookahead,
             allow_mask: native.allow_mask,
@@ -223,6 +225,7 @@ impl AutoOptions {
         reference: rs_jxl::multiframe::Reference,
     ) -> rs_jxl::multiframe::AutoOptions {
         rs_jxl::multiframe::AutoOptions {
+            adaptive_rate_feedback: self.adaptive_rate_feedback,
             reference,
             retained_reference: self.retained_reference,
             reference_lookahead: self.reference_lookahead,

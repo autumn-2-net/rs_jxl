@@ -142,6 +142,9 @@ pub(crate) struct EncodeFramesArgs {
     /// Disable additional cost-guided rectangle proposals; retain tile candidates
     #[arg(long)]
     no_adaptive_rectangles: bool,
+    /// Disable recent complete-Full rate feedback; retain first-frame-rate proposals
+    #[arg(long)]
+    no_adaptive_rate_feedback: bool,
     /// Tile side length for multi-rectangle planning
     #[arg(long, default_value_t = AutoOptions::default().tile_size, value_parser = clap::value_parser!(u32).range(1..), value_name = "PIXELS")]
     tile_size: u32,
@@ -184,6 +187,7 @@ impl EncodeFramesArgs {
             allow_multi_rect: !self.no_multi_rect,
             prune: !self.no_prune,
             adaptive_rectangles: !self.no_adaptive_rectangles,
+            adaptive_rate_feedback: !self.no_adaptive_rate_feedback,
             tile_size: self.tile_size,
             extra_tile_sizes: self.extra_tile_sizes.clone(),
             max_rectangles: self.max_rectangles,

@@ -71,6 +71,7 @@ fn fixture() -> Vec<Image> {
 
 fn auto(prune: bool) -> AutoOptions {
     AutoOptions {
+        adaptive_rate_feedback: true,
         reference: Reference::Previous,
         allow_mask: false,
         tile_size: 16,
@@ -206,6 +207,42 @@ fn recent_full_rate_beats_independently_encoded_static_geometry() {
         .encoded_bytes as f64
         / (SIDE * SIDE) as f64;
     let baseline = static_geometry_baseline(&images, &options, anchor);
+    let implicit = AutoOptions {
+        reference: Reference::Previous,
+        allow_mask: false,
+        tile_size: 16,
+        max_rectangles: 16,
+        prune: false,
+        ..Default::default()
+    };
+    assert!(implicit.adaptive_rate_feedback);
+    let default_result = encode_auto(&images, &DURATIONS, &options, &implicit).unwrap();
+    assert_eq!(
+        default_result.bytes, result.bytes,
+        "feedback is the default partition policy"
+    );
+    let disabled = encode_auto(
+        &images,
+        &DURATIONS,
+        &options,
+        &AutoOptions {
+            adaptive_rate_feedback: false,
+            ..auto(false)
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        disabled.bytes.len(),
+        baseline.len(),
+        "legacy must preserve the independently encoded static geometry cost"
+    );
+    assert_eq!(
+        disabled.bytes.len(),
+        baseline.len(),
+        "disabled feedback must retain static geometry costs"
+    );
+    assert!(disabled.frames.iter().all(|f| !f.adaptive_rate_feedback));
+    assert!(result.frames.iter().all(|f| f.adaptive_rate_feedback));
     assert!(
         result.bytes.len() < baseline.len(),
         "feedback={}, static={}",

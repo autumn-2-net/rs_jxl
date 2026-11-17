@@ -35,7 +35,8 @@ use crate::frame::{
 };
 use crate::headers::CustomTransformData;
 use crate::headers::color_encoding::ColorSpace;
-use crate::headers::frame_header::{Encoding, FrameHeader, FrameType};
+use crate::headers::extra_channels::ExtraChannel;
+use crate::headers::frame_header::{BlendingMode, Encoding, FrameHeader, FrameType};
 use crate::headers::toc::Toc;
 use crate::image::{BufferRecycler, DataTypeTag, Image, OwnedRawImage, Rect};
 #[cfg(test)]
@@ -200,16 +201,107 @@ simd_function!(
 );
 
 impl Frame {
+    // At frame construction, the preceding pipeline has already been dropped. If the old
+    // destination is uniquely owned and no operation reads its crop, retain the outside pixels
+    // in place rather than allocating and copying another full canvas for this hidden layer.
+    fn take_reusable_reference_canvas(
+        frame_header: &FrameHeader,
+        decoder_state: &mut DecoderState,
+        coalescing: bool,
+    ) -> Option<Vec<Image<f32>>> {
+        let metadata = &decoder_state.file_header.image_metadata;
+        let num_ec = metadata.extra_channel_info.len();
+        if !coalescing
+            || frame_header.frame_type != FrameType::RegularFrame
+            || frame_header.is_visible()
+            || !frame_header.can_be_referenced
+            || frame_header.save_before_ct
+            || frame_header.encoding != Encoding::Modular
+            || frame_header.has_patches()
+            || frame_header.has_lf_frame()
+            || frame_header.lf_level != 0
+            || frame_header.has_noise()
+            || frame_header.has_splines()
+            || frame_header.upsampling != 1
+            || frame_header.do_ycbcr
+            || metadata.xyb_encoded
+            || metadata.color_encoding.color_space != ColorSpace::RGB
+            || metadata.bit_depth.floating_point_sample()
+            || !(1..=16).contains(&metadata.bit_depth.bits_per_sample())
+            || decoder_state.native_integer_capture.is_some()
+            || decoder_state.jpeg_capture.is_some()
+            || num_ec > 1
+            || frame_header.num_extra_channels as usize != num_ec
+            || frame_header.ec_blending_info.len() != num_ec
+            || frame_header.ec_upsampling.len() != num_ec
+            || frame_header.ec_upsampling.iter().any(|&up| up != 1)
+            || metadata.extra_channel_info.iter().any(|info| {
+                info.ec_type != ExtraChannel::Alpha
+                    || info.dim_shift() != 0
+                    || info.bit_depth().floating_point_sample()
+                    || !(1..=16).contains(&info.bit_depth().bits_per_sample())
+            })
+        {
+            return None;
+        }
+        let destination = frame_header.save_as_reference as usize;
+        if std::iter::once(&frame_header.blending_info)
+            .chain(frame_header.ec_blending_info.iter())
+            .any(|blend| {
+                blend.mode != BlendingMode::Replace || blend.source as usize != destination
+            })
+        {
+            return None;
+        }
+        let size = (
+            decoder_state.file_header.size.xsize() as usize,
+            decoder_state.file_header.size.ysize() as usize,
+        );
+        let slots = Arc::get_mut(&mut decoder_state.reference_frames)?;
+        let reference = slots.get(destination)?.as_ref()?;
+        // Check before taking the slot. Ineligible pre-transform references must still go
+        // through the original blending validation rather than looking like absent references.
+        if reference.saved_before_color_transform
+            || reference.frame.len() != 3 + num_ec
+            || reference.frame.iter().any(|plane| plane.size() != size)
+        {
+            return None;
+        }
+        Some(slots[destination].take()?.frame)
+    }
+
+    #[cfg(test)]
     pub fn from_header_and_toc(
+        frame_header: FrameHeader,
+        toc: Toc,
+        decoder_state: DecoderState,
+        frame_counters: (usize, usize),
+        buffer_recycler: Arc<BufferRecycler>,
+    ) -> Result<Box<Self>> {
+        Self::from_header_and_toc_with_coalescing(
+            frame_header,
+            toc,
+            decoder_state,
+            frame_counters,
+            buffer_recycler,
+            false,
+        )
+    }
+
+    pub(crate) fn from_header_and_toc_with_coalescing(
         frame_header: FrameHeader,
         toc: Toc,
         mut decoder_state: DecoderState,
         frame_counters: (usize, usize),
         buffer_recycler: Arc<BufferRecycler>,
+        coalescing: bool,
     ) -> Result<Box<Self>> {
         if frame_header.frame_type == FrameType::LFFrame && frame_header.lf_level == 1 {
             decoder_state.lf_frame_was_rendered = false;
         }
+        let reusable_canvas =
+            Self::take_reusable_reference_canvas(&frame_header, &mut decoder_state, coalescing);
+        let reference_canvas_reused = reusable_canvas.is_some();
         let image_metadata = &decoder_state.file_header.image_metadata;
         let is_gray = !frame_header.do_ycbcr
             && !image_metadata.xyb_encoded
@@ -262,25 +354,26 @@ impl Frame {
             None
         };
 
-        let reference_frame_data =
-            if frame_header.can_be_referenced && native_integer_frame.is_none() {
-                let image_size = &decoder_state.file_header.size;
-                let image_size = (image_size.xsize() as usize, image_size.ysize() as usize);
-                let sz = if frame_header.save_before_ct {
-                    frame_header.size_upsampled()
-                } else {
-                    image_size
-                };
-
-                let num_ref_channels = 3 + image_metadata.extra_channel_info.len();
-                Some(
-                    (0..num_ref_channels)
-                        .map(|_| Image::new(sz))
-                        .collect::<Result<Vec<_>>>()?,
-                )
+        let reference_frame_data = if let Some(canvas) = reusable_canvas {
+            Some(canvas)
+        } else if frame_header.can_be_referenced && native_integer_frame.is_none() {
+            let image_size = &decoder_state.file_header.size;
+            let image_size = (image_size.xsize() as usize, image_size.ysize() as usize);
+            let sz = if frame_header.save_before_ct {
+                frame_header.size_upsampled()
             } else {
-                None
+                image_size
             };
+
+            let num_ref_channels = 3 + image_metadata.extra_channel_info.len();
+            Some(
+                (0..num_ref_channels)
+                    .map(|_| Image::new(sz))
+                    .collect::<Result<Vec<_>>>()?,
+            )
+        } else {
+            None
+        };
 
         let lf_frame_data = if frame_header.lf_level != 0 {
             Some(
@@ -312,6 +405,7 @@ impl Frame {
             native_integer_frame,
             render_pipeline: None,
             reference_frame_data,
+            reference_canvas_reused,
             lf_frame_data,
             section0_render_up_to_date: false,
             patches: Arc::new(RwLock::new(PatchesDictionary::new(num_extra_channels))),

@@ -108,7 +108,7 @@ fn extend_recent_rate(
     maps: &[(usize, u8, Arc<DiffMap>)],
     result: &mut Vec<Candidate>,
 ) -> Result<()> {
-    if !auto.allow_multi_rect || !auto.adaptive_rectangles {
+    if !auto.adaptive_rate_feedback || !auto.allow_multi_rect || !auto.adaptive_rectangles {
         return Ok(());
     }
     let Some(rate) = alternate_rate(anchor, recent) else {
@@ -361,6 +361,7 @@ mod tests {
         let (current, map) = sparse_changes();
         let maps = [(0, 1, Arc::clone(&map)), (1, 2, map)];
         let options = AutoOptions {
+            adaptive_rate_feedback: true,
             allow_mask: false,
             extra_tile_sizes: vec![8, 16],
             ..Default::default()
@@ -421,14 +422,21 @@ mod tests {
         let maps = [(1, 2, map)];
         for options in [
             AutoOptions {
+                adaptive_rate_feedback: false,
+                ..Default::default()
+            },
+            AutoOptions {
+                adaptive_rate_feedback: true,
                 adaptive_rectangles: false,
                 ..Default::default()
             },
             AutoOptions {
+                adaptive_rate_feedback: true,
                 allow_multi_rect: false,
                 ..Default::default()
             },
             AutoOptions {
+                adaptive_rate_feedback: true,
                 max_rectangles: 1,
                 ..Default::default()
             },
@@ -439,7 +447,10 @@ mod tests {
             extend_recent_rate(2, &options, 0.001, Some(3.0), &maps, &mut result).unwrap();
             assert_eq!(result.len(), count);
         }
-        let options = AutoOptions::default();
+        let options = AutoOptions {
+            adaptive_rate_feedback: true,
+            ..Default::default()
+        };
         let mut result = candidates_from_references(&current, 2, &options, 3.0, &maps).unwrap();
         let count = result.len();
         extend_recent_rate(2, &options, 3.0, Some(6.0), &maps, &mut result).unwrap();

@@ -210,7 +210,13 @@ impl Frame {
 
         let buffer_splitter = BufferSplitter::new(&mut buffers[..]);
 
-        pipeline_mut!(self, p, p.render_outside_frame(&buffer_splitter)?);
+        // For a hidden, coalesced, all-Replace same-slot layer, this canvas already contains
+        // the correct background. Keep Extend for crop coordinates/clipping, but do not fill
+        // the outside from the temporarily vacant reference slot. Such layers have no API
+        // Save stages, including during an explicit progressive flush.
+        if !self.reference_canvas_reused {
+            pipeline_mut!(self, p, p.render_outside_frame(&buffer_splitter)?);
+        }
 
         let should_render_non_final = self.allow_rendering_before_last_pass() && do_flush;
 

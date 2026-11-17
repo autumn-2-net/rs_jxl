@@ -361,6 +361,8 @@ pub struct Frame {
     #[cfg(not(test))]
     render_pipeline: Option<Box<crate::render::LowMemoryRenderPipeline>>,
     reference_frame_data: Option<Vec<Image<f32>>>,
+    // A hidden Replace layer can own its destination's old canvas. Only its crop is changed.
+    reference_canvas_reused: bool,
     lf_frame_data: Option<[Image<f32>; 3]>,
     section0_render_up_to_date: bool,
     group_status: GroupStatus,

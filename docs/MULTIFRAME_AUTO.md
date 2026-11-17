@@ -40,7 +40,8 @@ default, or the currently retained states when the new option is enabled:
 - Adaptive merged rectangles (`MergedPrevious`/`MergedFirst`): an additional
   cost-guided proposal when `allow_multi_rect` and `adaptive_rectangles` are
   enabled. The initial full frame's measured bytes per pixel remains the anchor.
-  When the most recent winning Full frame differs from that rate by at least
+  With `adaptive_rate_feedback=true` (the default),
+  when the most recent winning Full frame differs from that rate by at least
   2x, one additional base-grid proposal per reference uses that measured rate.
   Existing and extra-grid plans remain eligible; identical ordered rectangles
   for the same source are tried only once. A losing Full trial can be pruned,
@@ -53,10 +54,30 @@ This feedback addresses a simple opening frame followed by more complex images:
 the opening frame alone can substantially underestimate the cost of transmitting
 unchanged pixels between distant edits. It adds at most one actual encode trial
 per eligible reference, reusing difference maps, finalized-byte pruning, payload
-caching and caller budgets. It adds no new API field, frame tool or bitstream
-syntax. Static `analyze` uses the caller's geometry rate and cannot include this
+caching and caller budgets. It adds no frame tool or bitstream syntax.
+Static `analyze` uses the caller's geometry rate and cannot include this
 encode-time measurement; its candidate counts are not the feedback-expanded
 search history. See [measurements](MULTIFRAME_RATE_FEEDBACK_20261117.md).
+
+`AutoOptions.adaptive_rate_feedback` is a separate boolean alongside
+`allow_mask`, `allow_multi_rect` and `adaptive_rectangles`. It defaults to true;
+false restores the original first-frame rate policy. CLI callers can disable it
+with `--no-adaptive-rate-feedback`. Python callers use the existing options map:
+
+```python
+data, report = rs_jxl.encode_multiframe(
+    images, strategy="auto", effort=9, threads=4, return_info=True,
+    auto_options={"adaptive_rate_feedback": True},
+)
+```
+
+The Python `strategy` default remains `"crop"`; the feedback field only takes
+effect with `strategy="auto"`. Disabling multi-rectangle or adaptive-rectangle
+proposals also disables feedback proposals. Search reports include
+`adaptive_rate_feedback` as configured; it does not imply that a new proposal
+was needed or won. Both settings emit ordinary JXL and use the same decoder and
+`.jxl` extension. Feedback can select more rectangles, but full/crop/mask and
+original rectangle plans remain eligible and compete by actual encoded bytes.
 
 Rust builds a shared exact difference map per analyzed input/reference pair.
 Bounds, changed-pixel counts, mask construction and rectangle proposals reuse
