@@ -38,11 +38,16 @@ pub fn unpack(bytes: &[u8], dtype: Dtype, count: usize) -> Result<PixelData> {
     if bytes.len() != expected {
         return Err("pixel length does not match dimensions and dtype".into());
     }
-    // Chunk reads deliberately avoid typed pointer casts: inputs may be unaligned.
+    // Aligned little-endian buffers already contain the native sample words.
     macro_rules! words {
         ($size:literal, $convert:expr, $variant:ident) => {{
             let mut values = Vec::new();
             values.try_reserve_exact(count).map_err(message)?;
+            #[cfg(target_endian = "little")]
+            if let Ok(aligned) = bytemuck::try_cast_slice(bytes) {
+                values.extend_from_slice(aligned);
+                return Ok(PixelData::$variant(values));
+            }
             for chunk in bytes.chunks_exact($size) {
                 let array = chunk.try_into().map_err(message)?;
                 values.push(($convert)(array));

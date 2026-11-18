@@ -76,10 +76,60 @@ fn compatible(a: &Image, b: &Image) -> Result<()> {
     Ok(())
 }
 
+// Compare entire integer rows when locating the top and bottom. Within that
+// band only samples outside the known horizontal bounds can enlarge the crop.
+fn interleaved_bounds<T: Eq>(a: &[T], b: &[T], width: usize, channels: usize) -> Option<Rect> {
+    let stride = width * channels;
+    let rows = a.chunks_exact(stride).zip(b.chunks_exact(stride));
+    let top = rows.clone().position(|(a, b)| a != b)?;
+    let bottom = rows.clone().rposition(|(a, b)| a != b).unwrap();
+    let (mut left, mut right) = (width, 0);
+    for (a, b) in rows.skip(top).take(bottom - top + 1) {
+        let end = left * channels;
+        if let Some(i) = a[..end].iter().zip(&b[..end]).position(|(a, b)| a != b) {
+            left = i / channels;
+        }
+        let start = right * channels;
+        if let Some(i) = a[start..]
+            .iter()
+            .zip(&b[start..])
+            .rposition(|(a, b)| a != b)
+        {
+            right += i / channels + 1;
+        }
+        if left == 0 && right == width {
+            break;
+        }
+    }
+    Some(Rect {
+        x: left as u32,
+        y: top as u32,
+        width: (right - left) as u32,
+        height: (bottom - top + 1) as u32,
+    })
+}
+
 pub fn difference_bounds(previous: &Image, current: &Image) -> Result<Option<Rect>> {
     compatible(previous, current)?;
     let (w, h) = (current.width() as usize, current.height() as usize);
     let channels = current.layout().channels();
+    if current.channel_count() == channels
+        && !previous.has_modular_planes()
+        && !current.has_modular_planes()
+    {
+        match (previous.pixels(), current.pixels()) {
+            (PixelData::U8(a), PixelData::U8(b)) => {
+                return Ok(interleaved_bounds(a, b, w, channels));
+            }
+            (PixelData::U16(a), PixelData::U16(b)) | (PixelData::F16(a), PixelData::F16(b)) => {
+                return Ok(interleaved_bounds(a, b, w, channels));
+            }
+            (PixelData::U32(a), PixelData::U32(b)) => {
+                return Ok(interleaved_bounds(a, b, w, channels));
+            }
+            _ => {}
+        }
+    }
     let (mut left, mut top, mut right, mut bottom) = (w, h, 0, 0);
     for y in 0..h {
         for x in 0..w {
@@ -279,8 +329,13 @@ pub fn plan<'a>(
             });
             continue;
         }
-        let previous = difference_bounds(&images[i - 1], image)?;
+        let previous = if reference == Reference::First {
+            None
+        } else {
+            difference_bounds(&images[i - 1], image)?
+        };
         let first = match reference {
+            Reference::SmallestCrop if i == 1 => previous,
             Reference::First | Reference::SmallestCrop => difference_bounds(&images[0], image)?,
             _ => None,
         };

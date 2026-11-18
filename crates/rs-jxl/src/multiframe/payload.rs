@@ -20,11 +20,23 @@ pub(super) struct Payloads {
 }
 
 impl Payloads {
-    /// Even an unpopulated entry has a future reuse obligation. Parallel trial
-    /// batches must leave every such entry on the original serial path.
-    pub(super) fn has_entry(&self, rect: Rect) -> bool {
-        self.entries.contains_key(&key(rect))
+    // A partition has distinct rectangles, so each parallel job can own its
+    // entry until the batch completes. Cached sections are moved, never cloned.
+    pub(super) fn take_rect(&mut self, rect: Rect) -> Self {
+        let mut local = Self::default();
+        let key = key(rect);
+        if let Some(entry) = self.entries.remove(&key) {
+            local.entries.insert(key, entry);
+        }
+        local
     }
+
+    pub(super) fn restore_rect(&mut self, local: Self) {
+        self.hits += local.hits;
+        self.pixels += local.pixels;
+        self.entries.extend(local.entries);
+    }
+
     pub(super) fn new<'a>(candidates: impl Iterator<Item = &'a Candidate>) -> Self {
         let mut result = Self::default();
         for candidate in candidates.filter(|c| c.replace()) {

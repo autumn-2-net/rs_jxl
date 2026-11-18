@@ -78,20 +78,22 @@ pub(super) fn images(current: &Image, rect: Rect, diff: &DiffMap) -> Result<(Ima
             update
                 .try_reserve_exact(count)
                 .map_err(|_| Error::Limit("multiply mask allocation"))?;
-            for y in rect.y..rect.y + rect.height {
-                for x in rect.x..rect.x + rect.width {
-                    let offset = (y as usize * current.width() as usize + x as usize) * channels;
-                    let changed = diff.changed(x, y);
-                    for c in 0..channels {
-                        keep.push(if changed { 0 } else { maxima[c] as $word });
-                        update.push(if changed {
-                            $source[offset + c] as $word
-                        } else {
-                            0
-                        });
-                    }
+            let pixel = maxima.map(|v| v as $word);
+            keep.resize(count, pixel[0]);
+            if pixel[1..channels].iter().any(|&v| v != pixel[0]) {
+                for sample in keep.chunks_exact_mut(channels) {
+                    sample.copy_from_slice(&pixel[..channels]);
                 }
             }
+            update.resize(count, 0);
+            diff.changed_spans(rect, |src, dst, len| {
+                let range = dst * channels..(dst + len) * channels;
+                keep[range.clone()].fill(0);
+                let source = &$source[src * channels..(src + len) * channels];
+                for (target, &value) in update[range].iter_mut().zip(source) {
+                    *target = value as $word;
+                }
+            });
             (PixelData::$variant(keep), PixelData::$variant(update))
         }};
     }

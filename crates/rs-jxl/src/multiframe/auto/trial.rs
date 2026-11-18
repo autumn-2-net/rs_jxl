@@ -60,9 +60,16 @@ impl Trial<'_> {
             && workers > 1
             && !crate::execution::is_serial()
             && rayon::current_thread_index().is_some()
-            && candidate.rects.iter().all(|&r| !payloads.has_entry(r))
         {
-            return self.run_parallel(candidate, trial_refs, trial_slots, pixels, workers, started);
+            return self.run_parallel(
+                candidate,
+                trial_refs,
+                trial_slots,
+                pixels,
+                payloads,
+                workers,
+                started,
+            );
         }
         let mut bytes = Vec::new();
         let mut encoded_frames = 0;
@@ -232,15 +239,17 @@ impl Trial<'_> {
         })
     }
 
-    /// Only unbounded, unshared Replace payloads enter this path. Images and
+    /// Only unbounded Replace payloads enter this path. Images and
     /// encoded payloads live for at most one worker-sized batch, never the
     /// entire candidate. Reference validation/publication stays canonical.
+    #[allow(clippy::too_many_arguments)]
     fn run_parallel(
         &self,
         candidate: &Candidate,
         mut references: [Option<bool>; 4],
         mut slots: ReferenceSlots,
         pixels: &mut u64,
+        payloads: &mut Payloads,
         workers: usize,
         started: Instant,
     ) -> Result<Outcome> {
@@ -283,21 +292,34 @@ impl Trial<'_> {
                     last,
                     references,
                 )?;
-                jobs.push((image, options, last, final_part));
+                jobs.push((
+                    image,
+                    options,
+                    last,
+                    final_part,
+                    rect,
+                    payloads.take_rect(rect),
+                ));
             }
-            let encoded = crate::execution::map_mut(&mut jobs, |_, (image, options, last, _)| {
-                crate::encode::encode_logical_frame_trial(
-                    self.canvas,
-                    &Frame {
-                        image,
-                        options: options.clone(),
-                    },
-                    self.options,
-                    *last,
-                    None,
-                )
-            });
-            for (result, (_, settings, last, final_part)) in encoded.into_iter().zip(jobs) {
+            let encoded = crate::execution::map_mut(
+                &mut jobs,
+                |_, (image, options, last, _, rect, cache)| {
+                    cache.encode(
+                        *rect,
+                        self.canvas,
+                        &Frame {
+                            image,
+                            options: options.clone(),
+                        },
+                        self.options,
+                        *last,
+                        None,
+                    )
+                },
+            );
+            for (result, (_, settings, last, final_part, _, cache)) in encoded.into_iter().zip(jobs)
+            {
+                payloads.restore_rect(cache);
                 let output = result?.into_complete()?;
                 append(&mut bytes, output, self.options.max_output_bytes)?;
                 slots.saved_layer(

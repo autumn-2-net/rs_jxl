@@ -69,18 +69,10 @@ pub(super) fn mask_from_map(current: &Image, rect: Rect, map: &DiffMap) -> Resul
                 .try_reserve_exact(count)
                 .map_err(|_| Error::Limit("mask allocation"))?;
             pixels.resize(count, 0);
-            for y in 0..rect.height {
-                let source =
-                    ((y + rect.y) as usize * current.width() as usize + rect.x as usize) * channels;
-                let target = y as usize * rect.width as usize * channels;
-                for x in 0..rect.width {
-                    if map.changed(x + rect.x, y + rect.y) {
-                        let offset = x as usize * channels;
-                        pixels[target + offset..target + offset + channels]
-                            .copy_from_slice(&$values[source + offset..source + offset + channels]);
-                    }
-                }
-            }
+            map.changed_spans(rect, |src, dst, len| {
+                pixels[dst * channels..(dst + len) * channels]
+                    .copy_from_slice(&$values[src * channels..(src + len) * channels]);
+            });
             PixelData::$variant(pixels)
         }};
     }

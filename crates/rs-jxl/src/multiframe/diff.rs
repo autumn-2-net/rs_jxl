@@ -96,6 +96,7 @@ impl DiffMap {
         self.changed_pixels
     }
 
+    #[cfg(test)]
     /// Out-of-canvas coordinates are never changed.
     pub(super) fn changed(&self, x: u32, y: u32) -> bool {
         if x >= self.width || y >= self.height {
@@ -107,6 +108,24 @@ impl DiffMap {
 
     pub(super) fn mask_eligible(&self) -> bool {
         self.mask_eligible
+    }
+
+    /// Enumerate contiguous changed pixels within a row and bitmap word.
+    /// Offsets are pixels in the canvas and the packed crop, respectively.
+    pub(super) fn changed_spans(&self, rect: Rect, mut visit: impl FnMut(usize, usize, usize)) {
+        for row in 0..rect.height as usize {
+            let start = (row + rect.y as usize) * self.width as usize + rect.x as usize;
+            let width = rect.width as usize;
+            for (index, mut bits) in masked_words(&self.words, start, start + width) {
+                while bits != 0 {
+                    let first = bits.trailing_zeros();
+                    let run = (bits >> first).trailing_ones();
+                    let source = index * WORD_BITS + first as usize;
+                    visit(source, row * width + (source - start), run as usize);
+                    bits &= u64::MAX.checked_shl(first + run).unwrap_or(0);
+                }
+            }
+        }
     }
 
     /// Tight occupied-tile boxes in raster order; unlike `bounds`, these are not
@@ -790,6 +809,43 @@ mod tests {
         metadata.extra_channels[0].bit_depth = BitDepth::new(8).unwrap();
         let image = base.with_metadata(metadata, vec![]).unwrap();
         assert!(assert_oracle(&image, &image).mask_eligible());
+    }
+
+    #[test]
+    fn changed_spans_clip_full_words_and_partial_rows() {
+        let (width, height) = (151, 7);
+        let base = Image::new(
+            width,
+            height,
+            PixelLayout::Gray,
+            PixelData::U8(vec![0; (width * height) as usize]),
+        )
+        .unwrap();
+        let values = (0..width * height)
+            .map(|n| u8::from(n / width % 3 == 0 || n % 11 == 5 || n % 97 < 63))
+            .collect();
+        let changed = Image::new(width, height, PixelLayout::Gray, PixelData::U8(values)).unwrap();
+        let map = DiffMap::between(&base, &changed).unwrap();
+        let rect = Rect {
+            x: 9,
+            y: 1,
+            width: 137,
+            height: 5,
+        };
+        let mut visits = vec![0; (rect.width * rect.height) as usize];
+        map.changed_spans(rect, |source, target, len| {
+            for i in 0..len {
+                let x = (target + i) as u32 % rect.width + rect.x;
+                let y = (target + i) as u32 / rect.width + rect.y;
+                assert_eq!(source + i, (y * width + x) as usize);
+                visits[target + i] += 1;
+            }
+        });
+        for (i, visits) in visits.into_iter().enumerate() {
+            let x = i as u32 % rect.width + rect.x;
+            let y = i as u32 / rect.width + rect.y;
+            assert_eq!(visits, u8::from(map.changed(x, y)));
+        }
     }
 
     #[test]

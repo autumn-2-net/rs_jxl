@@ -130,7 +130,9 @@ impl PixelData {
                 "sample storage and declared channel depth disagree".into(),
             ));
         }
-        if !depth.is_float() {
+        // Full-width unsigned storage already enforces this bound. U32
+        // samples still require a scan because JXL integer depth stops at 31.
+        if !depth.is_float() && depth.bits_per_sample < self.bits() {
             let max = (1u32 << depth.bits_per_sample) - 1;
             if (0..count).any(|i| self.get(start + i * stride) as u32 > max) {
                 return Err(Error::InvalidInput(

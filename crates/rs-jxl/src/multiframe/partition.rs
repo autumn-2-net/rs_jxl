@@ -87,7 +87,11 @@ pub(super) fn propose(
         return Ok(None);
     };
     validate(tile_size, max_rectangles, bytes_per_pixel)?;
-    if max_rectangles == 1 || bytes_per_pixel == 0.0 {
+    // A fully changed rectangle has no empty area that a cut could save.
+    if max_rectangles == 1
+        || bytes_per_pixel == 0.0
+        || map.changed_pixels() == u64::from(bounds.width) * u64::from(bounds.height)
+    {
         let mut result = Vec::new();
         result
             .try_reserve_exact(1)
