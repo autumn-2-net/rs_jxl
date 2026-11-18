@@ -38,7 +38,7 @@ pub(super) fn eligible(previous: &Image, current: &Image) -> bool {
 /// These layers must bypass generated patch atlases. The ordinary integer-to-F32 stage maps
 /// each declared-depth maximum to exactly 1.0, so repeated multiplication retains the old
 /// normalized word. Source Add patches only promise recovery after integer quantization and
-/// cannot establish that intermediate identity. The engine excludes `options.has_patches()`.
+/// cannot establish that intermediate identity. The trial encoder uses patch-free options for these two layers.
 pub(super) fn images(current: &Image, rect: Rect, diff: &DiffMap) -> Result<(Image, Image)> {
     if !supported(current) || diff.width() != current.width() || diff.height() != current.height() {
         return Err(Error::InvalidInput(

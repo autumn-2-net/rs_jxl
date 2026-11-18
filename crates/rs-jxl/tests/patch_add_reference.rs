@@ -551,6 +551,72 @@ fn source_add_oracle_fixtures_really_activate() {
 }
 
 #[test]
+fn sparse_multiply_updates_preserve_a_source_add_background() {
+    use rs_jxl::decode::{DecodeOptions, decode};
+    use rs_jxl::metadata::Animation;
+    use rs_jxl::multiframe::{AutoOptions, Reference, Strategy, encode_auto};
+    let fixture = fixture(Case {
+        width: 385,
+        bits: 16,
+        layout: PixelLayout::GrayAlpha,
+        pattern: Pattern::Backgrounds,
+    });
+    fixture.assert_active();
+    let options = EncodeOptions {
+        source_patches: Some(fixture.config),
+        ..Default::default()
+    };
+    let mut metadata = fixture.image.metadata().clone();
+    metadata.animation = Some(Animation::default());
+    let base = fixture
+        .image
+        .with_metadata(metadata.clone(), vec![])
+        .unwrap();
+    let mut images = vec![base];
+    for step in 0..3 {
+        let previous = images.last().unwrap();
+        let PixelData::U16(mut samples) = previous.pixels().clone() else {
+            unreachable!()
+        };
+        for &(x, y) in &[(1, 1), (17, 17), (383, 81)] {
+            let i = 2 * (y * 385 + x);
+            samples[i] ^= 1 << step;
+            samples[i + 1] ^= 7 << step;
+        }
+        images.push(
+            Image::new(385, 83, PixelLayout::GrayAlpha, PixelData::U16(samples))
+                .unwrap()
+                .with_metadata(metadata.clone(), vec![])
+                .unwrap(),
+        );
+    }
+    let auto = AutoOptions {
+        reference: Reference::Previous,
+        allow_multi_rect: false,
+        ..Default::default()
+    };
+    let result = encode_auto(&images, &[1, 2, 3, 4], &options, &auto).unwrap();
+    let first = &result.frames[0];
+    let plain = encode_auto(&images, &[1, 2, 3, 4], &EncodeOptions::default(), &auto).unwrap();
+    assert_ne!(
+        first.candidates[first.winner_index].encoded_bytes,
+        plain.frames[0].candidates[plain.frames[0].winner_index].encoded_bytes
+    );
+    for f in &result.frames[1..] {
+        assert_eq!(
+            f.candidates[f.winner_index].strategy,
+            Strategy::MultiplyMaskPrevious
+        );
+    }
+    let decoded = decode(&result.bytes, &DecodeOptions::default()).unwrap();
+    assert_eq!(decoded.frames.len(), images.len());
+    for (i, (frame, image)) in decoded.frames.iter().zip(&images).enumerate() {
+        assert_eq!(frame.pixels, *image.pixels());
+        assert_eq!(frame.duration_ticks, i as u32 + 1);
+    }
+}
+
+#[test]
 #[ignore = "requires explicit RS_JXL_DJXL official decoder path list"]
 fn source_patch_block_hybrids_and_parallel_gather_match_official_djxl() {
     use rs_jxl::modular::{block_context, sample::GatherOptions};

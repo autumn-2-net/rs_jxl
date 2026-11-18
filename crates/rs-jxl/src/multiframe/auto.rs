@@ -142,7 +142,7 @@ fn encode_inner(
             &mut differences,
             &slots,
             &lookahead,
-            options.has_patches(),
+            options,
         )?
         .into_iter()
         .enumerate()
@@ -180,10 +180,23 @@ fn encode_inner(
             } else {
                 None
             };
+            // The keep layer must decode to exact zero/one before blending.
+            // Generated Add patches guarantee only the final integer samples.
+            let plain_mask;
+            let trial_options = if candidate.multiply_mask() && options.source_patches.is_some() {
+                plain_mask = EncodeOptions {
+                    source_patches: None,
+                    source_patch_reference: None,
+                    ..options.clone()
+                };
+                &plain_mask
+            } else {
+                options
+            };
             let trial = Trial {
                 canvas,
                 image,
-                options,
+                options: trial_options,
                 index,
                 duration: durations[index],
                 last_input: index + 1 == images.len(),

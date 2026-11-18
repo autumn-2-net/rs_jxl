@@ -56,7 +56,7 @@ pub(super) fn candidates(
     differences: &mut Vec<AutoDiffReport>,
     slots: &ReferenceSlots,
     lookahead: &Lookahead,
-    has_patches: bool,
+    options: &crate::EncodeOptions,
 ) -> Result<Vec<Candidate>> {
     let mut maps = Vec::new();
     if index != 0
@@ -109,11 +109,22 @@ pub(super) fn candidates(
     )?;
     // Preserve every preceding canonical candidate, including axis splits.
     // This two-layer operation is independent of the multi-rectangle budget.
-    if auto.allow_mask && auto.allow_multiply_mask && !has_patches {
+    if auto.allow_mask
+        && auto.allow_multiply_mask
+        && options.patches.is_none()
+        && options.tile_patches.is_none()
+    {
         for &(reference, source, ref diff) in &maps {
             let Some(rect) = diff.bounds() else {
                 continue;
             };
+            // For source-patch searches add a plain two-layer alternative only
+            // for sparse edits, where zero/max runs can cover the bbox cheaply.
+            if options.source_patches.is_some()
+                && diff.changed_pixels() > u64::from(rect.width) * u64::from(rect.height) / 8
+            {
+                continue;
+            }
             if !super::multiply_mask::eligible(&images[reference], &images[index]) {
                 continue;
             }
@@ -577,7 +588,38 @@ mod tests {
         );
     }
     #[test]
-    fn multiply_mask_appends_after_old_candidates_and_skips_patch_routes() {
+    fn source_patch_mask_density_uses_the_cropped_area() {
+        let make = |pixels| Image::new(32, 16, PixelLayout::Gray, PixelData::U8(pixels)).unwrap();
+        for (changes, eligible) in [(15, true), (16, true), (17, false)] {
+            let mut pixels = vec![0; 32 * 16];
+            // Always span 16x8 in the middle of a larger canvas.
+            for i in 0..changes - 1 {
+                pixels[4 * 32 + 8 + i] = 1;
+            }
+            pixels[11 * 32 + 23] = 1;
+            let images = [make(vec![0; 32 * 16]), make(pixels)];
+            let options = crate::EncodeOptions {
+                source_patches: Some(Default::default()),
+                ..Default::default()
+            };
+            let plans = candidates(
+                &images,
+                1,
+                &AutoOptions::default(),
+                1.0,
+                None,
+                &mut Vec::new(),
+                &ReferenceSlots::default(),
+                &Lookahead::default(),
+                &options,
+            )
+            .unwrap();
+            assert_eq!(plans.iter().any(Candidate::multiply_mask), eligible);
+        }
+    }
+
+    #[test]
+    fn multiply_mask_appends_after_old_candidates_and_skips_component_patches() {
         let first = Image::new(16, 16, PixelLayout::Gray, PixelData::U8(vec![0; 256])).unwrap();
         let mut values = vec![0; 256];
         values[17] = 71;
@@ -592,7 +634,7 @@ mod tests {
             allow_multiply_mask: true,
             ..disabled.clone()
         };
-        let plans = |auto: &AutoOptions, patches| {
+        let plans = |auto: &AutoOptions, patches: bool| {
             candidates(
                 &images,
                 1,
@@ -602,7 +644,10 @@ mod tests {
                 &mut Vec::new(),
                 &ReferenceSlots::default(),
                 &Lookahead::default(),
-                patches,
+                &crate::EncodeOptions {
+                    patches: patches.then(Default::default),
+                    ..Default::default()
+                },
             )
             .unwrap()
         };

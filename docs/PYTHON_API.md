@@ -350,7 +350,9 @@ It currently accepts integer 1..16-bit Gray/GA/RGB/RGBA in U8/U16 storage, with 
 than an optional full-resolution integer 1..16-bit alpha. Color and alpha depths
 may differ. It retains alpha metadata and all hidden RGB samples, including
 partial or associated alpha; it does not add alpha to RGB. Floating/wide samples,
-other extra planes and configured patch tools are ineligible. Other eligible
+other extra planes and component or tile patch configurations are ineligible.
+With source Add patch detection enabled, changes occupying at most one eighth
+of their bbox can use a patch-free pair of mask layers. Other eligible
 full/crop/mask/rectangle candidates remain available.
 
 To select the `f4e240c` candidate policy preceding splits and multiply masks, set both

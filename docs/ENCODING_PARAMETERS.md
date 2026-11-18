@@ -336,7 +336,8 @@ for frame in report["frames"]:
 - 新 Multiply/Add mask 接受 U8/U16 存储的整数 1..16 位 Gray/GA/RGB/RGBA；可有且仅有一个全分辨率、
   整数 1..16 位 alpha，颜色和 alpha 位深可不同。它将 alpha 作为独立样本处理，保留半透明、
   预乘标记和 invisible RGB，不给 RGB 添加 alpha。不支持其他 extra planes、浮点、宽整数或
-  subsampled alpha；配置任一种 component/source/tile patches 时不生成此候选。
+  subsampled alpha。配置 component 或 tile patches 时跳过此候选。使用 source Add patch
+  检测时，若变化像素数不超过 bbox 面积的 1/8，还会尝试不带 patch 的两层掩码。普通帧候选继续使用原配置。
   两层使用相同 bbox，先 Multiply 保留/清零，再 Add 写入变更样本；仅最后一层携带逻辑时长。
   它不受 `max_rectangles` 限制；完整候选的 `trial_pixels` 按每层计费，共两倍 bbox 面积。
   若被剪枝，仅计实际提交的层（含未编码完的一层），pruned 报告的 `planned_frames=2`。

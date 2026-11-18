@@ -420,13 +420,16 @@ fn floating_wide_extra_and_generated_patch_routes_keep_the_existing_candidates()
             _ => encoding.source_patches = Some(Default::default()),
         }
         let result = encode_auto(&images, &[2, 3], &encoding, &auto(true, false)).unwrap();
-        assert!(
-            result
-                .frames
-                .iter()
-                .flat_map(|f| &f.candidates)
-                .all(|c| !multiply(c.strategy))
-        );
+        let changed = &result.frames[1];
+        let winner = &changed.candidates[changed.winner_index];
+        if kind == 2 {
+            assert!(multiply(winner.strategy));
+            assert_eq!(winner.encoded_frames, 2);
+            let disabled = encode_auto(&images, &[2, 3], &encoding, &auto(false, false)).unwrap();
+            assert!(result.bytes.len() < disabled.bytes.len());
+        } else {
+            assert!(changed.candidates.iter().all(|c| !multiply(c.strategy)));
+        }
         verify(&result.bytes, &images, &[2, 3]);
     }
     let images: Vec<_> = images

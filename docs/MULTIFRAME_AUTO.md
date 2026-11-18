@@ -109,9 +109,10 @@ or RGBA storage. An optional alpha must be the sole extra channel, full resoluti
 integer 1..16 bits; its depth may differ from color. Alpha is an independent
 sample under Multiply/Add, so partial or associated alpha and invisible RGB do
 not use the opacity assumptions of the older BLEND mask. Other extra planes,
-floating/wide samples and subsampled alpha are ineligible. Configured component,
-source or tile patches disable this tool, even when detection might find no
-atlas. Full/crop and every other eligible fallback remain in the search.
+floating/wide samples and subsampled alpha are ineligible. Component and tile patch configurations exclude this tool. With source Add patch
+detection enabled, the search can also try a patch-free pair of mask layers
+when changed pixels occupy at most one eighth of their bounding box. Ordinary
+frame candidates still use the configured patch detector. The [sparse mask measurements](MULTIFRAME_PATCH_MASK_20261118.md) give complete file sizes and encode/decode throughput.
 
 To recover the candidate policy preceding these two tools (`f4e240c`),
 set `adaptive_splits=false` and `allow_multiply_mask=false`, keeping the remaining

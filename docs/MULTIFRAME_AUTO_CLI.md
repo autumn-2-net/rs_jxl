@@ -54,8 +54,9 @@ where the core can preserve samples and metadata exactly:
   color samples. Eligibility remains the core encoder's decision.
 - `--no-multiply-mask` disables only the new fixed two-layer Multiply/Add mask.
   It supports integer 1..16-bit Gray/GA/RGB/RGBA, including partial alpha and
-  hidden RGB, with at most one full-resolution alpha and no configured patch
-  tools. It does not add alpha to RGB. Both bbox layers are charged to trial work;
+  hidden RGB, with at most one full-resolution alpha. Component and tile patches
+  exclude it. With source Add patches, the search tries plain mask layers for
+  changes occupying at most one eighth of their bbox. It does not add alpha to RGB. Both bbox layers are charged to trial work;
   their fixed count of two is independent of `--max-rectangles`.
 - `--no-multi-rect` disables both tile and adaptive multi-rectangle candidates.
   Intermediate rectangles have zero duration; the final rectangle carries the
