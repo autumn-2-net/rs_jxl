@@ -166,3 +166,75 @@ pub(super) fn write_json_report(mut output: impl Write, result: &AutoEncodeResul
     writeln!(output)?;
     Ok(())
 }
+
+/// Crop reports describe the emitted plan and total wire bytes. No search or
+/// candidate timing/byte counts are invented for this single encoding.
+pub(super) fn write_crop_report(
+    mut output: impl Write,
+    plan: &[rs_jxl::multiframe::PlannedFrame<'_>],
+    output_bytes: usize,
+    elapsed: std::time::Duration,
+    json_output: bool,
+) -> Result<()> {
+    if json_output {
+        let animation = plan
+            .first()
+            .and_then(|frame| frame.image.metadata().animation)
+            .map(|animation| {
+                json!({
+                    "ticks_per_second_numerator": animation.ticks_per_second_numerator,
+                    "ticks_per_second_denominator": animation.ticks_per_second_denominator,
+                    "loops": animation.loops,
+                })
+            });
+        let frames: Vec<_> = plan
+            .iter()
+            .enumerate()
+            .map(|(index, frame)| {
+                json!({
+                    "index": index,
+                    "width": frame.image.width(), "height": frame.image.height(),
+                    "origin": [frame.options.origin.0, frame.options.origin.1],
+                    "duration": frame.options.duration,
+                    "source": frame.options.blend.source,
+                    "save_as_reference": frame.options.save_as_reference,
+                    "changed": frame.changed.map(|r| json!({
+                        "x": r.x, "y": r.y, "width": r.width, "height": r.height,
+                    })),
+                })
+            })
+            .collect();
+        serde_json::to_writer(
+            &mut output,
+            &json!({
+                "operation": "encode_frames", "strategy": "crop",
+                "inputs": plan.len(), "output_bytes": output_bytes,
+                "elapsed_seconds": elapsed.as_secs_f64(), "animation": animation, "frames": frames,
+            }),
+        )?;
+        writeln!(output)?;
+    } else {
+        for (index, frame) in plan.iter().enumerate() {
+            writeln!(
+                output,
+                "frame {}: strategy=crop width={} height={} origin={:?} duration={} source={} save_as_reference={} changed={:?}",
+                index + 1,
+                frame.image.width(),
+                frame.image.height(),
+                frame.options.origin,
+                frame.options.duration,
+                frame.options.blend.source,
+                frame.options.save_as_reference,
+                frame.changed
+            )?;
+        }
+        writeln!(
+            output,
+            "sequence: strategy=crop inputs={} output_bytes={} elapsed={:?}",
+            plan.len(),
+            output_bytes,
+            elapsed
+        )?;
+    }
+    Ok(())
+}

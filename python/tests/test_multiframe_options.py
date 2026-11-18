@@ -3,7 +3,7 @@
 from collections.abc import Mapping
 import json
 import sys
-from types import MappingProxyType
+from types import MappingProxyType, SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -45,10 +45,29 @@ class MultiframeOptionAdapters(unittest.TestCase):
         self.assertNotIn("auto_options", self.request(auto_options=None))
         self.assertEqual(self.request(strategy="auto", auto_options={})["auto_options"], {})
 
+    def test_default_strategy_matches_auto_and_explicit_crop_bypasses_search(self):
+        self.assertEqual(self.request(), self.request(strategy="auto"))
+        self.assertTrue(self.request()["auto"])
+        crop = self.request(strategy="crop")
+        self.assertFalse(crop["auto"])
+        self.assertNotIn("auto_options", crop)
+        # A reusable context inherits the same public default and preserves the
+        # explicit override; no native context is needed for request inspection.
+        encoder = object.__new__(rs_jxl.Encoder)
+        encoder._native = SimpleNamespace(threads=1, closed=False)
+        requests = []
+        with patch.object(multiframe, "execute", return_value=(b"encoded", {})) as execute:
+            for options in ({}, {"strategy": "auto"}, {"strategy": "crop"}):
+                encoder.encode_multiframe(self.frames, **options)
+                requests.append(execute.call_args.args[0])
+        self.assertEqual(requests[0], requests[1])
+        self.assertTrue(requests[0]["auto"])
+        self.assertFalse(requests[2]["auto"])
+
     def test_all_options_are_forwarded_at_top_level_without_mutating_mapping(self):
         options = {"allow_add_delta": False, "allow_mask": False, "allow_multiply_mask": False, "allow_multi_rect": True,
                    "tile_size": np.uint32(8), "max_rectangles": np.int64(4097),
-                   "prune": False, "adaptive_rectangles": False, "adaptive_rate_feedback": False, "adaptive_splits": False,
+                   "prune": False, "screen_candidates": False, "adaptive_rectangles": False, "adaptive_rate_feedback": False, "adaptive_splits": False,
                    "max_frames": 12, "max_total_trials": 30, "max_trial_pixels": 4000}
         original = options.copy()
         request = self.request(strategy="auto", reference="first",
@@ -73,8 +92,8 @@ class MultiframeOptionAdapters(unittest.TestCase):
 
     def test_adaptive_switches_are_independent_and_defaults_not_injected(self):
         self.assertNotIn("auto_options", self.request(strategy="auto"))
-        self.assertFalse(self.request()["auto"])
-        for name in ("adaptive_rate_feedback", "adaptive_splits", "allow_multiply_mask", "allow_add_delta"):
+        self.assertTrue(self.request()["auto"])
+        for name in ("screen_candidates", "adaptive_rate_feedback", "adaptive_splits", "allow_multiply_mask", "allow_add_delta"):
             for enabled in (False, True):
                 for disabled in ({}, {"allow_mask": False}, {"allow_multi_rect": False}, {"adaptive_rectangles": False}):
                     options = {name: enabled, **disabled}
@@ -92,7 +111,7 @@ class MultiframeOptionAdapters(unittest.TestCase):
                    ({"auto_options": {"unknown": True}}, TypeError)]
         for value in ([], [("prune", False)], True, 1, "prune"):
             invalid.append(({"auto_options": value}, TypeError))
-        for name in ("allow_add_delta", "allow_mask", "allow_multiply_mask", "allow_multi_rect", "prune", "adaptive_rectangles", "adaptive_rate_feedback", "adaptive_splits"):
+        for name in ("allow_add_delta", "allow_mask", "allow_multiply_mask", "allow_multi_rect", "prune", "screen_candidates", "adaptive_rectangles", "adaptive_rate_feedback", "adaptive_splits"):
             for value in (0, 1, "true", None, np.bool_(True)):
                 invalid.append(({"auto_options": {name: value}}, TypeError))
         for name in ("tile_size", "max_rectangles", "max_frames", "max_total_trials", "max_trial_pixels"):
@@ -147,6 +166,27 @@ class MultiframeOptionAdapters(unittest.TestCase):
 
 
 class NativeMultiframeOptions(unittest.TestCase):
+    def test_default_auto_matches_explicit_auto_and_crop_has_no_search_report(self):
+        first = np.arange(16 * 16 * 3, dtype=np.uint8).reshape(16, 16, 3)
+        second = first.copy()
+        second[2:4, 3:5] ^= 7
+        frames = [first, second]
+        for context in (None, rs_jxl.Encoder()):
+            try:
+                encode = rs_jxl.encode_multiframe if context is None else context.encode_multiframe
+                default, report = encode(frames, effort=3, return_info=True)
+                explicit, explicit_report = encode(frames, effort=3, strategy="auto", return_info=True)
+                self.assertEqual(default, explicit)
+                self.assertEqual([f["candidates"][f["winner_index"]]["strategy"] for f in report["frames"]],
+                                 [f["candidates"][f["winner_index"]]["strategy"] for f in explicit_report["frames"]])
+                crop, crop_report = encode(frames, effort=3, strategy="crop", return_info=True)
+                self.assertNotIn("frames", crop_report)
+                for actual, expected in zip(rs_jxl.decode(crop, frame=None), frames):
+                    np.testing.assert_array_equal(actual, expected)
+            finally:
+                if context is not None:
+                    context.close()
+
     def test_reports_and_exact_samples_with_and_without_pruning(self):
         for dtype in (np.uint8, np.uint16):
             first = np.arange(8 * 8 * 4, dtype=dtype).reshape(8, 8, 4)

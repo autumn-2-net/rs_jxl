@@ -10,8 +10,9 @@ mod input;
 mod report;
 
 pub(crate) use args::EncodeFramesArgs;
+use args::StrategyArg;
 use input::load_images;
-use report::{write_json_report, write_report};
+use report::{write_crop_report, write_json_report, write_report};
 
 pub(crate) fn run(args: EncodeFramesArgs) -> Result<()> {
     let _total = rs_jxl::profile::scope("cli.total");
@@ -33,21 +34,42 @@ pub(crate) fn run(args: EncodeFramesArgs) -> Result<()> {
         load_images(&args)?
     };
     eprintln!(
-        "note: encoding ordered decoded samples without sample, alpha, color or orientation conversion; automatic candidates are selected by encoded bytes, not elapsed time."
+        "note: encoding ordered decoded samples without sample, alpha, color or orientation conversion."
     );
-    let result = {
+    let bytes = {
         let _encoding = rs_jxl::profile::scope("cli.encode_frames");
         let mut encoder = Encoder::new(options.threads)?;
-        encoder.encode_auto(&images, &durations, &options, &args.auto_options())?
+        match args.strategy {
+            StrategyArg::Auto => {
+                let result =
+                    encoder.encode_auto(&images, &durations, &options, &args.auto_options())?;
+                if args.report_json {
+                    write_json_report(std::io::stderr().lock(), &result)?;
+                } else {
+                    write_report(std::io::stderr().lock(), &result)?;
+                }
+                result.bytes
+            }
+            StrategyArg::Crop => {
+                let started = std::time::Instant::now();
+                let plan = rs_jxl::multiframe::plan(&images, &durations, args.reference())?;
+                let frames: Vec<_> = plan.iter().map(|frame| frame.as_frame()).collect();
+                let bytes = encoder.encode_frames(&images[0], &frames, &options)?;
+                let elapsed = started.elapsed();
+                write_crop_report(
+                    std::io::stderr().lock(),
+                    &plan,
+                    bytes.len(),
+                    elapsed,
+                    args.report_json,
+                )?;
+                bytes
+            }
+        }
     };
-    if args.report_json {
-        write_json_report(std::io::stderr().lock(), &result)?;
-    } else {
-        write_report(std::io::stderr().lock(), &result)?;
-    }
     // Protect every source again before the existing transactional publisher.
     args.check_paths()?;
-    io::write_output(&args.inputs[0], &args.output, args.force, &result.bytes)
+    io::write_output(&args.inputs[0], &args.output, args.force, &bytes)
 }
 
 #[cfg(test)]

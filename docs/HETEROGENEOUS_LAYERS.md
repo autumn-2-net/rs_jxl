@@ -128,9 +128,11 @@ See [protocol](../crates/rs-jxl-ffi/protocol.md). Explicit tool options are
 supported; source-search and legacy automatic-frame keys are not silently used.
 
 With Python `encode_layers(..., effort=9)` and automatic group sizing, a layer
-that spans multiple groups and fits within 512 × 512 gets one additional
-trial using a single group. A group-sized MA training window scales with it.
-The encoder compares complete layer bytes and retains the smaller encoding.
+that spans multiple groups and fits within 512 × 512 uses the smallest group
+that can contain it. The encoder makes this choice from the layer dimensions
+before encoding. A group-sized MA training window scales with it. If this
+representation fails, or a finite sequence budget is exhausted, the encoder
+can retry using the previous byte comparison.
 An explicit `group_size_shift` selects a fixed group size. Rust callers can
 request this search with `layers::encode_with_group_search` or
 `Encoder::encode_layers_with_group_search`.

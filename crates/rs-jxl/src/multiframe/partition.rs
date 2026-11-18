@@ -12,7 +12,7 @@ use std::{cmp::Ordering, collections::BinaryHeap};
 // Heuristic bytes per layer for its frame header and independent coding setup,
 // not a measured or normative JXL header size. The objective is
 // sum(rectangle area * bytes_per_pixel + LAYER_OVERHEAD_BYTES).
-const LAYER_OVERHEAD_BYTES: f64 = 64.0;
+pub(super) const LAYER_OVERHEAD_BYTES: f64 = 64.0;
 const NO_PARENT: usize = usize::MAX;
 
 #[derive(Clone, Copy)]

@@ -96,7 +96,6 @@ impl DiffMap {
         self.changed_pixels
     }
 
-    #[cfg(test)]
     /// Out-of-canvas coordinates are never changed.
     pub(super) fn changed(&self, x: u32, y: u32) -> bool {
         if x >= self.width || y >= self.height {

@@ -55,7 +55,7 @@ fn auto(prune: bool) -> AutoOptions {
     }
 }
 #[test]
-fn parallel_unbounded_rectangles_keep_canonical_bytes_and_frames() {
+fn parallel_rectangles_keep_canonical_bytes_and_frames() {
     let images = fixtures();
     let durations = [2, 3, 5];
     let serial = encode_auto(&images, &durations, &options(1), &auto(false)).unwrap();
@@ -77,6 +77,50 @@ fn parallel_unbounded_rectangles_keep_canonical_bytes_and_frames() {
             assert!(frame.complete);
             assert_eq!(frame.duration_ticks, duration);
             assert_eq!(frame.pixels, *source.pixels());
+        }
+    }
+}
+
+#[test]
+fn screened_search_charges_one_trial_per_input_for_byte_and_word_samples() {
+    let bytes = fixtures();
+    let words: Vec<_> = bytes
+        .iter()
+        .map(|image| {
+            let PixelData::U8(samples) = image.pixels() else {
+                unreachable!()
+            };
+            let word_image = Image::new(
+                image.width(),
+                image.height(),
+                image.layout(),
+                PixelData::U16(samples.iter().map(|&v| u16::from(v) * 257).collect()),
+            )
+            .unwrap();
+            let mut metadata = word_image.metadata().clone();
+            metadata.animation = image.metadata().animation.clone();
+            word_image.with_metadata(metadata, vec![]).unwrap()
+        })
+        .collect();
+    for images in [&bytes, &words] {
+        let search = AutoOptions {
+            screen_candidates: true,
+            max_total_trials: images.len(),
+            ..Default::default()
+        };
+        let mut finite = options(4);
+        finite.max_output_bytes = 1 << 20;
+        let result = encode_auto(images, &[2, 3, 5], &finite, &search).unwrap();
+        assert!(
+            result
+                .frames
+                .iter()
+                .all(|f| f.candidates.len() == 1 && f.pruned.is_empty())
+        );
+        let decoded = decode(&result.bytes, &DecodeOptions::default()).unwrap();
+        assert_eq!(decoded.frames.len(), images.len());
+        for (actual, expected) in decoded.frames.iter().zip(images) {
+            assert_eq!(&actual.pixels, expected.pixels());
         }
     }
 }
@@ -130,4 +174,23 @@ fn parallel_trial_work_and_output_budgets_still_fail() {
     let mut limits = options(4);
     limits.max_output_bytes = 128;
     assert!(encode_auto(&images, &durations, &limits, &auto(false)).is_err());
+
+    // A finite work limit must allow the same pruned search as the serial
+    // encoder, even when a speculative rectangle could exceed the budget.
+    let mut pruned = auto(true);
+    let serial = encode_auto(&images, &durations, &options(1), &pruned).unwrap();
+    pruned.max_trial_pixels = serial
+        .frames
+        .iter()
+        .map(|f| {
+            f.candidates.iter().map(|c| c.trial_pixels).sum::<u64>()
+                + f.pruned.iter().map(|c| c.trial_pixels).sum::<u64>()
+        })
+        .sum();
+    assert_eq!(
+        encode_auto(&images, &durations, &options(4), &pruned)
+            .unwrap()
+            .bytes,
+        serial.bytes
+    );
 }

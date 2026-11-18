@@ -359,11 +359,12 @@ impl Frame {
         } else if frame_header.can_be_referenced && native_integer_frame.is_none() {
             let image_size = &decoder_state.file_header.size;
             let image_size = (image_size.xsize() as usize, image_size.ysize() as usize);
-            let sz = if frame_header.save_before_ct {
-                frame_header.size_upsampled()
-            } else {
-                image_size
-            };
+            let sz =
+                if frame_header.save_before_ct || (!coalescing && frame_header.needs_blending()) {
+                    frame_header.size_upsampled()
+                } else {
+                    image_size
+                };
 
             let num_ref_channels = 3 + image_metadata.extra_channel_info.len();
             Some(

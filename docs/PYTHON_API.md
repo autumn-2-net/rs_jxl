@@ -277,10 +277,10 @@ analysis = rs_jxl.analyze_multiframe([rgba, changed])
 bounds = analysis["frames"][1]["previous"]
 ```
 
-reference=previous/first/full/auto (none aliases full). Default strategy="crop"
-uses geometry; reference=auto chooses the smaller first/previous bbox, not
-measured bytes. strategy="auto" additionally encodes eligible full/crop/mask/
-multiple-rectangle candidates and retains byte winners. Proven-bound pruning
+reference=previous/first/full/auto (none aliases full). Default strategy="auto"
+selects one eligible full/crop/mask/multiple-rectangle candidate before encoding.
+Explicit strategy="crop" uses geometry only; reference=auto then chooses the
+smaller first/previous bbox without trial encoding. Proven-bound pruning
 and additional adaptive rectangle proposals are enabled by native defaults.
 return_info=True returns (encoded_output, strategy_report).
 The strategy report is the metadata dictionary itself, with `frames` candidate
@@ -302,7 +302,16 @@ winner = frame_report["candidates"][frame_report["winner_index"]]
 with `strategy="auto"` on `encode_multiframe` (including the `Encoder` method).
 It is forwarded as a structured top-level native request field, separate from
 `encoder_options`. Omitted entries use Rust defaults; Python does not fill in
-search defaults or perform difference analysis, planning or selection.
+search defaults or perform difference analysis, planning or selection. The native
+Python request defaults `screen_candidates` to true; low-level Rust defaults it
+to false. Screening selects one candidate before encoding, with cheap samples
+for packed U8 input without separate extra or Modular planes, and geometry for
+other inputs. There is no minimum frame size. The selected representation obeys
+the hard output budget; exceeding it returns a limit error without trying another
+candidate. Set `auto_options={"screen_candidates": False}` to restore
+the full proposed search. Screening is independent of exact `prune`; reports
+include only attempted candidates. This unifies Python and CLI strategy defaults,
+without changing effort, worker count, timing, or reference defaults.
 
 | Auto Option | Accepted Value | Native Default |
 | --- | --- | --- |
@@ -313,7 +322,8 @@ search defaults or perform difference analysis, planning or selection.
 | `tile_size` | positive u32 integer | 32 |
 | `extra_tile_sizes` | list/tuple of positive u32 integers | [] |
 | `max_rectangles` | positive native usize integer | 32 |
-| `prune` | bool | true |
+| `screen_candidates` | bool; select one candidate before encoding | true in Python/CLI; false in low-level Rust |
+| `prune` | bool; exact byte-bound pruning only | true |
 | `adaptive_rectangles` | bool | true |
 | `adaptive_rate_feedback` | bool; additional partitions using recent winning Full-frame costs | true |
 | `adaptive_splits` | bool; additional bounded two-axis geometric partition | true |
@@ -337,8 +347,8 @@ and reject duplicate members.
 for rate-guided geometry; it does not remove other tools. The default true adds recent-rate proposals while
 retaining all original choices; actual encoded bytes still select the winner.
 It has no effect if `allow_multi_rect` or `adaptive_rectangles` is false.
-`strategy="crop"` remains the Python default and does not use automatic-search
-options. `adaptive_splits=True` also requires `allow_multi_rect` and
+Explicit `strategy="crop"` bypasses automatic search and does not accept
+`auto_options`. The default is `strategy="auto"`. `adaptive_splits=True` also requires `allow_multi_rect` and
 `adaptive_rectangles`; it uses measured rates to propose a bounded two-axis
 partition while retaining older candidates. Disable it with
 `auto_options={"adaptive_splits": False}` or CLI `--no-adaptive-splits`.
@@ -365,7 +375,7 @@ To select the `f4e240c` candidate policy preceding splits and multiply masks, se
 `adaptive_splits=False`, `allow_multiply_mask=False` and `allow_add_delta=False` with other settings
 unchanged. Merely disabling `adaptive_rectangles` or rate feedback does not
 recover that whole candidate set. These are independent booleans, not a new
-strategy/mode parameter; `strategy="crop"` remains the Python default.
+strategy/mode parameter; `strategy="auto"` is the Python default.
 Automatic reports include the configured booleans
 `adaptive_rate_feedback`, `adaptive_splits`, `allow_add_delta` and `allow_multiply_mask`.
 

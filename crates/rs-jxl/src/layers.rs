@@ -136,9 +136,10 @@ pub fn encode(
     encode_with_group_search(images, options, layers, false)
 }
 
-/// Compare at most one alternative group size per layer against the supplied
-/// encoding. A group-sized MA sampling window follows the proposed group.
-/// Both choices keep each layer's raw samples, geometry, timing and blends.
+/// Select a single group for small layers that otherwise span several groups.
+/// A group-sized MA sampling window follows the selected group. Normal encoding
+/// runs once per layer; exact comparisons remain only as failure/budget fallback.
+/// Raw samples, geometry, timing and blends are preserved.
 pub fn encode_with_group_search(
     images: &[Image],
     options: &EncodeOptions,
@@ -163,7 +164,22 @@ pub(crate) fn encode_in_pool(
     search_groups: bool,
     pool: Option<&rayon::ThreadPool>,
 ) -> Result<LayerEncodeResult> {
-    let work = || encode_inner(images, options, layers, search_groups);
+    let work = || {
+        let started = Instant::now();
+        let result = match encode_inner(images, options, layers, search_groups, false) {
+            // Earlier single-choice layers may consume more of a finite
+            // sequence budget than the old per-layer minimum. Restore that
+            // minimum only on this exceptional resource-boundary path.
+            Err(Error::Limit(_)) if search_groups && options.max_output_bytes != usize::MAX => {
+                encode_inner(images, options, layers, true, true)
+            }
+            result => result,
+        };
+        result.map(|mut output| {
+            output.codec_seconds = started.elapsed().as_secs_f64();
+            output
+        })
+    };
     match pool {
         Some(pool) => execution::with_pool(pool, work),
         None => execution::serial(work),
@@ -175,6 +191,7 @@ fn encode_inner(
     options: &EncodeOptions,
     layers: &LayerOptions,
     search_groups: bool,
+    compare_groups: bool,
 ) -> Result<LayerEncodeResult> {
     let started = Instant::now();
     let plan = plan(images, layers)?;
@@ -206,43 +223,45 @@ fn encode_inner(
             .checked_sub(stream.len())
             .filter(|&n| n > 0)
             .ok_or(Error::Limit("encoded output bytes"))?;
-        let (mut bytes, _) = encoder::encode_logical_frame_geometry(
-            canvas,
-            frame,
-            &bounded,
-            index + 1 == plan.frames.len(),
-        )?;
         // A small layer spanning several groups can instead share one tree
-        // and one set of entropy tables. Bound each extra trial to 512 x 512.
+        // and one set of entropy tables. Restrict this choice to 512 x 512.
         let extent = frame.image.width().max(frame.image.height());
-        if search_groups && extent > 128u32 << bounded.group_size_shift && extent <= 512 {
-            let shift = if extent <= 256 { 1 } else { 2 };
-            let mut alternative = bounded.clone();
-            alternative.group_size_shift = shift;
-            // Source MA training skips channels larger than this window. A
-            // larger group needs its corresponding window to train on the
-            // newly combined channel. Preserve independent custom windows.
-            if let Some(policy) = &mut alternative.modular.sampling
-                && policy.max_channel_size == 128usize << bounded.group_size_shift
-            {
-                policy.max_channel_size = 128usize << shift;
-            }
-            // Charge only finalized wire bytes against the incumbent. An
-            // intermediate writer can need more space than its final sections.
-            match encoder::try_smaller_layer(
-                canvas,
-                frame,
-                &alternative,
-                index + 1 == plan.frames.len(),
-                bytes.len(),
-            ) {
-                Ok(encoder::budget::TrialEncode::Complete(trial)) if trial.len() < bytes.len() => {
-                    bytes = trial
+        let alternative =
+            if search_groups && extent > 128u32 << bounded.group_size_shift && extent <= 512 {
+                let shift = if extent <= 256 { 1 } else { 2 };
+                let mut alternative = bounded.clone();
+                alternative.group_size_shift = shift;
+                // Source MA training skips channels larger than this window. A
+                // larger group needs its corresponding window to train on the
+                // newly combined channel. Preserve independent custom windows.
+                if let Some(policy) = &mut alternative.modular.sampling
+                    && policy.max_channel_size == 128usize << bounded.group_size_shift
+                {
+                    policy.max_channel_size = 128usize << shift;
                 }
-                Ok(_) | Err(Error::Limit(_)) => {}
-                Err(error) => return Err(error),
+                Some(alternative)
+            } else {
+                None
+            };
+        let last = index + 1 == plan.frames.len();
+        let bytes = if let Some(alternative) = &alternative {
+            if compare_groups {
+                encode_compared_layer(canvas, frame, &bounded, alternative, last)?
+            } else {
+                // Geometry is a cheap, deterministic choice: avoid independent
+                // group trees and entropy headers for these small raw layers.
+                // Both single- and multi-threaded normal paths encode once.
+                match encoder::encode_logical_frame_geometry(canvas, frame, alternative, last) {
+                    Ok((bytes, _)) => bytes,
+                    // The original encoding could still fit or avoid an error
+                    // in the selected representation. Replay the old comparison
+                    // only on failure, with its original error precedence.
+                    Err(_) => encode_compared_layer(canvas, frame, &bounded, alternative, last)?,
+                }
             }
-        }
+        } else {
+            encoder::encode_logical_frame_geometry(canvas, frame, &bounded, last)?.0
+        };
         let length = stream
             .len()
             .checked_add(bytes.len())
@@ -282,6 +301,36 @@ fn encode_inner(
     })
 }
 
+/// Exceptional fallback: preserve the previous exact-rate and error policy
+/// when the single chosen representation fails or a finite sequence fills up.
+fn encode_compared_layer(
+    canvas: crate::frame::Geometry<'_>,
+    frame: &Frame<'_>,
+    original: &EncodeOptions,
+    alternative: &EncodeOptions,
+    last: bool,
+) -> Result<Vec<u8>> {
+    let (bytes, _) = encoder::encode_logical_frame_geometry(canvas, frame, original, last)?;
+    choose_smaller_layer(canvas, frame, alternative, last, bytes)
+}
+
+fn choose_smaller_layer(
+    canvas: crate::frame::Geometry<'_>,
+    frame: &Frame<'_>,
+    alternative: &EncodeOptions,
+    last: bool,
+    original: Vec<u8>,
+) -> Result<Vec<u8>> {
+    // Charge finalized wire bytes; scratch writers may exceed the incumbent.
+    match encoder::try_smaller_layer(canvas, frame, alternative, last, original.len()) {
+        Ok(encoder::budget::TrialEncode::Complete(trial)) if trial.len() < original.len() => {
+            Ok(trial)
+        }
+        Ok(_) | Err(Error::Limit(_)) => Ok(original),
+        Err(error) => Err(error),
+    }
+}
+
 #[cfg(test)]
 mod group_candidate_tests {
     use super::*;
@@ -291,7 +340,7 @@ mod group_candidate_tests {
     };
 
     #[test]
-    fn exact_rate_selection_preserves_raw_layers_and_hidden_rgb() {
+    fn single_group_selection_preserves_raw_layers_and_hidden_rgb() {
         let images: Vec<_> = [(64, 64), (272, 160)]
             .into_iter()
             .map(|(w, h)| {
@@ -345,6 +394,20 @@ mod group_candidate_tests {
                 assert_eq!(chosen.bytes, baseline.bytes);
             } else {
                 assert!(chosen.bytes.len() < baseline.bytes.len());
+                let compared = encode_inner(&ordered, &options, &layers, true, true).unwrap();
+                let mut finite = options.clone();
+                finite.max_output_bytes = compared.bytes.len();
+                let limited = encode_with_group_search(&ordered, &finite, &layers, true).unwrap();
+                assert!(limited.bytes.len() <= finite.max_output_bytes);
+                finite.max_output_bytes = 1;
+                assert!(matches!(
+                    encode_with_group_search(&ordered, &finite, &layers, true),
+                    Err(Error::Limit(_))
+                ));
+                let mut parallel = options.clone();
+                parallel.threads = 4;
+                let result = encode_with_group_search(&ordered, &parallel, &layers, true).unwrap();
+                assert_eq!(result.bytes, chosen.bytes);
             }
             assert_eq!(chosen.layers.len(), ordered.len());
             for (actual, expected) in chosen.layers.iter().zip(&layers.frames) {

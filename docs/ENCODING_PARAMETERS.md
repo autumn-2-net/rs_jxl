@@ -271,15 +271,15 @@ Python 转码的 `limits` 支持 `max_input_bytes`、`max_output_bytes`、
 
 | 参数 | Python 默认值 | 含义 |
 | --- | --- | --- |
-| `strategy` | **"crop"** | `"crop"` 只做单 bbox 规划；`"auto"` 对符合条件的 full/crop/mask/多矩形方案试编码，按实际字节选择 |
+| `strategy` | **"auto"** | 默认在编码前选出一个 full/crop/mask/多矩形候选；显式 `"crop"` 只做单 bbox 规划。关闭 screen_candidates 可恢复完整试编码搜索 |
 | `reference` | **"auto"** | `"previous"` 上一帧；`"first"` 第一帧；`"full"` 不做帧间差分；`"none"` 是 full 别名 |
 | `durations` | **1** | 单个 tick 数或每帧列表，`0..2^32-1`；0 是真正零时长 layer，不替换为 1 |
 | `tps` | **(1000, 1)** | ticks/second 的分子和分母；分子 `1..2^30`，分母 `1..1024` |
 | `loops` | **0** | `0..2^32-1`；0 表示无限循环 |
-| `auto_options` | **None** | 仅 `strategy="auto"` 可传，包括空字典；省略成员使用 Rust 默认值 |
+| `auto_options` | **None** | 仅 `strategy="auto"` 可传，包括空字典；Python/CLI 默认 screen_candidates=True，低层 Rust 默认 False；其他省略成员使用 Rust 默认值 |
 
 `reference="auto"` 有两种不同语义：`strategy="crop"` 时选第一帧/上一帧中较小 bbox；
-`strategy="auto"` 时让对应方案按实际编码字节比较。后者不是只做面积判断。
+`strategy="auto"` 默认在编码前筛选为一个候选；关闭 `screen_candidates` 才完整试编码并按实际字节比较。
 多帧不支持额外 `source_search=True`；其 effort 提供共用的 Modular 后端参数，
 `strategy="auto"` 选择的是帧表示方式，不是再跑一层完整静态图搜索。
 
@@ -295,6 +295,7 @@ Python 转码的 `limits` 支持 `max_input_bytes`、`max_output_bytes`、
 | `adaptive_rectangles` | **True**，bool | 在传统 tiled 候选之外加入成本估计驱动的合并矩形候选 |
 | `adaptive_rate_feedback` | **True**，bool | 保留首帧码率候选，并在最近获胜的完整 Full 码率相差至少两倍时增加对应候选；须开启多矩形和 adaptive_rectangles |
 | `adaptive_splits` | **True**，bool | 增加有界双轴几何切分候选，按实测码率估计分区；须开启多矩形和 adaptive_rectangles |
+| `screen_candidates` | **True**, bool | Python/CLI default: select one candidate before encoding. Packed U8 without separate extra/Modular planes uses samples; other inputs use geometry. No minimum size. The selected representation obeys the hard output budget; exceeding it returns a limit error without trying another candidate. False restores full proposed search, independently of `prune`. CLI: `--no-candidate-screen`. Low-level Rust defaults false. Reports list attempted candidates only. |
 | `prune` | **True**，bool | 只用已完成输出给出的字节下界终止必败候选；不是凭估计删候选 |
 | `retained_reference` | **False**，bool | 轮换两个完整参考画布，保留获胜差分的背景；要求 `reference="auto"` |
 | `reference_lookahead` | **False**，bool | 看下一输入的精确几何差异，辅助决定旧参考的保留；要求 retained_reference=True |
@@ -352,7 +353,7 @@ for frame in report["frames"]:
 都更小或更快。报告中 `adaptive_rate_feedback`、`adaptive_splits`、`allow_add_delta`、`allow_multiply_mask`
 是配置值。试编报告用 `AddDelta` 表示单层有符号差分，`reference_index` 给出参考输入帧。
 其他候选包括 `SplitPrevious/First/Retained` 和 `MultiplyMaskPrevious/First/Retained`（各自展开为三个完整枚举名）。Python 默认
-`strategy="crop"` 不变，只有显式 `strategy="auto"` 使用这些开关。
+`strategy="auto"` 现在是默认值；显式 `strategy="crop"` 绕过候选搜索且不接受这些开关。
 
 CLI 对应 `--no-adaptive-rate-feedback`、`--no-adaptive-splits`、`--no-add-delta`、`--no-multiply-mask`；
 `--no-mask` 是所有 mask 的总关闭开关。关闭 `adaptive_rectangles` 只禁用自适应矩形类，

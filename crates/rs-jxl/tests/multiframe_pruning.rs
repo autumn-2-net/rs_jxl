@@ -69,11 +69,6 @@ fn run(images: &[Image], auto: &AutoOptions, threads: usize) -> AutoEncodeResult
         assert_eq!(frame.height, expected.height() as usize);
         assert_eq!(frame.duration_ticks, 1);
     }
-    for index in [0, images.len() - 1] {
-        let selected = decode_frame(&result.bytes, index, &DecodeOptions::default()).unwrap();
-        assert_eq!(selected.frames.len(), 1);
-        assert_eq!(&selected.frames[0].pixels, images[index].pixels());
-    }
     for frame in &result.frames {
         assert_eq!(
             frame.winner_index,
@@ -237,7 +232,14 @@ fn equal_size_candidates_keep_the_first_winner_across_threads() {
         last.candidates[first].encoded_bytes
     );
     assert_eq!(last.winner_index, previous);
-    for threads in [1, 4, 1] {
+    // Selected-frame decoding is independent of candidate pruning. Check it
+    // once here rather than decoding both endpoints after every search below.
+    for index in [0, images.len() - 1] {
+        let selected = decode_frame(&full.bytes, index, &DecodeOptions::default()).unwrap();
+        assert_eq!(selected.frames.len(), 1);
+        assert_eq!(&selected.frames[0].pixels, images[index].pixels());
+    }
+    for threads in [1, 4] {
         compare_pruning(
             &full,
             &run(
@@ -548,58 +550,80 @@ fn zero_duration_merged_layers_preserve_samples_and_reference_slots() {
 
 #[test]
 fn adaptive_search_retains_every_legacy_candidate_without_size_regression() {
+    let mut exercised_new_partition = false;
     for (dense, noisy, hidden) in [
         (false, false, false),
         (true, false, false),
         (false, true, true),
         (true, true, true),
     ] {
-        let images = fixture(dense, noisy, hidden);
-        for reference in [
-            Reference::Previous,
-            Reference::First,
-            Reference::SmallestCrop,
-        ] {
-            let auto = AutoOptions {
-                reference,
-                tile_size: 16,
-                prune: false,
-                adaptive_rectangles: false,
-                ..Default::default()
-            };
-            let legacy = run(&images, &auto, 1);
-            let adaptive_options = AutoOptions {
-                adaptive_rectangles: true,
-                ..auto
-            };
-            let adaptive = run(&images, &adaptive_options, 1);
-            assert!(adaptive.bytes.len() <= legacy.bytes.len());
-            for (old, new) in legacy.frames.iter().zip(&adaptive.frames) {
-                for candidate in &old.candidates {
-                    let retained = new
-                        .candidates
-                        .iter()
-                        .find(|c| {
-                            c.strategy == candidate.strategy
-                                && c.source == candidate.source
-                                && c.tile_size == candidate.tile_size
-                        })
-                        .expect("adaptive search must retain legacy plans");
-                    assert_eq!(retained.encoded_bytes, candidate.encoded_bytes);
-                    assert_eq!(retained.encoded_frames, candidate.encoded_frames);
-                    assert_eq!(retained.trial_pixels, candidate.trial_pixels);
-                }
+        // SmallestCrop includes both first and previous candidate families in
+        // one search. The dedicated pruning/reference tests above exercise the
+        // individual reference modes and prune on/off, so do not repeat that
+        // Cartesian product here. This test compares actual legacy/adaptive
+        // payloads across all four content classes, not just their geometry.
+        // Keep non-aligned bounds and several changed tiles; the dense fixture
+        // crossing the 256-pixel group boundary remains in the pruning test.
+        let images: Vec<_> = fixture(dense, noisy, hidden)
+            .iter()
+            .map(|image| {
+                crop(
+                    image,
+                    Rect {
+                        x: 0,
+                        y: 0,
+                        width: 65,
+                        height: 49,
+                    },
+                )
+                .unwrap()
+            })
+            .collect();
+        let auto = AutoOptions {
+            reference: Reference::SmallestCrop,
+            tile_size: 16,
+            prune: false,
+            adaptive_rectangles: false,
+            ..Default::default()
+        };
+        let legacy = run(&images, &auto, 1);
+        let adaptive_options = AutoOptions {
+            adaptive_rectangles: true,
+            ..auto
+        };
+        let adaptive = run(&images, &adaptive_options, 1);
+        assert!(adaptive.bytes.len() <= legacy.bytes.len());
+        for (old, new) in legacy.frames.iter().zip(&adaptive.frames) {
+            exercised_new_partition |= new.candidates.iter().any(|candidate| {
+                candidate.encoded_frames > 1
+                    && matches!(
+                        candidate.strategy,
+                        Strategy::MergedPrevious | Strategy::MergedFirst
+                    )
+                    && !old.candidates.iter().any(|legacy| {
+                        legacy.strategy == candidate.strategy
+                            && legacy.source == candidate.source
+                            && legacy.tile_size == candidate.tile_size
+                    })
+            });
+            for candidate in &old.candidates {
+                let retained = new
+                    .candidates
+                    .iter()
+                    .find(|c| {
+                        c.strategy == candidate.strategy
+                            && c.source == candidate.source
+                            && c.tile_size == candidate.tile_size
+                    })
+                    .expect("adaptive search must retain legacy plans");
+                assert_eq!(retained.encoded_bytes, candidate.encoded_bytes);
+                assert_eq!(retained.encoded_frames, candidate.encoded_frames);
+                assert_eq!(retained.trial_pixels, candidate.trial_pixels);
             }
-            let pruned = run(
-                &images,
-                &AutoOptions {
-                    prune: true,
-                    ..adaptive_options
-                },
-                1,
-            );
-            compare_pruning(&adaptive, &pruned);
-            assert!(pruned.bytes.len() <= legacy.bytes.len());
         }
     }
+    assert!(
+        exercised_new_partition,
+        "the fixture matrix must encode a new adaptive multi-rectangle proposal"
+    );
 }

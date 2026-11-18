@@ -19,6 +19,13 @@ pub struct AutoOptions {
     pub max_rectangles: usize,
     /// Stop only when finalized output proves a trial cannot beat the winner.
     pub prune: bool,
+    /// Select one candidate using cheap samples or geometry, without trial
+    /// encoding (default off in this low-level Rust API).
+    /// Disable to retain the full proposed search set.
+    /// The selected representation obeys the hard output budget; exceeding it
+    /// returns Limit rather than trying another representation.
+    /// Independent of exact byte-bound pruning; may change the size winner.
+    pub screen_candidates: bool,
     /// Add a cost-estimated rectangle proposal; retain all legacy candidates.
     pub adaptive_rectangles: bool,
     /// Add partitions guided by the most recent winning complete Full frame
@@ -51,6 +58,7 @@ impl Default for AutoOptions {
             extra_tile_sizes: Vec::new(),
             max_rectangles: 32,
             prune: true,
+            screen_candidates: false,
             adaptive_rectangles: true,
             adaptive_rate_feedback: true,
             adaptive_splits: true,

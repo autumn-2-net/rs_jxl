@@ -9,6 +9,12 @@ use rs_jxl::multiframe::{AutoOptions, Reference};
 use crate::{Result, io, options::Tools, validators::parse_threads};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub(super) enum StrategyArg {
+    Auto,
+    Crop,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum ReferenceArg {
     Auto,
     Previous,
@@ -75,7 +81,8 @@ Discarding unsupported metadata may change displayed orientation.\n\
 Durations are integer ticks: seconds = ticks * tps denominator / tps numerator. \
 --duration applies to every input; --durations requires one comma-separated \
 value per input. Zero ticks mean a non-display layer, not a one-tick substitute.\n\
-Automatic selection measures encoded bytes, not elapsed time. --reference auto \
+Automatic selection uses size estimates before encoding by default; disabling \
+screening compares actual encoded bytes, not elapsed time. --reference auto \
 permits previous and first references. --retained-reference requires auto and \
 rotates two reference slots to also reuse a retained older canvas; the first \
 frame is no longer permanently pinned. --reference-lookahead additionally requires \
@@ -85,7 +92,14 @@ Both reference flags are off by default. Mask and multi-rectangle candidates are
 enabled by default when lossless and compatible. These are multiframe strategies, \
 not source-search or an effort mapping. Proven-bound pruning and adaptive rectangle \
 proposals are enabled by default; --no-prune and --no-adaptive-rectangles disable \
-them independently. Manual tool options and --threads apply.\n\
+them independently. Before encoding, select one candidate by cheap samples \
+for packed U8 inputs or geometry for other inputs; the chosen representation \
+obeys the hard output budget and exceeding it returns a limit error without \
+trying another candidate. --no-candidate-screen restores the full search \
+set independently of --no-prune. Reports include only attempted candidates. \
+Manual tool options and --threads apply. --strategy crop instead plans only \
+geometry: --reference auto chooses the smaller previous/first crop area. Crop \
+rejects automatic-search controls and trial budgets; --max-frames still applies.\n\
 No extra CLI input, decoded-sample or retained-sequence byte cap is imposed. \
 Frame, trial and trial-pixel budgets are unlimited unless explicitly supplied; \
 zero budgets explicitly refuse work. \
@@ -121,6 +135,9 @@ pub(crate) struct EncodeFramesArgs {
     /// Animation loop count; zero repeats indefinitely
     #[arg(long, default_value_t = 0, value_name = "N")]
     loops: u32,
+    /// Auto selects multiframe candidates; crop plans bounding rectangles only
+    #[arg(long, value_enum, default_value = "auto")]
+    pub(super) strategy: StrategyArg,
     /// Reference candidates: auto permits both previous and first
     #[arg(long, value_enum, default_value = "auto")]
     reference: ReferenceArg,
@@ -142,9 +159,12 @@ pub(crate) struct EncodeFramesArgs {
     /// Disable the safe multi-rectangle candidate
     #[arg(long)]
     no_multi_rect: bool,
-    /// Disable proven-bound pruning; complete every eligible candidate
+    /// Disable proven-bound pruning; complete every candidate retained by screening
     #[arg(long)]
     no_prune: bool,
+    /// Disable pre-encoding selection of one candidate; try the full proposed search
+    #[arg(long)]
+    no_candidate_screen: bool,
     /// Disable additional cost-guided rectangle proposals; retain tile candidates
     #[arg(long)]
     no_adaptive_rectangles: bool,
@@ -155,23 +175,23 @@ pub(crate) struct EncodeFramesArgs {
     #[arg(long)]
     no_adaptive_splits: bool,
     /// Tile side length for multi-rectangle planning
-    #[arg(long, default_value_t = AutoOptions::default().tile_size, value_parser = clap::value_parser!(u32).range(1..), value_name = "PIXELS")]
-    tile_size: u32,
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..), value_name = "PIXELS")]
+    tile_size: Option<u32>,
     /// Extra rectangle grids (comma-separated); actual bytes select the winner
     #[arg(long, value_delimiter = ',', value_parser = clap::value_parser!(u32).range(1..), value_name = "PIXELS,...")]
     extra_tile_sizes: Vec<u32>,
     /// Maximum rectangles in a multi-rectangle candidate (positive integer)
-    #[arg(long, default_value_t = AutoOptions::default().max_rectangles, value_parser = positive_usize, value_name = "N")]
-    max_rectangles: usize,
+    #[arg(long, value_parser = positive_usize, value_name = "N")]
+    max_rectangles: Option<usize>,
     /// Logical input frame budget (omitted: unlimited; generated layers not counted)
     #[arg(long, default_value_t = AutoOptions::default().max_frames, hide_default_value = true, value_name = "N")]
     pub(super) max_frames: usize,
     /// Hard total trial-encode budget (omitted: unlimited)
-    #[arg(long, default_value_t = AutoOptions::default().max_total_trials, hide_default_value = true, value_name = "N")]
-    max_total_trials: usize,
+    #[arg(long, hide_default_value = true, value_name = "N")]
+    max_total_trials: Option<usize>,
     /// Hard trial-pixel budget (omitted: unlimited)
-    #[arg(long, default_value_t = AutoOptions::default().max_trial_pixels, hide_default_value = true, value_name = "N")]
-    max_trial_pixels: u64,
+    #[arg(long, hide_default_value = true, value_name = "N")]
+    max_trial_pixels: Option<u64>,
     /// Encoder worker count (1..=256)
     #[arg(long, default_value = "1", value_parser = parse_threads, value_name = "N")]
     pub(super) threads: usize,
@@ -197,19 +217,47 @@ impl EncodeFramesArgs {
             allow_multiply_mask: !self.no_multiply_mask,
             allow_multi_rect: !self.no_multi_rect,
             prune: !self.no_prune,
+            screen_candidates: !self.no_candidate_screen,
             adaptive_rectangles: !self.no_adaptive_rectangles,
             adaptive_rate_feedback: !self.no_adaptive_rate_feedback,
             adaptive_splits: !self.no_adaptive_splits,
-            tile_size: self.tile_size,
+            tile_size: self.tile_size.unwrap_or(AutoOptions::default().tile_size),
             extra_tile_sizes: self.extra_tile_sizes.clone(),
-            max_rectangles: self.max_rectangles,
+            max_rectangles: self
+                .max_rectangles
+                .unwrap_or(AutoOptions::default().max_rectangles),
             max_frames: self.max_frames,
-            max_total_trials: self.max_total_trials,
-            max_trial_pixels: self.max_trial_pixels,
+            max_total_trials: self
+                .max_total_trials
+                .unwrap_or(AutoOptions::default().max_total_trials),
+            max_trial_pixels: self
+                .max_trial_pixels
+                .unwrap_or(AutoOptions::default().max_trial_pixels),
         }
     }
 
     pub(super) fn validate_options(&self) -> Result<()> {
+        if self.strategy == StrategyArg::Crop {
+            let search_only = self.retained_reference
+                || self.reference_lookahead
+                || self.no_mask
+                || self.no_multiply_mask
+                || self.no_add_delta
+                || self.no_multi_rect
+                || self.no_prune
+                || self.no_candidate_screen
+                || self.no_adaptive_rectangles
+                || self.no_adaptive_rate_feedback
+                || self.no_adaptive_splits
+                || self.tile_size.is_some()
+                || !self.extra_tile_sizes.is_empty()
+                || self.max_rectangles.is_some()
+                || self.max_total_trials.is_some()
+                || self.max_trial_pixels.is_some();
+            if search_only {
+                return Err("--strategy crop does not accept automatic-search controls or trial budgets; --max-frames, --reference, timing, threads and encoder tools still apply".into());
+            }
+        }
         if self.reference_lookahead && !self.retained_reference {
             return Err("--reference-lookahead requires --retained-reference".into());
         }
@@ -217,6 +265,10 @@ impl EncodeFramesArgs {
             return Err("--retained-reference requires --reference auto".into());
         }
         Ok(())
+    }
+
+    pub(super) fn reference(&self) -> Reference {
+        self.reference.core()
     }
 
     pub(super) fn animation(&self) -> Animation {

@@ -99,7 +99,7 @@ data, report = rs_jxl.encode_multiframe(
 )
 ```
 
-The Python `strategy` default remains `"crop"`; the feedback field only takes
+The Python `strategy` default is `"auto"`; the feedback field only takes
 effect with `strategy="auto"`. Disabling multi-rectangle or adaptive-rectangle
 proposals also disables feedback proposals. Search reports include
 `adaptive_rate_feedback` as configured; it does not imply that a new proposal
@@ -329,11 +329,22 @@ and charges only submitted layers, including an interrupted layer. It does not
 share ordinary REPLACE payload-cache entries. Logical `max_frames` still counts
 inputs, while candidate/pixel/output budgets apply to its actual work and bytes.
 
+`screen_candidates=true` is the Python and CLI default: select one candidate
+before encoding, using cheap samples for packed U8 input without separate extra
+or Modular planes, and geometry for other inputs. No minimum frame size applies.
+The selected representation obeys the hard output budget; exceeding it returns
+`Limit` without trying another candidate. The low-level
+Rust `AutoOptions::default()` keeps screening false for compatibility.
+Selection is a speed/size tradeoff and may change the winner; false restores the
+full proposed search. It is independent of `prune`. Reports contain only
+candidates actually attempted, including trials stopped by pruning.
+
 `prune=true` (the default) ranks inexpensive work first, then stops a losing
 trial only when finalized output gives a provable byte lower bound that cannot
-win under the canonical tie rule. An estimate cannot justify skipping a
+win under the canonical tie rule. Pruning never uses an estimate to skip a
 candidate. Reports are restored to canonical order afterward. Disabling pruning
-with `prune=false` completes all eligible trials or fails explicitly on an error.
+with `prune=false` completes all trials retained by screening or fails explicitly
+on an error. Disable both options to complete the full proposed search.
 For the same candidate set and sufficient budgets, pruning preserves selection;
 it does not change eligibility or the preference among equal-byte candidates.
 

@@ -55,7 +55,8 @@ impl Trial<'_> {
         let started = Instant::now();
         let initial_pixels = *pixels;
         let workers = crate::execution::worker_count().min(4);
-        if cutoff.is_none()
+        if (cutoff.is_none()
+            || (self.max_trial_pixels == u64::MAX && options.max_output_bytes == usize::MAX))
             && candidate.replace()
             && candidate.rects.len() > 1
             && workers > 1
@@ -68,8 +69,13 @@ impl Trial<'_> {
                 trial_slots,
                 pixels,
                 payloads,
-                workers,
+                if cutoff.is_some() {
+                    workers.min(2)
+                } else {
+                    workers
+                },
                 started,
+                cutoff,
             );
         }
         let mut bytes = Vec::new();
@@ -285,7 +291,8 @@ impl Trial<'_> {
         })
     }
 
-    /// Only unbounded Replace payloads enter this path. Images and
+    /// Replace payloads enter this path. Bounded trials require unlimited hard
+    /// budgets and use at most two speculative parts. Images and
     /// encoded payloads live for at most one worker-sized batch, never the
     /// entire candidate. Reference validation/publication stays canonical.
     #[allow(clippy::too_many_arguments)]
@@ -298,11 +305,20 @@ impl Trial<'_> {
         payloads: &mut Payloads,
         workers: usize,
         started: Instant,
+        cutoff: Option<usize>,
     ) -> Result<Outcome> {
         let initial_pixels = *pixels;
         let mut bytes = Vec::new();
+        let mut encoded_frames = 0;
+        let mut lower_bound = None;
+        let mut submitted_parts = 0;
         let mut depth = slots.add_depth[usize::from(candidate.source)];
         for (batch_index, rects) in candidate.rects.chunks(workers).enumerate() {
+            if cutoff.is_some_and(|maximum| bytes.len() >= maximum) {
+                lower_bound = Some(bytes.len());
+                break;
+            }
+            let remaining = cutoff.map(|maximum| maximum - bytes.len());
             let first = batch_index * workers;
             let mut jobs = Vec::with_capacity(rects.len());
             // Charge all speculative pixels before dispatch, so workers can
@@ -315,7 +331,6 @@ impl Trial<'_> {
                 let part = first + i;
                 let final_part = part + 1 == candidate.rects.len();
                 let last = self.last_input && final_part;
-                let image = crop(self.image, rect)?;
                 let options = FrameOptions {
                     origin: (rect.x as i32, rect.y as i32),
                     duration: if final_part { self.duration } else { 0 },
@@ -331,48 +346,73 @@ impl Trial<'_> {
                     },
                     ..Default::default()
                 };
+                jobs.push((options, last, final_part, rect, payloads.take_rect(rect)));
+                submitted_parts += 1;
+            }
+            let encoded =
+                crate::execution::map_mut(&mut jobs, |_, (options, last, _, rect, cache)| {
+                    let result = (|| {
+                        let image = crop(self.image, *rect)?;
+                        let budget = SectionBudget::new(remaining, self.options.max_output_bytes);
+                        cache.encode(
+                            *rect,
+                            self.canvas,
+                            &Frame {
+                                image: &image,
+                                options: options.clone(),
+                            },
+                            self.options,
+                            *last,
+                            budget.as_ref(),
+                        )
+                    })();
+                    if result.is_err() {
+                        // Failed encoding has not consumed its cache use.
+                        cache.skip(std::slice::from_ref(rect));
+                    }
+                    result
+                });
+            // Restore every cache before inspecting results. This includes
+            // speculative results beyond a cutoff and all error paths.
+            for (_, _, _, _, cache) in jobs.iter_mut() {
+                payloads.restore_rect(std::mem::take(cache));
+            }
+            for (result, (settings, last, final_part, rect, _)) in encoded.into_iter().zip(jobs) {
+                if cutoff.is_some_and(|maximum| bytes.len() >= maximum) {
+                    lower_bound = Some(bytes.len());
+                    break;
+                }
+                let (output, atlas) = result?;
                 references = crate::encode::validate_frame_references(
                     self.canvas.into(),
-                    (&image).into(),
-                    &options,
+                    // crop() retains an exact clone of the input metadata.
+                    crate::frame::Geometry {
+                        width: rect.width,
+                        height: rect.height,
+                        metadata: self.image.metadata(),
+                    },
+                    &settings,
                     self.options,
                     last,
                     references,
                 )?;
-                jobs.push((
-                    image,
-                    options,
-                    last,
-                    final_part,
-                    rect,
-                    payloads.take_rect(rect),
-                ));
-            }
-            let encoded = crate::execution::map_mut(
-                &mut jobs,
-                |_, (image, options, last, _, rect, cache)| {
-                    cache.encode(
-                        *rect,
-                        self.canvas,
-                        &Frame {
-                            image,
-                            options: options.clone(),
-                        },
-                        self.options,
-                        *last,
-                        None,
-                    )
-                },
-            );
-            for (result, (_, settings, last, final_part, _, cache)) in encoded.into_iter().zip(jobs)
-            {
-                payloads.restore_rect(cache);
-                let (output, atlas) = result?;
                 if atlas {
                     depth = None;
                 }
-                let output = output.into_complete()?;
+                let output = match output {
+                    TrialEncode::Complete(output) => output,
+                    TrialEncode::Bounded { lower_bound: bound } => {
+                        lower_bound = Some(
+                            bytes
+                                .len()
+                                .checked_add(bound)
+                                .ok_or(Error::Limit("automatic candidate size lower bound"))?,
+                        );
+                        break;
+                    }
+                };
                 append(&mut bytes, output, self.options.max_output_bytes)?;
+                encoded_frames += 1;
                 slots.saved_layer(
                     self.index,
                     settings.save_as_reference,
@@ -384,6 +424,24 @@ impl Trial<'_> {
                     slots.add_depth[usize::from(self.destination)] = depth;
                 }
             }
+            if lower_bound.is_some() {
+                break;
+            }
+        }
+        if let Some(lower_bound) = lower_bound {
+            payloads.skip(&candidate.rects[submitted_parts..]);
+            return Ok(Outcome::Pruned(AutoPrunedReport {
+                strategy: candidate.strategy,
+                tile_size: candidate.tile_size,
+                reference_index: candidate.reference_index,
+                source: candidate.source,
+                save_as_reference: if self.last_input { 0 } else { self.destination },
+                lower_bound,
+                encoded_frames,
+                planned_frames: candidate.rects.len(),
+                trial_pixels: *pixels - initial_pixels,
+                elapsed: started.elapsed(),
+            }));
         }
         let report = AutoCandidateReport {
             strategy: candidate.strategy,
@@ -392,7 +450,7 @@ impl Trial<'_> {
             source: candidate.source,
             save_as_reference: if self.last_input { 0 } else { self.destination },
             encoded_bytes: bytes.len(),
-            encoded_frames: candidate.rects.len(),
+            encoded_frames,
             trial_pixels: *pixels - initial_pixels,
             elapsed: started.elapsed(),
         };

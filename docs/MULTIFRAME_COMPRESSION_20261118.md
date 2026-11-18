@@ -23,7 +23,7 @@ nor the decoder. All older candidates remain available.
   This is a fixed two-layer operation, independent of the rectangle-count cap.
 
 Both booleans default to true in `AutoOptions`. Python uses the existing
-`auto_options` dictionary; its top-level default remains `strategy="crop"`.
+`auto_options` dictionary; its top-level default is now `strategy="auto"` (explicit crop remains available).
 CLI switches are `--no-adaptive-splits` and `--no-multiply-mask`. `allow_mask=false`
 or `--no-mask` disables both ordinary alpha masks and multiply masks. Reports
 include the requested booleans and distinct Split/MultiplyMask strategy labels.

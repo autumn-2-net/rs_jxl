@@ -55,6 +55,7 @@ class Encoder(_Context):
         return self._call(transcode_jpeg, src, output, **options)
 
     def encode_multiframe(self, frames, output=None, **options):
+        """Encode using the default screened auto strategy; crop is explicit."""
         return self._call(encode_multiframe, frames, output, **options)
 
     def encode_layers(self, images, output=None, **options):

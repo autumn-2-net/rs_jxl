@@ -23,7 +23,7 @@ use crate::frame::{DataStatus, DecoderState, Frame};
 use crate::headers::Orientation;
 use crate::headers::color_encoding::ColorSpace;
 use crate::headers::extra_channels::ExtraChannel;
-use crate::headers::frame_header::{Encoding, FrameHeader, FrameType};
+use crate::headers::frame_header::{BlendingMode, Encoding, FrameHeader, FrameType};
 use crate::image::{DataTypeTag, Image, OwnedRawImage, Rect};
 #[cfg(test)]
 use crate::render::SimpleRenderPipeline;
@@ -975,19 +975,6 @@ impl Frame {
             self.render_pipeline = None;
             return Ok(());
         }
-        if !coalescing
-            && self.header.can_be_referenced
-            && !self.header.save_before_ct
-            && self.header.needs_blending()
-        {
-            // Save the unblended layer before spot-color/alpha output transforms.
-            // It is composited only when finalized for use as a reference.
-            self.reference_frame_data = Some(
-                (0..3 + self.header.num_extra_channels as usize)
-                    .map(|_| Image::new(self.header.size_upsampled()))
-                    .collect::<Result<Vec<_>>>()?,
-            );
-        }
         #[cfg(test)]
         let render_pipeline = if self.use_simple_pipeline {
             Self::build_render_pipeline::<SimpleRenderPipeline>(
@@ -1057,6 +1044,40 @@ impl Frame {
         let Some(layer) = self.reference_frame_data.as_mut() else {
             return Ok(());
         };
+        // Independent raw layers typically Replace over an empty slot. The
+        // destination planes start at zero, including the entire off-layer
+        // region. Only the visible intersection has to be copied.
+        let references = &self.decoder_state.reference_frames;
+        if std::iter::once(&self.header.blending_info)
+            .chain(&self.header.ec_blending_info)
+            .all(|b| b.mode == BlendingMode::Replace && references[b.source as usize].is_none())
+        {
+            let size = &self.decoder_state.file_header.size;
+            let canvas_size = (size.xsize() as usize, size.ysize() as usize);
+            let (width, height) = self.header.size_upsampled();
+            let (x, y) = (i64::from(self.header.x0), i64::from(self.header.y0));
+            if (x, y) == (0, 0) && (width, height) == canvas_size {
+                return Ok(());
+            }
+            let left = x.clamp(0, canvas_size.0 as i64);
+            let right = (x + width as i64).clamp(0, canvas_size.0 as i64);
+            let top = y.clamp(0, canvas_size.1 as i64);
+            let bottom = (y + height as i64).clamp(0, canvas_size.1 as i64);
+            for plane in layer {
+                let mut canvas = Image::<f32>::new(canvas_size)?;
+                if left < right {
+                    for row in top..bottom {
+                        canvas.row_mut(row as usize)[left as usize..right as usize]
+                            .copy_from_slice(
+                                &plane.row((row - y) as usize)
+                                    [(left - x) as usize..(right - x) as usize],
+                            );
+                    }
+                }
+                *plane = canvas;
+            }
+            return Ok(());
+        }
         let blend = BlendingStage::new(
             &self.header,
             &self.decoder_state.file_header,

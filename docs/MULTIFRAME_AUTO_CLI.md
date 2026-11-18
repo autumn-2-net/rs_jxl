@@ -64,10 +64,20 @@ where the core can preserve samples and metadata exactly:
 - `--no-multi-rect` disables both tile and adaptive multi-rectangle candidates.
   Intermediate rectangles have zero duration; the final rectangle carries the
   input duration.
-- `--no-prune` disables proven-bound pruning. All eligible trials then complete
+- `--no-candidate-screen` disables candidate selection before encoding. By default,
+  one candidate is selected before encoding: packed U8 inputs without separate
+  extra or Modular planes use cheap samples, and other inputs use geometry.
+  There is no minimum frame size. The selected representation obeys the hard
+  output budget; exceeding it returns a limit error without trying another candidate.
+  This may change the size winner. Reports contain only attempted
+  candidates. This switch is independent of `--no-prune`; use both to complete
+  the full proposed search.
+
+- `--no-prune` disables proven-bound pruning. All trials retained by screening then complete
   or the command fails explicitly on an error. By default, inexpensive candidates
   may execute first; a candidate stops only when a provable byte lower bound
-  cannot win under the canonical tie rule. Estimates cannot remove old candidates.
+  cannot win under the canonical tie rule. Pruning itself never removes candidates
+  based on estimates; screening is a separate control.
 - `--no-adaptive-rectangles` disables merged, recent-rate and two-axis split
   proposals, retaining tile candidates. Measured bytes per pixel only propose
   geometry; actual encoded bytes select the winner. Pruning remains independent.
@@ -78,6 +88,12 @@ where the core can preserve samples and metadata exactly:
 - `--tile-size PIXELS` defaults to 32 and must be positive.
 - `--max-rectangles N` defaults to 32 and accepts positive native `usize` values,
   with no extra 4096 cap. Geometry is validated even if candidates are disabled.
+
+`encode-frames` defaults to `--strategy auto`. Python `encode_multiframe` and
+`Encoder.encode_multiframe` default to the same screened automatic strategy.
+Use CLI `--strategy crop` or Python `strategy="crop"` for explicit geometry-only
+planning without candidate trial encoding. Effort, threads, durations, and other defaults are
+unchanged; matching strategy alone does not make those settings identical.
 
 The new-tool booleans default to enabled. To recover the `f4e240c` candidate
 policy, disable signed Add, splits and multiply masks together, leaving other settings
@@ -331,3 +347,33 @@ The centralized 2026-10-24 release run passed all twelve CLI tests. Independent
 official-decoder acceptance for the core strategies is recorded in
 [MULTIFRAME_AUTO.md](MULTIFRAME_AUTO.md). This does not claim complete decoder
 conformance or complete pixel-lossless performance acceptance.
+
+
+## Explicit Crop Strategy
+
+Python and CLI both default to `auto`. To select the same geometry-only path as
+Python `encode_multiframe(..., strategy="crop")`:
+
+```powershell
+rs-jxl encode-frames first.png second.png -o crop.jxl --strategy crop --reference auto --duration 100 --tps 1000
+```
+
+`crop` calls `multiframe::plan` followed by `Encoder::encode_frames`. It chooses
+bounding rectangles without automatic candidate search. Here `--reference auto`
+selects the smaller first/previous difference rectangle by area; it does not
+measure encoded bytes. `previous`, `first` and `full` retain their planner meaning.
+Samples including invisible RGB, animation timebase, loops, durations, supported
+metadata, input ordering and transactional output handling use the same paths.
+
+`--max-frames` remains a hard input budget, including zero. Threads and manual
+encoder tools still apply. The planner and encoder retain format, allocation and
+encoder resource checks. Automatic-search controls are rejected with `crop`:
+retained-reference/lookahead, mask/Add/multi-rectangle disable flags, pruning,
+candidate screening, adaptive flags, tile grids, rectangle-count limits and
+trial/trial-pixel budgets. Explicitly supplying such an option is an error,
+including its usual default value; constraints are never silently ignored.
+
+Crop text and `--report-json` output report the actual planned rectangles,
+reference slots, durations and total codestream byte count. The elapsed value
+covers planning and encoding, excluding pool construction and file transport.
+There are no invented candidate, winner, per-frame byte or trial timing fields.

@@ -386,7 +386,8 @@ class NativeReferenceLookahead(fixtures.PixelAssertions, unittest.TestCase):
         frames = [base, base.copy(), base.copy()]
         frames[1][2:14, 2:14] ^= np.uint8(17)
         frames[2][2:14, 2:14] ^= np.uint8(33)
-        data, report = encode_lookahead(frames, patches=False, auto_options={"prune": False})
+        data, report = encode_lookahead(frames, patches=False, auto_options={
+            "prune": False, "screen_candidates": False})
         self.assertCounters(report)
         final = report["frames"][-1]
         self.assertGreater(final["reused_payloads"], 0)

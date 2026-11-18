@@ -128,6 +128,7 @@ pub(super) fn execute(
         let auto = request.auto_options.as_ref().map_or_else(
             || multiframe::AutoOptions {
                 reference: request.multiframe_reference(),
+                screen_candidates: true,
                 ..Default::default()
             },
             |auto| auto.native(request.multiframe_reference()),

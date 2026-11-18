@@ -407,3 +407,12 @@ added; this is a portable scalar specialization.
 The parent `decoder_parallel_pixels` palette/squeeze hidden-RGB test covers
 multigroup U8/U16 explicit palette decoding. Parent-run exact-output benchmarks
 and tests determine acceptance; this ledger does not assert measured speedup.
+
+## Raw cropped layer reference buffers (2026-11-18)
+
+`jxl/src/frame/decode.rs` allocates the post-color-transform reference planes
+at layer dimensions when raw output needs blending. `jxl/src/frame/render.rs`
+finalizes an all-Replace layer over empty reference slots by copying its
+visible intersection into zero-initialized canvas planes. Each plane replaces
+its layer buffer as soon as the copy finishes. Populated references and other
+blend modes continue through the standard extension and blending stages.

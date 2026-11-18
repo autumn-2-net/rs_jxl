@@ -24,7 +24,7 @@ def _auto_options(value, strategy):
         raise ValueError("auto_options require strategy='auto'")
     if not isinstance(value, Mapping):
         raise TypeError("auto_options must be a mapping of Rust option names")
-    booleans = {"allow_add_delta", "allow_mask", "allow_multiply_mask", "allow_multi_rect", "prune", "adaptive_rectangles",
+    booleans = {"allow_add_delta", "allow_mask", "allow_multiply_mask", "allow_multi_rect", "prune", "screen_candidates", "adaptive_rectangles",
                 "retained_reference", "reference_lookahead", "adaptive_rate_feedback", "adaptive_splits"}
     integers = {"tile_size": (1, 0xffffffff),
                 "max_rectangles": (1, sys.maxsize * 2 + 1),
@@ -111,7 +111,7 @@ def _images(frames, *, extra_channels=None, borrow_inputs=False, **options):
 
 
 def encode_multiframe(frames, output=None, *, layout="auto", durations=1,
-                      reference="auto", strategy="crop", tps=(1000, 1), loops=0,
+                      reference="auto", strategy="auto", tps=(1000, 1), loops=0,
                       effort=7, threads=1, lossless=True, distance=0,
                       extra_channels=None, bits_per_sample=0, color_encoding=None,
                       icc_profile=None, allow_device_copy=False, strip_metadata=False,
@@ -119,8 +119,10 @@ def encode_multiframe(frames, output=None, *, layout="auto", durations=1,
                       auto_options=None, _context=None, **tool_options):
     """Preserve every full input state; duration=0 remains a genuine layer.
 
-    reference='auto' uses the smaller first/previous crop. strategy='auto'
-    additionally compares eligible full/crop/mask/multiple-rectangle encodes.
+    strategy='auto' is the default and selects among eligible full/crop/mask/
+    multiple-rectangle candidates, with sample screening enabled by default.
+    Explicit strategy='crop' uses only geometry; reference='auto' then chooses
+    the smaller first/previous crop without trial encoding.
     auto_options is an optional mapping of native automatic-search controls;
     omitted fields retain Rust defaults. Analysis and selection stay in Rust.
     retained_reference=True opts into a rotating two-reference policy and
@@ -140,6 +142,15 @@ def encode_multiframe(frames, output=None, *, layout="auto", durations=1,
     mask does not depend on the multi-rectangle or adaptive controls.
     allow_add_delta defaults to True and tries a one-layer signed difference
     for eligible 8-bit inputs, independently of mask and rectangle controls.
+    screen_candidates defaults to True: select one candidate before encoding,
+    using cheap sample estimates for packed U8 inputs without separate extra or
+    Modular planes, or geometry for other inputs. There is no minimum frame
+    size. The selected representation remains subject to the hard output budget;
+    exceeding it returns a limit error without trying another candidate.
+    False restores the full
+    proposed search set and may improve size at greater encoding cost. Screening
+    is independent of prune, which only applies exact byte bounds. Candidate
+    reports contain only attempted candidates.
     extra_tile_sizes=[16, 64] adds partition grids without replacing tile_size.
     Duplicate partitions are skipped; extra trials may take longer. For a fixed
     reference state selection uses bytes, not minimum rectangle area.

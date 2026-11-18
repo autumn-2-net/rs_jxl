@@ -885,3 +885,121 @@ fn png_sequence_round_trip_preserves_hidden_rgb_depth_and_durations() {
         assert_eq!(fs::read_dir(&dir.0).unwrap().count(), 4);
     }
 }
+
+#[test]
+fn crop_strategy_is_explicit_and_rejects_search_only_controls() {
+    use super::args::StrategyArg;
+    assert_eq!(parse(&[]).strategy, StrategyArg::Auto);
+    let crop = parse(&[
+        "--strategy",
+        "crop",
+        "--reference",
+        "first",
+        "--threads",
+        "2",
+    ]);
+    assert_eq!(crop.strategy, StrategyArg::Crop);
+    assert_eq!(crop.reference(), Reference::First);
+    crop.validate_options().unwrap();
+    for flags in [
+        vec!["--retained-reference"],
+        vec!["--no-mask"],
+        vec!["--no-multiply-mask"],
+        vec!["--no-add-delta"],
+        vec!["--no-multi-rect"],
+        vec!["--no-prune"],
+        vec!["--no-candidate-screen"],
+        vec!["--no-adaptive-rectangles"],
+        vec!["--no-adaptive-rate-feedback"],
+        vec!["--no-adaptive-splits"],
+        vec!["--tile-size", "32"],
+        vec!["--extra-tile-sizes", "16"],
+        vec!["--max-rectangles", "32"],
+        vec!["--max-total-trials", "0"],
+        vec!["--max-trial-pixels", "0"],
+    ] {
+        let mut all = vec!["--strategy", "crop"];
+        all.extend(flags);
+        assert!(parse(&all).validate_options().is_err(), "{all:?}");
+    }
+    let limited = parse(&["--strategy", "crop", "--max-frames", "1"]);
+    limited.validate_options().unwrap();
+    assert!(limited.check_paths().is_err());
+}
+
+#[test]
+fn crop_cli_matches_geometry_plan_and_preserves_hidden_rgb_and_timing() {
+    let dir = TestDir::new();
+    let samples = [
+        [17, 23, 31, 0, 42, 53, 64, 255],
+        [91, 23, 31, 0, 42, 53, 64, 255],
+        [17, 23, 31, 0, 42, 53, 64, 255],
+    ];
+    let inputs: Vec<_> = (0..samples.len())
+        .map(|i| dir.0.join(format!("crop{i}.png")))
+        .collect();
+    for (path, data) in inputs.iter().zip(&samples) {
+        write_png(path, png::BitDepth::Eight, data);
+    }
+    let output = dir.0.join("crop.jxl");
+    let flags = [
+        "--strategy",
+        "crop",
+        "--reference",
+        "auto",
+        "--durations",
+        "2,3,5",
+        "--tps",
+        "24",
+        "--loops",
+        "3",
+        "--threads",
+        "2",
+        "--report-json",
+    ];
+    let args = file_args(&inputs, &output, &flags);
+    let images = load_images(&args).unwrap();
+    let durations = args.frame_durations().unwrap();
+    let plan = rs_jxl::multiframe::plan(&images, &durations, Reference::SmallestCrop).unwrap();
+    let frames: Vec<_> = plan.iter().map(|frame| frame.as_frame()).collect();
+    let mut options = EncodeOptions {
+        threads: args.threads,
+        ..Default::default()
+    };
+    args.tools.apply(&mut options).unwrap();
+    let expected = rs_jxl::codec::Encoder::new(2)
+        .unwrap()
+        .encode_frames(&images[0], &frames, &options)
+        .unwrap();
+    run(args).unwrap();
+    let bytes = fs::read(&output).unwrap();
+    assert_eq!(bytes, expected);
+    let decoded = rs_jxl::decode::decode(&bytes, &Default::default()).unwrap();
+    assert_eq!(decoded.frames.len(), samples.len());
+    let animation = decoded.info.animation.as_ref().unwrap();
+    assert_eq!(
+        (animation.tps_numerator, animation.tps_denominator),
+        (24, 1)
+    );
+    assert_eq!(animation.num_loops, 3);
+    for ((actual, expected), ticks) in decoded.frames.iter().zip(&samples).zip([2, 3, 5]) {
+        assert_eq!(actual.pixels, PixelData::U8(expected.to_vec()));
+        assert_eq!(actual.duration_ticks, ticks);
+    }
+    let mut json = Vec::new();
+    super::report::write_crop_report(
+        &mut json,
+        &plan,
+        bytes.len(),
+        std::time::Duration::from_millis(125),
+        true,
+    )
+    .unwrap();
+    let report: serde_json::Value = serde_json::from_slice(&json).unwrap();
+    assert_eq!(report["strategy"], "crop");
+    assert_eq!(report["output_bytes"], bytes.len());
+    assert_eq!(report["elapsed_seconds"], 0.125);
+    assert_eq!(report["frames"][1]["width"], 1);
+    assert!(report["frames"][1].get("candidates").is_none());
+    assert!(report["frames"][1].get("winner_index").is_none());
+}

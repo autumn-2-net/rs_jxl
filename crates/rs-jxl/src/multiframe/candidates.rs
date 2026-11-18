@@ -28,7 +28,7 @@ impl Candidate {
     pub(super) fn replace(&self) -> bool {
         !self.mask && !self.multiply_mask() && self.strategy != Strategy::AddDelta
     }
-    // Ranking only. No candidate is discarded using this estimate.
+    // Orders exhaustive trials and ranks geometry when a sample estimate is unavailable.
     pub(super) fn estimated_work(&self) -> u64 {
         let area = self.rects.iter().fold(0u64, |sum, rect| {
             sum.saturating_add(u64::from(rect.width) * u64::from(rect.height))
@@ -173,6 +173,9 @@ pub(super) fn candidates(
                 });
             }
         }
+    }
+    if auto.screen_candidates {
+        super::screen::select(&mut result, images, index);
     }
     Ok(result)
 }

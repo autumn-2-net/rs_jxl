@@ -104,7 +104,12 @@ fn strategies_preserve_integer_samples_hidden_rgb_and_timing() {
             PixelLayout::Rgb,
             PixelLayout::Rgba,
         ] {
-            for partial in [false, true] {
+            let alpha_cases: &[bool] = if layout.has_alpha() {
+                &[false, true]
+            } else {
+                &[false]
+            };
+            for &partial in alpha_cases {
                 let images = sequence(layout, bits, partial);
                 for reference in [
                     Reference::Full,

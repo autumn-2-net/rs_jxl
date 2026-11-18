@@ -197,7 +197,7 @@ print('encode_call_seconds', encode_call_seconds,
 要排除输入解码，需预先准备相同样本和元数据，保持各方案计时边界一致。
 
 分析的 `auto` 只做第一/上一帧几何比较；编码的 `strategy='auto'` 实际试编码选字节。
-默认 `strategy='crop'` 则只按 bbox 规划，搜索更少，不保证同等体积。
+默认 `strategy='auto'` 在编码前选出一个候选；显式 `strategy='crop'` 只按 bbox 规划，不试编码候选，不保证同等体积。
 保留历史参考会改变后续状态，当前帧最小也不保证整段最小。
 
 最终用同 effort、线程、像素和元数据对比独立 JXL 总和、full 多帧及 crop/auto。
