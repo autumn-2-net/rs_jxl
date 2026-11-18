@@ -175,7 +175,7 @@ pub(super) fn candidates(
         }
     }
     if auto.screen_candidates {
-        super::screen::select(&mut result, images, index);
+        super::screen::select(&mut result, images, index, options);
     }
     Ok(result)
 }

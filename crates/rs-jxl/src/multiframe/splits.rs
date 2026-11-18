@@ -53,7 +53,7 @@ struct Work {
     used: usize,
     limit: usize,
 }
-fn union(a: Rect, b: Rect) -> Rect {
+pub(super) fn union(a: Rect, b: Rect) -> Rect {
     let x = a.x.min(b.x);
     let y = a.y.min(b.y);
     Rect {
@@ -63,7 +63,7 @@ fn union(a: Rect, b: Rect) -> Rect {
         height: (a.y + a.height).max(b.y + b.height) - y,
     }
 }
-fn area(r: Rect) -> u64 {
+pub(super) fn area(r: Rect) -> u64 {
     u64::from(r.width) * u64::from(r.height)
 }
 fn coordinate(r: Rect, axis: u8, tile: u32) -> u32 {

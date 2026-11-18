@@ -62,7 +62,7 @@ impl Receipt {
 }
 
 // Wrapping before arithmetic shifts is part of the native RCT6 contract.
-fn ycocg(r: i32, g: i32, b: i32) -> [i32; 3] {
+pub(crate) fn ycocg(r: i32, g: i32, b: i32) -> [i32; 3] {
     let co = r.wrapping_sub(b);
     let t = b.wrapping_add(co >> 1);
     let cg = g.wrapping_sub(t);

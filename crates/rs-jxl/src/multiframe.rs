@@ -43,7 +43,7 @@ pub enum Reference {
     SmallestCrop,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Rect {
     pub x: u32,
     pub y: u32,

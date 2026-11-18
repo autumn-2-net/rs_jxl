@@ -127,3 +127,41 @@ For the eight explicit-layer cases above, all streams matched the two-trial
 baseline; eligible small-first pairs encoded at 0.386 / 0.490 MPix/s.
 The local command-line runner, reports and Python comparisons are in
 `out/multiframe-screen-20261118/`.
+
+## Recovering size with one encoded candidate per frame
+
+Compared with `24e8ff0`, the selector samples large canvases more densely
+when estimating raw-channel entropy. Under automatic RGB transform search
+it estimates YCoCg residuals and accounts for spatial context lost across
+dense splits. Alternative partitions reuse estimates for identical Replace
+rectangles. Both builds encoded one candidate per logical frame.
+
+These Windows x86_64 release runs alternated the old and new binaries within
+each sequence. The tables sum the median wall times of three measured runs
+after one warmup. CLI timing includes PNG input, process startup and file
+output. The complete-search sizes are the earlier measurements above.
+
+| CLI default | Frames | Bytes before | Bytes after | Seconds before / after | Encode MPix/s before / after |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Five development sequences | 50 | 4,984,137 | 4,951,001 | 7.867 / 7.797 | 1.745 / 1.760 |
+| Two held-out GIF sequences | 6 | 41,170 | 41,170 | 0.310 / 0.324 | 0.872 / 0.834 |
+
+The five-sequence result recovered 33,136 of the 40,953 bytes separating the
+previous screen from complete search (81%). Streamz demo saved 27,911 bytes
+and the t3 pair saved 5,225. The other three sizes matched. On the t3 pair
+alone the smaller result took 0.785 s versus 0.699 s. The two held-out
+sequences, `animation_patches` and `traffic_light`, were selected before
+measurement and did not participate in selection tuning. Official djxl
+reproduced all 56 input frames pixel for pixel.
+
+| Python E9, 4 threads | Frames | Bytes before | Bytes after | Seconds before / after | Encode MPix/s before / after |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 16 development sequences | 119 | 5,112,155 | 5,094,065 | 12.754 / 12.736 | 3.936 / 3.941 |
+
+Python timing covers the encode call with arrays already loaded. The new
+streams recovered 18,090 of the 29,710 bytes separating the previous screen
+from complete search (61%). Six sequences shrank, nine matched the old size,
+and Newton's cradle grew by 1,788 bytes. The two revisit cases reached their
+complete-search sizes, taking 0.284 / 0.342 s compared with 0.195 / 0.238 s
+previously. All 119 frames decoded to their original arrays. The local
+per-sequence reports and runners are in `out/multiframe-rate-24e8ff0/`.

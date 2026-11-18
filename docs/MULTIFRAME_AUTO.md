@@ -332,6 +332,12 @@ inputs, while candidate/pixel/output budgets apply to its actual work and bytes.
 `screen_candidates=true` is the Python and CLI default: select one candidate
 before encoding, using cheap samples for packed U8 input without separate extra
 or Modular planes, and geometry for other inputs. No minimum frame size applies.
+On packed U8 input the selector samples both values and spatial prediction
+errors. For RGB transform search it estimates YCoCg and charges dense
+multi-rectangle partitions for lost spatial context. With other settings the
+grid grows from at most 16 to at most 48 samples per axis on canvases of
+65,536 pixels or more. Identical ordinary Replace rectangles share an estimate
+within each logical frame.
 The selected representation obeys the hard output budget; exceeding it returns
 `Limit` without trying another candidate. The low-level
 Rust `AutoOptions::default()` keeps screening false for compatibility.

@@ -1,9 +1,20 @@
 //! Estimate the relative size of frame candidates before allocating any
 //! candidate images. The encoder still creates exact, lossless payloads.
-use super::{Rect, Strategy, candidates::Candidate, partition::LAYER_OVERHEAD_BYTES};
-use crate::{Image, PixelData};
+use super::{
+    Rect, Strategy,
+    candidates::Candidate,
+    partition::LAYER_OVERHEAD_BYTES,
+    splits::{area, union},
+};
+use crate::{EncodeOptions, Image, PixelData, modular::palette_groups::ycocg};
+use std::collections::HashMap;
 
-pub(super) fn select(candidates: &mut Vec<Candidate>, images: &[Image], index: usize) {
+pub(super) fn select(
+    candidates: &mut Vec<Candidate>,
+    images: &[Image],
+    index: usize,
+    options: &EncodeOptions,
+) {
     let image = &images[index];
     if candidates.len() <= 1 {
         return;
@@ -14,6 +25,21 @@ pub(super) fn select(candidates: &mut Vec<Candidate>, images: &[Image], index: u
         }
         _ => None,
     };
+    // RCT search includes YCoCg directly after identity. Use its decorrelated
+    // channels as a proxy when the encoder is choosing a color transform.
+    let search_rct = image.color_channels() == 3
+        && options
+            .modular
+            .rct_candidates
+            .is_some_and(|count| count >= 2);
+    // A wider grid captures sparse details on large canvases. Keep the cheaper
+    // grid for the transform search, whose color model already reduces variance.
+    let grid = if !search_rct && u64::from(image.width()) * u64::from(image.height()) >= 256 * 256 {
+        48
+    } else {
+        16
+    };
+    let mut replace_costs = HashMap::new();
     let mut best = (0, f64::INFINITY);
     for (rank, candidate) in candidates.iter().enumerate() {
         let reference = match (candidate.strategy, candidate.reference_index) {
@@ -24,9 +50,37 @@ pub(super) fn select(candidates: &mut Vec<Candidate>, images: &[Image], index: u
             _ => None,
         };
         let bits = if let Some(target) = target {
-            let mut sum = 0.0;
+            // Dense splits give up spatial context at each independent layer
+            // boundary. Discount that loss for splits that skip large gaps.
+            let scale = if search_rct && candidate.rects.len() > 1 {
+                let covered: u64 = candidate.rects.iter().copied().map(area).sum();
+                let bounds = candidate.rects.iter().copied().reduce(union).unwrap();
+                1.0 + 0.125 * covered as f64 / area(bounds) as f64
+            } else {
+                1.0
+            };
+            let layers = candidate.rects.len() * (1 + usize::from(candidate.multiply_mask()));
+            let mut sum = layers as f64 * 8.0 * LAYER_OVERHEAD_BYTES;
             for &rect in &candidate.rects {
-                sum += estimate_rect(image, target, reference, candidate, rect);
+                let estimate = || {
+                    if search_rct {
+                        estimate_rect::<true, 1021, 2041>(
+                            image, target, reference, candidate, rect, grid,
+                        )
+                    } else {
+                        estimate_rect::<false, 511, 1021>(
+                            image, target, reference, candidate, rect, grid,
+                        )
+                    }
+                };
+                // Ordinary Replace rectangles encode identical target samples
+                // across reference choices and competing partitions.
+                let payload = if candidate.replace() {
+                    *replace_costs.entry(rect).or_insert_with(estimate)
+                } else {
+                    estimate()
+                };
+                sum += payload * scale + area(rect) as f64 * 0.01;
                 if sum >= best.1 {
                     break;
                 }
@@ -44,12 +98,15 @@ pub(super) fn select(candidates: &mut Vec<Candidate>, images: &[Image], index: u
     candidates.push(selected);
 }
 
-fn estimate_rect(
+// Signed RGB differences range from -255 to 255. RCT6 doubles the chroma
+// range, and subtracting a clamped predictor can double that range again.
+fn estimate_rect<const RCT: bool, const VALUES: usize, const ERRORS: usize>(
     image: &Image,
     target: &[u8],
     reference: Option<&[u8]>,
     candidate: &Candidate,
     rect: Rect,
+    grid: u32,
 ) -> f64 {
     let channels = image.layout().channels();
     let multiply = candidate.multiply_mask();
@@ -68,17 +125,21 @@ fn estimate_rect(
                 values[c] =
                     i16::from(target[start + c]) - reference.map_or(0, |r| i16::from(r[start + c]));
             }
+            if RCT {
+                let [y, co, cg] = ycocg(values[0].into(), values[1].into(), values[2].into());
+                values[..3].copy_from_slice(&[y as i16, co as i16, cg as i16]);
+            }
         }
         // The multiply mask has the same keep/clear pattern in every channel.
         values[channels] = i16::from(multiply && !changed);
         values
     };
-    let mut values = [[0u16; 511]; 5];
-    let mut errors = [[0u16; 1021]; 5];
+    let mut values = [[0u16; VALUES]; 5];
+    let mut errors = [[0u16; ERRORS]; 5];
     // Stratified, repeatable positions avoid locking the grid to image patterns.
     // Include one west/north neighborhood to estimate spatial predictability.
-    let nx = rect.width.min(16);
-    let ny = rect.height.min(16);
+    let nx = rect.width.min(grid);
+    let ny = rect.height.min(grid);
     let mut jitter = 1u32;
     let mut position = |cell: u32, extent: u32, cells: u32| {
         let left = u64::from(cell) * u64::from(extent) / u64::from(cells);
@@ -104,8 +165,8 @@ fn estimate_rect(
                 } else {
                     (west[c] + north[c] - nw[c]).clamp(west[c].min(north[c]), west[c].max(north[c]))
                 };
-                values[c][(255 + v[c]) as usize] += 1;
-                errors[c][(510 + v[c] - pred) as usize] += 1;
+                values[c][((VALUES / 2) as i16 + v[c]) as usize] += 1;
+                errors[c][((ERRORS / 2) as i16 + v[c] - pred) as usize] += 1;
             }
         }
     }
@@ -123,8 +184,5 @@ fn estimate_rect(
     let bits_per_pixel: f64 = (0..planes)
         .map(|c| entropy(&values[c]).min(entropy(&errors[c])))
         .sum();
-    let area = f64::from(rect.width) * f64::from(rect.height);
-    // Even an apparently flat sample costs something to cover. Use the same
-    // per-layer overhead as the rectangle partitioner.
-    (1 + usize::from(multiply)) as f64 * 8.0 * LAYER_OVERHEAD_BYTES + area * (bits_per_pixel + 0.01)
+    area(rect) as f64 * bits_per_pixel
 }
