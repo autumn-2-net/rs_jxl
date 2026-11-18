@@ -390,3 +390,20 @@ internal background copy. Visible output and reference data remain the contract.
 The parent `decoder_reference_copy` includes a same-slot RGB/RGBA8/16 chain,
 incremental input and F32/raw-layer fallbacks, using an independent original-word
 compositor. The parent speed report records final validation and measurements.
+
+## Typed Explicit Palette Expansion (2026-11-18)
+
+`jxl/src/frame/modular/transforms/palette.rs` specializes zero-predictor
+palette expansion when one scan of the shared index plane proves that every
+index, after the existing negative-to-zero clamp, selects an explicit entry.
+It reads typed I16/I32 palette rows directly for each output channel, avoiding
+repeated byte decoding and explicit/implicit dispatch, as well as initializing
+implicit palettes for these groups. The index scan is shared by all channels.
+Implicit cube entries, empty palettes and partial-render overshoots retain the
+existing general implementation. Valid partial explicit indices use the same
+entries as the original clipped lookup. No unsafe code or ISA dependency is
+added; this is a portable scalar specialization.
+
+The parent `decoder_parallel_pixels` palette/squeeze hidden-RGB test covers
+multigroup U8/U16 explicit palette decoding. Parent-run exact-output benchmarks
+and tests determine acceptance; this ledger does not assert measured speedup.

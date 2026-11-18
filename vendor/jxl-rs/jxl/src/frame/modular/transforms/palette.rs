@@ -282,6 +282,56 @@ impl<'a, 'b> PaletteStep<'a, 'b> {
         if predictor == Predictor::Zero {
             assert_eq!(grid_xsize, 1);
             assert_eq!(buf_in.len(), 1);
+            // Ordinary explicit palettes need no implicit cube/delta lookup. Check the
+            // shared index plane once for all output channels, then use typed palette
+            // rows directly. Negative indices still select entry zero, as below.
+            // Out-of-range and partial-render overshoots keep the general path.
+            let palette_size = buf_pal.size(storage).0;
+            if palette_size != 0 {
+                if storage == ModularStorage::I16 {
+                    let indices = ImageRect::<i16>::from_raw(buf_in[0].data.as_rect());
+                    let all_explicit = (0..h).all(|y| {
+                        indices
+                            .row(y)
+                            .iter()
+                            .all(|&i| (i.max(0) as usize) < palette_size)
+                    });
+                    if all_explicit {
+                        let palette = ImageRect::<i16>::from_raw(buf_pal.data.as_rect());
+                        for (c, out_buf) in buf_out.iter_mut().enumerate() {
+                            let entries = palette.row(c);
+                            let mut out = ImageRectMut::<i16>::from_raw(out_buf.data.as_rect_mut());
+                            for y in 0..h {
+                                for (dst, &index) in out.row(y).iter_mut().zip(indices.row(y)) {
+                                    *dst = entries[index.max(0) as usize];
+                                }
+                            }
+                        }
+                        return Ok(());
+                    }
+                } else {
+                    let indices = ImageRect::<i32>::from_raw(buf_in[0].data.as_rect());
+                    let all_explicit = (0..h).all(|y| {
+                        indices
+                            .row(y)
+                            .iter()
+                            .all(|&i| (i.max(0) as usize) < palette_size)
+                    });
+                    if all_explicit {
+                        let palette = ImageRect::<i32>::from_raw(buf_pal.data.as_rect());
+                        for (c, out_buf) in buf_out.iter_mut().enumerate() {
+                            let entries = palette.row(c);
+                            let mut out = ImageRectMut::<i32>::from_raw(out_buf.data.as_rect_mut());
+                            for y in 0..h {
+                                for (dst, &index) in out.row(y).iter_mut().zip(indices.row(y)) {
+                                    *dst = entries[index.max(0) as usize];
+                                }
+                            }
+                        }
+                        return Ok(());
+                    }
+                }
+            }
             let is_single_channel = buf_out.len() == 1;
             for (c, out_buf) in buf_out.iter_mut().enumerate() {
                 let palette = Palette::new(&out_buf.bit_depth, c, buf_pal, storage);

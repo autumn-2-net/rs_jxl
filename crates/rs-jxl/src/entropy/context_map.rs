@@ -7,8 +7,9 @@
 //! Tries the source's simple, raw-coded, and MTF-coded representations. Unlike
 //! the source's dry histogram estimates, selection measures complete serialized
 //! candidates, including mode flags, nested headers, extra bits, and ANS state.
-//! Each coded candidate uses source RLE and source prefix/ANS selection, not
-//! Model::Auto's estimate. The winning bits are appended without re-encoding.
+//! Each coded candidate uses source RLE. Maps of 32..=256 entries compare
+//! exact prefix/ANS sizes; other maps retain source prefix/ANS selection. The
+//! winning bits are appended without re-encoding.
 //!
 //! A coded map has one literal context plus a distance context when RLE is
 //! accepted. That model's own map has at most two entries: source RLE cannot
@@ -30,6 +31,10 @@ use crate::tools::lz77::{self, Command, Literal, SourceConfig};
 use crate::{Error, Result};
 
 const MAX_HISTOGRAMS: usize = 256;
+// Bound the additional model fitting to metadata-sized maps, independently of
+// the potentially much larger global MA-tree leaf count.
+const EXACT_CODING_MAX_ENTRIES: usize = 256;
+const EXACT_CODING_MIN_ENTRIES: usize = 32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Representation {
@@ -185,6 +190,20 @@ fn rle_tokens(streams: &[Vec<Token>; 1]) -> Result<(Vec<Token>, bool)> {
 }
 
 fn coded_candidate(streams: &[Vec<Token>; 1], representation: Representation) -> Result<Candidate> {
+    let coding =
+        if (EXACT_CODING_MIN_ENTRIES..=EXACT_CODING_MAX_ENTRIES).contains(&streams[0].len()) {
+            Coding::Auto
+        } else {
+            Coding::Source
+        };
+    coded_candidate_with_coding(streams, representation, coding)
+}
+
+fn coded_candidate_with_coding(
+    streams: &[Vec<Token>; 1],
+    representation: Representation,
+    coding: Coding,
+) -> Result<Candidate> {
     debug_assert!(representation != Representation::Simple);
     let max_bytes = streams[0]
         .len()
@@ -202,7 +221,7 @@ fn coded_candidate(streams: &[Vec<Token>; 1], representation: Representation) ->
         &streams,
         1 + usize::from(enabled),
         enabled,
-        Coding::Source,
+        coding,
         &options,
     )?;
     let mut writer = BitWriter::new(max_bytes);
@@ -237,7 +256,7 @@ fn choose(context_map: &[u8], num_histograms: usize) -> Result<Candidate> {
         }
     }
     // Strict comparisons preserve source tie preferences: raw over MTF and
-    // coded over simple. Prefix/ANS selection is the source heuristic.
+    // coded over simple. The bounded small-map prefix/ANS comparison is exact.
     Ok(best)
 }
 
@@ -505,6 +524,44 @@ mod tests {
             );
         }
         costs
+    }
+
+    #[test]
+    fn small_map_coding_never_exceeds_source_and_large_maps_keep_policy() {
+        for length in [17, 99, 100, 127, 256, 257] {
+            let map: Vec<u8> = (0..length).map(|i| (i % 9) as u8).collect();
+            for (values, representation) in [
+                (map.clone(), Representation::Raw),
+                (
+                    move_to_front_transform(&map).unwrap(),
+                    Representation::MoveToFront,
+                ),
+            ] {
+                let streams = token_stream(&values).unwrap();
+                let source =
+                    coded_candidate_with_coding(&streams, representation, Coding::Source).unwrap();
+                let selected = coded_candidate(&streams, representation).unwrap();
+                if (EXACT_CODING_MIN_ENTRIES..=EXACT_CODING_MAX_ENTRIES).contains(&length) {
+                    assert!(selected.writer.bits_written() <= source.writer.bits_written());
+                } else {
+                    assert_eq!(
+                        serialized_bits(selected.writer),
+                        serialized_bits(source.writer)
+                    );
+                    continue;
+                }
+                wire_roundtrip(&map, selected);
+            }
+        }
+        // A 100-token balanced binary map crosses the source heuristic's ANS
+        // threshold, although its one-bit prefix codes avoid the ANS state.
+        let map: Vec<u8> = (0..100).map(|i| (i % 2) as u8).collect();
+        let streams = token_stream(&map).unwrap();
+        let source =
+            coded_candidate_with_coding(&streams, Representation::Raw, Coding::Source).unwrap();
+        let selected = coded_candidate(&streams, Representation::Raw).unwrap();
+        assert!(selected.writer.bits_written() < source.writer.bits_written());
+        wire_roundtrip(&map, selected);
     }
 
     #[test]

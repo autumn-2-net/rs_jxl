@@ -373,7 +373,7 @@ fn replacement_cost_tracks_nonzero_offsets_and_shared_token_extra_bits() {
     for (index, new) in [(0, 17), (1, -9), (2, 0), (3, 18), (5, i32::MIN), (6, 0)] {
         let old = offsets[index];
         let before = cost(&offsets, &counts);
-        let delta = replacement_cost(&counts, old, new);
+        let delta = replacement_cost(&counts, old, new, &mut SignalingCostCache::new());
         counts[UINT.encode(pack_signed(old)).token as usize] -= 1;
         counts[UINT.encode(pack_signed(new)).token as usize] += 1;
         offsets[index] = new;
@@ -1046,6 +1046,43 @@ fn stateless_literal_fit_bound_prevents_modulo_aliases_at_extreme_offsets() {
                     assert_eq!(i64::from(signed.wrapping_add(offset)), residual);
                 }
             }
+        }
+    }
+}
+
+#[test]
+fn cached_signaling_costs_preserve_bits_during_histogram_updates_and_evictions() {
+    let mut cache = SignalingCostCache::new();
+    for count in (0..=2048).chain((0..=2048).rev()) {
+        assert_eq!(cache.term(count).to_bits(), xlogx(count).to_bits());
+    }
+    let offsets = [i32::MIN, -10000, -17, -1, 0, 1, 17, 10000, i32::MAX];
+    let mut counts = [0; TOKENS];
+    for (i, count) in counts.iter_mut().enumerate() {
+        *count = (i as u64 * 7919) % 1024 + 1;
+    }
+    for round in 0..8 {
+        for old in offsets {
+            for new in offsets {
+                let a = UINT.encode(pack_signed(old));
+                let b = UINT.encode(pack_signed(new));
+                let extra = f64::from(b.nbits) - f64::from(a.nbits);
+                let expected = if a.token == b.token {
+                    extra
+                } else {
+                    let removed = counts[a.token as usize];
+                    let added = counts[b.token as usize];
+                    xlogx(removed) - xlogx(removed - 1) + xlogx(added) - xlogx(added + 1) + extra
+                };
+                assert_eq!(
+                    replacement_cost(&counts, old, new, &mut cache).to_bits(),
+                    expected.to_bits()
+                );
+            }
+        }
+        // The cache keys are populations, so histogram mutations cannot stale it.
+        for (i, count) in counts.iter_mut().enumerate() {
+            *count = (i as u64 * 17 + round * 127) % 2048 + 1;
         }
     }
 }

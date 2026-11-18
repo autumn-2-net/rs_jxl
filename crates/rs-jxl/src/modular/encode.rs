@@ -61,7 +61,7 @@ pub struct ModularOptions {
     pub entropy: Coding,
     /// Source e9 ordinary learned-tree defaults; false preserves explicit tools only.
     pub source_ma_defaults: bool,
-    /// Ordinary pixel e9 Sparse/prev1/ScreenedRuns defaults. Explicit source
+    /// Ordinary pixel e7–9 screened palettes and e9 Sparse/prev1. Explicit source
     /// tool settings win; false restores the earlier defaults for ablation.
     pub source_tool_defaults: bool,
     /// Post-training tools; source projection may supply e9 defaults when enabled.

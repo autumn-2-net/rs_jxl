@@ -430,9 +430,12 @@ fn project_native_metadata(
         .as_ref()
         .map(|p| p.tools)
         .unwrap_or_default();
-    if speed_tier == 1 && base.modular.source_tool_defaults && base.modular.palette_policy.is_none()
+    if (1..=3).contains(&speed_tier)
+        && base.modular.source_tool_defaults
+        && base.modular.palette_policy.is_none()
     {
         palette_tools.order = crate::modular::palette::PaletteOrder::ScreenedRuns;
+        palette_tools.mapping = crate::modular::palette::PaletteMapping::Flat;
     }
     let palette_grouping = options
         .modular

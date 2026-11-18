@@ -15,9 +15,9 @@
 //!
 //! `DefaultScorer` is the internal source-default f32 trainer path: caller-
 //! validated weighted totals, immutable cached deltas, fused movement/scoring,
-//! and a shared triangular contribution table for each side with total <=256.
+//! and a shared triangular contribution table for each side with total <=512.
 //! Its parent estimate uses FastLog2f directly, never a log(count) cache.
-//! Native sweeps with combined mass <=256 specialize to that table throughout,
+//! Native sweeps with combined mass <=512 specialize to that table throughout,
 //! hoisting block/tail layout without changing any split or accumulation order.
 //! `RS_JXL_MA_AVX512=1` opts into 16-bin dense computation with the same eight
 //! logical accumulation lanes. The flag and CPU/OS support are checked once
@@ -123,7 +123,7 @@ fn fast_contribution(count: u32, total: u32, inverse: f32) -> f32 {
     -(count as f32 * fast_log2::<false>(probability))
 }
 
-const SMALL_HISTOGRAM_TOTAL: u32 = 256;
+const SMALL_HISTOGRAM_TOTAL: u32 = 512;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DefaultBackend {
@@ -189,7 +189,7 @@ impl DefaultBackend {
 /// Lengths are checked before mutation; even invalid counts cannot cause an
 /// out-of-bounds native gather. No histogram allocation, copy, or delta clearing
 /// occurs during scoring. Each used numerical profile initializes its own
-/// shared 132612-byte table once; a normal process selects only one profile.
+/// shared 527364-byte table once; a normal process selects only one profile.
 ///
 /// Numerical profile: source FastLog2f with fused Horner multiply-add on
 /// AVX2+FMA, non-fused fallbacks, real division, integer count==total masking,

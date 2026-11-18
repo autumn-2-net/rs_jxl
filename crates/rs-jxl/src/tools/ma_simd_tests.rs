@@ -79,6 +79,27 @@ fn default_profiles() -> Vec<(DefaultScorer, usize)> {
 }
 
 #[test]
+fn default_zero_blocks_preserve_each_native_expression_and_lane_order() {
+    for (scorer, lanes) in default_profiles() {
+        for length in [8, 16, 17, 31, 64, 129, 256] {
+            for total in [0, 257, 4096, 65537, i32::MAX as u32] {
+                let mut counts = vec![0; length];
+                if total != 0 {
+                    counts[length - 1] = total / 3;
+                    counts[0] = total - counts[length - 1];
+                }
+                let expected = default_oracle(&counts, total, lanes, scorer.backend.uses_fma());
+                assert_eq!(
+                    scorer.estimate_bits(&counts, total).to_bits(),
+                    expected.to_bits(),
+                    "lanes={lanes} length={length} total={total}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn fma_horner_matches_independent_f32_and_native_lane_oracles() {
     let mut values = Vec::new();
     for exponent in -12..=0 {
@@ -775,11 +796,11 @@ fn default_split_sweep_rejects_invalid_layout_before_mutation() {
 fn default_small_table_is_shared_source_expression_not_log_cache() {
     let scorer = DefaultScorer::default();
     assert!(std::ptr::eq(scorer.small, DefaultScorer::new().small));
-    assert_eq!(std::mem::size_of_val(scorer.small), 132612);
-    assert_eq!(scorer.small_row(257), &[]);
+    assert_eq!(std::mem::size_of_val(scorer.small), 527364);
+    assert_eq!(scorer.small_row(SMALL_HISTOGRAM_TOTAL + 1), &[]);
     for (profile, width) in default_profiles() {
         assert_eq!(profile.lanes(), width);
-        for total in 0..=256 {
+        for total in 0..=SMALL_HISTOGRAM_TOTAL {
             let row = profile.small_row(total);
             assert_eq!(row.len(), total as usize + 1);
             for count in 0..=total {

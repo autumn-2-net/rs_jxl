@@ -408,8 +408,9 @@ fails if unsupported by encoder. spot_color is four floats, cfa_channel integer.
   strip_metadata=false; optional group_size_shift,rct,predictor,palette_colors,
   patches(bool),learning_fraction,ma_max_leaves,source_ma_defaults(bool, default true),
   source_tool_defaults(bool, default true),source_patch_parallel_gather(bool, default true).
-  source_tool_defaults enables ordinary pixel-lossless e9 Sparse LZ77, prev1
-  previous-channel MA features and Palette ScreenedRuns; these are not lab-only.
+  source_tool_defaults enables screened palette ordering and flat palette lookup
+  at pixel-lossless efforts 7–9. Effort 9 also enables Sparse LZ77 and prev1
+  previous-channel MA features.
   False disables only these automatic tool additions, preserving source_ma_defaults,
   source_patch_parallel_gather and explicit Rust tool overrides. Other efforts keep
   their existing tool defaults. The native base.modular.source_tool_defaults carries

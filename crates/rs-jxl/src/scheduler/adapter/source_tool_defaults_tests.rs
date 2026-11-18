@@ -1,5 +1,5 @@
 use super::*;
-use crate::modular::palette::{PaletteOrder, PaletteTools};
+use crate::modular::palette::{PaletteMapping, PaletteOrder, PaletteTools};
 use crate::modular::source_options::SourceBuffering;
 use crate::tools::lz77::SourceQuickMode;
 use crate::{PixelData, PixelLayout};
@@ -47,14 +47,13 @@ fn ordinary_e9_enables_all_three_tools_without_patch_or_search() {
                     }
                 );
             }
-            assert_eq!(
-                options.modular.palette_policy.unwrap().tools.order,
-                if effort == 9 {
-                    PaletteOrder::ScreenedRuns
-                } else {
-                    PaletteOrder::Default
-                }
-            );
+            let tools = options.modular.palette_policy.unwrap().tools;
+            let expected = if (7..=9).contains(&effort) {
+                (PaletteOrder::ScreenedRuns, PaletteMapping::Flat)
+            } else {
+                (PaletteOrder::Default, PaletteMapping::Tree)
+            };
+            assert_eq!((tools.order, tools.mapping), expected);
         }
     }
 }

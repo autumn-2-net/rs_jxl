@@ -56,6 +56,13 @@ macro_rules! default_kernel {
                 // a nonempty row; gather_entropy bounds its own indices.
                 unsafe { gather_entropy(row, counts) }
             } else {
+                // An empty block contributes only signed zero. Preserve the
+                // original multiply's signs (including total == 0), and still
+                // perform the caller's lane subtraction/reduction in order.
+                // SAFETY: all_zero has this backend's feature requirements.
+                if unsafe { all_zero(counts) } {
+                    return andnot_f(cast_f(eq_i(counts, total)), splat(-0.0));
+                }
                 let cf = convert(counts);
                 let probability = max(mul(cf, inverse), splat(MIN_PROBABILITY));
                 // SAFETY: same CPU feature and positive normal input.
@@ -793,6 +800,12 @@ pub(super) mod sse2 {
     };
 
     #[inline]
+    #[target_feature(enable = "sse2")]
+    unsafe fn all_zero(counts: __m128i) -> bool {
+        _mm_movemask_epi8(_mm_cmpeq_epi32(counts, _mm_setzero_si128())) == 0xffff
+    }
+
+    #[inline]
     fn tail_mask(len: usize) -> usize {
         debug_assert!(len < 4);
         len
@@ -884,6 +897,12 @@ pub(super) mod avx2 {
 
     #[inline]
     #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn all_zero(counts: __m256i) -> bool {
+        _mm256_testz_si256(counts, counts) != 0
+    }
+
+    #[inline]
+    #[target_feature(enable = "avx2")]
     pub(super) unsafe fn tail_mask(len: usize) -> __m256i {
         debug_assert!(len < 8);
         _mm256_cmpgt_epi32(
@@ -921,7 +940,7 @@ pub(super) mod avx2 {
     #[inline]
     #[target_feature(enable = "avx2")]
     pub(super) unsafe fn gather_entropy(row: &[f32], counts: __m256i) -> __m256 {
-        // The selected triangular row is nonempty and at most 257 floats.
+        // The selected triangular row is nonempty and at most 513 floats.
         // Clamp only gather addresses, so this safe crate API cannot read
         // out of bounds even if its numerical contract is violated. This
         // is a no-op for valid counts, not histogram validation or repair.
@@ -948,7 +967,7 @@ pub(super) mod avx2 {
 }
 
 pub(super) mod avx2_fma {
-    use super::avx2::{gather_entropy, load_tail, reduce_default, store_tail, tail_mask};
+    use super::avx2::{all_zero, gather_entropy, load_tail, reduce_default, store_tail, tail_mask};
     use super::{
         DefaultScorer, HistogramSplit, LOG_P, LOG_Q, MIN_PROBABILITY, cached_source_entropy,
         inverse_total, split_delta,
@@ -974,7 +993,7 @@ pub(super) mod avx2_fma {
 }
 
 pub(super) mod avx2_rcp {
-    use super::avx2::{gather_entropy, load_tail, reduce_default, store_tail, tail_mask};
+    use super::avx2::{all_zero, gather_entropy, load_tail, reduce_default, store_tail, tail_mask};
     use super::{
         DefaultScorer, HistogramSplit, LOG_P, LOG_Q, MIN_PROBABILITY, cached_source_entropy,
         inverse_total, split_delta,

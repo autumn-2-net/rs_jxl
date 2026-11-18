@@ -5,7 +5,7 @@
 //! separated from emission; clustering and hybrid-uint search are explicit tools.
 use std::ops::Range;
 
-use super::ans::{AnsCode, AnsToken, write_mapped_tokens};
+use super::ans::{AnsCode, AnsToken, mapped_tokens_bits, write_mapped_tokens};
 #[cfg(test)]
 use super::config_search::choose_config_plan;
 use super::config_search::choose_config_plan_and_histograms;
@@ -40,8 +40,8 @@ impl Token {
 pub enum Coding {
     Prefix,
     Ans,
-    /// Compare separately optimized prefix/ANS models using their header and
-    /// data costs. This is an encoder extension, not the source early heuristic.
+    /// Compare separately optimized prefix/ANS models using exact header and
+    /// payload bit lengths. This is an encoder extension, not the source heuristic.
     Auto,
     /// Source BuildAndEncodeHistograms: prefix for <100 tokens, Fastest
     /// clustering, or all-singleton raw histograms; otherwise ANS.
@@ -388,7 +388,7 @@ impl Model {
                 Err(Error::InvalidInput(_)) => return Ok(prefix),
                 Err(error) => return Err(error),
             };
-            return if prefix.estimated_bits(streams)? <= ans.estimated_bits(streams)? {
+            return if prefix.encoded_bits(streams)? <= ans.encoded_bits(streams)? {
                 Ok(prefix)
             } else {
                 Ok(ans)
@@ -613,31 +613,34 @@ impl Model {
         Ok(Some((models, work)))
     }
 
-    fn estimated_bits(&self, streams: &[Vec<Token>]) -> Result<f64> {
+    fn encoded_bits(&self, streams: &[Vec<Token>]) -> Result<usize> {
         let alphabet_total: usize = match &self.tables {
             Tables::Prefix(tables) => tables.iter().map(PrefixCode::alphabet_size).sum(),
             Tables::Ans(tables) => tables.iter().map(|t| t.normalized_counts().len()).sum(),
         };
         let mut header = BitWriter::new(alphabet_total * 8 + self.map.len() * 8 + 65536);
         self.write_header(&mut header)?;
-        let mut bits = header.bits_written() as f64;
+        let mut bits = header.bits_written();
         if let Tables::Prefix(tables) = &self.tables {
             for t in streams.iter().flatten() {
                 let t = self.map_token(*t)?;
-                bits += f64::from(
+                let token_bits = usize::from(
                     tables[t.context]
                         .symbol_bits(t.symbol)
                         .map_err(|e| Error::Encoding(e.to_string()))?,
-                ) + f64::from(t.nbits);
+                ) + usize::from(t.nbits);
+                bits = bits
+                    .checked_add(token_bits)
+                    .ok_or(Error::Limit("entropy bit count"))?;
             }
         }
         if let Tables::Ans(tables) = &self.tables {
-            bits += 32.0 * streams.len() as f64;
             for stream in streams {
-                for t in stream {
-                    let t = self.map_token(*t)?;
-                    bits += tables[t.context].symbol_cost(t.symbol)? + f64::from(t.nbits);
-                }
+                bits = bits
+                    .checked_add(mapped_tokens_bits(tables, stream.len(), |index| {
+                        self.map_token(stream[index])
+                    })?)
+                    .ok_or(Error::Limit("entropy bit count"))?;
             }
         }
         Ok(bits)
@@ -1152,6 +1155,34 @@ mod fixed_tests;
 mod tests {
     use super::super::options::{AnsHistogramStrategy, ClusterStrategy};
     use super::*;
+
+    #[test]
+    fn auto_selects_smallest_emitted_model_and_payload() {
+        for length in [0, 1, 17, 63, 100, 257, 1024] {
+            let streams = vec![
+                (0..length)
+                    .map(|i| Token::literal(i % 2, ((i * 13 + i / 7) % 31) as u32))
+                    .collect(),
+                vec![],
+            ];
+            let emitted_bits = |model: &Model| {
+                let mut writer = BitWriter::new(65536);
+                model.write_header(&mut writer).unwrap();
+                for stream in &streams {
+                    model.write_stream(stream, &mut writer).unwrap();
+                }
+                assert_eq!(model.encoded_bits(&streams).unwrap(), writer.bits_written());
+                writer.bits_written()
+            };
+            let prefix = Model::build(&streams, 2, false, Coding::Prefix).unwrap();
+            let ans = Model::build(&streams, 2, false, Coding::Ans).unwrap();
+            let auto = Model::build(&streams, 2, false, Coding::Auto).unwrap();
+            assert_eq!(
+                emitted_bits(&auto),
+                emitted_bits(&prefix).min(emitted_bits(&ans))
+            );
+        }
+    }
 
     #[test]
     fn ema_prefix_and_incremental_models_keep_original_path() {

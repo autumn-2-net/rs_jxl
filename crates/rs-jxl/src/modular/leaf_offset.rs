@@ -332,7 +332,39 @@ fn collect_leaves(
     Ok((leaves, offset_counts))
 }
 
-fn replacement_cost(counts: &[u64; TOKENS], old: i32, new: i32) -> f64 {
+// Histogram populations repeat across neighboring offset proposals and sweeps.
+// Cache only the integer-to-f64 term; retain the original arithmetic order.
+// Collisions repeat log2 without changing scores or bounding the population.
+struct SignalingCostCache {
+    entries: [(u64, f64); 256],
+}
+
+impl SignalingCostCache {
+    fn new() -> Self {
+        Self {
+            entries: [(0, 0.0); 256],
+        }
+    }
+
+    fn term(&mut self, count: u64) -> f64 {
+        if count < 2 {
+            return 0.0;
+        }
+        let slot = (count.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 56) as usize;
+        let entry = &mut self.entries[slot];
+        if entry.0 != count {
+            *entry = (count, xlogx(count));
+        }
+        entry.1
+    }
+}
+
+fn replacement_cost(
+    counts: &[u64; TOKENS],
+    old: i32,
+    new: i32,
+    cache: &mut SignalingCostCache,
+) -> f64 {
     let old = UINT.encode(pack_signed(old));
     let new = UINT.encode(pack_signed(new));
     let extra = f64::from(new.nbits) - f64::from(old.nbits);
@@ -341,7 +373,8 @@ fn replacement_cost(counts: &[u64; TOKENS], old: i32, new: i32) -> f64 {
     }
     let removed = counts[old.token as usize];
     let added = counts[new.token as usize];
-    xlogx(removed) - xlogx(removed - 1) + xlogx(added) - xlogx(added + 1) + extra
+    cache.term(removed) - cache.term(removed - 1) + cache.term(added) - cache.term(added + 1)
+        + extra
 }
 
 fn fit_distribution(
@@ -414,6 +447,7 @@ fn fit_distribution(
     };
     // Revisit only cached scores, not pixels: offsets share a signaling histogram.
     // Alternating sweeps reduce the one-way BFS bias without another encode.
+    let mut signaling_cache = SignalingCostCache::new();
     for sweep in 0..3 {
         let mut changed = false;
         for position in 0..proposals.len() {
@@ -426,7 +460,8 @@ fn fit_distribution(
             let (old, mut best_bits) = proposal.costs[proposal.selected];
             let mut best = proposal.selected;
             for (candidate, &(offset, residual_bits)) in proposal.costs.iter().enumerate() {
-                let bits = residual_bits + replacement_cost(&counts, old, offset);
+                let bits =
+                    residual_bits + replacement_cost(&counts, old, offset, &mut signaling_cache);
                 if bits + 1e-9 * best_bits.abs().max(1.0) < best_bits {
                     best = candidate;
                     best_bits = bits;

@@ -140,9 +140,9 @@ encoding, including still source search; JPEG byte transcoding rejects it.
 See [single-pass MA](MA_SINGLE_PASS_DEFAULT_20261114.md) and
 [combined Symmetric defaults](SYMMETRIC_MA_DEFAULT_20261114.md).
 
-Ordinary pixel-lossless effort 9 also defaults to Sparse LZ77, prev1
-previous-channel MA features and Palette ScreenedRuns. These are normal source
-defaults, not lab-only settings; public pixel effort still defaults to 7.
+Ordinary pixel-lossless efforts 7–9 use screened palette ordering and flat
+palette lookup. Effort 9 also enables Sparse LZ77 and prev1 previous-channel
+MA features. The default pixel effort is 7.
 Use `source_tool_defaults=False` or
 `encoder_options={"source_tool_defaults": False}` to disable these automatic
 tool additions. This does not disable `source_ma_defaults` or

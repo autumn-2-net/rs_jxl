@@ -99,6 +99,7 @@ fn allowed_counts(shift: u8) -> &'static AllowedCounts {
                 .last()
                 .is_some_and(|last| u32::from(last.count) == count)
             {
+                indices[i as usize] = (entries.len() - 1) as u16;
                 continue;
             }
             let (step_log, delta_log) = if count == 0 {
@@ -113,7 +114,7 @@ fn allowed_counts(shift: u8) -> &'static AllowedCounts {
             } else {
                 (0, 0)
             };
-            indices[count as usize] = entries.len() as u16;
+            indices[i as usize] = entries.len() as u16;
             entries.push(AllowedCount {
                 count: count as u16,
                 step_log,
@@ -181,16 +182,18 @@ pub(super) fn fast_population_cost(counts: &[u64]) -> Result<f32> {
         return Ok(normalized.histogram_bits()? as f32);
     }
     // Flat header bits do not read counts; each rebalance overwrites every bin.
-    let flat_sum = u128::from(total) * u128::from(log_table()[alphabet_size]) * 12;
+    let logs = log_table();
+    let flat_sum = u128::from(total) * u128::from(logs[alphabet_size]) * 12;
     let mut cost = normalized.histogram_bits()? as f32 + flat_sum as f32 * (1.0 / 2147483648.0);
     let mut bins = [Bin::default(); MAX_ALPHABET_SIZE];
+    let targets = NormalizationTargets::new(&counts[..alphabet_size], total);
     for shift in [0, 6, 11] {
         normalized.method = shift + 1;
-        normalized.rebalance_with_scratch(&counts[..alphabet_size], total, &mut bins)?;
+        normalized.rebalance_with_scratch(&counts[..alphabet_size], &targets, &mut bins)?;
         let sum: i64 = counts[..alphabet_size]
             .iter()
             .zip(normalized.counts.iter())
-            .map(|(&weight, &count)| weight as i64 * i64::from(log_table()[usize::from(count)]))
+            .map(|(&weight, &count)| weight as i64 * i64::from(logs[usize::from(count)]))
             .sum();
         let data_bits = (total as f32 - sum as f32 * (1.0 / 2147483648.0)) * 12.0;
         let candidate = normalized.histogram_bits()? as f32 + data_bits;
@@ -257,18 +260,21 @@ impl NormalizedHistogram {
             AnsHistogramStrategy::Direct6 => &[6],
         };
         let mut normalized = result.clone();
+        let targets = NormalizationTargets::new(&counts[..alphabet_size], total);
+        let mut bins = [Bin::default(); MAX_ALPHABET_SIZE];
+        let logs = log_table();
         for &shift in shifts {
             normalized.method = shift + 1;
-            normalized.rebalance(&counts[..alphabet_size], total)?;
+            normalized.rebalance_with_scratch(&counts[..alphabet_size], &targets, &mut bins)?;
             let sum: i64 = counts[..alphabet_size]
                 .iter()
                 .zip(&normalized.counts)
-                .map(|(&weight, &count)| weight as i64 * i64::from(log_table()[usize::from(count)]))
+                .map(|(&weight, &count)| weight as i64 * i64::from(logs[usize::from(count)]))
                 .sum();
             let data_bits = (total as f32 - sum as f32 * (1.0 / 2147483648.0)) * 12.0;
             normalized.cost = normalized.histogram_bits()? as f32 + data_bits;
             if direct || normalized.cost < result.cost {
-                result = normalized.clone();
+                result.clone_from(&normalized);
             }
         }
         Ok(result)
@@ -278,8 +284,13 @@ impl NormalizedHistogram {
         self.encode(&mut |bits, value| Ok(writer.write(bits, value)?))
     }
 
+    #[cfg(test)]
     fn rebalance(&mut self, weights: &[u64], total: u64) -> Result<()> {
-        self.rebalance_with_scratch(weights, total, &mut [Bin::default(); MAX_ALPHABET_SIZE])
+        self.rebalance_with_scratch(
+            weights,
+            &NormalizationTargets::new(weights, total),
+            &mut [Bin::default(); MAX_ALPHABET_SIZE],
+        )
     }
 }
 
@@ -380,11 +391,42 @@ impl<Counts: AsRef<[u16]>> NormalizedHistogram<Counts> {
     }
 }
 
+/// Rounded targets and the balancing bin depend only on the input population.
+/// The precision trials quantize these targets using their own allowed counts.
+struct NormalizationTargets {
+    rounded: [u16; MAX_ALPHABET_SIZE],
+    adjustable: [bool; MAX_ALPHABET_SIZE],
+    remainder_pos: usize,
+}
+
+impl NormalizationTargets {
+    fn new(weights: &[u64], total: u64) -> Self {
+        let mut targets = Self {
+            rounded: [0; MAX_ALPHABET_SIZE],
+            adjustable: [false; MAX_ALPHABET_SIZE],
+            remainder_pos: 0,
+        };
+        let norm = TABLE_SIZE as f64 / total as f64;
+        for (i, &weight) in weights.iter().enumerate() {
+            if weight > weights[targets.remainder_pos] {
+                targets.remainder_pos = i;
+            }
+            let target = weight as f64 * norm;
+            targets.rounded[i] = (target.round() as u16)
+                .max(u16::from(weight != 0))
+                .min(TABLE_SIZE as u16 - 1);
+            targets.adjustable[i] = target > 1.0;
+        }
+        targets.adjustable[targets.remainder_pos] = false;
+        targets
+    }
+}
+
 impl<Counts: AsRef<[u16]> + AsMut<[u16]>> NormalizedHistogram<Counts> {
     fn rebalance_with_scratch(
         &mut self,
         weights: &[u64],
-        total: u64,
+        targets: &NormalizationTargets,
         bins: &mut [Bin; MAX_ALPHABET_SIZE],
     ) -> Result<()> {
         let counts = self.counts.as_mut();
@@ -392,42 +434,25 @@ impl<Counts: AsRef<[u16]> + AsMut<[u16]>> NormalizedHistogram<Counts> {
         let allowed = allowed_counts(shift);
         let ac = &allowed.entries;
         let logs = log_table();
-        let norm = TABLE_SIZE as f64 / total as f64;
         let mut num_bins = 0;
-        let mut remainder_pos = 0;
-        let mut max_freq = 0i64;
+        let mut remainder_pos = targets.remainder_pos;
+        let max_freq = weights[remainder_pos] as i64;
         let mut rest = TABLE_SIZE as i32;
         for (n, &weight) in weights.iter().enumerate() {
-            let freq = weight as i64;
-            if freq > max_freq {
-                remainder_pos = n;
-                max_freq = freq;
-            }
-            let target = weight as f64 * norm;
-            let mut count = (target.round() as u32)
-                .max(u32::from(weight > 0))
-                .min(TABLE_SIZE as u32 - 1);
-            count &= !((1 << smallest_increment_log(count, shift)) - 1);
-            counts[n] = count as u16;
+            let count_index = usize::from(allowed.indices[usize::from(targets.rounded[n])]);
+            let count = ac[count_index].count;
+            counts[n] = count;
             rest -= count as i32;
-            if target > 1.0 {
+            if targets.adjustable[n] {
                 bins[num_bins] = Bin {
-                    freq,
-                    count_index: usize::from(allowed.indices[count as usize]),
+                    freq: weight as i64,
+                    count_index,
                     bin_index: n,
                 };
                 num_bins += 1;
             }
         }
-        // Stable compaction preserves first-equal increment/decrement choices.
-        let mut retained = 0;
-        for i in 0..num_bins {
-            if bins[i].bin_index != remainder_pos {
-                bins[retained] = bins[i];
-                retained += 1;
-            }
-        }
-        let bins = &mut bins[..retained];
+        let bins = &mut bins[..num_bins];
         rest += i32::from(counts[remainder_pos]);
         if !bins.is_empty() {
             let max_log = ac[1].step_log;
@@ -874,7 +899,11 @@ mod tests {
                     symbols: prototype.symbols,
                 };
                 actual
-                    .rebalance_with_scratch(weights, total, &mut bins)
+                    .rebalance_with_scratch(
+                        weights,
+                        &NormalizationTargets::new(weights, total),
+                        &mut bins,
+                    )
                     .unwrap();
                 assert_eq!(&*actual.counts, expected.counts.as_slice());
                 assert_eq!(actual.omit_pos, expected.omit_pos);
@@ -1040,6 +1069,13 @@ mod tests {
         for shift in 0..12 {
             let allowed = allowed_counts(shift);
             assert_eq!(allowed.entries.last().unwrap().count, 0);
+            for (target, &index) in allowed.indices.iter().enumerate() {
+                let drop = smallest_increment_log(target as u32, shift);
+                assert_eq!(
+                    allowed.entries[usize::from(index)].count as usize,
+                    target & !((1 << drop) - 1)
+                );
+            }
             for (i, entry) in allowed.entries.iter().enumerate() {
                 assert_eq!(usize::from(allowed.indices[usize::from(entry.count)]), i);
                 let drop = smallest_increment_log(u32::from(entry.count), shift);

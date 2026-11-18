@@ -68,7 +68,14 @@ impl BitWriter {
             self.storage
                 .try_reserve(padded - self.storage.len())
                 .map_err(|_| BitWriterError::Allocation)?;
-            self.storage.resize(padded, 0);
+            // Initialize spare bytes in batches so small writes can store a word
+            // directly. Bound extra initialization and copying when a writer is cloned.
+            let initialized = self
+                .storage
+                .capacity()
+                .min(padded.saturating_add(4096))
+                .min(self.max_bytes.saturating_add(8));
+            self.storage.resize(initialized, 0);
         }
         Ok(())
     }
@@ -127,9 +134,30 @@ impl BitWriter {
     pub fn append_unaligned(&mut self, other: &Self) -> Result<()> {
         self.reserve(other.bits_written)?;
         let full_bytes = other.bits_written / 8;
-        for &byte in &other.storage[..full_bytes] {
-            self.write(8, u64::from(byte))?;
+        let offset = self.bits_written / 8;
+        let shift = self.bits_written % 8;
+        if shift == 0 {
+            self.storage[offset..offset + full_bytes].copy_from_slice(&other.storage[..full_bytes]);
+            self.storage[offset + full_bytes] = 0;
+        } else {
+            let mut carry = self.storage[offset];
+            let mut src = other.storage[..full_bytes].chunks_exact(8);
+            let mut pos = offset;
+            for bytes in &mut src {
+                let word = u64::from_le_bytes(bytes.try_into().unwrap());
+                let merged = (word << shift) | u64::from(carry);
+                self.storage[pos..pos + 8].copy_from_slice(&merged.to_le_bytes());
+                carry = (word >> (64 - shift)) as u8;
+                pos += 8;
+            }
+            for &byte in src.remainder() {
+                self.storage[pos] = (byte << shift) | carry;
+                carry = byte >> (8 - shift);
+                pos += 1;
+            }
+            self.storage[pos] = carry;
         }
+        self.bits_written += full_bytes * 8;
         let tail = (other.bits_written % 8) as u8;
         if tail != 0 {
             self.write(
@@ -185,6 +213,32 @@ mod tests {
             &[0xff, 0x81, 0x5d, 0x15, 0x42, 0x71]
         );
     }
+    #[test]
+    fn bulk_append_matches_bit_writes_across_word_and_byte_boundaries() {
+        for shift in 0..8 {
+            for bits in 0..=137 {
+                let mut source = BitWriter::new(18);
+                let mut actual = BitWriter::new(19);
+                let mut expected = BitWriter::new(19);
+                for writer in [&mut actual, &mut expected] {
+                    writer.write(shift, (1 << shift) - 1).unwrap();
+                }
+                for i in 0..bits {
+                    let bit = u64::from((i * 13 + i / 5) % 7 < 3);
+                    source.write(1, bit).unwrap();
+                    expected.write(1, bit).unwrap();
+                }
+                actual.append_unaligned(&source).unwrap();
+                assert_eq!(actual.bits_written(), expected.bits_written());
+                for writer in [&mut actual, &mut expected] {
+                    writer.write(7, 87).unwrap();
+                    writer.zero_pad_to_byte().unwrap();
+                }
+                assert_eq!(actual.bytes().unwrap(), expected.bytes().unwrap());
+            }
+        }
+    }
+
     #[test]
     fn rejects_invalid_operations_without_changing_bits() {
         let mut w = BitWriter::new(1);

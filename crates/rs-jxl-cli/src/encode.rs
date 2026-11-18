@@ -68,7 +68,7 @@ pub(crate) struct EncodeArgs {
     /// Disable automatic e9 MA learner/offsets/scoring; explicit tools still apply.
     #[arg(long, requires = "source_effort")]
     pub(crate) no_source_ma_defaults: bool,
-    /// Disable automatic e9 Sparse LZ77, prev1 and Palette ScreenedRuns defaults.
+    /// Disable automatic e7–9 screened palettes and e9 Sparse LZ77 and prev1.
     #[arg(long, requires = "source_effort")]
     pub(crate) no_source_tool_defaults: bool,
     /// Disable automatic parallel gather for Source Add patches; explicit gathers still apply.

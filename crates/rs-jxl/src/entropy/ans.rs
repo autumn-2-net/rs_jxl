@@ -318,6 +318,37 @@ pub fn write_tokens(codes: &[AnsCode], tokens: &[AnsToken], writer: &mut BitWrit
     write_mapped_tokens(codes, tokens.len(), |index| Ok(tokens[index]), writer)
 }
 
+/// Exact payload length without allocating reverse output chunks. Replaying the
+/// source rANS state is necessary: Shannon costs omit the discrete 16-bit
+/// renormalization boundaries and can select a larger model for short streams.
+pub(crate) fn mapped_tokens_bits(
+    codes: &[AnsCode],
+    token_count: usize,
+    mut map: impl FnMut(usize) -> Result<AnsToken>,
+) -> Result<usize> {
+    let mut ans = AnsCoder {
+        state: INITIAL_STATE,
+    };
+    let mut bits = 32usize;
+    for index in (0..token_count).rev() {
+        let token = map(index)?;
+        let code = codes
+            .get(token.context)
+            .ok_or_else(|| Error::InvalidInput("ANS token context outside code table".into()))?;
+        let info = code.symbol_info(token.symbol)?;
+        if token.nbits > 32 || u64::from(token.bits) >> token.nbits != 0 {
+            return Err(Error::InvalidInput(
+                "ANS token extra bits do not fit their width".into(),
+            ));
+        }
+        let (renormalization, _) = ans.put_symbol(info, &code.reverse_map);
+        bits = bits
+            .checked_add(usize::from(token.nbits) + usize::from(renormalization))
+            .ok_or(Error::Limit("ANS token bit count"))?;
+    }
+    Ok(bits)
+}
+
 /// Source WriteTokens maps original tokens while visiting them in reverse.
 /// Keep only the reverse bit chunks, not a second array of expanded tokens.
 /// Mapping/validation failures cannot modify the destination writer.
@@ -366,6 +397,35 @@ pub(crate) fn write_mapped_tokens(
 pub(super) mod tests {
     use super::super::ans_histogram::test_decode::Reader;
     use super::*;
+
+    #[test]
+    fn counted_payload_matches_emission_across_renormalization_boundaries() {
+        let codes = [
+            AnsCode::from_counts(&[1, 7, 31, 3, 101], 5).unwrap(),
+            AnsCode::from_counts(&[79, 2, 3, 41, 1], 5).unwrap(),
+        ];
+        for length in [0, 1, 2, 7, 15, 16, 17, 31, 32, 33, 127, 1024] {
+            let tokens: Vec<_> = (0..length)
+                .map(|i| AnsToken {
+                    context: i % 2,
+                    symbol: (i * 13 + i / 7) % 5,
+                    nbits: (i % 33) as u8,
+                    bits: if i % 33 == 32 {
+                        u32::MAX
+                    } else {
+                        (1u32 << (i % 33)) - 1
+                    },
+                })
+                .collect();
+            let counted = mapped_tokens_bits(&codes, tokens.len(), |i| Ok(tokens[i])).unwrap();
+            for offset in [0, 1, 7] {
+                let mut writer = BitWriter::new(65536);
+                writer.write(offset, 0).unwrap();
+                write_tokens(&codes, &tokens, &mut writer).unwrap();
+                assert_eq!(writer.bits_written() - usize::from(offset), counted);
+            }
+        }
+    }
 
     // Expanded reference table: physically move symbol/ordinal pairs between
     // buckets. This does not use AliasEntry, Lookup, or the encoder inverse map.
