@@ -388,25 +388,24 @@ pub fn palette_forward_with_options(
     }
     let mut candidates = Vec::new();
     let mut implicit_used = 0;
-    let mut color = vec![0; num_channels];
-    for (x, &first) in planes[0].iter().enumerate() {
-        color[0] = first;
-        for (value, plane) in color[1..].iter_mut().zip(&planes[1..]) {
-            *value = plane[x];
-        }
-        let entry = colors.get(&color)?;
+    let complete = palette_order::visit_runs(planes, |color, run| {
+        let entry = colors.get(color)?;
         if !entry.seen {
             entry.seen = true;
             if entry.implicit {
                 implicit_used += 1;
             } else {
-                candidates.push(color.clone());
+                candidates.push(color.to_vec());
                 if candidates.len() > max_colors as usize {
-                    return Ok(None);
+                    return Ok(false);
                 }
             }
         }
-        entry.count += 1;
+        entry.count += run.len();
+        Ok(true)
+    })?;
+    if !complete {
+        return Ok(None);
     }
     if candidates.len() + implicit_used == 1 {
         return Ok(None);
@@ -425,9 +424,11 @@ pub fn palette_forward_with_options(
         // Low depths and <3 channels have duplicate colors: LAST index wins.
         colors.get(color)?.index = palette_size + k;
     }
-    if ordered {
-        palette_order::reorder(&mut candidates, &mut colors, planes, width, height, tools)?;
-    }
+    let screened_indices = if ordered {
+        palette_order::reorder(&mut candidates, &mut colors, planes, width, height, tools)?
+    } else {
+        None
+    };
     let mut palette = Vec::new();
     palette
         .try_reserve_exact(num_channels)
@@ -441,13 +442,10 @@ pub fn palette_forward_with_options(
         }
         colors.get(&color)?.index = index;
     }
-    let mut indices = zeroed_samples(len)?;
-    for (x, index) in indices.iter_mut().enumerate() {
-        for (value, plane) in color.iter_mut().zip(planes) {
-            *value = plane[x];
-        }
-        *index = colors.get(&color)?.index as i32;
-    }
+    let indices = match screened_indices {
+        Some(indices) => indices,
+        None => palette_order::raster_indices(planes, &mut colors, &mut [])?,
+    };
     Ok(Some(PaletteOutput { palette, indices }))
 }
 

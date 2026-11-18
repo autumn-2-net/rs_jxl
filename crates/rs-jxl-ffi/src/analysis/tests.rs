@@ -252,6 +252,7 @@ fn analysis_enums_have_explicit_snake_case_wire_names() {
         (Strategy::SplitPrevious, "split_previous"),
         (Strategy::SplitFirst, "split_first"),
         (Strategy::SplitRetained, "split_retained"),
+        (Strategy::AddDelta, "add_delta"),
         (Strategy::MultiplyMaskPrevious, "multiply_mask_previous"),
         (Strategy::MultiplyMaskFirst, "multiply_mask_first"),
         (Strategy::MultiplyMaskRetained, "multiply_mask_retained"),

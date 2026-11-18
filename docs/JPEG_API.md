@@ -37,6 +37,12 @@ untouched. Destination I/O errors can still fail publication or a stdout write.
 | `--sample-limit N` | No extra ceiling by default; explicit N is a hard shared MA sample ceiling, not a sampling target |
 | `--force` | Allow replacing an existing regular output file |
 
+At effort 9–11, the direct encoder uses symmetric MA training for learned
+auxiliary trees when decoding speed is zero. High-effort AC models also try
+extending adjacent histogram IDs across unused contexts. The encoder compares
+the serialized map lengths and keeps the shorter map. These choices use
+standard Modular and VarDCT syntax. [Size and throughput measurements](JPEG_COMPRESSION_20261118.md)
+
 The CLI applies the other library budgets below. It has no metadata-stripping
 or pixel-fallback mode. Use the Rust API to customize the remaining budgets.
 

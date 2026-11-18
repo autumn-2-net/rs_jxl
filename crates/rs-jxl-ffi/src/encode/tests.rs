@@ -113,6 +113,7 @@ fn source_ma_defaults_reaches_pixel_projection_without_changing_effort_defaults(
 #[test]
 fn auto_report_keeps_native_statistics_and_separates_pruned_bounds() {
     let frame = AutoFrameReport {
+        allow_add_delta: true,
         allow_multiply_mask: false,
         adaptive_splits: false,
         adaptive_rate_feedback: true,
@@ -177,6 +178,7 @@ fn auto_report_keeps_native_statistics_and_separates_pruned_bounds() {
             "reference_lookahead": true,
             "adaptive_rate_feedback": true,
             "adaptive_splits": false,
+            "allow_add_delta": true,
             "allow_multiply_mask": false,
             "lookahead_comparisons": 3,
             "reused_payloads": 2,

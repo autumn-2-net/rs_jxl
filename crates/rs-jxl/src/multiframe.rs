@@ -6,6 +6,7 @@ use crate::{
 };
 use std::borrow::Cow;
 
+mod add_delta;
 mod analysis;
 mod auto;
 mod candidates;

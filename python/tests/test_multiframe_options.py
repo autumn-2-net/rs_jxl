@@ -46,7 +46,7 @@ class MultiframeOptionAdapters(unittest.TestCase):
         self.assertEqual(self.request(strategy="auto", auto_options={})["auto_options"], {})
 
     def test_all_options_are_forwarded_at_top_level_without_mutating_mapping(self):
-        options = {"allow_mask": False, "allow_multiply_mask": False, "allow_multi_rect": True,
+        options = {"allow_add_delta": False, "allow_mask": False, "allow_multiply_mask": False, "allow_multi_rect": True,
                    "tile_size": np.uint32(8), "max_rectangles": np.int64(4097),
                    "prune": False, "adaptive_rectangles": False, "adaptive_rate_feedback": False, "adaptive_splits": False,
                    "max_frames": 12, "max_total_trials": 30, "max_trial_pixels": 4000}
@@ -74,7 +74,7 @@ class MultiframeOptionAdapters(unittest.TestCase):
     def test_adaptive_switches_are_independent_and_defaults_not_injected(self):
         self.assertNotIn("auto_options", self.request(strategy="auto"))
         self.assertFalse(self.request()["auto"])
-        for name in ("adaptive_rate_feedback", "adaptive_splits", "allow_multiply_mask"):
+        for name in ("adaptive_rate_feedback", "adaptive_splits", "allow_multiply_mask", "allow_add_delta"):
             for enabled in (False, True):
                 for disabled in ({}, {"allow_mask": False}, {"allow_multi_rect": False}, {"adaptive_rectangles": False}):
                     options = {name: enabled, **disabled}
@@ -92,7 +92,7 @@ class MultiframeOptionAdapters(unittest.TestCase):
                    ({"auto_options": {"unknown": True}}, TypeError)]
         for value in ([], [("prune", False)], True, 1, "prune"):
             invalid.append(({"auto_options": value}, TypeError))
-        for name in ("allow_mask", "allow_multiply_mask", "allow_multi_rect", "prune", "adaptive_rectangles", "adaptive_rate_feedback", "adaptive_splits"):
+        for name in ("allow_add_delta", "allow_mask", "allow_multiply_mask", "allow_multi_rect", "prune", "adaptive_rectangles", "adaptive_rate_feedback", "adaptive_splits"):
             for value in (0, 1, "true", None, np.bool_(True)):
                 invalid.append(({"auto_options": {name: value}}, TypeError))
         for name in ("tile_size", "max_rectangles", "max_frames", "max_total_trials", "max_trial_pixels"):

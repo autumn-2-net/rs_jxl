@@ -105,6 +105,10 @@ fn sparse_mask_and_regions_share_actual_encoder_planning() {
         rgba(80, 72, &[(1, 1), (65, 65)], 255),
     ];
     let auto = AutoOptions {
+        // Match the tools available to static geometry analysis.
+        allow_add_delta: false,
+        allow_multiply_mask: false,
+        adaptive_splits: false,
         tile_size: 16,
         max_rectangles: 8,
         prune: false,

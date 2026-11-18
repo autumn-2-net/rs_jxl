@@ -558,9 +558,11 @@ fn pruning_preserves_retained_winner_lengths_and_samples_with_mask_candidates() 
                 .any(|candidate| candidate.strategy == Strategy::MaskRetained),
             opaque
         );
-        assert!(retained_strategy(
-            report.candidates[report.winner_index].strategy
-        ));
+        // A2 must reuse A. A signed Add can use the same retained slot.
+        assert_eq!(
+            report.candidates[report.winner_index].reference_index,
+            Some(1)
+        );
         assert_decoded(&bounded, &images, &[1; 4]);
         assert_decoded(&complete, &images, &[1; 4]);
         assert_reference_reports(&bounded, &[1; 4], true);

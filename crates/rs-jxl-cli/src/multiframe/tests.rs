@@ -48,6 +48,8 @@ fn defaults_preserve_order_and_enable_safe_strategies() {
     args.validate_options().unwrap();
     assert!(auto.allow_mask && auto.allow_multi_rect);
     assert!(auto.allow_multiply_mask);
+    assert!(auto.allow_add_delta);
+    assert!(!parse(&["--no-add-delta"]).auto_options().allow_add_delta);
     assert_eq!(auto.prune, AutoOptions::default().prune);
     assert_eq!(
         auto.adaptive_rectangles,
@@ -467,6 +469,7 @@ fn report_uses_actual_candidate_statistics_and_core_winner() {
     let result = AutoEncodeResult {
         bytes: vec![0; 123],
         frames: vec![AutoFrameReport {
+            allow_add_delta: true,
             allow_multiply_mask: false,
             adaptive_splits: false,
             adaptive_rate_feedback: true,
@@ -542,7 +545,7 @@ fn report_uses_actual_candidate_statistics_and_core_winner() {
     assert_eq!(
         report,
         concat!(
-            "frame 1: winner=1 candidates=2 pruned=1 analysis_elapsed=250ms retained_reference=true reference_lookahead=true adaptive_rate_feedback=true adaptive_splits=false allow_multiply_mask=false lookahead_comparisons=3 reused_payloads=2 reused_payload_pixels=25 references_before=[None, Some(0), Some(1), None] references_after=[None, Some(0), Some(1), None]\n",
+            "frame 1: winner=1 candidates=2 pruned=1 analysis_elapsed=250ms retained_reference=true reference_lookahead=true adaptive_rate_feedback=true adaptive_splits=false allow_multiply_mask=false allow_add_delta=true lookahead_comparisons=3 reused_payloads=2 reused_payload_pixels=25 references_before=[None, Some(0), Some(1), None] references_after=[None, Some(0), Some(1), None]\n",
             "  difference reference=1 source=2 changed_pixels=0 bounds=None\n",
             "  difference reference=0 source=1 changed_pixels=6 bounds=Some(Rect { x: 1, y: 2, width: 3, height: 4 })\n",
             "  candidate=0 strategy=Full reference_index=None source=0 save_as_reference=0 encoded_bytes=100 encoded_frames=1 trial_pixels=100 elapsed=1s\n",
@@ -569,6 +572,7 @@ fn report_uses_actual_candidate_statistics_and_core_winner() {
                 "reference_lookahead": true,
                 "adaptive_rate_feedback": true,
                 "adaptive_splits": false,
+                "allow_add_delta": true,
                 "allow_multiply_mask": false,
                 "lookahead_comparisons": 3,
                 "reused_payloads": 2,

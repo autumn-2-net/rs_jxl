@@ -655,6 +655,49 @@ impl Model {
         self.configs.len()
     }
 
+    /// Optimize the map for a closed collection of streams. Every emitted token,
+    /// including LZ lengths and distances, keeps its fitted table and uint config.
+    pub(crate) fn simplify_unused_contexts(&mut self, streams: &[Vec<Token>]) -> Result<()> {
+        if self.histogram_count() <= 1 {
+            return Ok(());
+        }
+        let mut used = vec![false; self.map.len()];
+        for token in streams.iter().flatten() {
+            used[token.context] = true;
+        }
+        let Some(first) = used.iter().position(|&u| u) else {
+            return Ok(());
+        };
+        let mut anchored = [false; 256];
+        for (&id, &active) in self.map.iter().zip(&used) {
+            anchored[usize::from(id)] |= active;
+        }
+        // The decoder requires every table ID. Keep an anchor even for a table
+        // referenced solely by unused contexts.
+        for (&id, active) in self.map.iter().zip(&mut used) {
+            if !anchored[usize::from(id)] {
+                *active = true;
+                anchored[usize::from(id)] = true;
+            }
+        }
+        let mut candidate = self.map.clone();
+        let mut previous = candidate[first];
+        for (id, active) in candidate.iter_mut().zip(used) {
+            if active {
+                previous = *id;
+            } else {
+                *id = previous;
+            }
+        }
+        if candidate != self.map {
+            let size = |map: &[u8]| super::context_map::encoded_bits(map, self.histogram_count());
+            if size(&candidate)? < size(&self.map)? {
+                self.map = candidate;
+            }
+        }
+        Ok(())
+    }
+
     pub fn context_count(&self) -> usize {
         self.map.len()
     }

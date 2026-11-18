@@ -286,6 +286,7 @@ Python 转码的 `limits` 支持 `max_input_bytes`、`max_output_bytes`、
 | `auto_options` 成员 | 默认值 / 范围 | 作用 |
 | --- | --- | --- |
 | `allow_mask` | **True**，bool | mask 总开关；允许安全条件下的二值 alpha mask + BLEND，也门控 Multiply/Add mask |
+| `allow_add_delta` | **True**，bool | 用标准 Add 图层试编当前帧与参考帧的有符号差值。适用于 8 位灰度和 RGB，带 alpha 时仅尝试最后一帧。CLI 用 `--no-add-delta` 关闭 |
 | `allow_multiply_mask` | **True**，bool | 增加固定两层的 Multiply/Add mask；须同时 allow_mask=True，不依赖多矩形或 adaptive 开关 |
 | `allow_multi_rect` | **True**，bool | 允许多个 REPLACE 矩形层；关闭也关闭 merged、码率反馈及 split 候选，不关闭 mask |
 | `tile_size` | **32**，正 u32 | 初始网格边长；不是每个最终 crop 都必须这么大 |
@@ -348,15 +349,15 @@ for frame in report["frames"]:
 - 相同 crop payload 的合法复用由内部处理，无需参数；并非所有 mask/patch 候选都能共享。
 
 以上新工具均保留 full/crop 和其他符合条件的旧候选，按实际完整编码字节选择，不保证每个输入
-都更小或更快。报告中 `adaptive_rate_feedback`、`adaptive_splits`、`allow_multiply_mask`
-是配置值，不表示一定符合条件或获胜；新策略名为 `SplitPrevious/First/Retained` 和
-`MultiplyMaskPrevious/First/Retained`（各自展开为三个完整枚举名）。Python 默认
+都更小或更快。报告中 `adaptive_rate_feedback`、`adaptive_splits`、`allow_add_delta`、`allow_multiply_mask`
+是配置值。试编报告用 `AddDelta` 表示单层有符号差分，`reference_index` 给出参考输入帧。
+其他候选包括 `SplitPrevious/First/Retained` 和 `MultiplyMaskPrevious/First/Retained`（各自展开为三个完整枚举名）。Python 默认
 `strategy="crop"` 不变，只有显式 `strategy="auto"` 使用这些开关。
 
-CLI 对应 `--no-adaptive-rate-feedback`、`--no-adaptive-splits`、`--no-multiply-mask`；
+CLI 对应 `--no-adaptive-rate-feedback`、`--no-adaptive-splits`、`--no-add-delta`、`--no-multiply-mask`；
 `--no-mask` 是所有 mask 的总关闭开关。关闭 `adaptive_rectangles` 只禁用自适应矩形类，
 不会禁用 Multiply/Add mask，不能据此声称恢复全部旧候选。若要恢复新增这两个工具之前的
-`f4e240c` 候选策略，应同时设 `adaptive_splits=False`、`allow_multiply_mask=False`，其他参数保持
+`f4e240c` 候选策略，应同时设 `allow_add_delta=False`、`adaptive_splits=False`、`allow_multiply_mask=False`，其他参数保持
 不变；`adaptive_rate_feedback` 仍是独立开关，False 只恢复首帧码率估计。
 
 ### 异尺寸与显式 layers

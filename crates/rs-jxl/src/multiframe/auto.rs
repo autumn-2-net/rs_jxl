@@ -183,7 +183,10 @@ fn encode_inner(
             // The keep layer must decode to exact zero/one before blending.
             // Generated Add patches guarantee only the final integer samples.
             let plain_mask;
-            let trial_options = if candidate.multiply_mask() && options.source_patches.is_some() {
+            let trial_options = if (candidate.multiply_mask()
+                || candidate.strategy == Strategy::AddDelta)
+                && options.source_patches.is_some()
+            {
                 plain_mask = EncodeOptions {
                     source_patches: None,
                     source_patch_reference: None,
@@ -195,6 +198,7 @@ fn encode_inner(
             };
             let trial = Trial {
                 canvas,
+                reference: candidate.reference_index.map(|i| &images[i]),
                 image,
                 options: trial_options,
                 index,
@@ -261,6 +265,7 @@ fn encode_inner(
         append(&mut stream, winner_bytes, options.max_output_bytes)?;
         available = winner_references;
         reports.push(AutoFrameReport {
+            allow_add_delta: auto.allow_add_delta,
             allow_multiply_mask: auto.allow_multiply_mask,
             adaptive_splits: auto.adaptive_splits,
             adaptive_rate_feedback: auto.adaptive_rate_feedback,

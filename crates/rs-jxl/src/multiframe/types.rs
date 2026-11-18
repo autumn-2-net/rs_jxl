@@ -6,6 +6,8 @@ use std::time::Duration;
 pub struct AutoOptions {
     /// SmallestCrop tests both first/previous references using actual bytes.
     pub reference: Reference,
+    /// Try a signed temporal difference in a standard Add layer.
+    pub allow_add_delta: bool,
     pub allow_mask: bool,
     /// Add two-layer multiply/add masks (default on); inactive when allow_mask is false.
     pub allow_multiply_mask: bool,
@@ -41,6 +43,7 @@ impl Default for AutoOptions {
     fn default() -> Self {
         Self {
             reference: Reference::SmallestCrop,
+            allow_add_delta: true,
             allow_mask: true,
             allow_multiply_mask: true,
             allow_multi_rect: true,
@@ -81,6 +84,7 @@ pub enum Strategy {
     MultiplyMaskPrevious,
     MultiplyMaskFirst,
     MultiplyMaskRetained,
+    AddDelta,
 }
 
 #[derive(Debug)]
@@ -124,6 +128,7 @@ pub struct AutoDiffReport {
 }
 #[derive(Debug)]
 pub struct AutoFrameReport {
+    pub allow_add_delta: bool,
     pub allow_multiply_mask: bool,
     pub adaptive_splits: bool,
     /// Requested configuration; disabled multi-rectangle/adaptive controls can

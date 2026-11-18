@@ -524,6 +524,72 @@ fn extra_png(main: &Path, index: usize) -> PathBuf {
 }
 
 #[test]
+fn temporal_add_requires_a_reference_without_an_active_patch_atlas() {
+    use rs_jxl::multiframe::{AutoOptions, Strategy, encode_auto};
+
+    let fixture = fixture(Case {
+        width: 385,
+        bits: 8,
+        layout: PixelLayout::Gray,
+        pattern: Pattern::Backgrounds,
+    });
+    fixture.assert_active();
+    let mut metadata = fixture.image.metadata().clone();
+    metadata.animation = Some(Default::default());
+    let background = fixture
+        .image
+        .with_metadata(metadata.clone(), vec![])
+        .unwrap();
+    let PixelData::U8(mut data) = background.pixels().clone() else {
+        unreachable!()
+    };
+    data[0] ^= 1;
+    let last = data.len() - 1;
+    data[last] ^= 1;
+    let update = Image::new(
+        background.width(),
+        background.height(),
+        PixelLayout::Gray,
+        PixelData::U8(data),
+    )
+    .unwrap()
+    .with_metadata(metadata, vec![])
+    .unwrap();
+    let images = [background, update];
+    let policy = AutoOptions {
+        allow_multi_rect: false,
+        allow_mask: false,
+        prune: false,
+        ..Default::default()
+    };
+    for source_patches in [None, Some(fixture.config)] {
+        let eligible = source_patches.is_none();
+        let result = encode_auto(
+            &images,
+            &[1, 2],
+            &EncodeOptions {
+                source_patches,
+                ..Default::default()
+            },
+            &policy,
+        )
+        .unwrap();
+        assert_eq!(
+            result.frames[1]
+                .candidates
+                .iter()
+                .any(|c| c.strategy == Strategy::AddDelta),
+            eligible
+        );
+        let decoded = rs_jxl::decode::decode(&result.bytes, &Default::default()).unwrap();
+        assert_eq!(decoded.frames.len(), 2);
+        for (image, frame) in images.iter().zip(&decoded.frames) {
+            assert_eq!(image.pixels(), &frame.pixels);
+        }
+    }
+}
+
+#[test]
 fn source_add_oracle_fixtures_really_activate() {
     for case in cases() {
         let fixture = fixture(case);

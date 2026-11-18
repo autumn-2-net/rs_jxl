@@ -136,6 +136,9 @@ pub(crate) struct EncodeFramesArgs {
     /// Disable two-layer multiply/add masks (also disabled by --no-mask)
     #[arg(long)]
     no_multiply_mask: bool,
+    /// Disable signed temporal Add layers
+    #[arg(long)]
+    no_add_delta: bool,
     /// Disable the safe multi-rectangle candidate
     #[arg(long)]
     no_multi_rect: bool,
@@ -189,6 +192,7 @@ impl EncodeFramesArgs {
             reference: self.reference.core(),
             retained_reference: self.retained_reference,
             reference_lookahead: self.reference_lookahead,
+            allow_add_delta: !self.no_add_delta,
             allow_mask: !self.no_mask,
             allow_multiply_mask: !self.no_multiply_mask,
             allow_multi_rect: !self.no_multi_rect,

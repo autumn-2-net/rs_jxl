@@ -71,6 +71,7 @@ fn fixture() -> Vec<Image> {
 
 fn auto(prune: bool) -> AutoOptions {
     AutoOptions {
+        allow_add_delta: false,
         adaptive_splits: false,
         adaptive_rate_feedback: true,
         reference: Reference::Previous,
@@ -209,6 +210,7 @@ fn recent_full_rate_beats_independently_encoded_static_geometry() {
         / (SIDE * SIDE) as f64;
     let baseline = static_geometry_baseline(&images, &options, anchor);
     let implicit = AutoOptions {
+        allow_add_delta: false,
         adaptive_splits: false,
         reference: Reference::Previous,
         allow_mask: false,

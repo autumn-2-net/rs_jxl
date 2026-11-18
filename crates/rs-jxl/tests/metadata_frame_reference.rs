@@ -396,6 +396,7 @@ fn merged_rectangles_match_official_decoders() {
                         // This oracle specifically requires the original merged proposal.
                         adaptive_splits: false,
                         allow_multiply_mask: false,
+                        allow_add_delta: false,
                         ..Default::default()
                     },
                 )

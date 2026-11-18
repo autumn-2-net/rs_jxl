@@ -36,6 +36,45 @@ fn fixture(lz: bool) -> (Vec<Vec<Token>>, Vec<u8>, Vec<Vec<u64>>) {
 }
 
 #[test]
+fn unused_context_fill_preserves_payload_and_referenced_table_ids() {
+    let (streams, map, counts) = fixture(true);
+    let tokens = &streams[0];
+    let literal = *tokens.iter().find(|t| map[t.context] == 1).unwrap();
+    let tail = streams.last().unwrap();
+    for observed in [
+        vec![literal],
+        [vec![literal], tail[tail.len() - 2..].to_vec()].concat(),
+    ] {
+        let mut model = Model::from_clustering(
+            &streams,
+            counts.clone(),
+            map.clone(),
+            true,
+            false,
+            &Default::default(),
+        )
+        .unwrap();
+        let payload = |model: &Model| {
+            let mut w = BitWriter::new(4096);
+            model.write_stream(&observed, &mut w).unwrap();
+            let bits = w.bits_written();
+            w.zero_pad_to_byte().unwrap();
+            (bits, w.into_bytes().unwrap())
+        };
+        let before = payload(&model);
+        model
+            .simplify_unused_contexts(std::slice::from_ref(&observed))
+            .unwrap();
+        assert_ne!(model.map, map);
+        assert!(model.map.contains(&0) && model.map.contains(&1));
+        for t in &observed {
+            assert_eq!(model.map[t.context], map[t.context]);
+        }
+        assert_eq!(payload(&model), before);
+    }
+}
+
+#[test]
 fn context_map_models_keep_streams_lz_and_alignment_and_can_save_actual_bits() {
     for lz in [false, true] {
         for (uint_config, streaming_mode) in [

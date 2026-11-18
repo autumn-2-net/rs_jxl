@@ -31,6 +31,7 @@ fn auto(enabled: bool, prune: bool) -> AutoOptions {
         reference: Reference::Previous,
         allow_mask: true,
         allow_multiply_mask: enabled,
+        allow_add_delta: false,
         allow_multi_rect: false,
         prune,
         ..Default::default()

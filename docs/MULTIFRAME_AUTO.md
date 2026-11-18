@@ -31,6 +31,18 @@ also test the following, against the previous image and/or the first image by
 default, or the currently retained states when the new option is enabled:
 
 - Crop REPLACE: the exact bounding rectangle of all changed samples.
+- Signed temporal difference (`AddDelta`). One standard Add layer carries
+  current minus reference over the change bounds. It can win when scattered
+  edits leave many zeroes, or a broad edit has a small residual alphabet.
+  The report identifies the chosen input in `reference_index`. Each trial
+  charges one bounding-box area. `allow_add_delta` defaults to true and is
+  independent of the mask and rectangle switches.
+  The search accepts 8-bit gray and RGB. Gray-alpha and RGBA qualify on the
+  final input, including samples under zero alpha. A reference must come from
+  a full Replace without a patch atlas or from at most 31 preceding signed
+  Add steps. This bounds rounding error in the rendered reference. The
+  encoder skips component and tile patch configurations and encodes the delta
+  itself without a source patch atlas. See the [signed Add measurements](MULTIFRAME_ADD_DELTA_20261118.md).
 - Binary alpha mask: changed pixels retain their current values; unchanged
   pixels become zero with alpha zero. BLEND references the chosen full image.
 - Multiply/add mask (`MultiplyMaskPrevious`/`MultiplyMaskFirst`/
@@ -69,7 +81,7 @@ unchanged pixels between distant edits. It adds at most one actual encode trial
 per eligible reference, reusing difference maps, finalized-byte pruning, payload
 caching and caller budgets. It adds no frame tool or bitstream syntax.
 Static `analyze` uses the caller's geometry rate and cannot include this
-encode-time measurement. It also does not add two-axis split or multiply-mask
+encode-time measurement. It also does not add signed Add, two-axis split or multiply-mask
 proposals: it has neither measured-rate history nor encoder patch options.
 Its candidate counts are not the full automatic encode search history. See
 [feedback measurements](MULTIFRAME_RATE_FEEDBACK_20261117.md).
@@ -115,7 +127,7 @@ when changed pixels occupy at most one eighth of their bounding box. Ordinary
 frame candidates still use the configured patch detector. The [sparse mask measurements](MULTIFRAME_PATCH_MASK_20261118.md) give complete file sizes and encode/decode throughput.
 
 To recover the candidate policy preceding these two tools (`f4e240c`),
-set `adaptive_splits=false` and `allow_multiply_mask=false`, keeping the remaining
+set `adaptive_splits=false`, `allow_multiply_mask=false` and `allow_add_delta=false`, keeping the remaining
 controls unchanged. `adaptive_rate_feedback` remains a separate control; turning
 it off selects the first-frame rate, not the whole older candidate set.
 See [the split/mask comparison](MULTIFRAME_COMPRESSION_20261118.md) for complete
@@ -287,7 +299,7 @@ always considered. Each `AutoFrameReport` contains:
   is never a completed size. `encoded_frames` counts fully finished regular
   layers only, excluding an interrupted layer and private reference-only frames.
 - `analysis_elapsed`: native elapsed difference/planning time.
-- `adaptive_rate_feedback`, `adaptive_splits` and `allow_multiply_mask`: configured
+- `adaptive_rate_feedback`, `adaptive_splits`, `allow_add_delta` and `allow_multiply_mask`: configured
   booleans, not evidence that a corresponding proposal was eligible or selected.
 - `differences`: `AutoDiffReport` entries containing zero-based input `reference`,
   exact `changed_pixels`, and `bounds: Option<Rect>`. No change has zero pixels
@@ -351,7 +363,7 @@ pixel plus 64 heuristic bytes per layer; 64 is not a normative header size.
 The planner is not an exhaustive partition search. Allocation is checked, and
 there is no quadratic all-pairs rectangle search.
 Both geometry controls must be positive; `max_rectangles` has no additional
-4096 cap. `allow_mask`, `allow_multiply_mask`, `allow_multi_rect`, `prune`,
+4096 cap. `allow_add_delta`, `allow_mask`, `allow_multiply_mask`, `allow_multi_rect`, `prune`,
 `adaptive_rectangles`, `adaptive_rate_feedback` and `adaptive_splits` default to
 true. `adaptive_rectangles=false` removes merged, recent-rate and two-axis split
 proposals while retaining tile plans; it does not disable multiply masks.

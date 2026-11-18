@@ -24,7 +24,7 @@ def _auto_options(value, strategy):
         raise ValueError("auto_options require strategy='auto'")
     if not isinstance(value, Mapping):
         raise TypeError("auto_options must be a mapping of Rust option names")
-    booleans = {"allow_mask", "allow_multiply_mask", "allow_multi_rect", "prune", "adaptive_rectangles",
+    booleans = {"allow_add_delta", "allow_mask", "allow_multiply_mask", "allow_multi_rect", "prune", "adaptive_rectangles",
                 "retained_reference", "reference_lookahead", "adaptive_rate_feedback", "adaptive_splits"}
     integers = {"tile_size": (1, 0xffffffff),
                 "max_rectangles": (1, sys.maxsize * 2 + 1),
@@ -57,7 +57,7 @@ def _analysis_options(value):
         return {}
     if not isinstance(value, Mapping):
         raise TypeError("analysis_options must be a mapping of Rust option names")
-    booleans = {"allow_mask", "allow_multi_rect", "adaptive_rectangles"}
+    booleans = {"allow_add_delta", "allow_mask", "allow_multi_rect", "adaptive_rectangles"}
     integers = {"tile_size": (1, 0xffffffff),
                 "max_rectangles": (1, sys.maxsize * 2 + 1),
                 "history_window": (0, sys.maxsize * 2 + 1)}
@@ -138,6 +138,8 @@ def encode_multiframe(frames, output=None, *, layout="auto", durations=1,
     allow_multiply_mask defaults to True and permits two-layer multiply/add
     masks. allow_mask=False disables both ordinary and multiply masks; the new
     mask does not depend on the multi-rectangle or adaptive controls.
+    allow_add_delta defaults to True and tries a one-layer signed difference
+    for eligible 8-bit inputs, independently of mask and rectangle controls.
     extra_tile_sizes=[16, 64] adds partition grids without replacing tile_size.
     Duplicate partitions are skipped; extra trials may take longer. For a fixed
     reference state selection uses bytes, not minimum rectangle area.

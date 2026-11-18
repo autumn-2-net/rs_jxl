@@ -220,6 +220,7 @@ impl LosslessPaletteMap {
 }
 
 pub(super) enum PaletteMap {
+    SmallTree(BTreeMap<[i32; 4], MapEntry>),
     Tree(BTreeMap<Vec<i32>, MapEntry>),
     Flat(LosslessPaletteMap),
 }
@@ -228,6 +229,8 @@ impl PaletteMap {
     pub fn new(channels: usize, mapping: PaletteMapping) -> Self {
         if mapping == PaletteMapping::Flat && channels <= 4 {
             Self::Flat(LosslessPaletteMap::new(channels))
+        } else if channels <= 4 {
+            Self::SmallTree(BTreeMap::new())
         } else {
             Self::Tree(BTreeMap::new())
         }
@@ -236,9 +239,79 @@ impl PaletteMap {
     pub fn get(&mut self, color: &[i32]) -> Result<&mut MapEntry> {
         match self {
             Self::Flat(map) => map.get(color),
+            Self::SmallTree(map) => {
+                let mut key = [0; 4];
+                key[..color.len()].copy_from_slice(color);
+                Ok(map.entry(key).or_default())
+            }
             Self::Tree(map) => Ok(map.entry(color.to_vec()).or_default()),
         }
     }
+}
+
+/// Visit maximal equal-color runs in raster order, including runs across rows.
+/// Discovery can stop immediately after the explicit palette overflows.
+pub(super) fn visit_runs(
+    planes: &[Vec<i32>],
+    mut visit: impl FnMut(&[i32], std::ops::Range<usize>) -> Result<bool>,
+) -> Result<bool> {
+    let len = planes[0].len();
+    macro_rules! visit_fixed {
+        ($($plane:ident),+) => {{
+            let mut start = 0;
+            while start < len {
+                let color = [$($plane[start]),+];
+                let mut end = start + 1;
+                while end < len && [$($plane[end]),+] == color {
+                    end += 1;
+                }
+                if !visit(&color, start..end)? {
+                    return Ok(false);
+                }
+                start = end;
+            }
+        }};
+    }
+    match planes {
+        [a, b] => visit_fixed!(a, b),
+        [a, b, c] => visit_fixed!(a, b, c),
+        [a, b, c, d] => visit_fixed!(a, b, c, d),
+        _ => {
+            let mut color = vec![0; planes.len()];
+            let mut start = 0;
+            while start < len {
+                for (value, plane) in color.iter_mut().zip(planes) {
+                    *value = plane[start];
+                }
+                let mut end = start + 1;
+                while end < len && planes.iter().zip(&color).all(|(p, &v)| p[end] == v) {
+                    end += 1;
+                }
+                if !visit(&color, start..end)? {
+                    return Ok(false);
+                }
+                start = end;
+            }
+        }
+    }
+    Ok(true)
+}
+
+pub(super) fn raster_indices(
+    planes: &[Vec<i32>],
+    map: &mut PaletteMap,
+    run_counts: &mut [usize],
+) -> Result<Vec<i32>> {
+    let mut indices = super::zeroed_samples(planes[0].len())?;
+    visit_runs(planes, |color, run| {
+        let index = map.get(color)?.index;
+        indices[run].fill(index as i32);
+        if let Some(count) = run_counts.get_mut(index) {
+            *count += 1;
+        }
+        Ok(true)
+    })?;
+    Ok(indices)
 }
 
 fn band(frequency: usize) -> usize {
@@ -487,11 +560,11 @@ pub(super) fn reorder(
     width: usize,
     height: usize,
     mut tools: PaletteTools,
-) -> Result<()> {
+) -> Result<Option<Vec<i32>>> {
     tools.order.validate()?;
     let channels = planes.len();
     if channels < 3 {
-        return Ok(());
+        return Ok(None);
     }
     let frequencies: Vec<_> = colors
         .iter()
@@ -531,12 +604,15 @@ pub(super) fn reorder(
     } else {
         None
     };
+    let mut screened_indices = None;
     let order = if let Some(order) = graph_order {
         order
     } else if (channels > 4 || tools.geometry == PaletteGeometry::None)
         && tools.order == PaletteOrder::ScreenedRuns
     {
-        screen::order(colors, &frequencies, map, planes, width, height)?
+        let (order, indices) = screen::order(colors, &frequencies, map, planes, width, height)?;
+        screened_indices = Some(indices);
+        order
     } else if (channels > 4 || tools.geometry == PaletteGeometry::None)
         && matches!(
             tools.order,
@@ -660,7 +736,7 @@ pub(super) fn reorder(
         .into_iter()
         .map(|i| std::mem::take(&mut old[i]))
         .collect();
-    Ok(())
+    Ok(screened_indices)
 }
 
 #[cfg(test)]

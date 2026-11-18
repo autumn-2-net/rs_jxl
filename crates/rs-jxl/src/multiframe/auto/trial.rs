@@ -22,6 +22,7 @@ pub(super) enum Outcome {
 }
 
 pub(super) struct Trial<'a> {
+    pub reference: Option<&'a Image>,
     pub canvas: &'a Image,
     pub image: &'a Image,
     pub options: &'a EncodeOptions,
@@ -94,7 +95,15 @@ impl Trial<'_> {
             submitted_parts += 1;
             let final_part = part + 1 == planned_frames;
             let last = self.last_input && final_part;
-            let frame_image = if candidate.multiply_mask() {
+            let delta = candidate.strategy == crate::multiframe::Strategy::AddDelta;
+            let frame_image = if delta {
+                Cow::Owned(crate::multiframe::add_delta::image(
+                    self.reference.expect("delta reference"),
+                    image,
+                    rect,
+                    candidate.diff.as_ref().expect("delta change map"),
+                )?)
+            } else if candidate.multiply_mask() {
                 if multiply_images.is_none() {
                     let (keep, update) = crate::multiframe::multiply_mask::images(
                         image,
@@ -140,7 +149,9 @@ impl Trial<'_> {
                         } else {
                             destination
                         },
-                        mode: if candidate.multiply_mask() {
+                        mode: if delta {
+                            BlendMode::Add
+                        } else if candidate.multiply_mask() {
                             if part == 0 {
                                 BlendMode::Multiply
                             } else {
@@ -168,7 +179,18 @@ impl Trial<'_> {
                 cutoff.map(|maximum| maximum - bytes.len()),
                 options.max_output_bytes,
             );
-            let encoded = if !candidate.replace() {
+            let mut generated_atlas = false;
+            let full = candidate.strategy == crate::multiframe::Strategy::Full;
+            let encoded = if full {
+                crate::encode::encode_full_frame_trial(
+                    canvas,
+                    &frame,
+                    options,
+                    last,
+                    budget.as_ref(),
+                    &mut generated_atlas,
+                )
+            } else if !candidate.replace() {
                 crate::encode::encode_logical_frame_trial(
                     canvas,
                     &frame,
@@ -183,6 +205,13 @@ impl Trial<'_> {
                 TrialEncode::Complete(encoded) => {
                     append(&mut bytes, encoded, options.max_output_bytes)?;
                     encoded_frames += 1;
+                    let depth = if full && !generated_atlas {
+                        Some(0)
+                    } else if delta {
+                        trial_slots.add_depth[usize::from(candidate.source)].map(|n| n + 1)
+                    } else {
+                        None
+                    };
                     trial_slots.saved_layer(
                         index,
                         frame.options.save_as_reference,
@@ -190,6 +219,9 @@ impl Trial<'_> {
                         final_part,
                         last,
                     );
+                    if final_part && !last {
+                        trial_slots.add_depth[usize::from(destination)] = depth;
+                    }
                 }
                 TrialEncode::Bounded { lower_bound: bound } => {
                     lower_bound = Some(

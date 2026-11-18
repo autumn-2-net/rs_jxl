@@ -396,6 +396,7 @@ fn adaptive_tools_do_not_require_other_search_controls() {
 fn auto_options_forward_all_overrides_and_zero_budgets() {
     let request = automatic(json!({
         "allow_mask": false,
+        "allow_add_delta": false,
         "allow_multiply_mask": false,
         "allow_multi_rect": false,
         "tile_size": 8,
@@ -416,6 +417,7 @@ fn auto_options_forward_all_overrides_and_zero_budgets() {
     assert!(!auto.reference_lookahead);
     assert!(!auto.allow_mask && !auto.allow_multi_rect);
     assert!(!auto.allow_multiply_mask);
+    assert!(!auto.allow_add_delta);
     assert!(!auto.prune && !auto.adaptive_rectangles);
     assert!(!auto.adaptive_rate_feedback);
     assert!(!auto.adaptive_splits);

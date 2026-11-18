@@ -374,6 +374,26 @@ pub(crate) fn encode_logical_frame_trial(
     )
 }
 
+/// Report whether a full Replace layer used a generated atlas. A temporal Add
+/// predictor needs the rendered reference to start at a known precision.
+pub(crate) fn encode_full_frame_trial(
+    canvas: &Image,
+    frame: &crate::frame::Frame<'_>,
+    options: &EncodeOptions,
+    last: bool,
+    budget: Option<&SectionBudget>,
+    generated_atlas: &mut bool,
+) -> Result<TrialEncode<Vec<u8>>> {
+    encode_logical_frame_impl(
+        FrameCanvas::Image(canvas),
+        frame,
+        options,
+        last,
+        budget,
+        Some(generated_atlas),
+    )
+}
+
 /// The canvas contributes metadata and framing only, never samples. Region
 /// sequence input may materialize the current frame without a canvas Image.
 pub(crate) fn encode_logical_frame_geometry(

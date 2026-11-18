@@ -4,8 +4,7 @@
 //! The caller must compare complete serialized models against the baseline.
 
 use super::{Histogram, entropy_sketch, merge_lower_bound, pair_population_cost};
-use crate::bit_writer::BitWriter;
-use crate::entropy::context_map::write_context_map;
+use crate::entropy::context_map::encoded_bits as map_bits;
 use crate::{Error, Result};
 
 #[derive(Clone, Copy, Debug)]
@@ -47,22 +46,6 @@ pub(crate) struct Work {
     pub pairs: usize,
     pub map_trials: usize,
     pub merges: usize,
-}
-
-fn map_bits(map: &[u8], histograms: usize) -> Result<usize> {
-    // A single raw context has no map syntax, unlike several contexts mapped
-    // to one histogram (three bits).
-    if map.len() == 1 && histograms == 1 {
-        return Ok(0);
-    }
-    let capacity = map
-        .len()
-        .checked_mul(8)
-        .and_then(|n| n.checked_add(65536))
-        .ok_or(Error::Limit("context-map scratch size"))?;
-    let mut writer = BitWriter::new(capacity);
-    write_context_map(map, histograms, &mut writer)?;
-    Ok(writer.bits_written())
 }
 
 // Keep raw-context positions (including the LZ distance context) unchanged.

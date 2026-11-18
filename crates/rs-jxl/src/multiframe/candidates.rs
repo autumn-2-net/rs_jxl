@@ -26,7 +26,7 @@ impl Candidate {
         )
     }
     pub(super) fn replace(&self) -> bool {
-        !self.mask && !self.multiply_mask()
+        !self.mask && !self.multiply_mask() && self.strategy != Strategy::AddDelta
     }
     // Ranking only. No candidate is discarded using this estimate.
     pub(super) fn estimated_work(&self) -> u64 {
@@ -148,6 +148,30 @@ pub(super) fn candidates(
                 rects: vec![rect],
                 mask: false,
             });
+        }
+    }
+    if auto.allow_add_delta && options.patches.is_none() && options.tile_patches.is_none() {
+        for &(reference, source, ref diff) in &maps {
+            let Some(rect) = diff.bounds() else { continue };
+            if slots.add_depth[usize::from(source)].is_some_and(|n| n < super::add_delta::MAX_DEPTH)
+                && super::add_delta::promising(
+                    &images[reference],
+                    &images[index],
+                    rect,
+                    diff,
+                    index + 1 == images.len(),
+                )
+            {
+                result.push(Candidate {
+                    strategy: Strategy::AddDelta,
+                    tile_size: None,
+                    reference_index: Some(reference),
+                    diff: Some(Arc::clone(diff)),
+                    source,
+                    rects: vec![rect],
+                    mask: false,
+                });
+            }
         }
     }
     Ok(result)

@@ -241,6 +241,14 @@ fn choose(context_map: &[u8], num_histograms: usize) -> Result<Candidate> {
     Ok(best)
 }
 
+/// A single context has no map field in the entropy header.
+pub(crate) fn encoded_bits(map: &[u8], histograms: usize) -> Result<usize> {
+    if map.len() == 1 && histograms == 1 {
+        return Ok(0);
+    }
+    Ok(choose(map, histograms)?.writer.bits_written())
+}
+
 /// Write one complete context map. The map must reference every histogram in
 /// `0..num_histograms`, where num_histograms is 1..=256. The outer stream must
 /// call this only when it has more than one raw context; a one-histogram map

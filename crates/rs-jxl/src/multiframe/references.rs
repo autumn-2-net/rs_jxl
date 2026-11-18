@@ -4,6 +4,8 @@
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(super) struct ReferenceSlots {
+    // Number of signed Add steps from a full patch-free Replace, by slot.
+    pub(super) add_depth: [Option<u8>; 4],
     pub(super) frames: [Option<usize>; 4],
 }
 
@@ -49,6 +51,7 @@ impl ReferenceSlots {
             // An intermediate rectangle is a partial composite, not the full
             // logical input. Do not advertise it as a reusable historical state.
             self.frames[usize::from(slot)] = final_part.then_some(index);
+            self.add_depth[usize::from(slot)] = None;
         }
     }
 }

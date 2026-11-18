@@ -57,6 +57,7 @@ fn options(threads: usize) -> EncodeOptions {
 fn auto(enabled: bool, prune: bool) -> AutoOptions {
     AutoOptions {
         adaptive_splits: enabled,
+        allow_add_delta: false,
         reference: Reference::Previous,
         allow_mask: false,
         tile_size: 16,

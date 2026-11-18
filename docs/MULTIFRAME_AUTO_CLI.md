@@ -48,6 +48,9 @@ older geometric bounding-box heuristic used by `multiframe::plan`.
 full frames only. Mask and multi-rectangle strategies are enabled by default
 where the core can preserve samples and metadata exactly:
 
+- `--no-add-delta` disables the single-layer signed temporal difference.
+  It defaults to enabled for eligible 8-bit sequences and operates independently
+  of masks and rectangle partitioning.
 - `--no-mask` disables both mask tools. The ordinary alpha-mask route requires an
   existing opaque integer gray-alpha/RGBA image with exactly one alpha channel;
   it does not insert alpha, reinterpret partial transparency or discard hidden
@@ -76,8 +79,8 @@ where the core can preserve samples and metadata exactly:
 - `--max-rectangles N` defaults to 32 and accepts positive native `usize` values,
   with no extra 4096 cap. Geometry is validated even if candidates are disabled.
 
-The three new-tool booleans default to enabled. To recover the `f4e240c` candidate
-policy, disable splits and multiply masks together, leaving other settings
+The new-tool booleans default to enabled. To recover the `f4e240c` candidate
+policy, disable signed Add, splits and multiply masks together, leaving other settings
 unchanged. See [compression and speed measurements](MULTIFRAME_COMPRESSION_20261118.md).
 
 ### Retained References (Opt-In)
@@ -142,10 +145,10 @@ of fewer bytes for either the next frame or the whole sequence.
 
 Candidate reports identify each logical input frame (one-based), the winner
 index, completed candidate count, pruned count and native `analysis_elapsed`.
-They also include configured `adaptive_rate_feedback`, `adaptive_splits` and
-`allow_multiply_mask` booleans; eligibility can still prevent a requested tool
-from producing a candidate. New strategies use `SplitPrevious/First/Retained`
-and `MultiplyMaskPrevious/First/Retained` labels.
+They also include the configured `adaptive_rate_feedback`, `adaptive_splits`,
+`allow_multiply_mask` and `allow_add_delta` booleans. Candidates report
+`SplitPrevious/First/Retained`, `MultiplyMaskPrevious/First/Retained` or
+`AddDelta` when the corresponding tool runs.
 The zero-based winner index addresses completed candidates in canonical order,
 not execution order. New Merged candidates follow all legacy candidates to keep
 existing equal-byte preferences. `candidate=N` lines report strategy via Rust

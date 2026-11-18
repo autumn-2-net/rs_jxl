@@ -10,7 +10,7 @@ const GRID: usize = 4;
 const MIN_GAIN: f64 = 0.03;
 
 struct Sample {
-    ids: Vec<usize>,
+    ids: Vec<i32>,
     width: usize,
     height: usize,
     population: usize,
@@ -34,17 +34,11 @@ fn default_order(colors: &[Vec<i32>], frequencies: &[usize]) -> Vec<usize> {
     order
 }
 
-fn samples(
-    map: &mut PaletteMap,
-    planes: &[Vec<i32>],
-    width: usize,
-    height: usize,
-) -> Result<Vec<Sample>> {
+fn samples(indices: &[i32], width: usize, height: usize) -> Vec<Sample> {
     let _scope = crate::profile::scope("palette.order.screen.sample");
     let nx = width.div_ceil(TILE).min(GRID);
     let ny = height.div_ceil(TILE).min(GRID);
     let mut result = Vec::with_capacity(nx * ny);
-    let mut color = vec![0; planes.len()];
     for gy in 0..ny {
         let y0 = gy * height / ny;
         let y1 = (gy + 1) * height / ny;
@@ -57,12 +51,8 @@ fn samples(
             let x = x0 + (x1 - x0 - tw) / 2;
             let mut ids = Vec::with_capacity(tw * th);
             for yy in y..y + th {
-                for xx in x..x + tw {
-                    for (value, plane) in color.iter_mut().zip(planes) {
-                        *value = plane[yy * width + xx];
-                    }
-                    ids.push(map.get(&color)?.index);
-                }
+                let start = yy * width + x;
+                ids.extend_from_slice(&indices[start..start + tw]);
             }
             result.push(Sample {
                 ids,
@@ -73,7 +63,16 @@ fn samples(
             });
         }
     }
-    Ok(result)
+    result
+}
+
+fn remap_order(order: &[usize], canonical: &[usize]) -> Vec<i32> {
+    let mut remap = vec![0; order.len()];
+    for (index, &original) in order.iter().enumerate() {
+        // Multiple promoted implicit colors can alias one tuple. Last assignment wins.
+        remap[canonical[original]] = index as i32;
+    }
+    remap
 }
 
 fn score(
@@ -84,12 +83,7 @@ fn score(
 ) -> Result<Score> {
     let _scope = crate::profile::scope("palette.order.screen.cost");
     let n = order.len();
-    let mut remap = vec![0i32; n];
-    for (index, &original) in order.iter().enumerate() {
-        // Duplicate implicit promotions use the last assignment, exactly like
-        // the final palette mapping. Non-promoted implicit IDs are unchanged.
-        remap[canonical[original]] = index as i32;
-    }
+    let remap = remap_order(order, canonical);
     let palette: Vec<_> = (0..colors[0].len())
         .flat_map(|c| order.iter().map(move |&i| colors[i][c]))
         .collect();
@@ -108,7 +102,7 @@ fn score(
             sample
                 .ids
                 .iter()
-                .map(|&id| if id < n { remap[id] } else { id as i32 }),
+                .map(|&id| remap.get(id as usize).copied().unwrap_or(id)),
         );
         // Contiguous original-resolution tiles preserve interior neighbors.
         // Tile boundaries use the cost kernel's own edge rules for every order.
@@ -155,27 +149,51 @@ pub(super) fn order(
     planes: &[Vec<i32>],
     width: usize,
     height: usize,
-) -> Result<Vec<usize>> {
+) -> Result<(Vec<usize>, Vec<i32>)> {
     let _scope = crate::profile::scope("palette.order.screen");
     let default = default_order(colors, frequencies);
+    for (id, color) in colors.iter().enumerate() {
+        map.get(color)?.index = id;
+    }
+    let mut run_counts = vec![0; colors.len()];
+    let mut indices = super::raster_indices(planes, map, &mut run_counts)?;
     if colors.len() < 2 {
         let _decision = crate::profile::scope("palette.order.screen.default");
-        return Ok(default);
+        return Ok((default, indices));
     }
-    let scores = runs::scores(colors, map, planes)?;
     let canonical = colors
         .iter()
         .map(|color| map.get(color).map(|entry| entry.index))
         .collect::<Result<Vec<_>>>()?;
-    let samples = samples(map, planes, width, height)?;
-    let baseline = match score(&default, colors, &canonical, &samples) {
+    let scores: Vec<_> = canonical.iter().map(|&id| run_counts[id]).collect();
+    let samples = samples(&indices, width, height);
+    let order = select_order(
+        colors, default, &canonical, &scores, &samples, width, height,
+    );
+    let remap = remap_order(&order, &canonical);
+    for id in &mut indices {
+        *id = remap.get(*id as usize).copied().unwrap_or(*id);
+    }
+    Ok((order, indices))
+}
+
+fn select_order(
+    colors: &[Vec<i32>],
+    default: Vec<usize>,
+    canonical: &[usize],
+    scores: &[usize],
+    samples: &[Sample],
+    width: usize,
+    height: usize,
+) -> Vec<usize> {
+    let baseline = match score(&default, colors, canonical, samples) {
         Ok(score) => score,
         Err(error) => {
             // A heuristic kernel's population/extra-bit limits must not become
             // new input restrictions on the actual lossless encoder.
             let _decision = crate::profile::scope("palette.order.screen.default");
             crate::profile::note("palette.screen.cost_unavailable", error);
-            return Ok(default);
+            return default;
         }
     };
     let mut candidates = vec![("default", default, baseline)];
@@ -185,11 +203,11 @@ pub(super) fn order(
         ("hot32", Some(32)),
         ("hot128", Some(128)),
     ] {
-        let candidate = runs::rank(colors, &scores, hot);
+        let candidate = runs::rank(colors, scores, hot);
         if candidates.iter().any(|(_, order, _)| *order == candidate) {
             continue;
         }
-        let score = match score(&candidate, colors, &canonical, &samples) {
+        let score = match score(&candidate, colors, canonical, samples) {
             Ok(score) => score,
             Err(error) => {
                 crate::profile::note("palette.screen.cost_unavailable", error);
@@ -236,12 +254,40 @@ pub(super) fn order(
             candidates[selected].2.total / baseline.total.max(1.0)
         ),
     );
-    Ok(candidates.swap_remove(selected).1)
+    candidates.swap_remove(selected).1
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selected_indices_match_final_dictionary_for_aliases_runs_and_implicit_colors() {
+        let colors = vec![vec![4, -2, 7, 0], vec![8, 0, 1, 255], vec![4, -2, 7, 0]];
+        let implicit = vec![0; 4];
+        let keys = [&colors[0], &implicit, &colors[1]];
+        // One run spans a scanline and all three colors recur in later rows.
+        let ids = [0, 1, 1, 1, 1, 1, 0, 2, 2, 2, 0, 1];
+        let planes: Vec<_> = (0..4)
+            .map(|c| ids.iter().map(|&id| keys[id][c]).collect())
+            .collect();
+        for mapping in [
+            super::super::PaletteMapping::Tree,
+            super::super::PaletteMapping::Flat,
+        ] {
+            let mut map = PaletteMap::new(4, mapping);
+            map.get(&implicit).unwrap().index = 14;
+            let (chosen, indices) = order(&colors, &[3, 3, 3], &mut map, &planes, 4, 3).unwrap();
+            for (i, &original) in chosen.iter().enumerate() {
+                map.get(&colors[original]).unwrap().index = i;
+            }
+            let expected: Vec<_> = ids
+                .iter()
+                .map(|&id| map.get(keys[id]).unwrap().index as i32)
+                .collect();
+            assert_eq!(indices, expected);
+        }
+    }
 
     #[test]
     fn admission_requires_consistent_gain_and_finite_nonzero_baseline() {
@@ -289,10 +335,7 @@ mod tests {
     #[test]
     fn sampling_is_bounded_contiguous_and_partitions_the_population() {
         let (width, height) = (277, 291);
-        let planes = vec![vec![123; width * height]; 3];
-        let mut map = PaletteMap::new(3, super::super::PaletteMapping::Flat);
-        map.get(&[123; 3]).unwrap().index = 5;
-        let samples = samples(&mut map, &planes, width, height).unwrap();
+        let samples = samples(&vec![5; width * height], width, height);
         assert_eq!(samples.len(), GRID * GRID);
         assert_eq!(
             samples.iter().map(|s| s.population).sum::<usize>(),

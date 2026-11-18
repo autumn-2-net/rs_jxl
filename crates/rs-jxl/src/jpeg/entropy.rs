@@ -149,7 +149,11 @@ impl CoefficientEntropy {
             | AcLzSearch::FastForced
             | AcLzSearch::OptimalForced => LzPolicy::Explicit(&config),
         };
-        Self::new(streams, contexts, options, lz, max_tokens)
+        let mut entropy = Self::new(streams, contexts, options, lz, max_tokens)?;
+        if tier <= SpeedTier::Tortoise {
+            entropy.model.simplify_unused_contexts(&entropy.streams)?;
+        }
+        Ok(entropy)
     }
 
     pub fn new(

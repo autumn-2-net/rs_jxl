@@ -307,6 +307,7 @@ search defaults or perform difference analysis, planning or selection.
 | Auto Option | Accepted Value | Native Default |
 | --- | --- | --- |
 | `allow_mask` | bool; master gate for ordinary alpha and multiply masks | true |
+| `allow_add_delta` | bool; one signed temporal difference layer on eligible 8-bit frames | true |
 | `allow_multiply_mask` | bool; two-layer Multiply/Add mask when eligible | true |
 | `allow_multi_rect` | bool | true |
 | `tile_size` | positive u32 integer | 32 |
@@ -355,13 +356,18 @@ With source Add patch detection enabled, changes occupying at most one eighth
 of their bbox can use a patch-free pair of mask layers. Other eligible
 full/crop/mask/rectangle candidates remain available.
 
-To select the `f4e240c` candidate policy preceding splits and multiply masks, set both
-`adaptive_splits=False` and `allow_multiply_mask=False` with other settings
+For 8-bit gray and RGB, `allow_add_delta=True` can store current minus reference
+in one standard Add layer. Gray-alpha and RGBA qualify on the final input.
+Mask and partition switches are independent of this tool. A completed trial
+reports `AddDelta` and the input it used in `reference_index`.
+
+To select the `f4e240c` candidate policy preceding splits and multiply masks, set
+`adaptive_splits=False`, `allow_multiply_mask=False` and `allow_add_delta=False` with other settings
 unchanged. Merely disabling `adaptive_rectangles` or rate feedback does not
 recover that whole candidate set. These are independent booleans, not a new
 strategy/mode parameter; `strategy="crop"` remains the Python default.
-Automatic reports include all three configured booleans
-`adaptive_rate_feedback`, `adaptive_splits` and `allow_multiply_mask`.
+Automatic reports include the configured booleans
+`adaptive_rate_feedback`, `adaptive_splits`, `allow_add_delta` and `allow_multiply_mask`.
 
 Automatic frame reports distinguish completed work from pruning:
 

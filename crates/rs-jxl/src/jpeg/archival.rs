@@ -77,6 +77,12 @@ impl Default for TranscodeOptions {
 }
 
 impl TranscodeOptions {
+    fn resolve_direct(&self) -> Result<CoefficientOptions> {
+        let mut settings = self.resolve()?;
+        settings.symmetric_ma = self.effort >= 9 && self.decoding_speed == 0;
+        Ok(settings)
+    }
+
     pub(crate) fn resolve(&self) -> Result<CoefficientOptions> {
         if let Some(limits) = self.cooperative_ma {
             limits.validate()?;
@@ -131,7 +137,7 @@ impl TranscodeOptions {
 /// occurs. Unsupported JPEG structures or exhausted budgets return an error.
 /// ICC metadata is validated strictly; malformed profiles are not discarded.
 pub fn transcode(input: &[u8], options: &TranscodeOptions) -> Result<Vec<u8>> {
-    let settings = options.resolve()?;
+    let settings = options.resolve_direct()?;
     let jpeg = read_input(input, &options.limits.input)?;
     encode_coefficients(&jpeg, &settings)
 }
@@ -141,7 +147,7 @@ pub(crate) fn transcode_in_pool(
     options: &TranscodeOptions,
     pool: Option<&rayon::ThreadPool>,
 ) -> Result<Vec<u8>> {
-    let settings = options.resolve()?;
+    let settings = options.resolve_direct()?;
     let jpeg = read_input(input, &options.limits.input)?;
     encode_coefficients_in_pool(&jpeg, &settings, pool)
 }
@@ -333,14 +339,17 @@ mod tests {
     #[test]
     fn all_efforts_resolve_and_invalid_options_reject_before_input() {
         for effort in 1..=11 {
-            let settings = TranscodeOptions {
+            let mut options = TranscodeOptions {
                 effort,
                 ..Default::default()
-            }
-            .resolve()
-            .unwrap();
+            };
+            let settings = options.resolve().unwrap();
             assert_eq!(settings.tier as i8, 10 - effort.clamp(2, 10) as i8);
             assert_eq!(settings.reconstruction_quality, (effort + 1).min(11));
+            assert!(!settings.symmetric_ma);
+            assert_eq!(options.resolve_direct().unwrap().symmetric_ma, effort >= 9);
+            options.decoding_speed = 1;
+            assert!(!options.resolve_direct().unwrap().symmetric_ma);
         }
         for effort in [0, 12, 255] {
             assert!(
