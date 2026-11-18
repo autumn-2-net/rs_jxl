@@ -56,6 +56,10 @@ fn report(result: &LayerEncodeResult, jpeg_input: bool) -> Value {
     })
 }
 
+fn search_groups(request: &crate::request::Options) -> bool {
+    request.effort.is_some_and(|effort| effort >= 9) && request.group_size_shift.is_none()
+}
+
 pub(crate) fn execute(
     request: &Request,
     data: &[u8],
@@ -77,9 +81,12 @@ pub(crate) fn execute(
         .layer_options
         .as_ref()
         .map_or_else(|| LayerOptions::default().native(), LayerOptions::native);
+    let search_groups = search_groups(&request.options);
     let result = match context {
-        Some(encoder) => encoder.encode_layers(&images, &options, &layers),
-        None => layers::encode(&images, &options, &layers),
+        Some(encoder) => {
+            encoder.encode_layers_with_group_search(&images, &options, &layers, search_groups)
+        }
+        None => layers::encode_with_group_search(&images, &options, &layers, search_groups),
     }
     .map_err(message)?;
     Ok((report(&result, jpeg_input), result.bytes))
@@ -89,6 +96,20 @@ pub(crate) fn execute(
 mod tests {
     use super::*;
     use rs_jxl::layers::{LayerInfo, default_frame_options};
+
+    #[test]
+    fn automatic_group_trials_keep_explicit_overrides() {
+        let mut request = crate::request::Options {
+            effort: Some(9),
+            ..Default::default()
+        };
+        assert!(search_groups(&request));
+        request.group_size_shift = Some(0);
+        assert!(!search_groups(&request));
+        request.group_size_shift = None;
+        request.effort = Some(8);
+        assert!(!search_groups(&request));
+    }
 
     #[test]
     fn report_uses_native_fields_and_snake_case_blends() {

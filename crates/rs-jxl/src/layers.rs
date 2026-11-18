@@ -133,19 +133,37 @@ pub fn encode(
     options: &EncodeOptions,
     layers: &LayerOptions,
 ) -> Result<LayerEncodeResult> {
+    encode_with_group_search(images, options, layers, false)
+}
+
+/// Compare at most one alternative group size per layer against the supplied
+/// encoding. A group-sized MA sampling window follows the proposed group.
+/// Both choices keep each layer's raw samples, geometry, timing and blends.
+pub fn encode_with_group_search(
+    images: &[Image],
+    options: &EncodeOptions,
+    layers: &LayerOptions,
+    search_groups: bool,
+) -> Result<LayerEncodeResult> {
     if options.threads == 1 || execution::is_serial() {
-        return encode_in_pool(images, options, layers, None);
+        return encode_in_pool(images, options, layers, search_groups, None);
     }
-    crate::codec::Encoder::new(options.threads)?.encode_layers(images, options, layers)
+    crate::codec::Encoder::new(options.threads)?.encode_layers_with_group_search(
+        images,
+        options,
+        layers,
+        search_groups,
+    )
 }
 
 pub(crate) fn encode_in_pool(
     images: &[Image],
     options: &EncodeOptions,
     layers: &LayerOptions,
+    search_groups: bool,
     pool: Option<&rayon::ThreadPool>,
 ) -> Result<LayerEncodeResult> {
-    let work = || encode_inner(images, options, layers);
+    let work = || encode_inner(images, options, layers, search_groups);
     match pool {
         Some(pool) => execution::with_pool(pool, work),
         None => execution::serial(work),
@@ -156,6 +174,7 @@ fn encode_inner(
     images: &[Image],
     options: &EncodeOptions,
     layers: &LayerOptions,
+    search_groups: bool,
 ) -> Result<LayerEncodeResult> {
     let started = Instant::now();
     let plan = plan(images, layers)?;
@@ -187,12 +206,43 @@ fn encode_inner(
             .checked_sub(stream.len())
             .filter(|&n| n > 0)
             .ok_or(Error::Limit("encoded output bytes"))?;
-        let (bytes, _) = encoder::encode_logical_frame_geometry(
+        let (mut bytes, _) = encoder::encode_logical_frame_geometry(
             canvas,
             frame,
             &bounded,
             index + 1 == plan.frames.len(),
         )?;
+        // A small layer spanning several groups can instead share one tree
+        // and one set of entropy tables. Bound each extra trial to 512 x 512.
+        let extent = frame.image.width().max(frame.image.height());
+        if search_groups && extent > 128u32 << bounded.group_size_shift && extent <= 512 {
+            let shift = if extent <= 256 { 1 } else { 2 };
+            let mut alternative = bounded.clone();
+            alternative.group_size_shift = shift;
+            // Source MA training skips channels larger than this window. A
+            // larger group needs its corresponding window to train on the
+            // newly combined channel. Preserve independent custom windows.
+            if let Some(policy) = &mut alternative.modular.sampling
+                && policy.max_channel_size == 128usize << bounded.group_size_shift
+            {
+                policy.max_channel_size = 128usize << shift;
+            }
+            // Charge only finalized wire bytes against the incumbent. An
+            // intermediate writer can need more space than its final sections.
+            match encoder::try_smaller_layer(
+                canvas,
+                frame,
+                &alternative,
+                index + 1 == plan.frames.len(),
+                bytes.len(),
+            ) {
+                Ok(encoder::budget::TrialEncode::Complete(trial)) if trial.len() < bytes.len() => {
+                    bytes = trial
+                }
+                Ok(_) | Err(Error::Limit(_)) => {}
+                Err(error) => return Err(error),
+            }
+        }
         let length = stream
             .len()
             .checked_add(bytes.len())
@@ -230,4 +280,93 @@ fn encode_inner(
         layers: info,
         codec_seconds: started.elapsed().as_secs_f64(),
     })
+}
+
+#[cfg(test)]
+mod group_candidate_tests {
+    use super::*;
+    use crate::{
+        PixelData, PixelLayout,
+        decode::{DecodeOptions, decode},
+    };
+
+    #[test]
+    fn exact_rate_selection_preserves_raw_layers_and_hidden_rgb() {
+        let images: Vec<_> = [(64, 64), (272, 160)]
+            .into_iter()
+            .map(|(w, h)| {
+                let samples = (0..w * h)
+                    .flat_map(|i| {
+                        let (x, y) = (i % w, i / w);
+                        let tile = (x / 13 + y / 11 * 3) % 11;
+                        [
+                            (tile * 31) as u8,
+                            (tile * 19) as u8,
+                            (tile * 7) as u8,
+                            if (x + y) % 13 == 0 { 0 } else { 255 },
+                        ]
+                    })
+                    .collect();
+                Image::new(w, h, PixelLayout::Rgba, PixelData::U8(samples)).unwrap()
+            })
+            .collect();
+        for reverse in [false, true] {
+            let ordered: Vec<_> = if reverse {
+                images.iter().rev().cloned().collect()
+            } else {
+                images.clone()
+            };
+            let params = crate::scheduler::CandidateParams::default()
+                .backend(9)
+                .unwrap();
+            let options = crate::scheduler::adapter::project_native(
+                &params,
+                &ordered[0],
+                &Default::default(),
+            )
+            .unwrap()
+            .exact_options()
+            .unwrap();
+            let mut layers = LayerOptions::default();
+            layers.canvas = Some((150, 60));
+            layers.frames = ordered
+                .iter()
+                .enumerate()
+                .map(|(index, _)| {
+                    let mut frame = default_frame_options();
+                    frame.origin = (-2, 3);
+                    frame.name = format!("original layer {index}");
+                    frame
+                })
+                .collect();
+            let baseline = encode(&ordered, &options, &layers).unwrap();
+            let chosen = encode_with_group_search(&ordered, &options, &layers, true).unwrap();
+            if reverse {
+                assert_eq!(chosen.bytes, baseline.bytes);
+            } else {
+                assert!(chosen.bytes.len() < baseline.bytes.len());
+            }
+            assert_eq!(chosen.layers.len(), ordered.len());
+            for (actual, expected) in chosen.layers.iter().zip(&layers.frames) {
+                assert_eq!(actual.options.name, expected.name);
+                assert_eq!(actual.options.origin, expected.origin);
+            }
+            let decoded = decode(
+                &chosen.bytes,
+                &DecodeOptions {
+                    coalescing: false,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(decoded.frames.len(), ordered.len());
+            for (actual, expected) in decoded.frames.iter().zip(&ordered) {
+                assert_eq!(
+                    (actual.width, actual.height),
+                    (expected.width() as usize, expected.height() as usize)
+                );
+                assert_eq!(&actual.pixels, expected.pixels());
+            }
+        }
+    }
 }

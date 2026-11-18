@@ -102,3 +102,43 @@ eleven measured repetitions yielded 0.247 and 0.244 MPix/s on that sequence.
 The table uses the original three repetitions for every sequence. Decoder
 code was unchanged. Local measurement records are in
 `out/multiframe-speed3/{dev,gifs,real,revisit}.json`.
+
+## Add after cropped reference updates
+
+An atlas-free partial Replace refreshes its covered samples and carries the
+background through elsewhere. A patch-free Multiply/Add mask either preserves
+the reference sample or replaces it with a fresh sample. The automatic encoder
+now carries the conservative signed-Add depth bound through these operations,
+including cached and parallel rectangle encodes. A generated atlas invalidates
+the bound. The existing 8-bit eligibility checks and 32-add limit still apply.
+The dense update screen now admits a residual alphabet up to four fifths the
+size of the sampled target alphabet, up from three quarters. The screen only
+admits a trial. The encoder chooses the winner using its actual frame bytes.
+
+Baseline `5a868ae`, effort 9, four threads, one warmup and three measured
+repetitions with alternating build order. Throughput uses total logical pixels
+divided by the sum of per-sequence median wall times through the Python API.
+Sizes cover complete files. The first two rows include the real pair used to
+evaluate the change to the dense-update screen.
+
+| Sequences | Complete bytes before / after | Change | Encode MPix/s before / after | Decode MPix/s before / after |
+| --- | ---: | ---: | ---: | ---: |
+| Existing 13 sequences, 76 frames | 5,172,895 / 4,978,805 | −3.75% | 0.923 / 0.906 | 48.060 / 51.840 |
+| Two real-image pairs | 2,419,910 / 2,237,072 | −7.56% | 1.844 / 1.709 | 55.701 / 62.809 |
+| Nine development sequences and controls | 2,102,904 / 2,102,904 | 0.00% | 0.430 / 0.436 | 27.725 / 25.993 |
+| Newton's cradle and streamz demo | 650,081 / 638,829 | −1.73% | 0.165 / 0.170 | 26.330 / 26.084 |
+| Two previously unused GIF samples, 40 frames | 11,965 / 11,965 | 0.00% | 0.929 / 0.910 | 29.194 / 25.415 |
+| Synthetic crop followed by a tint, 3 frames | 183,165 / 91,675 | −49.95% | 0.317 / 0.284 | 11.265 / 14.651 |
+
+The t2 pair accounts for 182,838 bytes of the 194,090-byte reduction on the
+original corpus. Its encoder speed went from 0.496 to 0.449 MPix/s. Newton's
+cradle saved 9,425 bytes and streamz demo saved 1,827 bytes. The additional GIF
+samples used all 24 frames of scikit-image's `no_time_for_that_tiny.gif`
+and the first 16 displayed frames of Streamlit's fireworks GIF. Splitting
+signed residuals into disjoint rectangles added 15 trials across the 16
+sequences and won zero. The measured build uses a single Add rectangle.
+
+Local inputs, build hashes, trial records and streams are in
+`out/multiframe-layers-rate-20261118/`. The paired runner checks frame
+samples, durations and supplied ICC data on every call. The independent
+djxl check compares all displayed frames with the original 8-bit samples.

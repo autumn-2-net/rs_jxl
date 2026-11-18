@@ -46,7 +46,7 @@ pub(super) fn promising(
         }
     }
     let distinct = |h: &[bool]| h.iter().filter(|&&v| v).count();
-    distinct(&deltas) * 4 <= distinct(&targets) * 3
+    distinct(&deltas) * 5 <= distinct(&targets) * 4
 }
 
 pub(super) fn image(

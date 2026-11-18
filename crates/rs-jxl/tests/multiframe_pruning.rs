@@ -124,6 +124,7 @@ fn compare_pruning(full: &AutoEncodeResult, pruned: &AutoEncodeResult) {
         let winner = &expected.candidates[expected.winner_index];
         let actual_winner = &actual.candidates[actual.winner_index];
         assert_eq!(actual_winner.strategy, winner.strategy);
+        assert_eq!(actual_winner.source, winner.source);
         assert_eq!(actual_winner.encoded_bytes, winner.encoded_bytes);
         assert_eq!(actual_winner.encoded_frames, winner.encoded_frames);
         assert_eq!(
@@ -134,12 +135,20 @@ fn compare_pruning(full: &AutoEncodeResult, pruned: &AutoEncodeResult) {
             let completed: Vec<_> = actual
                 .candidates
                 .iter()
-                .filter(|c| c.strategy == candidate.strategy)
+                .filter(|c| {
+                    c.strategy == candidate.strategy
+                        && c.source == candidate.source
+                        && c.tile_size == candidate.tile_size
+                })
                 .collect();
             let stopped: Vec<_> = actual
                 .pruned
                 .iter()
-                .filter(|c| c.strategy == candidate.strategy)
+                .filter(|c| {
+                    c.strategy == candidate.strategy
+                        && c.source == candidate.source
+                        && c.tile_size == candidate.tile_size
+                })
                 .collect();
             assert_eq!(completed.len() + stopped.len(), 1);
             if let Some(completed) = completed.first() {
@@ -570,7 +579,11 @@ fn adaptive_search_retains_every_legacy_candidate_without_size_regression() {
                     let retained = new
                         .candidates
                         .iter()
-                        .find(|c| c.strategy == candidate.strategy)
+                        .find(|c| {
+                            c.strategy == candidate.strategy
+                                && c.source == candidate.source
+                                && c.tile_size == candidate.tile_size
+                        })
                         .expect("adaptive search must retain legacy plans");
                     assert_eq!(retained.encoded_bytes, candidate.encoded_bytes);
                     assert_eq!(retained.encoded_frames, candidate.encoded_frames);

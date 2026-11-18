@@ -374,9 +374,9 @@ pub(crate) fn encode_logical_frame_trial(
     )
 }
 
-/// Report whether a full Replace layer used a generated atlas. A temporal Add
+/// Report whether a Replace layer used a generated atlas. A temporal Add
 /// predictor needs the rendered reference to start at a known precision.
-pub(crate) fn encode_full_frame_trial(
+pub(crate) fn encode_replace_frame_trial(
     canvas: &Image,
     frame: &crate::frame::Frame<'_>,
     options: &EncodeOptions,
@@ -413,6 +413,24 @@ pub(crate) fn encode_logical_frame_geometry(
     )?
     .into_complete()?;
     Ok((bytes, generated_reference))
+}
+
+pub(crate) fn try_smaller_layer(
+    canvas: crate::frame::Geometry<'_>,
+    frame: &crate::frame::Frame<'_>,
+    options: &EncodeOptions,
+    last: bool,
+    incumbent: usize,
+) -> Result<TrialEncode<Vec<u8>>> {
+    let budget = SectionBudget::new(Some(incumbent), options.max_output_bytes);
+    encode_logical_frame_impl(
+        FrameCanvas::Geometry(canvas),
+        frame,
+        options,
+        last,
+        budget.as_ref(),
+        None,
+    )
 }
 
 #[derive(Clone, Copy)]

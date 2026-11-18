@@ -82,6 +82,11 @@ impl Trial<'_> {
             candidate.rects.len()
         };
         let mut multiply_images: Option<std::array::IntoIter<Image, 2>> = None;
+        // A partial Replace copies fresh samples into the rectangle and retains
+        // its background everywhere else. Capture the bound before any parts
+        // overwrite the source slot (source and destination may coincide).
+        let source_depth = trial_slots.add_depth[usize::from(candidate.source)];
+        let mut depth = source_depth;
         for part in 0..planned_frames {
             let rect = candidate.rects[if candidate.multiply_mask() { 0 } else { part }];
             if cutoff.is_some_and(|maximum| bytes.len() >= maximum) {
@@ -182,7 +187,7 @@ impl Trial<'_> {
             let mut generated_atlas = false;
             let full = candidate.strategy == crate::multiframe::Strategy::Full;
             let encoded = if full {
-                crate::encode::encode_full_frame_trial(
+                crate::encode::encode_replace_frame_trial(
                     canvas,
                     &frame,
                     options,
@@ -199,16 +204,25 @@ impl Trial<'_> {
                     budget.as_ref(),
                 )
             } else {
-                payloads.encode(rect, canvas, &frame, options, last, budget.as_ref())
+                let (encoded, atlas) =
+                    payloads.encode(rect, canvas, &frame, options, last, budget.as_ref())?;
+                generated_atlas = atlas;
+                Ok(encoded)
             }?;
             match encoded {
                 TrialEncode::Complete(encoded) => {
                     append(&mut bytes, encoded, options.max_output_bytes)?;
                     encoded_frames += 1;
-                    let depth = if full && !generated_atlas {
+                    depth = if generated_atlas {
+                        None
+                    } else if full {
                         Some(0)
                     } else if delta {
-                        trial_slots.add_depth[usize::from(candidate.source)].map(|n| n + 1)
+                        source_depth.map(|n| n + 1)
+                    } else if candidate.replace() || candidate.multiply_mask() {
+                        // Multiply by exact 0/1, followed by adding fresh samples
+                        // to cleared locations and zero to all other samples.
+                        depth
                     } else {
                         None
                     };
@@ -287,6 +301,7 @@ impl Trial<'_> {
     ) -> Result<Outcome> {
         let initial_pixels = *pixels;
         let mut bytes = Vec::new();
+        let mut depth = slots.add_depth[usize::from(candidate.source)];
         for (batch_index, rects) in candidate.rects.chunks(workers).enumerate() {
             let first = batch_index * workers;
             let mut jobs = Vec::with_capacity(rects.len());
@@ -352,7 +367,11 @@ impl Trial<'_> {
             for (result, (_, settings, last, final_part, _, cache)) in encoded.into_iter().zip(jobs)
             {
                 payloads.restore_rect(cache);
-                let output = result?.into_complete()?;
+                let (output, atlas) = result?;
+                if atlas {
+                    depth = None;
+                }
+                let output = output.into_complete()?;
                 append(&mut bytes, output, self.options.max_output_bytes)?;
                 slots.saved_layer(
                     self.index,
@@ -361,6 +380,9 @@ impl Trial<'_> {
                     final_part,
                     last,
                 );
+                if final_part && !last {
+                    slots.add_depth[usize::from(self.destination)] = depth;
+                }
             }
         }
         let report = AutoCandidateReport {

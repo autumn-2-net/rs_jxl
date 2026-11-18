@@ -4,6 +4,51 @@ use rs_jxl::multiframe::{AutoOptions, Reference, Strategy, encode_auto};
 use rs_jxl::{EncodeOptions, Image, PixelData, PixelLayout};
 
 #[test]
+fn crop_preserves_the_reference_for_a_later_signed_update() {
+    let mut samples: Vec<u8> = (0..64 * 64)
+        .map(|i| ((i * 183 + i / 7) % 251) as u8)
+        .collect();
+    let mut images = Vec::new();
+    for step in 0..4 {
+        match step {
+            1 | 2 => samples[step * 67] ^= 63,
+            3 => samples.iter_mut().for_each(|v| *v = v.wrapping_add(1)),
+            _ => {}
+        }
+        let image = Image::new(64, 64, PixelLayout::Gray, PixelData::U8(samples.clone())).unwrap();
+        let mut metadata = image.metadata().clone();
+        metadata.animation = Some(Animation::default());
+        images.push(image.with_metadata(metadata, vec![]).unwrap());
+    }
+    let auto = AutoOptions {
+        reference: Reference::Previous,
+        allow_mask: false,
+        ..Default::default()
+    };
+    let durations = [5, 6, 7, 8];
+    let result = encode_auto(&images, &durations, &EncodeOptions::default(), &auto).unwrap();
+    let winners: Vec<_> = result
+        .frames
+        .iter()
+        .map(|r| r.candidates[r.winner_index].strategy)
+        .collect();
+    assert_eq!(
+        winners,
+        [
+            Strategy::Full,
+            Strategy::CropPrevious,
+            Strategy::CropPrevious,
+            Strategy::AddDelta
+        ]
+    );
+    let decoded = decode(&result.bytes, &DecodeOptions::default()).unwrap();
+    for ((frame, original), ticks) in decoded.frames.iter().zip(&images).zip(durations) {
+        assert_eq!(&frame.pixels, original.pixels());
+        assert_eq!(frame.duration_ticks, ticks);
+    }
+}
+
+#[test]
 fn signed_add_chain_refreshes_its_reference_and_preserves_every_frame() {
     let images: Vec<_> = (0..36)
         .map(|frame| {

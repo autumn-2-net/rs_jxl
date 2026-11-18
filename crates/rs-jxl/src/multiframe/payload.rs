@@ -57,9 +57,13 @@ impl Payloads {
         options: &EncodeOptions,
         last: bool,
         budget: Option<&SectionBudget>,
-    ) -> Result<TrialEncode<Vec<u8>>> {
+    ) -> Result<(TrialEncode<Vec<u8>>, bool)> {
         let Some((uses, cache)) = self.entries.get_mut(&key(rect)) else {
-            return encode::encode_logical_frame_trial(canvas, frame, options, last, budget);
+            let mut atlas = false;
+            let encoded = encode::encode_replace_frame_trial(
+                canvas, frame, options, last, budget, &mut atlas,
+            )?;
+            return Ok((encoded, atlas));
         };
         if cache.contains(&()) {
             self.hits += 1;
@@ -74,11 +78,14 @@ impl Payloads {
             cache,
             (),
         )?;
+        // Only completed, atlas-free regular layers populate this cache.
+        // The caller consumes the flag only for a completed trial.
+        let atlas = !cache.contains(&());
         *uses -= 1;
         if *uses == 0 {
             self.entries.remove(&key(rect));
         }
-        Ok(output)
+        Ok((output, atlas))
     }
 
     pub(super) fn skip(&mut self, rects: &[Rect]) {
@@ -178,6 +185,7 @@ mod tests {
                 payloads
                     .encode(rect, &image, &frame, &options, false, None)
                     .unwrap()
+                    .0
                     .into_complete()
                     .unwrap(),
             );
@@ -198,6 +206,7 @@ mod tests {
             let hit = payloads
                 .encode(b, &image, &frame, &options, last, None)
                 .unwrap()
+                .0
                 .into_complete()
                 .unwrap();
             let ordinary = encode::encode_logical_frame_trial(&image, &frame, &options, last, None)

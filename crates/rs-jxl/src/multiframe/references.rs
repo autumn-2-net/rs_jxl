@@ -4,7 +4,7 @@
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(super) struct ReferenceSlots {
-    // Number of signed Add steps from a full patch-free Replace, by slot.
+    // Upper bound on signed Add steps at any pixel since a patch-free Full.
     pub(super) add_depth: [Option<u8>; 4],
     pub(super) frames: [Option<usize>; 4],
 }

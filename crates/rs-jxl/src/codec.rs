@@ -300,8 +300,19 @@ impl Encoder {
         options: &EncodeOptions,
         layers: &crate::layers::LayerOptions,
     ) -> Result<crate::layers::LayerEncodeResult> {
+        self.encode_layers_with_group_search(images, options, layers, false)
+    }
+
+    /// Exact byte selection between the original and one group size per layer.
+    pub fn encode_layers_with_group_search(
+        &mut self,
+        images: &[Image],
+        options: &EncodeOptions,
+        layers: &crate::layers::LayerOptions,
+        search_groups: bool,
+    ) -> Result<crate::layers::LayerEncodeResult> {
         self.check_threads(options.threads)?;
-        crate::layers::encode_in_pool(images, options, layers, self.pool.as_ref())
+        crate::layers::encode_in_pool(images, options, layers, search_groups, self.pool.as_ref())
     }
 
     pub fn transcode_jpeg(

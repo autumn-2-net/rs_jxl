@@ -127,6 +127,14 @@ The C ABI uses `operation: "encode_layers"` with `images`, `options` and
 See [protocol](../crates/rs-jxl-ffi/protocol.md). Explicit tool options are
 supported; source-search and legacy automatic-frame keys are not silently used.
 
+With Python `encode_layers(..., effort=9)` and automatic group sizing, a layer
+that spans multiple groups and fits within 512 × 512 gets one additional
+trial using a single group. A group-sized MA training window scales with it.
+The encoder compares complete layer bytes and retains the smaller encoding.
+An explicit `group_size_shift` selects a fixed group size. Rust callers can
+request this search with `layers::encode_with_group_search` or
+`Encoder::encode_layers_with_group_search`.
+
 ## Scope and Compatibility
 
 This is separate from `encode_multiframe(auto=True)` and `analyze_multiframe`,
@@ -177,3 +185,26 @@ matching is performed: the 0.21% size difference is not evidence for a new
 inter-frame compression algorithm. A separate array-based independent run gave
 586,696 bytes; it is not used in the table because file metadata was not passed
 through the same input route.
+
+## Per-layer group sizing at effort 9
+
+Compared with `5a868ae`, the automatic group trial produced these complete
+two-layer file sizes on Windows x86_64. Both layers had named rectangles at
+origin (−2, 3) on a 200 × 120 canvas. The first three cases use 64 × 64
+and 272 × 160 RGBA inputs, including nonzero RGB under zero alpha. The last
+case uses center crops of 90 × 110 and 380 × 290 pixels from the existing
+t2 pair. The reverse-order controls placed the larger image first.
+
+| Inputs | Small first, bytes before / after | Saving | Small first encode MPix/s | Small first raw decode MPix/s | Large first, bytes before / after |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Tiled pattern | 967 / 808 | 16.44% | 0.626 / 0.451 | 23.477 / 15.846 | 807 / 807 |
+| Gradient | 490 / 341 | 30.41% | 0.772 / 0.360 | 11.194 / 5.292 | 340 / 340 |
+| Random RGB with alpha mask | 146,045 / 145,895 | 0.10% | 0.544 / 0.260 | 11.322 / 6.062 | 145,894 / 145,894 |
+| Real image crops | 65,711 / 64,219 | 2.27% | 0.603 / 0.282 | 13.923 / 6.258 | 64,220 / 64,220 |
+
+The Python benchmark used reusable four-thread contexts, one warmup and
+three measured repetitions per build. Raw decode timing includes two separate
+`decode_layer` calls on the same stream. Each run checked both raw rectangles
+against the input, including out-of-canvas samples. Official djxl also
+recovered the expected clipped canvas in all eight cases. Local measurements
+and scripts are in `out/multiframe-layers-rate-20261118/`.
