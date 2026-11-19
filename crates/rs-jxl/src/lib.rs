@@ -23,6 +23,9 @@
 //! Runtime decoding uses maintained official Rust decoder sources; see [`decode`].
 #![deny(unsafe_op_in_unsafe_fn)]
 
+/// Default requested effort for the CLI and the public language bindings.
+pub const DEFAULT_EFFORT: u8 = 9;
+
 pub mod bit_writer;
 pub mod codec;
 pub mod color;

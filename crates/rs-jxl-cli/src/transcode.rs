@@ -42,7 +42,7 @@ pub(crate) struct TranscodeArgs {
     /// JXL container output path, or '-' for binary stdout
     output: PathBuf,
     /// Source coefficient backend effort (1..=11)
-    #[arg(long, value_name = "N", default_value = "3", value_parser = clap::value_parser!(u8).range(1..=11))]
+    #[arg(long, value_name = "N", default_value_t = rs_jxl::DEFAULT_EFFORT, value_parser = clap::value_parser!(u8).range(1..=11))]
     effort: u8,
     /// Run the optimized source JPEG search prefix (up to six complete trials)
     #[arg(long)]
@@ -191,7 +191,7 @@ mod tests {
     }
 
     #[test]
-    fn defaults_follow_public_transcode_options_and_limits() {
+    fn defaults_use_public_effort_and_transcode_limits() {
         let args = parse(&[]);
         assert_eq!(args.input, Path::new("-"));
         assert_eq!(args.output, Path::new("-"));
@@ -200,7 +200,7 @@ mod tests {
         assert!(parse(&["--source-search"]).source_search);
         let options = args.options();
         let defaults = TranscodeOptions::default();
-        assert_eq!(options.effort, defaults.effort);
+        assert_eq!(options.effort, rs_jxl::DEFAULT_EFFORT);
         assert_eq!(options.threads, defaults.threads);
         assert_eq!(options.decoding_speed, defaults.decoding_speed);
         assert_eq!(options.reconstruction_quality, None);

@@ -57,7 +57,7 @@ fn report(result: &LayerEncodeResult, jpeg_input: bool) -> Value {
 }
 
 fn search_groups(request: &crate::request::Options) -> bool {
-    request.effort.is_some_and(|effort| effort >= 9) && request.group_size_shift.is_none()
+    request.effort() >= 9 && request.group_size_shift.is_none()
 }
 
 pub(crate) fn execute(
@@ -99,10 +99,7 @@ mod tests {
 
     #[test]
     fn automatic_group_trials_keep_explicit_overrides() {
-        let mut request = crate::request::Options {
-            effort: Some(9),
-            ..Default::default()
-        };
+        let mut request = crate::request::Options::default();
         assert!(search_groups(&request));
         request.group_size_shift = Some(0);
         assert!(!search_groups(&request));

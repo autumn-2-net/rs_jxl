@@ -5,7 +5,7 @@ use rs_jxl::modular::ma_train::MaBudgetMode;
 #[test]
 fn ma_budget_parser_keeps_defaults_and_accepts_manual_source_and_pilot() {
     for route in [
-        vec![],
+        vec!["--rct", "6"],
         vec!["--source-effort", "9"],
         vec!["--source-effort", "9", "--source-search", "--source-pilot"],
     ] {
@@ -32,8 +32,8 @@ fn ma_budget_parser_keeps_defaults_and_accepts_manual_source_and_pilot() {
             ]);
             let args = expect_encode(Cli::try_parse_from(explicit).unwrap().command);
             let mut options = EncodeOptions::default();
-            if args.source_effort.is_none() {
-                args.tools.apply(&mut options).unwrap();
+            if let Some(tools) = &args.tools {
+                tools.apply(&mut options).unwrap();
             }
             args.ma_budget.apply(&mut options.modular);
             args.ma_pruning.apply(&mut options.modular);

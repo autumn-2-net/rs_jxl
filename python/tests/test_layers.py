@@ -55,7 +55,7 @@ class LayerAdapters(unittest.TestCase):
         self.assertIn("encode_layers", rs_jxl.__all__)
         self.assertEqual(request["operation"], "encode_layers")
         self.assertEqual(request["layer_options"], {})
-        self.assertEqual(request["options"], {"effort": 7, "threads": 1,
+        self.assertEqual(request["options"], {"effort": 9, "threads": 1,
                                              "source_search": False, "strip_metadata": False})
         self.assertEqual([(spec["width"], spec["height"]) for spec in request["images"]],
                          [(3, 2), (2, 4)])

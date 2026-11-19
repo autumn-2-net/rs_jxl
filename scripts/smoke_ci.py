@@ -107,7 +107,9 @@ def smoke(codec, cli, directory):
                                        subsampling=0, progressive=False, optimize=False)
     original_jpeg = jpeg.read_bytes()
     python_jxl = directory / "python-jpeg.jxl"
-    codec.transcode_jpeg(jpeg, python_jxl, effort=3, threads=1)
+    codec.transcode_jpeg(jpeg, python_jxl)
+    require(python_jxl.read_bytes() == codec.encode(jpeg, effort=9),
+            "Python JPEG entry points disagree on the default effort")
     require(codec.reconstruct_jpeg(python_jxl, threads=1) == original_jpeg,
             "Python JPEG reconstruction differs from the original bytes")
     print("PASS Python JPEG byte-exact reconstruction", flush=True)
@@ -116,7 +118,9 @@ def smoke(codec, cli, directory):
     png_jxl = directory / "cli-png.jxl"
     restored_png = directory / "restored.png"
     Image.fromarray(rgba8).save(png, format="PNG")
-    run_cli(cli, directory, "encode", png, png_jxl, "--source-effort", "3", "--threads", "1")
+    run_cli(cli, directory, "encode", png, png_jxl)
+    require(png_jxl.read_bytes() == codec.encode(png) == codec.encode(png, effort=9),
+            "Default still-image effort differs between CLI and wheel")
     exact_pixels(codec.decode(png_jxl, threads=1), rgba8, "CLI PNG to Python")
     run_cli(cli, directory, "decode", png_jxl, restored_png, "--threads", "1")
     with Image.open(restored_png) as image:
@@ -125,7 +129,9 @@ def smoke(codec, cli, directory):
 
     jpeg_jxl = directory / "cli-jpeg.jxl"
     restored_jpeg = directory / "restored.jpg"
-    run_cli(cli, directory, "transcode-jpeg", jpeg, jpeg_jxl, "--effort", "3", "--threads", "1")
+    run_cli(cli, directory, "transcode-jpeg", jpeg, jpeg_jxl)
+    require(jpeg_jxl.read_bytes() == python_jxl.read_bytes(),
+            "Default JPEG transcoding differs between CLI and wheel")
     require(codec.reconstruct_jpeg(jpeg_jxl, threads=1) == original_jpeg,
             "CLI JPEG transcode to Python reconstruction differs")
     run_cli(cli, directory, "decode", jpeg_jxl, restored_jpeg,
@@ -138,6 +144,17 @@ def smoke(codec, cli, directory):
     require(restored_python_jpeg.read_bytes() == original_jpeg,
             "Python JPEG transcode to CLI reconstruction differs")
     print("PASS CLI JPEG byte-exact reconstruction and Python interoperability", flush=True)
+
+    paths = []
+    for index, frame in enumerate(frames):
+        path = directory / f"frame-{index}.png"
+        Image.fromarray(frame).save(path)
+        paths.append(path)
+    frames_jxl = directory / "cli-frames.jxl"
+    run_cli(cli, directory, "encode-frames", *paths, "-o", frames_jxl)
+    require(frames_jxl.read_bytes() == codec.encode_multiframe(paths)
+            == codec.encode_multiframe(paths, durations=100, effort=9),
+            "Default multiframe encoding differs between CLI and wheel")
 
 
 def main():

@@ -42,6 +42,13 @@ impl Default for Animation {
     }
 }
 impl Animation {
+    /// A 100 ms display interval rounded to the nearest positive whole tick.
+    pub fn default_frame_ticks(self) -> Result<u32> {
+        self.validate()?;
+        let divisor = 10 * self.ticks_per_second_denominator;
+        Ok(((self.ticks_per_second_numerator + divisor / 2) / divisor).max(1))
+    }
+
     pub fn validate(self) -> Result<()> {
         if self.ticks_per_second_numerator == 0
             || self.ticks_per_second_numerator > 1 << 30

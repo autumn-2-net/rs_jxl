@@ -96,7 +96,7 @@ pub(super) fn execute(
         loops: request.loops.unwrap_or(0),
         timecodes: false,
     };
-    animation.validate().map_err(message)?;
+    let default_ticks = animation.default_frame_ticks().map_err(message)?;
     let images = images
         .into_iter()
         .map(|image| {
@@ -110,7 +110,7 @@ pub(super) fn execute(
     let durations = request
         .durations
         .clone()
-        .unwrap_or_else(|| vec![1; images.len()]);
+        .unwrap_or_else(|| vec![default_ticks; images.len()]);
     let options = pixel_options(&images[0], &request.options)?;
     let mut report = json!({
         "operation": "encode_multiframe",

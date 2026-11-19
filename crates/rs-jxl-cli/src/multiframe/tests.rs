@@ -279,7 +279,7 @@ fn explicit_timing_and_strategy_options_are_forwarded() {
     assert_eq!(auto.max_total_trials, 300);
     assert_eq!(auto.max_trial_pixels, 4000);
     let mut options = EncodeOptions::default();
-    args.tools.apply(&mut options).unwrap();
+    args.tools.as_ref().unwrap().apply(&mut options).unwrap();
     assert_eq!(options.modular.rct, Some(0));
     assert_eq!(args.threads, 2);
     for (name, reference) in [
@@ -318,6 +318,12 @@ fn pruning_and_adaptive_controls_are_independent_and_budgets_accept_zero() {
 
 #[test]
 fn durations_are_exact_and_never_implicitly_repeated_or_clamped() {
+    for (tps, expected) in [("25", 3), ("30000/1001", 3), ("1/1024", 1)] {
+        assert_eq!(
+            parse(&["--tps", tps]).frame_durations().unwrap(),
+            [expected; 2]
+        );
+    }
     assert_eq!(
         parse(&["--duration", "13"]).frame_durations().unwrap(),
         [13, 13]
@@ -372,8 +378,8 @@ fn invalid_timebases_limits_and_unsupported_search_fail() {
         vec!["--duration", "4294967296"],
         vec!["--durations", "1,,2"],
         vec!["--reference", "unknown"],
-        vec!["--effort", "3"],
-        vec!["--source-effort", "3"],
+        vec!["--effort", "0"],
+        vec!["--source-effort", "12"],
         vec!["--source-search"],
     ] {
         let mut argv = vec!["rs-jxl", "encode-frames", "a", "-o", "b"];
@@ -962,11 +968,15 @@ fn crop_cli_matches_geometry_plan_and_preserves_hidden_rgb_and_timing() {
     let durations = args.frame_durations().unwrap();
     let plan = rs_jxl::multiframe::plan(&images, &durations, Reference::SmallestCrop).unwrap();
     let frames: Vec<_> = plan.iter().map(|frame| frame.as_frame()).collect();
-    let mut options = EncodeOptions {
-        threads: args.threads,
-        ..Default::default()
-    };
-    args.tools.apply(&mut options).unwrap();
+    let options = args
+        .source_options(
+            &images[0],
+            &EncodeOptions {
+                threads: 2,
+                ..Default::default()
+            },
+        )
+        .unwrap();
     let expected = rs_jxl::codec::Encoder::new(2)
         .unwrap()
         .encode_frames(&images[0], &frames, &options)
@@ -1002,4 +1012,29 @@ fn crop_cli_matches_geometry_plan_and_preserves_hidden_rgb_and_timing() {
     assert_eq!(report["frames"][1]["width"], 1);
     assert!(report["frames"][1].get("candidates").is_none());
     assert!(report["frames"][1].get("winner_index").is_none());
+}
+
+#[test]
+fn effort_and_explicit_manual_tools_select_distinct_modes() {
+    assert!(parse(&[]).tools.is_none());
+    assert!(parse(&["--rct", "6"]).tools.is_some());
+    for flag in ["--effort", "--source-effort"] {
+        let args = parse(&[flag, "3"]);
+        assert_eq!(args.effort, Some(3));
+        assert!(args.tools.is_none());
+        assert!(
+            Cli::try_parse_from([
+                "rs-jxl",
+                "encode-frames",
+                "a.png",
+                "-o",
+                "b.jxl",
+                flag,
+                "3",
+                "--rct",
+                "6",
+            ])
+            .is_err()
+        );
+    }
 }

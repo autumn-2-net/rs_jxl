@@ -67,7 +67,8 @@ fn source_override_flags_require_source_mode_and_validate_ranges() {
     ] {
         let mut argv = vec!["rs-jxl", "encode", "-", "-"];
         argv.extend(flags);
-        assert!(Cli::try_parse_from(argv).is_err());
+        let args = expect_encode(Cli::try_parse_from(argv).unwrap().command);
+        assert!(args.job().unwrap().source.is_some());
     }
     for (flag, value) in [
         ("--source-group-size-shift", "4"),

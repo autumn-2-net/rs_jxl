@@ -75,7 +75,7 @@ def _frames(value):
 
 
 def encode_layers(images, output=None, *, canvas=None, layer_options=None,
-                  tps=None, loops=0, layout="auto", effort=7, threads=1,
+                  tps=None, loops=0, layout="auto", effort=_options.DEFAULT_EFFORT, threads=1,
                   lossless=True, distance=0, extra_channels=None,
                   bits_per_sample=0, color_encoding=None, icc_profile=None,
                   allow_device_copy=False, strip_metadata=False, return_info=False,

@@ -18,7 +18,10 @@ fn cli_shape_and_defaults() {
     assert_eq!(args.threads, 1);
     assert!(!args.force);
     assert!(!args.strip_metadata);
-    assert_eq!(args.source_effort, None);
+    assert_eq!(
+        args.job().unwrap().source.unwrap().params,
+        CandidateParams::default().backend(9).unwrap()
+    );
     assert!(!args.source_search);
     assert!(!args.source_scout);
     assert_eq!(args.source_sample_limit, None);
@@ -83,10 +86,10 @@ fn source_arguments_and_resources() {
         );
     }
     for extra in [
-        vec!["--source-search"],
+        vec!["--source-search", "--rct", "6"],
         vec!["--source-scout"],
         vec!["--source-pilot"],
-        vec!["--source-sample-limit", "1048576"],
+        vec!["--source-sample-limit", "1048576", "--rct", "6"],
     ] {
         let mut argv = vec!["rs-jxl", "encode", "a", "b"];
         argv.extend(extra);
@@ -163,6 +166,7 @@ fn typed_jobs_forward_shared_resource_controls_without_changing_modes() {
     use rs_jxl::modular::ma_train::MaBudgetMode;
 
     let routes: &[&[&str]] = &[
+        &["--rct", "6"],
         &[],
         &["--source-effort", "3"],
         &["--source-effort", "11"],
@@ -194,19 +198,20 @@ fn typed_jobs_forward_shared_resource_controls_without_changing_modes() {
                 "--strip-metadata",
                 "--force",
             ]);
-            if !route.is_empty() {
+            let source = !route.contains(&"--rct");
+            if source {
                 flags.extend_from_slice(&["--source-sample-limit", "4096"]);
             }
             let args = encode_args(&flags);
             assert!(args.strip_metadata && args.force);
             let job = args.job().unwrap();
-            assert_eq!(job.source.is_some(), !route.is_empty());
+            assert_eq!(job.source.is_some(), source);
             assert_eq!(job.options.threads, 2);
             let modular = &job.options.modular;
             assert_eq!(modular.ma_budget_mode, Some(expected));
             assert_eq!(modular.ma_max_leaves, Some(17));
             assert!(modular.source_property_dedup && modular.source_ma_dominance);
-            assert_eq!(modular.sample_limit, (!route.is_empty()).then_some(4096));
+            assert_eq!(modular.sample_limit, source.then_some(4096));
         }
     }
 }
@@ -215,7 +220,7 @@ fn typed_jobs_forward_shared_resource_controls_without_changing_modes() {
 fn typed_manual_jobs_keep_tool_defaults_overrides_and_validation() {
     use rs_jxl::modular::predictor::Predictor;
 
-    let job = encode_args(&[]).job().unwrap();
+    let job = encode_args(&["--rct", "6"]).job().unwrap();
     assert!(job.source.is_none());
     assert_eq!(job.options.threads, 1);
     assert_eq!(job.options.modular.rct, Some(6));
@@ -454,7 +459,7 @@ fn source_rejects_every_explicit_manual_tool_including_defaults() {
 
 #[test]
 fn only_supported_options_are_accepted() {
-    for option in ["--effort", "--quality", "--lossy"] {
+    for option in ["--quality", "--lossy"] {
         assert!(Cli::try_parse_from(["rs-jxl", "encode", "a", "b", option, "1"]).is_err());
     }
     for count in ["0", "-1", "257", "abc", "18446744073709551616"] {

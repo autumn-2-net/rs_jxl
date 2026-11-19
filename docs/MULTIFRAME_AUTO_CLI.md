@@ -2,7 +2,8 @@
 
 `rs-jxl encode-frames` accepts ordered still PNG/JPEG paths and invokes
 `rs_jxl::multiframe::encode_auto`. It uses the existing CLI input decoders and
-transactional output writer. It does not run source-search or map effort levels.
+transactional output writer. The ordinary CLI and Python encoder default to
+native pixel effort 9. It does not run the separate source-search driver.
 
 ```powershell
 cargo run -p rs-jxl-cli -- encode-frames frame000.png frame001.png frame002.png -o animation.jxl --duration 100 --tps 1000 --loops 0
@@ -25,13 +26,13 @@ rs-jxl encode-frames a.png b.png b2.png a2.png -o animation.jxl --retained-refer
   A single input is also accepted. Formats are detected by signature.
 - `-o/--output` is required. Use `-o -` for binary stdout. At most one input may
   be `-` for stdin. All diagnostics go to stderr.
-- `--duration TICKS` applies one duration to every input; its default is 100.
+- `--duration TICKS` applies one duration to every input; omitting timing selects 100 ms per frame, rounded to the nearest positive whole tick.
 - `--durations TICKS,...` requires exactly one unsigned 32-bit value per input.
   It can be repeated. It conflicts with an explicitly supplied `--duration`;
   a one-element list is not broadcast to multiple inputs.
 - `--tps NUM[/DEN]` defaults to `1000` (1000/1 ticks per second). Duration in
   seconds is `TICKS * DEN / NUM`. The numerator must be in `1..=1073741824`
-  and denominator in `1..=1024`. No rounding or fraction normalization occurs.
+  and denominator in `1..=1024`. Explicit tick counts are exact.
 - `--loops N` defaults to 0, meaning unlimited repetition; 1 means one play.
 - A zero duration remains zero: it is a non-display layer, not a one-tick
   display frame. Coalesced decoder output need not contain one displayed frame
@@ -243,8 +244,10 @@ guarantee, are recorded in [MULTIFRAME_RETAINED_BENCHMARK.md](MULTIFRAME_RETAINE
 The existing manual `Tools` flags (for example `--rct`, `--predictor`,
 `--entropy`, `--lz77`, palette and squeeze options) and `--threads 1..=256` are
 forwarded through `EncodeOptions`. Incompatible tool combinations fail in the
-core; they are not silently disabled. `--effort`, `--source-effort` and
-`--source-search` are not accepted by this command.
+core; they are not silently disabled. `--effort` (`--source-effort`) selects
+the native policy for both auto and crop. Passing an explicit tool such as
+`--rct 6` selects the manual configuration even when the value is its default. The
+separate `--source-search` driver is not accepted by this command.
 
 ## Exact Input Semantics
 

@@ -61,6 +61,10 @@ pub struct Limits {
 }
 
 impl Options {
+    pub fn effort(&self) -> u8 {
+        self.effort.unwrap_or(rs_jxl::DEFAULT_EFFORT)
+    }
+
     pub fn has_tool_overrides(&self) -> bool {
         self.group_size_shift.is_some()
             || self.rct.is_some()

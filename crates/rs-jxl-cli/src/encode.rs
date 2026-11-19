@@ -12,9 +12,6 @@ use crate::{Result, input, io, options};
 
 #[derive(Debug, Args)]
 #[command(
-    group = clap::ArgGroup::new("source_patch_mode")
-        .args(["source_effort", "source_patches"])
-        .multiple(true),
     after_long_help = "JPEG input is pixel-lossless relative to zune-jpeg's \
 decoded samples only; original JPEG bytes cannot be reconstructed.\n\
 PNG sRGB/gAMA/cHRM/iCCP and JPEG ICC color metadata are preserved. \
@@ -26,7 +23,7 @@ unsupported metadata can change displayed orientation without changing samples.\
 APNG, CMYK/YCCK JPEG and non-8-bit JPEG are unsupported. No extra input-size \
 or pixel-count cap is imposed; format, allocation and overflow checks still apply. \
 Explicit encoder resource budgets are enforced as well.\n\
-Source mode is experimental and entirely Rust: --source-effort 1..11 encodes \
+The default is effort 9. --effort 1..11 (alias --source-effort) encodes \
 one native candidate; --source-search additionally runs the existing native \
 pixel search driver (effort 11 uses its separate full-frame tournament). \
 At effort 9/10, --source-scout selects an experimental coverage-guided frontier \
@@ -57,25 +54,25 @@ Existing output is not replaced unless --force is supplied."
 )]
 pub(crate) struct EncodeArgs {
     #[command(flatten)]
-    pub(crate) tools: options::Tools,
+    pub(crate) tools: Option<options::Tools>,
     #[command(flatten)]
     pub(crate) ma_budget: options::MaBudgetOptions,
     #[command(flatten)]
     pub(crate) ma_pruning: options::MaPruningOptions,
-    /// Experimental source policy: one native candidate at effort 1..=11
-    #[arg(long, value_name = "N", conflicts_with = "manual_tools", value_parser = clap::value_parser!(u8).range(1..=11))]
+    /// Source policy, default 9. Explicit low-level tools select manual encoding.
+    #[arg(long = "effort", visible_alias = "source-effort", value_name = "N", conflicts_with = "manual_tools", value_parser = clap::value_parser!(u8).range(1..=11))]
     pub(crate) source_effort: Option<u8>,
     /// Disable automatic e9 MA learner/offsets/scoring; explicit tools still apply.
-    #[arg(long, requires = "source_effort")]
+    #[arg(long, conflicts_with = "manual_tools")]
     pub(crate) no_source_ma_defaults: bool,
     /// Disable automatic e7–9 screened palettes and e9 Sparse LZ77 and prev1.
-    #[arg(long, requires = "source_effort")]
+    #[arg(long, conflicts_with = "manual_tools")]
     pub(crate) no_source_tool_defaults: bool,
     /// Disable automatic parallel gather for Source Add patches; explicit gathers still apply.
-    #[arg(long, requires = "source_patch_mode")]
+    #[arg(long)]
     pub(crate) no_source_patch_parallel_gather: bool,
     /// Run native pixel search instead of just one source candidate
-    #[arg(long, requires = "source_effort")]
+    #[arg(long, conflicts_with = "manual_tools")]
     pub(crate) source_search: bool,
     /// Experimental coverage-guided search at source effort 9/10
     #[arg(long, requires = "source_search")]
@@ -87,57 +84,57 @@ pub(crate) struct EncodeArgs {
     #[arg(long, requires = "source_pilot")]
     pub(crate) source_progressive_groups: bool,
     /// Optional hard MA training sample limit; omitted means no sample-count cap
-    #[arg(long, value_name = "N", requires = "source_effort", value_parser = parse_sample_limit)]
+    #[arg(long, value_name = "N", conflicts_with = "manual_tools", value_parser = parse_sample_limit)]
     pub(crate) source_sample_limit: Option<usize>,
     /// Optional source grouping shift override: 0..=3 gives 128/256/512/1024
     /// pixel groups; omitted keeps the source automatic choice.
-    #[arg(long, value_name = "N", requires = "source_effort",
+    #[arg(long, value_name = "N", conflicts_with = "manual_tools",
           value_parser = clap::value_parser!(u8).range(0..=3))]
     pub(crate) source_group_size_shift: Option<u8>,
     /// Opt-in post-training entropy-mode comparison: the alternate coding
     /// (ANS vs Prefix) is serialized and kept only when actually smaller.
-    #[arg(long, requires = "source_effort")]
+    #[arg(long, conflicts_with = "manual_tools")]
     pub(crate) source_refine_entropy: bool,
     /// Opt-in post-training leaf refitting: the refitted tree is serialized and
     /// kept only when actually smaller.
-    #[arg(long, requires = "source_effort")]
+    #[arg(long, conflicts_with = "manual_tools")]
     pub(crate) source_refine_leaves: bool,
     /// Opt-in static leaf offset fitting: candidates are serialized and kept
     /// only when actually smaller.
-    #[arg(long, requires = "source_effort")]
+    #[arg(long, conflicts_with = "manual_tools")]
     pub(crate) source_refine_offsets: bool,
     /// Opt-in ANS context-map merge proposals: each candidate is serialized and
     /// kept only when actually smaller (multiple trials, highest cost).
-    #[arg(long, requires = "source_effort")]
+    #[arg(long, conflicts_with = "manual_tools")]
     pub(crate) source_refine_context_map: bool,
     /// Opt-in source responsive mode: the whole-frame default squeeze script and
     /// the responsive sampling/predictor policy (may change the codestream).
-    #[arg(long, requires = "source_effort")]
+    #[arg(long, conflicts_with = "manual_tools")]
     pub(crate) source_responsive: bool,
     /// Opt-in lossless precise entropy: forces the Tortoise entropy tier.
-    #[arg(long, requires = "source_effort")]
+    #[arg(long, conflicts_with = "manual_tools")]
     pub(crate) source_precise_entropy: bool,
     /// Previous-channel MA properties (0..=16; 0 explicitly disables them).
     /// Omitted means automatic (prev1 at e9); counts are clamped by channel count.
-    #[arg(long, value_name = "N", requires = "source_effort",
+    #[arg(long, value_name = "N", conflicts_with = "manual_tools",
           value_parser = clap::value_parser!(u8).range(0..=16))]
     pub(crate) source_max_properties: Option<u8>,
     /// Opt-in previous-channel property subset at source effort 9/10: 4 keeps
     /// the full upstream set per channel, 2 keeps signed sample + signed
     /// residual (17, 19), 1 keeps the signed residual only (19). Effective
     /// only when previous-channel properties are enabled.
-    #[arg(long, value_name = "N", requires = "source_effort", value_parser = parse_prev_props)]
+    #[arg(long, value_name = "N", conflicts_with = "manual_tools", value_parser = parse_prev_props)]
     pub(crate) source_prev_props: Option<u8>,
     /// Opt-in careful first LZ77 pass instead of the fast prefix matcher.
-    #[arg(long, requires = "source_effort")]
+    #[arg(long, conflicts_with = "manual_tools")]
     pub(crate) source_lz77_careful_first_pass: bool,
     /// Opt-in Optc256 bucket matcher (short32/long8 rings + 24 spatial anchors)
     /// instead of the default hash chain.
-    #[arg(long, requires = "source_effort")]
+    #[arg(long, conflicts_with = "manual_tools")]
     pub(crate) source_bucket_matcher: bool,
     /// Opt-in source buffering override: auto (default), full (one shared
     /// full-frame tree), above2048, streaming.
-    #[arg(long, value_name = "MODE", requires = "source_effort",
+    #[arg(long, value_name = "MODE", conflicts_with = "manual_tools",
           value_parser = ["auto", "full", "above2048", "streaming"])]
     pub(crate) source_buffering: Option<String>,
     /// PNG or JPEG input path, or '-' for stdin (detected by file signature)
@@ -162,15 +159,22 @@ impl EncodeArgs {
             source_patch_parallel_gather: !self.no_source_patch_parallel_gather,
             ..EncodeOptions::default()
         };
-        let Some(effort) = self.source_effort else {
-            self.tools.apply(&mut options)?;
+        if let Some(tools) = &self.tools {
+            tools.apply(&mut options)?;
+            if self.no_source_patch_parallel_gather && options.source_patches.is_none() {
+                return Err(
+                    "--no-source-patch-parallel-gather requires --source-patches in manual mode"
+                        .into(),
+                );
+            }
             self.ma_budget.apply(&mut options.modular);
             self.ma_pruning.apply(&mut options.modular);
             return Ok(EncodeJob {
                 options,
                 source: None,
             });
-        };
+        }
+        let effort = self.source_effort.unwrap_or(options::DEFAULT_EFFORT);
         self.ma_budget.apply(&mut options.modular);
         self.ma_pruning.apply(&mut options.modular);
         options.modular.sample_limit = self.source_sample_limit;

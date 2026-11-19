@@ -1,5 +1,6 @@
 //! CLI adapters for the directly ported pixel-lossless tools.
 use clap::{Args, ValueEnum};
+pub(crate) use rs_jxl::DEFAULT_EFFORT;
 use rs_jxl::entropy::stream::Coding;
 use rs_jxl::modular::predictor::Predictor;
 use rs_jxl::tools::lz77::Lz77Mode;

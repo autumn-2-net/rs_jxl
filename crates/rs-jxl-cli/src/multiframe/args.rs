@@ -90,7 +90,9 @@ frame is no longer permanently pinned. --reference-lookahead additionally requir
 choose an old state to retain, without future trial encodes or a global size guarantee. \
 Both reference flags are off by default. Mask and multi-rectangle candidates are \
 enabled by default when lossless and compatible. These are multiframe strategies, \
-not source-search or an effort mapping. Proven-bound pruning and adaptive rectangle \
+not source-search. --effort (alias --source-effort) selects a native pixel policy. \
+Explicit low-level tools instead select manual mode and conflict with explicit \
+effort. Proven-bound pruning and adaptive rectangle \
 proposals are enabled by default; --no-prune and --no-adaptive-rectangles disable \
 them independently. Before encoding, select one candidate by cheap samples \
 for packed U8 inputs or geometry for other inputs; the chosen representation \
@@ -111,21 +113,20 @@ Output must differ from every input, including with --force."
 )]
 pub(crate) struct EncodeFramesArgs {
     #[command(flatten)]
-    pub(super) tools: Tools,
+    pub(super) tools: Option<Tools>,
+    /// Native pixel effort 1..=11; omitted uses the shared CLI/Python default
+    #[arg(long, visible_alias = "source-effort", conflicts_with = "manual_tools",
+          value_parser = clap::value_parser!(u8).range(1..=11))]
+    pub(super) effort: Option<u8>,
     /// Ordered PNG/JPEG input paths (format detected by signature)
     #[arg(required = true, num_args = 1.., value_name = "INPUT")]
     pub(super) inputs: Vec<PathBuf>,
     /// JXL output path, or '-' for binary stdout
     #[arg(short, long, value_name = "OUTPUT")]
     pub(super) output: PathBuf,
-    /// Uniform duration in ticks, including zero for a non-display layer
-    #[arg(
-        long,
-        default_value_t = 100,
-        conflicts_with = "durations",
-        value_name = "TICKS"
-    )]
-    duration: u32,
+    /// Uniform duration in ticks (default 100 ms). Zero creates a non-display layer.
+    #[arg(long, conflicts_with = "durations", value_name = "TICKS")]
+    duration: Option<u32>,
     /// One tick count per input, comma-separated; may be repeated
     #[arg(long, value_delimiter = ',', num_args = 1, value_name = "TICKS,...")]
     durations: Vec<u32>,
@@ -207,6 +208,16 @@ pub(crate) struct EncodeFramesArgs {
 }
 
 impl EncodeFramesArgs {
+    pub(super) fn source_options(
+        &self,
+        image: &rs_jxl::Image,
+        base: &rs_jxl::EncodeOptions,
+    ) -> Result<rs_jxl::EncodeOptions> {
+        let params = rs_jxl::scheduler::CandidateParams::default()
+            .backend(self.effort.unwrap_or(crate::options::DEFAULT_EFFORT))?;
+        Ok(rs_jxl::scheduler::adapter::project_native(&params, image, base)?.exact_options()?)
+    }
+
     pub(super) fn auto_options(&self) -> AutoOptions {
         AutoOptions {
             reference: self.reference.core(),
@@ -294,7 +305,11 @@ impl EncodeFramesArgs {
         }
         let mut durations = Vec::new();
         durations.try_reserve_exact(self.inputs.len())?;
-        durations.resize(self.inputs.len(), self.duration);
+        durations.resize(
+            self.inputs.len(),
+            self.duration
+                .unwrap_or(self.animation().default_frame_ticks()?),
+        );
         Ok(durations)
     }
 

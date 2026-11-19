@@ -17,7 +17,7 @@ mod multiframe;
 
 fn candidate(options: &Options) -> Result<(CandidateParams, EncodeOptions)> {
     let mut params = CandidateParams::default()
-        .backend(options.effort.unwrap_or(7))
+        .backend(options.effort())
         .map_err(message)?;
     params.group_size_shift = options.group_size_shift;
     params.rct = options.rct;
@@ -161,7 +161,7 @@ pub fn transcode_with_context(
     let o = &request.options;
     let mut options = jpeg::TranscodeOptions {
         threads: o.threads.unwrap_or(1),
-        effort: o.effort.unwrap_or(7),
+        effort: o.effort(),
         reconstruction_quality: o.brotli_quality,
         cfl: if o.no_cfl.unwrap_or(false) {
             CflMode::Disabled

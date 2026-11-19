@@ -5,6 +5,8 @@ import os
 
 from ._arrays import integer
 
+DEFAULT_EFFORT = 9
+
 
 def threads(value) -> int:
     value = integer(value, "threads", 0, 256)

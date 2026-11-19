@@ -18,6 +18,9 @@ rust-version = "1.89"
 publish = false
 
 [workspace.dependencies]
+# Shipped CLI and Python library share the same codec feature set even when
+# built in separate Cargo invocations.
+rs-jxl = { path = "crates/rs-jxl", features = ["experimental-lz77-hotspots"] }
 rayon = "1.10"
 png = "=0.18.1"
 zune-jpeg = "=0.5.15"

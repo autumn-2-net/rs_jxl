@@ -107,7 +107,7 @@ fn source_ma_defaults_reaches_pixel_projection_without_changing_effort_defaults(
         }
     }
     let (params, _) = super::candidate(&Options::default()).unwrap();
-    assert_eq!(params.speed_tier, 3);
+    assert_eq!(params.speed_tier, 1); // E9
 }
 
 #[test]

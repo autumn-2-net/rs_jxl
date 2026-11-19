@@ -253,8 +253,11 @@ cargo build --locked --release -p rs-jxl-cli
 
 Linux/macOS use `./target/release/rs-jxl`; those platforms still require actual
 verification. No CMake or external encoder is needed. `--help` lists explicit
-tools. Experimental `--source-effort 1..11` executes one native source-policy
-candidate; adding `--source-search` runs the migrated scheduler and retains its
+tools. The CLI and Python use effort 9 by default for pixel encoding and
+byte-reversible JPEG transcoding. For pixels, `--effort 1..11` (also
+`--source-effort`) executes one native source-policy candidate. Passing a
+manual tool such as `--rct 6` selects the manual pixel configuration.
+Adding `--source-search` to still encoding runs the migrated scheduler and retains its
 winning output. These modes do not claim complete source/performance parity.
 Do not combine them with manual tool flags. `--source-sample-limit N` controls
 the hard MA sample resource ceiling, not the source sampling fraction; exceeding

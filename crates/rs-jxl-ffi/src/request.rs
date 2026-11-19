@@ -97,7 +97,7 @@ pub enum ValidatedRequest<'a> {
 
 #[derive(Debug)]
 pub struct Sequence<'a> {
-    /// None means one tick for each image; explicit zero durations are retained.
+    /// None means a 100 ms display interval rounded to whole positive ticks.
     pub durations: Option<&'a [u32]>,
     pub reference: rs_jxl::multiframe::Reference,
     pub animation: rs_jxl::metadata::Animation,
@@ -317,7 +317,7 @@ impl Request {
         if !(1..=256).contains(&o.threads.unwrap_or(1)) {
             return Err("threads must be 1..256".into());
         }
-        if !(1..=11).contains(&o.effort.unwrap_or(7)) {
+        if !(1..=11).contains(&o.effort()) {
             return Err("effort must be 1..11".into());
         }
         if o.brotli_quality.is_some_and(|v| v > 11) {

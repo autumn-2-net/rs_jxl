@@ -23,7 +23,9 @@ pub(crate) fn run(args: EncodeFramesArgs) -> Result<()> {
         threads: args.threads,
         ..EncodeOptions::default()
     };
-    args.tools.apply(&mut options)?;
+    if let Some(tools) = &args.tools {
+        tools.apply(&mut options)?;
+    }
     if args.strip_metadata {
         eprintln!(
             "warning: --strip-metadata discards unsupported metadata without color conversion or EXIF orientation transforms; supported color metadata is retained, but displayed orientation may change."
@@ -33,6 +35,11 @@ pub(crate) fn run(args: EncodeFramesArgs) -> Result<()> {
         let _input = rs_jxl::profile::scope("cli.input_decode");
         load_images(&args)?
     };
+    // Native effort projection needs the original canvas dimensions/metadata.
+    // Explicit manual tools retain their existing preflight and options.
+    if args.tools.is_none() {
+        options = args.source_options(&images[0], &options)?;
+    }
     eprintln!(
         "note: encoding ordered decoded samples without sample, alpha, color or orientation conversion."
     );

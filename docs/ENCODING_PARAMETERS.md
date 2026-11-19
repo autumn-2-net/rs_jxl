@@ -30,7 +30,7 @@ CLI 有一个重要区别：`rs-jxl encode input.jpg ...` 是像素路径；JPEG
 
 | 参数 | 默认值 / 范围 | 含义 |
 | --- | --- | --- |
-| `effort` | `encode` / `encode_multiframe` / `encode_layers` 为 **7**；`transcode_jpeg` 为 **9**；整数 `1..11` | 后端策略等级，不是有损质量等级；更高不保证更小或按固定比例变慢 |
+| `effort` | **9**，整数 `1..11` | 像素、图层和 JPEG 可逆转码使用相同的默认等级；各等级的速度和体积取决于输入 |
 | `threads` | **1**；整数 `0..256` | 1 为调用线程串行；0 在 Python 中解析为 CPU 数量，最多 256；Rust 原始接口要求 `1..256` |
 | `lossless` | **True** | 像素接口不提供有损编码；`False` 报错 |
 | `distance` | **0** | 非零报错；没有 `distance=1` 等有损模式 |
@@ -76,8 +76,7 @@ print(meta["report"])
 MA 树、调色板和熵模型。**关闭 `source_search` 并不等于后端没有搜索。**
 
 Python 把 effort 映射为 `CandidateParams.speed_tier = 10 - effort`，再投影到
-`EncodeOptions`。原始 `EncodeOptions` 本身没有 effort 字段，也没有统一的
-“默认 e7”；不能把它的手动工具默认值当成 Python e7 的配置。
+`EncodeOptions`。原始 Rust `EncodeOptions` 直接保存底层工具配置。
 
 | effort | 固定 source 后端的要点 |
 | --- | --- |
@@ -245,9 +244,8 @@ assert rs_jxl.reconstruct_jpeg(data) == original
 | `order` | **"source"**；`"source"/"default"/"adaptive"` | 系数扫描顺序策略：按 source 门控、固定默认顺序、显式自适应顺序 |
 | `limits` | **None** | 显式资源上限字典；超限失败，不退化到有损或像素重编码 |
 
-`encode("input.jpg")` 使用的是 `encode` 的默认 **effort=7**；
-`transcode_jpeg("input.jpg")` 默认 **effort=9**。需要可比结果时显式传相同 effort。
-Rust `TranscodeOptions::default()` 和 CLI `transcode-jpeg` 的默认 effort 则是 **3**。
+Python `encode("input.jpg")`、`transcode_jpeg("input.jpg")` 和 CLI
+`transcode-jpeg` 均默认 **effort=9**。Rust 底层 `TranscodeOptions::default()` 使用 **3**。
 
 JPEG 搜索请求等级达到 `1/3/5/7/9/10` 时，依次纳入后端 effort
 `3/5/7/8/9/10`；请求 11 与 10 使用同一候选前缀。它复用输入准备和可复用数据，
@@ -273,7 +271,7 @@ Python 转码的 `limits` 支持 `max_input_bytes`、`max_output_bytes`、
 | --- | --- | --- |
 | `strategy` | **"auto"** | 默认在编码前选出一个 full/crop/mask/多矩形候选；显式 `"crop"` 只做单 bbox 规划。关闭 screen_candidates 可恢复完整试编码搜索 |
 | `reference` | **"auto"** | `"previous"` 上一帧；`"first"` 第一帧；`"full"` 不做帧间差分；`"none"` 是 full 别名 |
-| `durations` | **1** | 单个 tick 数或每帧列表，`0..2^32-1`；0 是真正零时长 layer，不替换为 1 |
+| `durations` | **None**，每帧 100 ms | 省略时按时基取最接近的正整数 tick；显式值为单个 tick 数或每帧列表，`0..2^32-1`，0 表示零时长图层 |
 | `tps` | **(1000, 1)** | ticks/second 的分子和分母；分子 `1..2^30`，分母 `1..1024` |
 | `loops` | **0** | `0..2^32-1`；0 表示无限循环 |
 | `auto_options` | **None** | 仅 `strategy="auto"` 可传，包括空字典；Python/CLI 默认 screen_candidates=True，低层 Rust 默认 False；其他省略成员使用 Rust 默认值 |
@@ -444,17 +442,17 @@ Rust 可通过 `ModularOptions.source_lz77` 进一步控制 source 匹配与解�
 ### CLI 与 Python 不同
 
 `source_tool_defaults=False` 可以通过 Python 关键字或 `encoder_options` 传入，
-JSON 省略时为 true。它不改变像素编码的默认 effort=7，也不改变其他 effort 的工具默认值。
+JSON 省略时为 true。像素编码默认 effort=9。
 Rust 对应 `base.modular.source_tool_defaults`。
 
 CLI 关闭示例：`rs-jxl encode in.png out.jxl --source-effort 9 --no-source-tool-defaults`。
-此开关要求指定 `--source-effort`，也可与 `--source-search` 同用。
+此开关也可使用默认等级或与 `--source-search` 同用。
 `--source-max-properties N` 区分省略和显式零：省略为自动（仅 e9 默认 prev1），
 `0` 明确关闭跨通道 MA，非零值按可用变换通道数裁剪。
 即使关闭三项自动默认值，显式通道数量仍有效；Python/JSON 尚未单独暴露此数量。
 
 CLI `encode --source-effort 9` 对应 source 候选；加 `--source-search` 才是额外搜索。
-不指定 source effort 的 CLI `encode` 使用手动 `Tools`，**不是默认 Python e7**。
+CLI `encode` 和 `encode-frames` 均默认使用 E9；显式传入手动工具参数会启用手动配置。
 source effort 与手动工具参数互斥，不能把所有 CLI 开关拼在一起。
 
 手动 CLI 已有 `--rct`、`--predictor`、`--weighted-preset`、`--rct-candidates`、

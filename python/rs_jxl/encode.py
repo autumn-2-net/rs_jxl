@@ -6,7 +6,7 @@ from ._io import is_source, read_bytes, write_or_return
 from . import _options
 
 
-def transcode_jpeg(src, output=None, *, effort=9, threads=1, source_search=False,
+def transcode_jpeg(src, output=None, *, effort=_options.DEFAULT_EFFORT, threads=1, source_search=False,
                    brotli_quality=None, no_cfl=False, order="source", limits=None,
                    return_info=False, _context=None):
     """Preserve original JPEG bytes; unsupported JPEG forms fail without pixel fallback."""
@@ -19,7 +19,7 @@ def transcode_jpeg(src, output=None, *, effort=9, threads=1, source_search=False
     return (result, meta) if return_info else result
 
 
-def encode(src, output=None, *, layout="auto", effort=7, threads=1,
+def encode(src, output=None, *, layout="auto", effort=_options.DEFAULT_EFFORT, threads=1,
            lossless=True, distance=0, lossless_jpeg=True, source_search=False,
            strip_metadata=False, extra_channels=None, bits_per_sample=0,
            color_encoding=None, icc_profile=None, orientation=1,

@@ -87,7 +87,7 @@ serial child scopes fall back before Batch allocation, and not every image or
 effort uses this route. JPEG byte-transcode policy is unchanged. Details and
 the explicit Rust override are in [the Batch report](CHAIN_BATCH_PARALLEL_20261111.md).
 
-encode defaults: effort=7, threads=1, lossless=True, distance=0,
+encode defaults: effort=9, threads=1, lossless=True, distance=0,
 lossless_jpeg=True, source_search=False. JPEG bytes default to coefficient
 transcoding; unsupported structures fail without pixel fallback.
 transcode_jpeg is explicit, defaults effort=9, and exposes source_search,
@@ -133,7 +133,7 @@ MA learning, Half description-cost scoring and single-pass Distribution leaf
 offsets. Offset decisions precede LZ77 and entropy coding; they do not encode a second version
 to reject size regressions. This remains pixel-lossless, but individual files
 can grow. Other efforts and JPEG byte transcoding are unchanged. Public pixel
-effort defaults remain 7. Use `source_ma_defaults=False` (also accepted inside
+effort defaults to 9. Use `source_ma_defaults=False` (also accepted inside
 `encoder_options`) to disable all three automatic additions and restore the
 pre-profile e9 policy. This switch is supported for pixel still/multiframe/layer
 encoding, including still source search; JPEG byte transcoding rejects it.
@@ -142,7 +142,7 @@ See [single-pass MA](MA_SINGLE_PASS_DEFAULT_20261114.md) and
 
 Ordinary pixel-lossless efforts 7–9 use screened palette ordering and flat
 palette lookup. Effort 9 also enables Sparse LZ77 and prev1 previous-channel
-MA features. The default pixel effort is 7.
+MA features.
 Use `source_tool_defaults=False` or
 `encoder_options={"source_tool_defaults": False}` to disable these automatic
 tool additions. This does not disable `source_ma_defaults` or
@@ -153,7 +153,7 @@ and nonpixel operations reject either boolean value. Other efforts retain their
 existing tool defaults. Python does not expose a separate `source_max_properties`.
 
 CLI equivalent: `rs-jxl encode in.png out.jxl --source-effort 9
---no-source-tool-defaults` (the opt-out requires `--source-effort`). CLI
+--no-source-tool-defaults`. CLI
 `--source-max-properties N` is explicit: omitted means auto (prev1 only at e9),
 `0` disables previous-channel properties, and nonzero selects a count clamped
 by transformed channels. Explicit counts remain effective with the coarse opt-out.
@@ -276,6 +276,9 @@ all_frames = rs_jxl.decode(data, frame=None)
 analysis = rs_jxl.analyze_multiframe([rgba, changed])
 bounds = analysis["frames"][1]["previous"]
 ```
+
+Omitted durations use 100 ms per frame, rounded to the nearest positive tick
+at the requested timebase. Explicit durations are tick counts, including zero.
 
 reference=previous/first/full/auto (none aliases full). Default strategy="auto"
 selects one eligible full/crop/mask/multiple-rectangle candidate before encoding.
@@ -708,7 +711,7 @@ The full signature is:
 
 ```python
 encode_layers(images, output=None, *, canvas=None, layer_options=None,
-              tps=None, loops=0, layout="auto", effort=7, threads=1,
+              tps=None, loops=0, layout="auto", effort=9, threads=1,
               lossless=True, distance=0, extra_channels=None, bits_per_sample=0,
               color_encoding=None, icc_profile=None, allow_device_copy=False,
               strip_metadata=False, return_info=False, encoder_options=None,

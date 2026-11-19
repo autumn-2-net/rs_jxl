@@ -144,7 +144,7 @@ encode requires one image; multiframe and encode_layers require nonempty images.
 consume entire data buffer and reject images. info is JXL header inspection;
 read_image is shared PNG/JPEG pixel input decoding.
 
-durations defaults to one tick per image; supplied length must equal image count,
+durations defaults to 100 ms per image rounded to the nearest positive whole tick; supplied length must equal image count,
 zeros remain zeros. reference=previous (full/previous/first/smallest_crop),
 timebase=[1000,1] (ticks per second numerator/denominator), loops=0, auto=false.
 encode_multiframe always sets animation metadata. auto uses the native automatic
@@ -404,7 +404,7 @@ fails if unsupported by encoder. spot_color is four floats, cfa_channel integer.
 
 ## Options
 
-- encode/encode_multiframe/encode_layers: threads=1, effort=7, source_search=false,
+- encode/encode_multiframe/encode_layers: threads=1, effort=9, source_search=false,
   strip_metadata=false; optional group_size_shift,rct,predictor,palette_colors,
   patches(bool),learning_fraction,ma_max_leaves,source_ma_defaults(bool, default true),
   source_tool_defaults(bool, default true),source_patch_parallel_gather(bool, default true).
@@ -418,8 +418,8 @@ fails if unsupported by encoder. spot_color is four floats, cfa_channel integer.
   Omission means true; explicit false remains distinct. Null, non-booleans and
   duplicate keys fail. JPEG transcoding and all nonpixel operations reject either
   boolean value. max_properties is not separately exposed by this JSON API.
-  CLI: encode --source-effort 9 --no-source-tool-defaults; the opt-out requires
-  --source-effort. --source-max-properties N supplies an explicit count (0 disables);
+  The CLI equivalent is encode --no-source-tool-defaults.
+  --source-max-properties N supplies an explicit count (0 disables);
   omission leaves automatic prev1 at e9. Explicit counts survive the coarse opt-out.
   source_patch_parallel_gather enables channel-parallel sparse MA gathering only
   after a real Source Add patch plan, with source sampling and threads > 1.
@@ -445,7 +445,7 @@ fails if unsupported by encoder. spot_color is four floats, cfa_channel integer.
 - info: threads=1,coalescing=true,adjust_orientation=true,limits={}.
 - read_image: strip_metadata=false only. Returns packed native decoded samples.
 - reconstruct_jpeg: threads=1,limits={}; byte-exact only, no pixel fallback.
-- transcode_jpeg: threads=1,effort=7,source_search=false,brotli_quality=null,
+- transcode_jpeg: threads=1,effort=9,source_search=false,brotli_quality=null,
   no_cfl=false,order=source (source/default/adaptive),limits={}.
 
 `legacy_gradient` is accepted only for `decode`/`decode_to_png`, including decoder

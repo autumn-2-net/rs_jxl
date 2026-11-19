@@ -8,8 +8,11 @@ publish.workspace = true
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[features]
+decoder-avx512 = ["rs-jxl/decoder-avx512"]
+
 [dependencies]
-rs-jxl = { path = "../rs-jxl" }
+rs-jxl.workspace = true
 rs-jxl-image = { path = "../rs-jxl-image" }
 serde = { version = "1", features = ["derive"] }
 png.workspace = true

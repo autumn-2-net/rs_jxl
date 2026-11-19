@@ -110,14 +110,16 @@ def _images(frames, *, extra_channels=None, borrow_inputs=False, **options):
     return payload, specs
 
 
-def encode_multiframe(frames, output=None, *, layout="auto", durations=1,
+def encode_multiframe(frames, output=None, *, layout="auto", durations=None,
                       reference="auto", strategy="auto", tps=(1000, 1), loops=0,
-                      effort=7, threads=1, lossless=True, distance=0,
+                      effort=_options.DEFAULT_EFFORT, threads=1, lossless=True, distance=0,
                       extra_channels=None, bits_per_sample=0, color_encoding=None,
                       icc_profile=None, allow_device_copy=False, strip_metadata=False,
                       return_info=False, encoder_options=None, borrow_inputs=False,
                       auto_options=None, _context=None, **tool_options):
-    """Preserve every full input state; duration=0 remains a genuine layer.
+    """Preserve every full input state. Omitted durations use 100 ms per frame,
+    rounded to the nearest positive whole tick. Explicit durations are ticks
+    and zero creates a non-display layer.
 
     strategy='auto' is the default and selects among eligible full/crop/mask/
     multiple-rectangle candidates, with sample screening enabled by default.
@@ -167,14 +169,6 @@ def encode_multiframe(frames, output=None, *, layout="auto", durations=1,
                              borrow_inputs=borrow_inputs,
                              bits_per_sample=bits_per_sample, color_encoding=color_encoding,
                              icc_profile=icc_profile, allow_device_copy=allow_device_copy)
-    if durations is None:
-        durations = 1
-    try:
-        ticks = [integer(durations, "duration", 0, 0xffffffff)] * len(specs)
-    except TypeError:
-        ticks = [integer(value, "duration", 0, 0xffffffff) for value in durations]
-    if len(ticks) != len(specs):
-        raise ValueError("one duration per frame is required")
     if len(tps) != 2:
         raise ValueError("tps must be (numerator, denominator)")
     timebase = [integer(tps[0], "tps numerator", 1, 1 << 30),
@@ -182,9 +176,17 @@ def encode_multiframe(frames, output=None, *, layout="auto", durations=1,
     options = _options.encoder(effort, threads, False, encoder_options, tool_options)
     options["strip_metadata"] = strip_metadata
     request = {"operation": "encode_multiframe", "images": specs,
-               "options": options, "durations": ticks, "timebase": timebase,
+               "options": options, "timebase": timebase,
                "loops": integer(loops, "loops", 0, 0xffffffff),
                "reference": references[reference], "auto": strategy == "auto"}
+    if durations is not None:
+        try:
+            ticks = [integer(durations, "duration", 0, 0xffffffff)] * len(specs)
+        except TypeError:
+            ticks = [integer(value, "duration", 0, 0xffffffff) for value in durations]
+        if len(ticks) != len(specs):
+            raise ValueError("one duration per frame is required")
+        request["durations"] = ticks
     if automatic is not None:
         request["auto_options"] = automatic
     data, meta = execute(request, payload.data, context=_context)
