@@ -1,6 +1,6 @@
-//! Development-only exact patch experiments; not part of the installed CLI.
-//! selected_mode=source means the source detector candidate is enabled, not
-//! proof that discovery emitted a dictionary. Source gates can still disable it.
+//! Development-only lossless patch experiments; not part of the installed CLI.
+//! selected_mode records the enabled route. source_patch_selected records
+//! whether the completed encode contains a source patch dictionary.
 //! Screened tiles use cheap admission before encoding; guarded is an explicit
 //! dual-encode diagnostic, not the admission policy.
 use clap::{Parser, ValueEnum};
@@ -16,6 +16,7 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum Mode {
+    Ordinary,
     Off,
     Source,
     Components,
@@ -26,6 +27,7 @@ enum Mode {
 impl Mode {
     fn name(self) -> &'static str {
         match self {
+            Self::Ordinary => "ordinary",
             Self::Off => "off",
             Self::Source => "source",
             Self::Components => "components",
@@ -94,6 +96,12 @@ struct Args {
     threads: u16,
     #[arg(long, value_enum, default_value = "off")]
     mode: Mode,
+    /// Allow near-match proposals while retaining exact reconstruction (source only).
+    #[arg(long)]
+    near_match: bool,
+    /// Divisor for detector fingerprints (source only, defaults to 1).
+    #[arg(long, alias = "fingerprint-divisor", value_parser = ["1", "2", "4"])]
+    source_fingerprint_divisor: Option<String>,
     #[arg(long, default_value_t = 16, value_parser = positive_size)]
     tile_size: usize,
     #[arg(long, value_enum, default_value = "screened")]
@@ -101,6 +109,9 @@ struct Args {
     /// Match grid seeds at arbitrary pixel destinations (tiles/guarded only).
     #[arg(long)]
     off_grid: bool,
+    /// Merge adjacent matching tiles into larger rectangles (tiles/guarded only).
+    #[arg(long)]
+    expand_rectangles: bool,
     /// Replace MA learning with a standard-predictor spatial tree (off/source).
     #[arg(long, value_parser = ["8", "16"])]
     block_size: Option<String>,
@@ -265,6 +276,9 @@ fn run(args: Args) -> Result<()> {
     if args.off_grid && !matches!(args.mode, Mode::Tiles | Mode::Guarded) {
         return Err("--off-grid requires --mode tiles or guarded".into());
     }
+    if args.expand_rectangles && !matches!(args.mode, Mode::Tiles | Mode::Guarded) {
+        return Err("--expand-rectangles requires --mode tiles or guarded".into());
+    }
     if args.block_size.is_some() && !matches!(args.mode, Mode::Off | Mode::Source) {
         return Err("--block-size requires --mode off or source".into());
     }
@@ -277,6 +291,12 @@ fn run(args: Args) -> Result<()> {
     }
     if args.source_representative.is_some() && args.mode != Mode::Source {
         return Err("--source-representative requires --mode source".into());
+    }
+    if args.near_match && args.mode != Mode::Source {
+        return Err("--near-match requires --mode source".into());
+    }
+    if args.source_fingerprint_divisor.is_some() && args.mode != Mode::Source {
+        return Err("--source-fingerprint-divisor requires --mode source".into());
     }
     if args.output.exists() {
         return Err("benchmark output already exists".into());
@@ -315,9 +335,11 @@ fn run(args: Args) -> Result<()> {
             &reference_block_receipt,
         );
     }
-    // Keep the normal source candidate's non-patch settings across all trials.
+    // Keep the ordinary native candidate's non-patch settings across all trials.
     let mut options = adapter::project_native(&params, &image, &base)?.exact_options()?;
-    clear_detectors(&mut options);
+    if args.mode != Mode::Ordinary {
+        clear_detectors(&mut options);
+    }
     let representative_receipt = Arc::new(rs_jxl::tools::patches::RepresentativeReceipt::default());
     if args.mode == Mode::Source {
         params.patches = Override::On;
@@ -325,24 +347,32 @@ fn run(args: Args) -> Result<()> {
         // Only adopt the forced detector and its deferred atlas policy.
         options.source_patches = source.source_patches;
         options.source_patch_reference = source.source_patch_reference;
-        if let Some(config) = &mut options.source_patches {
-            use rs_jxl::tools::patches::RepresentativeMode;
-            config.representative.mode = match args.source_representative.as_deref() {
-                Some("medoid") => RepresentativeMode::Medoid,
-                Some("entropy") => RepresentativeMode::MinEntropy,
+    }
+    if let Some(config) = &mut options.source_patches {
+        use rs_jxl::tools::patches::RepresentativeMode;
+        if args.near_match {
+            config.near_match = true;
+        }
+        if let Some(divisor) = &args.source_fingerprint_divisor {
+            config.fingerprint_divisor = divisor.parse()?;
+        }
+        if let Some(mode) = args.source_representative.as_deref() {
+            config.representative.mode = match mode {
+                "medoid" => RepresentativeMode::Medoid,
+                "entropy" => RepresentativeMode::MinEntropy,
                 _ => RepresentativeMode::First,
             };
-            if let Some(n) = args.representative_candidates {
-                config.representative.candidates = n;
-            }
-            if let Some(n) = args.representative_occurrences {
-                config.representative.occurrences = n;
-            }
-            if let Some(n) = args.representative_pixels {
-                config.representative.pixels = n;
-            }
-            config.representative.receipt = Some(Arc::clone(&representative_receipt));
         }
+        if let Some(n) = args.representative_candidates {
+            config.representative.candidates = n;
+        }
+        if let Some(n) = args.representative_occurrences {
+            config.representative.occurrences = n;
+        }
+        if let Some(n) = args.representative_pixels {
+            config.representative.pixels = n;
+        }
+        config.representative.receipt = Some(Arc::clone(&representative_receipt));
     }
     if args.parallel_gather {
         configure_parallel_gather(&mut options, args.threads, args.gather_waves);
@@ -362,6 +392,11 @@ fn run(args: Args) -> Result<()> {
     let mut guard_work = None;
     let mut source_detector_enabled = None;
     let (bytes, seconds, mut selected_mode) = match args.mode {
+        Mode::Ordinary => {
+            source_detector_enabled = Some(options.source_patches.is_some());
+            let (bytes, seconds) = encode_timed(&image, &options)?;
+            (bytes, seconds, Mode::Ordinary)
+        }
         Mode::Off => {
             let (bytes, seconds) = encode_timed(&image, &options)?;
             (bytes, seconds, Mode::Off)
@@ -386,6 +421,7 @@ fn run(args: Args) -> Result<()> {
             tiles.tile_patches = Some(TilePatchOptions {
                 tile_size: args.tile_size,
                 off_grid: args.off_grid,
+                expand_rectangles: args.expand_rectangles,
                 force: args.tile_admission == TileAdmission::Force,
                 receipt: Some(Arc::clone(&receipt)),
                 ..Default::default()
@@ -422,10 +458,12 @@ fn run(args: Args) -> Result<()> {
         serde_json::json!({
             "tile_size": args.tile_size,
             "off_grid": args.off_grid,
+            "expand_rectangles": args.expand_rectangles,
             "windows_examined": work.windows_examined,
             "discovery_limited": work.discovery_limited,
             "calls": work.calls, "tiles_examined": work.tiles_examined,
             "constant_tiles": work.constant_tiles, "repeated_groups": work.repeated_groups,
+            "merged_groups": work.merged_groups,
             "selected_groups": work.selected_groups, "positions": work.positions,
             "covered_pixels": work.covered_pixels, "atlas_pixels": work.atlas_pixels,
             "admission_rejected": work.admission_rejected,
@@ -440,8 +478,15 @@ fn run(args: Args) -> Result<()> {
         })
     });
     let pixels = f64::from(image.width()) * f64::from(image.height());
-    let representative_work = (args.mode == Mode::Source).then(|| {
-        let work = representative_receipt.snapshot();
+    let work = representative_receipt.snapshot();
+    // Each source candidate is encoded once, and a successful encode always
+    // serializes a prepared source plan as a reference frame and dictionary.
+    let source_patch_selected = match args.mode {
+        Mode::Off => Some(false),
+        Mode::Ordinary | Mode::Source => Some(work.emitted_plans != 0),
+        _ => None,
+    };
+    let representative_work = matches!(args.mode, Mode::Ordinary | Mode::Source).then(|| {
         serde_json::json!({
             "mode": args.source_representative.as_deref().unwrap_or("first"),
             "candidates_budget": args.representative_candidates.unwrap_or(8),
@@ -495,8 +540,10 @@ fn run(args: Args) -> Result<()> {
             "width": image.width(), "height": image.height(),
             "mode": args.mode.name(), "selected_mode": selected_mode.name(),
             "source_detector_enabled": source_detector_enabled,
-            "source_patch_selected": if args.mode == Mode::Off { Some(false) } else { None },
-            "selected_mode_contract": "enabled route only; source does not prove dictionary/reference emission",
+            "source_patch_selected": source_patch_selected,
+            "near_match": args.near_match,
+            "fingerprint_divisor": options.source_patches.as_ref().map(|config| config.fingerprint_divisor),
+            "selected_mode_contract": "enabled route; source_patch_selected records source dictionary/reference emission",
             "tile_admission": matches!(args.mode, Mode::Tiles | Mode::Guarded)
                 .then(|| args.tile_admission.name()),
             "tile_work": tile_work, "guard_work": guard_work,

@@ -70,6 +70,9 @@ pub use representative::{
     RepresentativeMode, RepresentativeOptions, RepresentativeReceipt, RepresentativeStats,
 };
 
+#[path = "patch_source_near.rs"]
+mod near;
+
 /// The source outer gate, before detector overrides and seed availability.
 /// Override On does not bypass the speed/depth/groupwise gate.
 pub fn source_enabled(
@@ -129,6 +132,8 @@ pub struct SourcePatchConfig {
     /// Source fingerprint experiment: 1 (default), 2, or 4. Does not quantize
     /// the actual atlas, nor permit dropping occurrence-specific residuals.
     pub fingerprint_divisor: i32,
+    /// Try bounded same-size cross-fingerprint groups for integer color.
+    pub near_match: bool,
     /// Opt-in reference-instance selection; does not change detection/grouping.
     pub representative: RepresentativeOptions,
     pub limits: PatchOptions,
@@ -147,6 +152,7 @@ impl Default for SourcePatchConfig {
             fast: true,
             min_peak: 2,
             fingerprint_divisor: 1,
+            near_match: false,
             representative: RepresentativeOptions::default(),
             limits: PatchOptions::default(),
         }
@@ -355,6 +361,7 @@ fn quantize(delta: f32, channel: usize) -> i32 {
 
 #[derive(Default)]
 struct Work {
+    near_candidate: Option<Vec<PatchInfo>>,
     #[cfg(test)]
     initial_queue: usize,
     #[cfg(test)]
@@ -622,6 +629,7 @@ fn detect_profiled<const PROFILE: bool>(
     let mut visited = zeros::<u8>(pixels)?;
     let mut stack = Vec::new();
     let mut groups = BTreeMap::<Fingerprint, PendingPatch>::new();
+    let near_match = config.near_match && matches!(image.samples, DetectionSamples::Integer(..));
     let retain_origins = config.representative.mode != RepresentativeMode::First
         && matches!(image.samples, DetectionSamples::Integer(..));
     let mut positions = 0;
@@ -778,22 +786,25 @@ fn detect_profiled<const PROFILE: bool>(
     if PROFILE {
         profile.counts.groups = groups.len();
     }
-    if groups
+    let largest = groups
         .iter()
         .filter(|(_, p)| p.positions.len() >= limits.min_occurrences)
         .map(|(key, _)| key.width * key.height)
         .max()
-        .unwrap_or(0)
-        < limits.min_max_patch_area
-    {
+        .unwrap_or(0);
+    if !near_match && largest < limits.min_max_patch_area {
         return Ok(Vec::new());
     }
     // Only retained representatives need exact samples. Fingerprint equality
     // is quantized, so retain each representative's own background origin.
     let mut info = Vec::new();
+    let mut unmatched = Vec::new();
     let mut representative_work = RepresentativeStats::default();
     for (key, mut patch) in groups {
         if patch.positions.len() < limits.min_occurrences {
+            if near_match && unmatched.len() < near::MAX_UNMATCHED {
+                unmatched.push(((key.width, key.height), patch));
+            }
             continue;
         }
         representative::choose(
@@ -831,6 +842,17 @@ fn detect_profiled<const PROFILE: bool>(
     // Source area sort leaves equal-area order unspecified; use stable key
     // order for reproducible Rust output. This does not change pixel replay.
     info.sort_by_key(|p| std::cmp::Reverse(p.key.width * p.key.height));
+    if near_match {
+        let _near_scope = crate::profile::scope("patch.source.near_match");
+        work.near_candidate = near::propose(image, &info, unmatched, limits).filter(|candidate| {
+            candidate
+                .first()
+                .is_some_and(|p| p.key.width * p.key.height >= limits.min_max_patch_area)
+        });
+    }
+    if largest < limits.min_max_patch_area {
+        info.clear();
+    }
     Ok(info)
 }
 
@@ -1078,11 +1100,27 @@ pub fn discover_source(
         ));
     }
     let detector_scope = crate::profile::scope("patch.source.detect");
-    let info = detect(image, config, &mut Work::default())?;
+    let mut work = Work::default();
+    let info = detect(image, config, &mut work)?;
     drop(detector_scope);
+    if let Some(candidate) = work.near_candidate {
+        match assemble_add_plan(image, config, &candidate) {
+            Ok(Some(plan)) => return Ok(Some(plan)),
+            Ok(None) | Err(Error::Encoding(_)) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    assemble_add_plan(image, config, &info)
+}
+
+fn assemble_add_plan(
+    image: ImageView<'_>,
+    config: &SourcePatchConfig,
+    info: &[PatchInfo],
+) -> Result<Option<AddPatchPlan>> {
     let packing_scope = crate::profile::scope("patch.source.pack_dictionary");
     let Some(packed) = pack_dictionary(
-        &info,
+        info,
         image.color_channels,
         image.planes.len() - image.color_channels,
         config.limits.max_reference_pixels,
@@ -1614,6 +1652,81 @@ mod tests {
             assert!(plan.residual.requires_signed_samples());
             replay(&image, &plan);
         }
+    }
+
+    #[test]
+    fn near_match_crosses_fingerprints_and_preserves_hidden_rgb() {
+        let mut image = blank(8, 3, 2);
+        for plane in &mut image.planes[..3] {
+            plane.fill(200);
+            for (x0, y0) in [(17, 13), (53, 33), (89, 53)] {
+                for y in 0..11 {
+                    for x in 0..11 {
+                        let delta = if (x + y) % 2 == 0 { 99 } else { 69 };
+                        plane[(y0 + y) * image.width + x0 + x] = 200 - delta;
+                    }
+                }
+            }
+            // Cross a fingerprint boundary independently in each occurrence.
+            for (x, y, value) in [(17, 13, 99), (53, 33, 79), (89, 53, 101)] {
+                plane[y * image.width + x] = value;
+            }
+        }
+        let default = SourcePatchConfig::default();
+        assert!(discover_source(image.view(), &default).unwrap().is_none());
+        let config = SourcePatchConfig {
+            near_match: true,
+            ..default
+        };
+        let plan = discover_source(image.view(), &config).unwrap().unwrap();
+        assert_eq!(plan.dictionary.references.len(), 1);
+        assert_eq!(plan.dictionary.positions.len(), 3);
+        assert!(plan.reference.planes[0].iter().any(|&sample| sample < 0));
+        replay(&image, &plan);
+    }
+
+    #[test]
+    fn near_match_extends_a_baseline_template_and_rejects_opposite_color() {
+        let mut image = blank(16, 3, 1);
+        for plane in &mut image.planes[..3] {
+            plane.fill(32768);
+            for (x0, y0, sign, shift) in [
+                (13, 13, -1, 0),
+                (41, 25, -1, 0),
+                (69, 37, -1, 200),
+                (97, 49, 1, 200),
+            ] {
+                for y in 0..11 {
+                    for x in 0..11 {
+                        let delta = if x == 0 && y == 0 {
+                            25600 + shift
+                        } else if (x + y) % 2 == 0 {
+                            25000
+                        } else {
+                            22000
+                        };
+                        plane[(y0 + y) * image.width + x0 + x] = 32768 + sign * delta;
+                    }
+                }
+            }
+        }
+        let default = SourcePatchConfig::default();
+        let baseline = discover_source(image.view(), &default).unwrap().unwrap();
+        assert_eq!(baseline.dictionary.positions.len(), 2);
+        let near = discover_source(
+            image.view(),
+            &SourcePatchConfig {
+                near_match: true,
+                ..default
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(near.reference, baseline.reference);
+        assert_eq!(near.dictionary.references.len(), 1);
+        assert_eq!(near.dictionary.positions.len(), 3);
+        assert_eq!(near.dictionary.positions[2].x, 69);
+        replay(&image, &near);
     }
 
     #[test]

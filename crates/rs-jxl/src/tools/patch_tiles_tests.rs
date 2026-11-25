@@ -8,6 +8,56 @@ fn forced() -> TilePatchOptions {
     }
 }
 
+#[test]
+fn rectangles_require_matching_neighbors_in_every_copy() {
+    let (width, height) = (72, 24);
+    let mut image = ReferenceImage {
+        width,
+        height,
+        bit_depth: 16,
+        color_channels: 3,
+        planes: vec![vec![0; width * height]; 4],
+    };
+    for origin in [0, 24, 48] {
+        for y in 0..16 {
+            for x in 0..16 {
+                image.planes[0][y * width + origin + x] = (137 * x + 217 * y) as i32;
+            }
+        }
+    }
+    let receipt = Arc::new(TilePatchReceipt::default());
+    let options = TilePatchOptions {
+        tile_size: 8,
+        expand_rectangles: true,
+        receipt: Some(receipt.clone()),
+        ..forced()
+    };
+    for damaged in [false, true] {
+        if damaged {
+            // Only hidden red differs, in the last copy's lower right tile.
+            image.planes[0][9 * width + 48 + 9] ^= 1;
+        }
+        let plan = discover_tiles(image.view(), &options).unwrap().unwrap();
+        if damaged {
+            assert!(plan.dictionary.references.len() > 1);
+        } else {
+            assert_eq!(plan.dictionary.references.len(), 1);
+            let rect = &plan.dictionary.references[0];
+            assert_eq!((rect.width, rect.height), (16, 16));
+            assert_eq!(receipt.snapshot().merged_groups, 3);
+            assert_eq!(receipt.snapshot().covered_pixels, 3 * 256);
+        }
+        let residual = ImageView {
+            planes: &plan.residual,
+            ..image.view()
+        };
+        assert_eq!(
+            compose(residual, plan.reference.view(), &plan.dictionary).unwrap(),
+            image.planes
+        );
+    }
+}
+
 fn fixture(bits: u32, colors: usize, extras: usize) -> ReferenceImage {
     let (width, height) = (65, 35);
     let maximum = (1 << bits) - 1;

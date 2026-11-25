@@ -12,15 +12,21 @@ pub(super) struct Estimate {
 
 // Fixed JXL predictors only. Independent tile boundaries intentionally charge
 // the source and reference alike; boundary disruption is charged separately.
-fn tile_bits(planes: &[Vec<i32>], stride: usize, origin: usize, side: usize) -> f64 {
+fn tile_bits(
+    planes: &[Vec<i32>],
+    stride: usize,
+    origin: usize,
+    width: usize,
+    height: usize,
+) -> f64 {
     let config = HybridUintConfig::default();
-    let count = (side * side) as f64;
+    let count = (width * height) as f64;
     let mut bits = 0.0;
     for plane in planes {
         let mut histogram = [[0u64; 128]; 4];
         let mut extra = [0u64; 4];
-        for y in 0..side {
-            for x in 0..side {
+        for y in 0..height {
+            for x in 0..width {
                 let p = origin + y * stride + x;
                 let left = if x == 0 { 0 } else { plane[p - 1] };
                 let top = if y == 0 { 0 } else { plane[p - stride] };
@@ -75,14 +81,16 @@ pub(super) fn estimate(
     let mut source_bits = 0.0;
     let mut saving = 0.0;
     let mut dictionary = 512.0 + 64.0 * image.planes.len() as f64;
-    let boundary = (2 * side) as f64 * image.planes.len() as f64 * image.bit_depth as f64;
     for (patch, &(ax, ay)) in info.iter().zip(&packing.2) {
+        let (w, h) = (patch.key.width, patch.key.height);
+        let boundary = (w + h) as f64 * image.planes.len() as f64 * image.bit_depth as f64;
         let (x, y) = patch.positions[0];
         let original = tile_bits(
             image.planes,
             image.width,
             y as usize * image.width + x as usize,
-            side,
+            w,
+            h,
         );
         let copies = patch.positions.len() as f64;
         source_bits += original * copies;
@@ -91,7 +99,8 @@ pub(super) fn estimate(
         saving += (copies - 1.0) * original - copies * boundary;
         dictionary += integer_bits(ax as u64)
             + integer_bits(ay as u64)
-            + 2.0 * integer_bits((side - 1) as u64)
+            + integer_bits((w - 1) as u64)
+            + integer_bits((h - 1) as u64)
             + integer_bits(patch.positions.len() as u64 - 1)
             + 16.0;
         let mut previous = None;
@@ -123,7 +132,7 @@ pub(super) fn estimate(
     for sample in 0..samples {
         let tile = (count / samples) * sample + (count % samples) * sample / samples;
         let origin = (tile / columns) * side * image.width + (tile % columns) * side;
-        sampled_bits += tile_bits(image.planes, image.width, origin, side);
+        sampled_bits += tile_bits(image.planes, image.width, origin, side, side);
     }
     let covered = count * side * side;
     let edge_pixels = image.width * image.height - covered;

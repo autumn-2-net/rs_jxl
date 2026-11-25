@@ -706,15 +706,14 @@ fn source_patch_block_hybrids_and_parallel_gather_match_official_djxl() {
             threads: 4,
             ..Default::default()
         };
-        let original = adapter::project_native(&params, &fixture.image, &base)
-            .unwrap()
-            .exact_options()
-            .unwrap();
         for tile_size in [8, 16] {
             for (reference_block, residual_block) in
                 [(false, false), (true, false), (false, true), (true, true)]
             {
-                let mut options = original.clone();
+                // Set each block context before projection so effort 9 only
+                // selects its automatic learner on untargeted frames.
+                let mut main_base = base.clone();
+                let mut reference_base = base.clone();
                 let reference = Arc::new(block_context::Receipt::default());
                 let residual = Arc::new(block_context::Receipt::default());
                 let gather = GatherOptions {
@@ -722,18 +721,15 @@ fn source_patch_block_hybrids_and_parallel_gather_match_official_djxl() {
                     sparse: true,
                     ..Default::default()
                 };
-                options.modular.source_gather = Some(gather.clone());
-                let policy = options.source_patch_reference.as_mut().unwrap();
-                policy.modular.source_gather = Some(gather);
                 if reference_block {
-                    policy.modular.block_context = Some(block_context::Options {
+                    reference_base.modular.block_context = Some(block_context::Options {
                         tile_size,
                         receipt: Some(reference.clone()),
                         ..Default::default()
                     });
                 }
                 if residual_block {
-                    options.modular.block_context = Some(block_context::Options {
+                    main_base.modular.block_context = Some(block_context::Options {
                         tile_size,
                         receipt: Some(residual.clone()),
                         ..Default::default()
@@ -741,7 +737,22 @@ fn source_patch_block_hybrids_and_parallel_gather_match_official_djxl() {
                 }
                 let context =
                     format!("hybrid-{bits}-{tile_size}-{reference_block}-{residual_block}");
-                let encoded = encode(&fixture.image, &options).unwrap();
+                let mut options = adapter::project_native(&params, &fixture.image, &main_base)
+                    .unwrap()
+                    .exact_options()
+                    .unwrap();
+                let mut policy = adapter::source_patch_reference_policy(
+                    &params,
+                    &fixture.image,
+                    &reference_base,
+                    Default::default(),
+                )
+                .unwrap();
+                options.modular.source_gather = Some(gather.clone());
+                policy.modular.source_gather = Some(gather);
+                options.source_patch_reference = Some(policy);
+                let encoded =
+                    encode(&fixture.image, &options).unwrap_or_else(|e| panic!("{context}: {e}"));
                 assert_eq!(reference.snapshot().trees > 0, reference_block, "{context}");
                 assert_eq!(residual.snapshot().trees > 0, residual_block, "{context}");
                 let input = scratch.path.join(format!("{context}.jxl"));

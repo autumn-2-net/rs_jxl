@@ -18,12 +18,16 @@ use crate::{Error, Result};
 mod admission;
 #[path = "patch_off_grid.rs"]
 mod off_grid;
+#[path = "patch_tile_rectangles.rs"]
+mod rectangles;
 
 #[derive(Clone, Debug)]
 pub struct TilePatchOptions {
     /// Search arbitrary pixel origins for exact copies of grid-seeded tiles.
     /// Independent experimental detector; the fixed-grid default is unchanged.
     pub off_grid: bool,
+    /// Merge adjacent exact groups when every occurrence has the same neighbor.
+    pub expand_rectangles: bool,
     /// Off-grid seed/occurrence count guard. Exhaustion declines this candidate,
     /// never truncates input or fails ordinary encoding.
     pub max_discovery_positions: usize,
@@ -49,6 +53,7 @@ impl Default for TilePatchOptions {
     fn default() -> Self {
         Self {
             off_grid: false,
+            expand_rectangles: false,
             max_discovery_positions: 262_144,
             force: false,
             min_estimated_savings: 0.02,
@@ -109,6 +114,7 @@ pub struct TilePatchStats {
     pub tiles_examined: usize,
     pub constant_tiles: usize,
     pub repeated_groups: usize,
+    pub merged_groups: usize,
     pub selected_groups: usize,
     pub positions: usize,
     pub covered_pixels: usize,
@@ -137,6 +143,7 @@ impl TilePatchReceipt {
         total.tiles_examined += other.tiles_examined;
         total.constant_tiles += other.constant_tiles;
         total.repeated_groups += other.repeated_groups;
+        total.merged_groups += other.merged_groups;
         total.selected_groups += other.selected_groups;
         total.positions += other.positions;
         total.covered_pixels += other.covered_pixels;
@@ -341,7 +348,11 @@ fn discover_inner(
         }
         range.end = range.start + occurrences;
         remaining -= occurrences;
-        selected.push(range);
+        selected.push(rectangles::Group {
+            range,
+            width: side,
+            height: side,
+        });
     }
     if selected.is_empty() {
         return Ok(None);
@@ -357,27 +368,44 @@ fn discover_inner(
             return Ok(None);
         }
     };
-    let payload = area
-        .checked_mul(image.planes.len())
-        .ok_or(Error::Limit("tile patch samples"))?;
+    let packing = if options.expand_rectangles
+        && let Some((merged, new_packing)) = rectangles::expand(
+            image.width,
+            &index,
+            &selected,
+            packing.0,
+            options.max_reference_pixels,
+        ) {
+        stats.merged_groups = selected.len() - merged.len();
+        selected = merged;
+        new_packing
+    } else {
+        packing
+    };
     let mut info = Vec::with_capacity(selected.len());
-    for range in selected {
-        let tiles = &index[range];
+    let mut covered = 0;
+    for group in selected {
+        let tiles = &index[group.range];
         let origin = tiles[0].origin;
+        let area = group.width * group.height;
+        covered += area * tiles.len();
+        let payload = area
+            .checked_mul(image.planes.len())
+            .ok_or(Error::Limit("tile patch samples"))?;
         let mut samples = Vec::new();
         samples
             .try_reserve_exact(payload)
             .map_err(|_| Error::Limit("tile patch payload allocation"))?;
         for plane in image.planes {
-            for y in 0..side {
+            for y in 0..group.height {
                 let first = origin + y * image.width;
-                samples.extend_from_slice(&plane[first..first + side]);
+                samples.extend_from_slice(&plane[first..first + group.width]);
             }
         }
         info.push(PatchInfo {
             key: PatchKey {
-                width: side,
-                height: side,
+                width: group.width,
+                height: group.height,
                 samples,
             },
             positions: tiles
@@ -405,7 +433,7 @@ fn discover_inner(
     let plan = build_plan(image, &info, packing)?;
     stats.selected_groups = plan.dictionary.references.len();
     stats.positions = plan.dictionary.positions.len();
-    stats.covered_pixels = stats.positions * area;
+    stats.covered_pixels = covered;
     stats.atlas_pixels = plan.reference.width * plan.reference.height;
     Ok(Some(plan))
 }
