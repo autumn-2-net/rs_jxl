@@ -193,6 +193,48 @@ pub fn image(spec: &ImageSpec, data: &[u8], strip_metadata: bool) -> Result<(Ima
     Ok((image.with_metadata(meta, planes).map_err(message)?, false))
 }
 
+fn describe_plane(
+    (dtype, sample_bytes): (&str, usize),
+    samples: usize,
+    offset: usize,
+    width: usize,
+    height: usize,
+    channels: usize,
+) -> Result<(Value, usize)> {
+    if samples != sample_count(width, height, channels)? {
+        return Err("output plane dimensions do not match storage".into());
+    }
+    let length = samples
+        .checked_mul(sample_bytes)
+        .ok_or("output byte count overflow")?;
+    offset
+        .checked_add(length)
+        .filter(|n| *n <= isize::MAX as usize)
+        .ok_or("output exceeds isize::MAX")?;
+    Ok((
+        json!({"width":width,"height":height,"channels":channels,"dtype":dtype,"offset":offset,"length":length}),
+        length,
+    ))
+}
+
+pub fn append_owned(
+    data: &mut Vec<u8>,
+    pixels: PixelData,
+    width: usize,
+    height: usize,
+    channels: usize,
+) -> Result<Value> {
+    match pixels {
+        PixelData::U8(bytes) if data.is_empty() => {
+            let (descriptor, _) =
+                describe_plane(("u8", 1), bytes.len(), 0, width, height, channels)?;
+            *data = bytes;
+            Ok(descriptor)
+        }
+        other => append(data, &other, width, height, channels),
+    }
+}
+
 pub fn append(
     data: &mut Vec<u8>,
     pixels: &PixelData,
@@ -200,25 +242,15 @@ pub fn append(
     height: usize,
     channels: usize,
 ) -> Result<Value> {
-    if pixels.len() != sample_count(width, height, channels)? {
-        return Err("output plane dimensions do not match storage".into());
-    }
-    let (dtype, bytes) = match pixels {
+    let format = match pixels {
         PixelData::U8(_) => ("u8", 1),
         PixelData::U16(_) => ("u16", 2),
         PixelData::U32(_) => ("u32", 4),
         PixelData::F16(_) => ("f16", 2),
         PixelData::F32(_) => ("f32", 4),
     };
-    let length = pixels
-        .len()
-        .checked_mul(bytes)
-        .ok_or("output byte count overflow")?;
-    let offset = data.len();
-    offset
-        .checked_add(length)
-        .filter(|n| *n <= isize::MAX as usize)
-        .ok_or("output exceeds isize::MAX")?;
+    let (descriptor, length) =
+        describe_plane(format, pixels.len(), data.len(), width, height, channels)?;
     data.try_reserve(length).map_err(message)?;
     macro_rules! append_words {
         ($values:expr) => {{
@@ -238,9 +270,7 @@ pub fn append(
         PixelData::U32(v) => append_words!(v),
         PixelData::F32(v) => append_words!(v),
     }
-    Ok(
-        json!({"width":width,"height":height,"channels":channels,"dtype":dtype,"offset":offset,"length":length}),
-    )
+    Ok(descriptor)
 }
 
 pub fn extra_metadata(info: &ExtraChannelInfo, index: usize) -> Value {
@@ -322,6 +352,19 @@ mod tests {
         assert_eq!(image.channel_dimensions(1), (2, 2));
         assert_eq!(image.extra_planes()[0].len(), 4);
         assert!(region(&[0], usize::MAX, 2).is_err());
+    }
+
+    #[test]
+    fn owned_u8_planes_reuse_the_first_allocation() {
+        let first = vec![11, 22, 33];
+        let base = first.as_ptr();
+        let mut packed = Vec::new();
+        let first = append_owned(&mut packed, PixelData::U8(first), 1, 1, 3).unwrap();
+        assert_eq!(packed.as_ptr(), base);
+        assert_eq!(first["offset"], 0);
+        let next = append_owned(&mut packed, PixelData::U8(vec![44]), 1, 1, 1).unwrap();
+        assert_eq!(next["offset"], 3);
+        assert_eq!(packed, [11, 22, 33, 44]);
     }
 
     #[test]

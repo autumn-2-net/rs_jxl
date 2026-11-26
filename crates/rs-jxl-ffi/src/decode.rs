@@ -139,10 +139,10 @@ pub fn execute_with_context(
     result["output_intensity_target"] = json!(image.output_intensity_target);
     let mut data = Vec::new();
     let mut frames = Vec::new();
-    for frame in &image.frames {
-        let mut value = pixels::append(
+    for frame in image.frames {
+        let mut value = pixels::append_owned(
             &mut data,
-            &frame.pixels,
+            frame.pixels,
             frame.width,
             frame.height,
             frame.layout.channels(),
